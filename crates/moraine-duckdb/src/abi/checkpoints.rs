@@ -125,10 +125,9 @@ pub unsafe extern "C" fn moraine_create_checkpoint(
 /// # Safety
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
-/// point to a valid [`MoraineS3Config`] whose non-null fields are valid
-/// NUL-terminated C strings. `out_items` must be a valid, writable
-/// `*mut *mut MoraineCheckpoint` and `out_len` a valid, writable
-/// `*mut usize`. `err`, if non-null, must be a valid, writable
+/// satisfy [`MoraineS3Config`]'s borrowing contract. `out_items` must be a
+/// valid, writable `*mut *mut MoraineCheckpoint` and `out_len` a valid,
+/// writable `*mut usize`. `err`, if non-null, must be a valid, writable
 /// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_checkpoints(
@@ -218,9 +217,9 @@ pub unsafe extern "C" fn moraine_checkpoints_free(items: *mut MoraineCheckpoint,
 /// # Safety
 ///
 /// `path` and `id` must be valid NUL-terminated C strings. `s3`, if
-/// non-null, must point to a valid [`MoraineS3Config`] whose non-null
-/// fields are valid NUL-terminated C strings. `err`, if non-null, must be
-/// a valid, writable [`MoraineError`]. All for the duration of this call.
+/// non-null, must satisfy [`MoraineS3Config`]'s borrowing contract. `err`, if
+/// non-null, must be a valid, writable [`MoraineError`]. All for the duration
+/// of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_delete_checkpoint(
     path: *const c_char,

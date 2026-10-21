@@ -1149,6 +1149,7 @@ fn schema_info(value: &SchemaValue) -> SchemaInfo {
     SchemaInfo {
         id: SchemaId::new(value.schema_id),
         name: value.schema_name.clone(),
+        parent: value.parent_schema_id.map(SchemaId::new),
     }
 }
 
@@ -1595,6 +1596,7 @@ mod tests {
             schema_name: name.into(),
             path: format!("{name}/"),
             path_is_relative: true,
+            parent_schema_id: None,
         }
     }
 

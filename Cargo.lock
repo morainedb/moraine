@@ -2004,6 +2004,7 @@ name = "moraine-duckdb"
 version = "0.7.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "cbindgen",
  "futures",

@@ -369,6 +369,9 @@ async fn continued(
     let from = u64::try_from(prefix.len()).ok()?;
     let to = u64::try_from(end).ok()?;
     let rest = file.store.read_range(path, from..to).await.ok()?;
+    if rest.len() != end.checked_sub(prefix.len())? {
+        return None;
+    }
 
     let mut bytes = Vec::with_capacity(end);
     bytes.extend_from_slice(&prefix);

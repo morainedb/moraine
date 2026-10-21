@@ -334,7 +334,7 @@ std::vector<duckdb::Value> SchemaShape(const MoraineSchemaRow &r) {
 
 std::vector<duckdb::Value> ExtendedSchemaShape(const MoraineSchemaRow &r) {
 	auto values = SchemaShape(r);
-	values.push_back(duckdb::Value(duckdb::LogicalType::BIGINT));
+	values.push_back(OptBigint(r.has_parent_schema_id, r.parent_schema_id));
 	return values;
 }
 

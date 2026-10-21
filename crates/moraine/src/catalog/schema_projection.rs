@@ -131,9 +131,14 @@ impl CatalogSnapshot {
         if !changed {
             return Ok(columns);
         }
-        let history =
-            read::scan_entity_kind(handle, EntityRecordKind::Column, Versions::LiveAndEnded)
-                .await?;
+        let history = read::scan_entity_kind_of(
+            handle,
+            EntityRecordKind::Column,
+            Versions::LiveAndEnded,
+            table.get(),
+        )
+        .await?
+        .ok_or_else(|| Error::Corruption("column history is not table-scoped".to_owned()))?;
         let source_retained = read::read_snapshot(handle, snapshot).await?.is_some();
         for column in &mut columns {
             let historical = history.iter().find_map(|record| match record {
@@ -228,6 +233,72 @@ fn hive_value(path: &str, name: &str, data_type: Option<&DataType>) -> Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn historical_column_resolution_reads_only_its_table() {
+        use std::{cell::Cell, sync::Arc};
+
+        use object_store::memory::InMemory;
+
+        use crate::{
+            Catalog, CatalogOptions, ColumnDef, ColumnId,
+            store::key::{EntityKey, Key},
+        };
+
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let table = Cell::new(None);
+        let written = catalog
+            .commit(|tx| {
+                let schema = tx.create_schema("s")?;
+                table.set(Some(tx.create_table(
+                    schema,
+                    "t",
+                    &[ColumnDef {
+                        name: "original".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )?));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let table = table.get().unwrap();
+        catalog
+            .commit(|tx| tx.rename_column(table, ColumnId::new(1), "renamed"))
+            .await
+            .unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+
+        // An unrelated table's history must never be decoded by this read.
+        let tx = catalog.begin_write_tx().unwrap();
+        tx.put(
+            Key::history(
+                EntityKey::Column {
+                    table_id: table.get() + 1,
+                    column_id: 1,
+                },
+                written.get(),
+            )
+            .encode(),
+            b"invalid column",
+        )
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let session = catalog.begin_read().await.unwrap();
+        let columns = snapshot
+            .inline_read_columns(session.handle(), table, written.get())
+            .await
+            .unwrap();
+        assert_eq!(columns[0].source_name.as_deref(), Some("original"));
+        session.finish();
+        catalog.close().await.unwrap();
+    }
 
     #[test]
     fn hive_values_decode_escapes_and_preserve_string_null_rules() {

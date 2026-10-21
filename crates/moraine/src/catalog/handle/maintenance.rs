@@ -489,6 +489,10 @@ impl Catalog {
                 "index {index} is still live; drop it before reclaiming its entries"
             )));
         }
+        // Unallocated IDs may become live after this snapshot.
+        if index.get() >= head.snapshot.next_catalog_id {
+            return Ok(0);
+        }
 
         let mut deletes: Vec<commit::StagedWrite> = Vec::new();
         let session = self.begin_read().await?;
@@ -568,11 +572,19 @@ impl Catalog {
             return Ok(report);
         }
 
-        // Index ids are never reused, so liveness decided once holds for
-        // the whole pass.
-        let live: HashSet<u64> = self
-            .snapshot()
-            .await?
+        let snapshot = self.snapshot().await?;
+        self.reclaim_orphaned_indexes(&snapshot, &request, &mut report)
+            .await?;
+        Ok(report)
+    }
+
+    async fn reclaim_orphaned_indexes(
+        &self,
+        snapshot: &crate::CatalogSnapshot,
+        request: &MaintenanceRequest,
+        report: &mut MaintenanceReport,
+    ) -> Result<()> {
+        let live: HashSet<u64> = snapshot
             .indexes
             .values()
             .flat_map(|per_table| per_table.keys().copied())
@@ -581,6 +593,10 @@ impl Catalog {
         for kind in [IndexKind::Unique, IndexKind::Multi] {
             let mut from = 0u64;
             while let Some(index_id) = self.first_index_id_from(kind, from).await? {
+                // Later scans may see new indexes absent from this snapshot.
+                if index_id >= snapshot.snapshot.next_catalog_id {
+                    break;
+                }
                 if !live.contains(&index_id) {
                     let reclaimed = self
                         .reclaim_dead_range(kind, index_id, request.batch_size, request.pace)
@@ -598,23 +614,13 @@ impl Catalog {
             }
         }
 
-        Ok(report)
+        Ok(())
     }
 
-    /// Re-registers every inlined schema version that still holds rows
-    /// while carrying a deregistration marker, and returns the
-    /// `(table_id, schema_version)` pairs it re-listed.
-    ///
-    /// A flush deregisters the version it emptied, and the `CREATE TABLE`
-    /// that first made a version is the only thing that registers one. A
-    /// version left deregistered with rows still under it is therefore
-    /// listed by nothing: its name resolves and scans read it, but no
-    /// flush enumerates it, so its rows never reach a data file. Clearing
-    /// the marker puts it back in `ducklake_inlined_data_tables` with its
-    /// retained schema untouched, and the next flush drains it.
-    ///
-    /// Safe to repeat: a version whose rows are already flushed away has
-    /// nothing under its marker and is left deregistered.
+    /// Re-registers deregistered inline schema versions that still hold rows,
+    /// making them eligible for flushing. Returns their `(table_id,
+    /// schema_version)` pairs; empty versions remain deregistered, so the
+    /// repair is safe to repeat.
     ///
     /// # Errors
     ///
@@ -806,12 +812,7 @@ impl Catalog {
         Ok(CompactStoreReport { merges })
     }
 
-    /// Deletes every entry of one dead index, `batch_size` per commit,
-    /// returning the total. The caller has already established that the
-    /// index is not live.
-    /// Every `(table_id, data_file_id)` an ended data-file version names,
-    /// which is what a time-travelling read resolves a dropped or replaced
-    /// file through.
+    /// File identities retained in history for time travel.
     async fn historical_data_files(&self) -> Result<HashSet<(u64, u64)>> {
         let session = self.begin_read().await?;
         let mut seen = HashSet::new();
@@ -1040,6 +1041,83 @@ mod tests {
             key::{InlineKey, Key},
         },
     };
+
+    #[tokio::test]
+    async fn index_sweep_preserves_indexes_created_after_its_snapshot() {
+        use std::cell::Cell;
+
+        use crate::{ColumnDef, ColumnId, IndexDef, IndexEntry, IndexKeyValue, IntWidth};
+
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let table = Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.create_schema("s")?;
+                table.set(Some(tx.create_table(
+                    schema,
+                    "t",
+                    &[ColumnDef {
+                        name: "id".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )?));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let table = table.get().unwrap();
+        let before = catalog.snapshot().await.unwrap();
+
+        for unique in [false, true] {
+            let index = Cell::new(None);
+            let value = IndexKeyValue::Int {
+                value: 7,
+                width: IntWidth::I64,
+            };
+            catalog
+                .commit(|tx| {
+                    index.set(Some(tx.create_index(
+                        table,
+                        &IndexDef {
+                            name: format!("index_{unique}"),
+                            columns: vec![ColumnId::new(1)],
+                            unique,
+                        },
+                        &[IndexEntry {
+                            row_id: 0,
+                            values: vec![Some(value.clone())],
+                        }],
+                    )?));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let mut report = super::MaintenanceReport::default();
+            catalog
+                .reclaim_orphaned_indexes(
+                    &before,
+                    &super::MaintenanceRequest::default(),
+                    &mut report,
+                )
+                .await
+                .unwrap();
+            assert_eq!(report.index_entries_reclaimed, 0);
+            assert_eq!(
+                catalog
+                    .index_lookup(table, index.get().unwrap(), &[value])
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        catalog.close().await.unwrap();
+    }
 
     /// Writes one raw inline key. The scans behind the repair read keys
     /// alone, so the value only has to exist.

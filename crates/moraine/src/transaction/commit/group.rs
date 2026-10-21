@@ -1,12 +1,6 @@
-//! The rendezvous concurrent commits meet at, so several become one batch.
-//!
-//! A store admits one batch at a time. A commit that finds the store free
-//! opens a batch and stages onto it; a commit that finds one forming joins
-//! it; a commit that finds one being submitted waits for the next. A batch
-//! seals the moment no caller is on its way into it; nothing waits on a
-//! timer. A submitted batch is visible and folded before it is durable, so
-//! the next batch forms and submits while it awaits its flush, and the
-//! flush pacer lets the two share one.
+//! Coalesces concurrent commits into batches without a timer.
+//! Submission is serialized; durability waits overlap so batches can share a
+//! flush.
 
 use std::sync::{
     Arc,
@@ -556,10 +550,8 @@ impl Coalescer {
     }
 }
 
-/// Holds the store's one flight slot for as long as a batch needs it.
-/// Dropping it admits the next batch, so a submission whose task is
-/// dropped or which panics outside the guarded region cannot latch the
-/// store closed.
+/// Holds the submission slot; dropping it admits the next batch, including
+/// after cancellation or panic.
 struct Flight(Arc<Coalescer>);
 
 impl Drop for Flight {
@@ -571,17 +563,8 @@ impl Drop for Flight {
     }
 }
 
-/// Waits for acknowledgement the way [`await_outcome`] does, and seals the
-/// batch itself if nothing else will.
-///
-/// A batch a caller staged onto without sealing is sealed by whichever
-/// arrival leaves last, on a task of its own. A task that never runs leaves
-/// the batch in `forming` with its outcome sender alive, so every member
-/// riding it waits for a message no one will send, against nothing that is
-/// running. The waiter cannot be the thing that went missing -- it is the
-/// one blocked -- so it takes the work rather than delegating it, and the
-/// caller that would otherwise have issued the next commit is exactly the
-/// caller stuck here.
+/// Waits for acknowledgement, sealing abandoned batches if their background
+/// sealing task never ran.
 pub(crate) async fn await_outcome_sealing(
     coalescer: &Arc<Coalescer>,
     mut outcome: watch::Receiver<BatchState>,

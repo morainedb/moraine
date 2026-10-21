@@ -114,16 +114,9 @@ impl MoraineCatalogHandle {
         }
     }
 
-    /// Spawns the attach's best-effort passes: with `preload`, every
-    /// table's index and inline probe ranges into the block cache; with a
-    /// `DATA_PATH` store, the row summaries of files that have none.
-    ///
-    /// The summary pass is the backfill for files written before summaries
-    /// were published; every commit after this attach publishes its own,
-    /// so between them nothing is left behind. It walks the whole catalog,
-    /// but a file already published costs one header read and nothing
-    /// else, so a lake that has been through it once barely notices the
-    /// next.
+    /// Optionally warms index and inline ranges. Writers with a data store
+    /// also publish missing row summaries; existing summaries cost one header
+    /// read.
     pub(crate) fn spawn_warm_at_attach(&self, preload: bool) {
         let data_store = match self.catalog {
             AttachedCatalog::Writer(_) => self.data_store.clone(),
@@ -151,13 +144,8 @@ impl MoraineCatalogHandle {
         }));
     }
 
-    /// Spawns a commit's best-effort follow-up: the touched tables' index
-    /// and inline ranges into the block cache, and — with a `DATA_PATH`
-    /// store — the row summaries of the files this commit registered,
-    /// published for every other process.
-    ///
-    /// Bounded to what the commit added rather than to whole tables, so a
-    /// hot ingest table does not re-walk itself on every commit.
+    /// Warms touched tables and publishes summaries of files registered since
+    /// the preceding snapshot, when a data store is available.
     pub(crate) fn spawn_commit_passes(&self, tables: Vec<TableId>, committed: SnapshotId) {
         if tables.is_empty() {
             return;

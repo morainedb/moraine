@@ -426,8 +426,10 @@ pub struct ColumnStats {
 pub struct SchemaInfo {
     /// The schema's id.
     pub id: SchemaId,
-    /// The schema's name, unique among live schemas.
+    /// The schema's name, unique among live schemas of its parent.
     pub name: String,
+    /// The schema this one nests under, absent at the top level.
+    pub parent: Option<SchemaId>,
 }
 
 /// A live table.

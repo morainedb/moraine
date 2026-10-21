@@ -275,10 +275,17 @@ fn encode_row_set(
 /// consumed tag named.
 fn decode_row_set(shape: RowSetShape, reader: &mut impl Read) -> foyer::Result<FileRowSet> {
     Ok(match shape {
-        RowSetShape::Range => FileRowSet::Range {
-            start: read_u64(reader)?,
-            end: read_u64(reader)?,
-        },
+        RowSetShape::Range => {
+            let start = read_u64(reader)?;
+            let end = read_u64(reader)?;
+            if start > end {
+                return Err(foyer::Error::new(
+                    foyer::ErrorKind::Parse,
+                    "inverted row range",
+                ));
+            }
+            FileRowSet::Range { start, end }
+        }
         RowSetShape::Roaring => FileRowSet::Roaring(read_roaring_body(reader)?),
         RowSetShape::Sorted => FileRowSet::Sorted(read_sorted_body(reader)?),
     })
@@ -290,9 +297,16 @@ fn read_roaring_body(reader: &mut impl Read) -> foyer::Result<RoaringTreemap> {
 
 fn read_sorted_body(reader: &mut impl Read) -> foyer::Result<Vec<u64>> {
     let count = usize::try_from(read_u64(reader)?).unwrap_or(usize::MAX);
-    (0..count)
+    let rows = (0..count)
         .map(|_| read_u64(reader))
-        .collect::<foyer::Result<Vec<u64>>>()
+        .collect::<foyer::Result<Vec<u64>>>()?;
+    if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            "row membership must be strictly ascending",
+        ));
+    }
+    Ok(rows)
 }
 
 #[derive(Clone, Copy)]
@@ -566,7 +580,7 @@ pub(super) fn decode_membership(reader: &mut impl Read) -> foyer::Result<FileRow
 /// Reads back the body [`encode_positioned_row_set`] wrote, given the
 /// consumed tag.
 fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<PositionedRowSet> {
-    match tag {
+    let positioned = match tag {
         tag::RANGE_ASCENDING => Ok(PositionedRowSet {
             rows: decode_row_set(RowSetShape::Range, reader)?,
             order: RowOrder::Ascending,
@@ -633,14 +647,18 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             foyer::ErrorKind::Parse,
             format!("unknown row-summary tag {other}"),
         )),
+    }?;
+    if let RowOrder::Permuted(positions) = &positioned.order {
+        validate_positions(positions)?;
     }
+    Ok(positioned)
 }
 
 fn decode_repeated_row_set(
     shape: RowSetShape,
     reader: &mut impl Read,
 ) -> foyer::Result<PositionedRowSet> {
-    let rows = repeated_membership(shape, reader)?;
+    let rows = decode_row_set(shape, reader)?;
     let offsets = read_permutation(repeated_offset_count(&rows), reader)?;
     let positions = read_permutation(offsets.last().copied().unwrap_or(0) as usize, reader)?;
     validated_repeated(rows, offsets, positions)
@@ -650,7 +668,7 @@ fn decode_packed_repeated_row_set(
     shape: RowSetShape,
     reader: &mut impl Read,
 ) -> foyer::Result<PositionedRowSet> {
-    let rows = repeated_membership(shape, reader)?;
+    let rows = decode_row_set(shape, reader)?;
     let physical = read_u64(reader)?;
     let offsets = read_packed_positions(
         repeated_offset_count(&rows),
@@ -663,21 +681,6 @@ fn decode_packed_repeated_row_set(
         reader,
     )?;
     validated_repeated(rows, offsets, positions)
-}
-
-/// The membership half of a repeated summary, refusing a sorted run that
-/// is not strictly ascending.
-fn repeated_membership(shape: RowSetShape, reader: &mut impl Read) -> foyer::Result<FileRowSet> {
-    let rows = decode_row_set(shape, reader)?;
-    if let FileRowSet::Sorted(members) = &rows
-        && members.windows(2).any(|pair| pair[0] >= pair[1])
-    {
-        return Err(foyer::Error::new(
-            foyer::ErrorKind::Parse,
-            "invalid repeated row membership",
-        ));
-    }
-    Ok(rows)
 }
 
 /// One offset per member, plus the terminator.
@@ -706,8 +709,18 @@ fn validated_repeated(
     if offsets.last().copied().unwrap_or(0) as usize != positions.len() {
         return Err(malformed());
     }
+    validate_positions(&positions)?;
+    Ok(PositionedRowSet {
+        rows,
+        order: RowOrder::Repeated { offsets, positions },
+    })
+}
+
+/// Every physical position must occur exactly once.
+fn validate_positions(positions: &[u32]) -> foyer::Result<()> {
+    let malformed = || foyer::Error::new(foyer::ErrorKind::Parse, "invalid row positions");
     let mut seen = vec![false; positions.len()];
-    for &position in &positions {
+    for &position in positions {
         let Some(seen) = seen.get_mut(position as usize) else {
             return Err(malformed());
         };
@@ -716,10 +729,7 @@ fn validated_repeated(
         }
         *seen = true;
     }
-    Ok(PositionedRowSet {
-        rows,
-        order: RowOrder::Repeated { offsets, positions },
-    })
+    Ok(())
 }
 
 fn parse_failed(error: impl std::error::Error + Send + Sync + 'static) -> foyer::Error {

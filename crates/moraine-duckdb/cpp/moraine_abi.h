@@ -108,9 +108,37 @@ typedef struct MoraineSnapshotHandle MoraineSnapshotHandle;
 // and `stage` mutates the overlay the dumps read.
 typedef struct MoraineTxHandle MoraineTxHandle;
 
+// Receives credentials; expiry is Unix epoch milliseconds, or zero if unknown.
+// Strings are null or NUL-terminated UTF-8, valid until this call returns.
+typedef void (*MoraineS3CredentialReceiver)(void *output,
+                                            const char *key_id,
+                                            const char *secret,
+                                            const char *token,
+                                            int64_t expiration_epoch_ms);
+
+// Retained credential provider. Callbacks may run on any thread and must
+// not unwind. `load` calls its receiver exactly once on success, before
+// returning; it returns false on failure. Calls may overlap across stores.
+typedef struct MoraineS3CredentialSource {
+  // Callback state, kept alive by balanced retain/release calls.
+  void *context;
+  // Adds one ownership reference; cannot fail.
+  void (*retain)(void*);
+  // Releases one ownership reference.
+  void (*release)(void*);
+  // Resolves credentials without touching the attaching connection.
+  bool (*load)(void*, MoraineS3CredentialReceiver, void*);
+} MoraineS3CredentialSource;
+
 // Mirrors the C `MoraineS3Config`: S3 credentials for an `s3://` store,
-// sourced from a DuckDB secret. Null/empty fields fall back to the AWS_*
-// environment; `use_ssl` is -1 unset, 0 false, 1 true.
+// sourced from a DuckDB secret. A null or entirely unset config uses the
+// AWS_* environment; `use_ssl` is -1 unset, 0 false, 1 true.
+//
+// # Borrowing contract
+//
+// The struct and non-null NUL-terminated strings must stay live for the ABI
+// call. A non-null `credential_source` must stay live for that call and obey
+// its callback contract; Rust retains its context for the store's lifetime.
 typedef struct MoraineS3Config {
   // AWS access key id.
   const char *key_id;
@@ -126,6 +154,8 @@ typedef struct MoraineS3Config {
   const char *url_style;
   // TLS toggle: -1 unset, 0 plain HTTP, 1 HTTPS.
   int32_t use_ssl;
+  // Optional refreshable credentials, retained when borrowed by Rust.
+  const struct MoraineS3CredentialSource *credential_source;
 } MoraineS3Config;
 
 // Mirrors the C `MoraineWalStore`: where a catalog's write-ahead log is
@@ -638,6 +668,10 @@ typedef struct MoraineSchemaRow {
   char *path;
   // `path_is_relative`.
   bool path_is_relative;
+  // Whether `parent_schema_id` is present (`false` at the top level).
+  bool has_parent_schema_id;
+  // `parent_schema_id`, valid iff `has_parent_schema_id`.
+  uint64_t parent_schema_id;
 } MoraineSchemaRow;
 
 // One `ducklake_table` row, as returned by [`moraine_dump_tables`].
@@ -1324,8 +1358,8 @@ void moraine_error_free(char *message);
 // `path`'s scheme selects the store: a local filesystem directory
 // (created if absent) by default, `memory://` for an in-memory store, or
 // `s3://<bucket>[/<prefix>]` for S3. For an `s3://` path, `s3` supplies
-// credentials (any field unset falls back to the AWS_* environment); it
-// may be null to use the environment alone and is ignored otherwise.
+// explicit settings; null or entirely unset uses the AWS_* environment.
+// It is ignored for other schemes.
 //
 // `encrypted` requests DuckLake data-file encryption. Recorded when a
 // fresh store bootstraps; ignored on an already-initialized store, whose
@@ -1390,10 +1424,9 @@ void moraine_error_free(char *message);
 // # Safety
 //
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null,
-// must point to a valid [`MoraineS3Config`] whose non-null fields are
-// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
-// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-// `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
+// must satisfy [`MoraineS3Config`]'s borrowing contract. `cache_dir`,
+// `data_path`, and `checkpoint`, if non-null, must be valid NUL-terminated C
+// strings. `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
 // `path` is null or a NUL-terminated C string and whose `s3` is null or a
 // valid [`MoraineS3Config`].
 // `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
@@ -1524,9 +1557,8 @@ int32_t moraine_raise_catalog_version(struct MoraineCatalogHandle *handle,
 // # Safety
 //
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
-// point to a valid [`MoraineS3Config`] whose non-null fields are valid
-// NUL-terminated C strings. `wal`, if non-null, must point to a valid
-// [`MoraineWalStore`] under the same contract as
+// satisfy [`MoraineS3Config`]'s borrowing contract. `wal`, if non-null, must
+// point to a valid [`MoraineWalStore`] under the same contract as
 // [`moraine_attach_with_wal_store`]'s. `cache_dir`, if non-null, must be a
 // valid NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
 // `cache_puts` are unconstrained. `out`
@@ -2424,9 +2456,8 @@ int32_t moraine_snapshot_id(struct MoraineSnapshotHandle *snapshot,
 // # Safety
 //
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
-// point to a valid [`MoraineS3Config`] whose non-null fields are valid
-// NUL-terminated C strings. `from` and `to`, if non-null, must each point
-// to a valid [`MoraineWalStore`] under the contract
+// satisfy [`MoraineS3Config`]'s borrowing contract. `from` and `to`, if
+// non-null, must each point to a valid [`MoraineWalStore`] under the contract
 // [`super::moraine_attach_with_wal_store`] states. `out_moved` must be a
 // valid, writable `*mut bool`, and `err`, if non-null, a valid, writable
 // [`MoraineError`]. All for the duration of this call.
@@ -2473,10 +2504,9 @@ int32_t moraine_create_checkpoint(struct MoraineCatalogHandle *handle,
 // # Safety
 //
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
-// point to a valid [`MoraineS3Config`] whose non-null fields are valid
-// NUL-terminated C strings. `out_items` must be a valid, writable
-// `*mut *mut MoraineCheckpoint` and `out_len` a valid, writable
-// `*mut usize`. `err`, if non-null, must be a valid, writable
+// satisfy [`MoraineS3Config`]'s borrowing contract. `out_items` must be a
+// valid, writable `*mut *mut MoraineCheckpoint` and `out_len` a valid,
+// writable `*mut usize`. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
 int32_t moraine_checkpoints(const char *path,
                             const struct MoraineS3Config *s3,
@@ -2503,9 +2533,9 @@ void moraine_checkpoints_free(struct MoraineCheckpoint *items, size_t len);
 // # Safety
 //
 // `path` and `id` must be valid NUL-terminated C strings. `s3`, if
-// non-null, must point to a valid [`MoraineS3Config`] whose non-null
-// fields are valid NUL-terminated C strings. `err`, if non-null, must be
-// a valid, writable [`MoraineError`]. All for the duration of this call.
+// non-null, must satisfy [`MoraineS3Config`]'s borrowing contract. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the duration
+// of this call.
 int32_t moraine_delete_checkpoint(const char *path,
                                   const struct MoraineS3Config *s3,
                                   const char *id,

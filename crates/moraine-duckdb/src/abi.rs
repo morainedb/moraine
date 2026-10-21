@@ -26,6 +26,7 @@ mod maintenance;
 mod positions;
 mod read_scope;
 mod row_scan;
+mod s3_credentials;
 mod snapshot;
 mod wal_store;
 
@@ -49,6 +50,7 @@ pub use maintenance::*;
 pub use positions::*;
 pub use read_scope::*;
 pub use row_scan::*;
+pub use s3_credentials::*;
 pub use snapshot::*;
 pub use wal_store::*;
 

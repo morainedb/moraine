@@ -153,6 +153,66 @@ fn a_dense_summary_publishes_its_range() {
     assert!(!decoded.rows.contains(103));
 }
 
+#[test]
+fn malformed_summary_membership_is_rejected() {
+    for rows in [
+        FileRowSet::Range { start: 9, end: 3 },
+        FileRowSet::Sorted(vec![30, 10, 70]),
+        FileRowSet::Sorted(vec![10, 10, 70]),
+    ] {
+        let bytes = sidecar::encode(
+            identity(),
+            &PositionedRowSet {
+                rows,
+                order: RowOrder::Ascending,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sidecar::membership(identity(), &bytes).err(),
+            Some(Rejected::Malformed)
+        );
+        assert_eq!(
+            sidecar::summary(identity(), &bytes).err(),
+            Some(Rejected::Malformed)
+        );
+    }
+}
+
+#[test]
+fn malformed_summary_permutations_are_rejected() {
+    // Three two-bit positions: a duplicate, then an out-of-bounds position.
+    for packed in [0b10_00_00, 0b11_01_00] {
+        let mut bytes = sidecar::encode(
+            identity(),
+            &PositionedRowSet {
+                rows: FileRowSet::Sorted(vec![10, 30, 70]),
+                order: RowOrder::Permuted(vec![0, 1, 2]),
+            },
+        )
+        .unwrap();
+        *bytes.last_mut().unwrap() = packed;
+        assert_eq!(
+            sidecar::summary(identity(), &bytes).err(),
+            Some(Rejected::Malformed)
+        );
+    }
+}
+
+#[test]
+fn malformed_summary_cardinality_is_rejected() {
+    let mut bytes = sidecar::encode(identity(), &permuted()).unwrap();
+    bytes[36..44].copy_from_slice(&4_u64.to_le_bytes());
+    assert_eq!(
+        sidecar::membership(identity(), &bytes).err(),
+        Some(Rejected::Malformed)
+    );
+    assert_eq!(
+        sidecar::summary(identity(), &bytes).err(),
+        Some(Rejected::Malformed)
+    );
+}
+
 proptest::proptest! {
     /// Any file order publishes and reads back with the positions it had.
     #[test]

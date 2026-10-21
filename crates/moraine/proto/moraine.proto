@@ -21,6 +21,9 @@ message SchemaValue {
   string schema_name = 5;
   string path = 6;
   bool path_is_relative = 7;
+  // The schema this one nests under. Written from catalog version 1.1 on;
+  // absent for a top-level schema and for a writer that predates it.
+  optional uint64 parent_schema_id = 8;
 }
 
 // ducklake_table.

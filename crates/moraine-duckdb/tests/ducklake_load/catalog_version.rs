@@ -359,3 +359,96 @@ fn raising_prefixes_the_lifecycle_columns_of_an_inlined_table() {
         "every other UPDATE is still refused, got: {refused}"
     );
 }
+
+/// A raised store takes DDL that writes the columns its shape added.
+///
+/// DuckLake writes `parent_schema_id` on every schema it inserts once the
+/// catalog serves 1.1, so a store that reports the raised shape has to
+/// accept the wider row — a schema created on one is the shortest thing
+/// that proves it.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
+fn a_raised_store_takes_a_new_schema() {
+    let store = TempDir::new("raised-schema-store");
+    let data = TempDir::new("raised-schema-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);",
+    );
+    assert_eq!(
+        raise(store.path(), ", confirm => true"),
+        vec![vec!["1.0", "1.1"]]
+    );
+
+    run_ducklake_sql(store.path(), data.path(), "CREATE SCHEMA lake.s2;");
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT schema_name, parent_schema_id IS NULL \
+             FROM __ducklake_metadata_lake.main.ducklake_schema \
+             WHERE end_snapshot IS NULL ORDER BY schema_name;",
+        )),
+        vec![
+            vec!["main".to_string(), "true".to_string()],
+            vec!["s2".to_string(), "true".to_string()]
+        ],
+        "a top-level schema records no parent"
+    );
+}
+
+/// A schema nested under another records the parent DuckLake gave it, and
+/// reads back under its qualified name.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
+fn a_nested_schema_records_its_parent() {
+    let store = TempDir::new("nested-schema-store");
+    let data = TempDir::new("nested-schema-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);",
+    );
+    assert_eq!(
+        raise(store.path(), ", confirm => true"),
+        vec![vec!["1.0", "1.1"]]
+    );
+
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE SCHEMA lake.outer; CREATE SCHEMA lake.outer.inner;",
+    );
+
+    let rows = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT child.schema_name, parent.schema_name \
+         FROM __ducklake_metadata_lake.main.ducklake_schema child \
+         JOIN __ducklake_metadata_lake.main.ducklake_schema parent \
+           ON child.parent_schema_id = parent.schema_id \
+         WHERE child.end_snapshot IS NULL AND parent.end_snapshot IS NULL;",
+    ));
+    assert_eq!(
+        rows,
+        vec![vec!["inner".to_string(), "outer".to_string()]],
+        "the nested schema points at its parent: {rows:?}"
+    );
+
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.outer.inner.t(a BIGINT); INSERT INTO lake.outer.inner.t VALUES (7);",
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT a FROM lake.outer.inner.t;",
+        )),
+        vec![vec!["7"]],
+        "a table in the nested schema reads back under its qualified name"
+    );
+}

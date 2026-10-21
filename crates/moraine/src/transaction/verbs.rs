@@ -206,6 +206,7 @@ impl Transaction {
             schema_name: name.to_owned(),
             path: format!("{name}/"),
             path_is_relative: true,
+            parent_schema_id: None,
         });
         self.ops.push(Operation::CreateSchema {
             schema_id,
@@ -3505,6 +3506,7 @@ mod tests {
             schema_name: "main".into(),
             path: "main/".into(),
             path_is_relative: true,
+            parent_schema_id: None,
         };
         let mut transaction = Transaction::new(
             CatalogSnapshot::build(

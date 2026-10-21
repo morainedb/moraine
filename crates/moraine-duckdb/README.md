@@ -116,6 +116,13 @@ interval buys no freshness at all: every query refreshes. It sets how
 often the reader polls to keep its checkpoint alive, so longer is simply
 cheaper, within SlateDB's checkpoint lifetime.
 
+**Temporary S3 credentials.** Use a DuckDB `credential_chain` secret with
+`REFRESH 'auto'` for long-lived attaches. Moraine refreshes credentials through
+that provider before their reported expiry; when no expiry is reported, it
+refreshes every minute. Refresh failures surface as store errors. Explicit
+temporary keys without a refresh provider, or changes to the secret's region,
+endpoint, or provider recipe, require detach/reattach.
+
 **Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
 attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
 …) read-only by default, and a read-only attach cannot create a catalog. To
