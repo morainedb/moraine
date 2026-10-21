@@ -337,3 +337,13 @@ extension's attach exposes tailing and both polls.
 - **Options only, no registry.** Clean for embedding hosts; unreachable
   from the extension, which cannot construct the provider. Both routes,
   with the explicit one winning.
+
+## Per-open progress and held writers
+
+`CommitLogProvider::session` creates a provider scoped to one open. Stateful
+providers return fresh state; stateless implementations may return `None` to
+retain the supplied provider. A catalog obtains its reader and committer from
+the same session. Each writer open creates another session, and a promoted holder
+retains that writer's committer alongside its `Db`. Its tail reads and applied
+cursor updates use the held committer, while reader catch-up uses the catalog's
+reader session. A fenced writer must never advance its replacement's replay point.

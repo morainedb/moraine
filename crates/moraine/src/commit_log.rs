@@ -178,9 +178,16 @@ pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
 /// Every method receives the object store the catalog records as its log
 /// store — the catalog store itself unless a separate one was configured —
 /// already wrapped in the catalog's retrying transport, and the catalog's
-/// path within it. The plugs and the committer for one path share one
-/// fold cursor.
+/// path within it. Call `session` once per open, then obtain all plugs
+/// and the committer from that session. Each held writer owns its fold cursor.
 pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
+    /// Creates isolated progress state for one catalog open. Stateless
+    /// providers may return `None`; stateful providers must return a fresh
+    /// session.
+    fn session(&self) -> Option<Arc<dyn CommitLogProvider>> {
+        None
+    }
+
     /// The writer-side plug one read-write open builds its store with: it
     /// replays the log past the store's replay point as the fold, and
     /// reports the fold cursor as the flushed id.
@@ -295,6 +302,7 @@ pub(crate) struct LogCommitter {
 
 /// The store a process holds, and the idle poll folding into it.
 pub(crate) struct Holder {
+    pub(crate) committer: Arc<dyn SlotCommitter>,
     pub(crate) db: slatedb::Db,
     pub(crate) fold_poll: Option<FoldPoll>,
 }
@@ -420,6 +428,18 @@ impl fmt::Debug for LogCommitter {
 }
 
 impl LogCommitter {
+    /// The cursor bound to the held writer, or the reader's committer.
+    pub(crate) fn fold_committer(&self) -> Arc<dyn SlotCommitter> {
+        self.holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or_else(
+                || Arc::clone(&self.committer),
+                |holder| Arc::clone(&holder.committer),
+            )
+    }
+
     /// The store this process holds, if it does.
     pub(crate) fn db(&self) -> Option<slatedb::Db> {
         self.holder
@@ -436,13 +456,19 @@ impl LogCommitter {
 
     /// Takes `db` as the store this process folds into, polling for peers'
     /// slots every `poll`.
-    pub(crate) fn promote(&self, db: slatedb::Db, poll: Duration) {
+    pub(crate) fn promote(
+        &self,
+        db: slatedb::Db,
+        committer: Arc<dyn SlotCommitter>,
+        poll: Duration,
+    ) {
         let fold_poll = FoldPoll::spawn(self.clone(), poll);
         *self
             .holder
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Holder {
             db,
+            committer,
             fold_poll: Some(fold_poll),
         });
         self.folds_since_open.store(0, Ordering::Release);
@@ -515,7 +541,7 @@ impl LogCommitter {
     /// once enough slots have folded since the last flush: the replay point
     /// moves, so a cold open replays at most that many slots.
     pub(crate) async fn folded(&self, sequence: u64) -> Result<()> {
-        self.committer.mark_folded(sequence);
+        self.fold_committer().mark_folded(sequence);
         self.folds_since_open.fetch_add(1, Ordering::AcqRel);
         let Some(db) = self.db() else {
             return Ok(());
@@ -554,7 +580,7 @@ impl LogCommitter {
     /// Folds whatever has landed past this process's cursor. The folder's
     /// idle poll, and the sprint's catch-up.
     pub(crate) async fn fold_tail(&self) -> Result<u64> {
-        let slots = self.committer.tail().await?;
+        let slots = self.fold_committer().tail().await?;
         let count = u64::try_from(slots.len()).unwrap_or(u64::MAX);
         self.fold_slots(slots).await?;
 

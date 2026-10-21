@@ -480,7 +480,8 @@ async fn open_writer_store(
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     warm_segments: Vec<census::SegmentSize>,
 ) -> Result<OpenedWriter> {
-    let provider = commit_log_provider(options);
+    let provider =
+        commit_log_provider(options).map(|provider| provider.session().unwrap_or(provider));
     // The writer paces its own flushes; the store's timer stays off so the
     // pacing is exact.
     let store_builder = |provider: Option<Arc<dyn crate::CommitLogProvider>>| {
@@ -530,8 +531,9 @@ async fn open_writer_store(
     let commit_log = match (committer, &provider) {
         (Some(committer), Some(provider)) => {
             let mut log = LogCommitter {
-                committer,
+                committer: Arc::clone(&committer),
                 holder: Arc::new(std::sync::Mutex::new(Some(crate::commit_log::Holder {
+                    committer,
                     db: db.clone(),
                     fold_poll: None,
                 }))),
@@ -630,18 +632,17 @@ async fn take_store(
     Ok((opened.db, opened.commit_log))
 }
 
-/// Takes the store and keeps only it: the log the open built is a second
-/// handle over the same cursor.
+/// Takes the store and its writer-bound committer, stopping the temporary poll.
 async fn take_store_only(
     object_store: Arc<dyn ObjectStore>,
     options: &CatalogOptions,
-) -> Result<Db> {
+) -> Result<(Db, Arc<dyn crate::SlotCommitter>)> {
     let (db, log) = take_store(object_store, options).await?;
-    if let Some(log) = log {
-        log.demote().await;
-    }
+    let log =
+        log.ok_or_else(|| Error::Configuration("taking a log store requires a provider".into()))?;
+    log.demote().await;
 
-    Ok(db)
+    Ok((db, log.committer))
 }
 
 /// The commit-log provider an open builds its store over: the options' own,
@@ -1760,6 +1761,11 @@ impl Catalog {
         options: CatalogOptions,
         provider: Arc<dyn crate::CommitLogProvider>,
     ) -> Result<Self> {
+        let provider = provider.session().unwrap_or(provider);
+        let options = CatalogOptions {
+            commit_log: Some(Arc::clone(&provider)),
+            ..options
+        };
         let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
             .wal_object_store(
                 options
@@ -1810,8 +1816,8 @@ impl Catalog {
             flushing: flushing_for(provider.as_ref(), &options, &object_store, &log_store),
             reader: Some(Arc::clone(&reader)),
         };
-        if let Some(db) = adopting {
-            log.promote(db, options.commit_log_fold_poll);
+        if let Some((db, writer_committer)) = adopting {
+            log.promote(db, writer_committer, options.commit_log_fold_poll);
             // Adoption is a fold of its own: the store goes straight back,
             // since no committer keeps it.
             release_held_store(&log).await?;
@@ -1854,15 +1860,16 @@ impl Catalog {
         else {
             return Ok(false);
         };
+        let _held = commit_log.guard.lock().await;
         if commit_log.holds_store() {
             return Ok(false);
         }
-        let db = Box::pin(take_store_only(
+        let (db, writer_committer) = Box::pin(take_store_only(
             Arc::clone(&sprint.object_store),
             &sprint.options,
         ))
         .await?;
-        commit_log.promote(db, sprint.options.commit_log_fold_poll);
+        commit_log.promote(db, writer_committer, sprint.options.commit_log_fold_poll);
 
         Ok(true)
     }
@@ -2108,7 +2115,7 @@ impl Catalog {
         let _held = log.guard.lock().await;
 
         let folded = log.fold_tail().await?;
-        let landed = log.committer.tail().await?;
+        let landed = log.fold_committer().tail().await?;
         if let Some((sequence, _)) = landed.first() {
             release_held_store(&log).await?;
             return Err(Error::Constraint(format!(
