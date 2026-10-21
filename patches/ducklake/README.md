@@ -29,7 +29,10 @@ applies them) and then the series below, in file-name order:
    inlined rows through the Appender API instead of formatting them into an
    `INSERT ... VALUES` list, whose cost is per row and dominated by binding
    it; a subclass cache would never be cleared, since the invalidation hook
-   is public but not virtual.
+   is public but not virtual. Re-measured at DuckDB 2.0, where DuckLake's
+   own path stopped formatting per-row SQL: the Appender is still ~2 ms a
+   commit faster, so both it and this patch stay
+   ([measurement](../../docs/inlined-write-appender.md)).
 
 4. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
    metadata backend's structured `commit_outcome=unknown` error field, with
