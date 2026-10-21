@@ -62,8 +62,7 @@ struct MaintenanceConfig {
 // Parses the `MAINTENANCE_*` attach options, in whatever order they
 // arrive. Throws `BinderException` on an unknown step, an unknown
 // parameter, or a step disabled while one of its parameters is supplied.
-MaintenanceConfig ParseMaintenanceOptions(
-    const std::vector<std::pair<std::string, duckdb::Value>> &options);
+MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::string, duckdb::Value>> &options);
 
 // Drives maintenance for one attached lake: a timer thread when the
 // attach configured an interval, plus the on-demand trigger. Both run the
@@ -99,8 +98,7 @@ private:
 	void RecordPass(duckdb::timestamp_t started_at, const char *trigger,
 	                const std::vector<MaintenanceStep> &report) noexcept;
 	// Issues one `CALL ducklake_<step>(...)` on `connection`.
-	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
-	                                const DuckLakeStep &step);
+	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake, const DuckLakeStep &step);
 	MaintenanceStep RunSweep();
 	// Reports what `RunSweep`'s single pass reclaimed from the file column
 	// statistics of data files no snapshot can still resolve. Runs after

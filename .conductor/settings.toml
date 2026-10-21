@@ -46,6 +46,12 @@ fi
 rustup toolchain install nightly-2026-08-29 --profile minimal --component rustfmt
 cargo --version >/dev/null
 
+# The commit hook uses the same pinned C/C++ formatter as CI.
+python3 -m venv target/clang-tools
+target/clang-tools/bin/python -m pip install \
+  "clang-format==$(cat .clang-tools-version)" \
+  "clang-tidy==$(cat .clang-tools-version)"
+
 # `cargo xtask e2e` compiles DuckDB itself, and every workspace builds it
 # in its own tree, so without a compiler cache each one pays ten minutes
 # for the same objects. DuckDB's cmake routes compiles through ccache or

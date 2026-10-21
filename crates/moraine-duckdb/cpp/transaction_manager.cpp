@@ -20,8 +20,8 @@ bool MoraineTransaction::SnapshotStamp(uint64_t &snapshot_id, uint64_t &batch_se
 		stamp_resolved_ = true;
 		if (snapshot_ != nullptr) {
 			MoraineError err {};
-			stamp_present_ = moraine_snapshot_stamp(snapshot_, &stamp_snapshot_id_, &stamp_batch_seq_, &err) ==
-			                 MORAINE_OK;
+			stamp_present_ =
+			    moraine_snapshot_stamp(snapshot_, &stamp_snapshot_id_, &stamp_batch_seq_, &err) == MORAINE_OK;
 			if (!stamp_present_ && err.message != nullptr) {
 				moraine_error_free(err.message);
 			}
@@ -54,9 +54,8 @@ MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 		// The owning client context, when still alive, makes the head read
 		// cancellable; a gone context degrades to a non-cancellable call.
 		auto client = context.lock();
-		auto code =
-		    moraine_tx_begin(catalog_handle_, snapshot_, &tx, client ? moraine_shim_is_interrupted : nullptr,
-		                     client.get(), &err);
+		auto code = moraine_tx_begin(catalog_handle_, snapshot_, &tx, client ? moraine_shim_is_interrupted : nullptr,
+		                             client.get(), &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
@@ -135,8 +134,7 @@ uint64_t MoraineTransaction::RegisterScannedRows(const MetadataTableSpec &spec,
 	return base;
 }
 
-const std::vector<duckdb::Value> *MoraineTransaction::ScannedRow(const MetadataTableSpec &spec,
-                                                                 uint64_t row_id) const {
+const std::vector<duckdb::Value> *MoraineTransaction::ScannedRow(const MetadataTableSpec &spec, uint64_t row_id) const {
 	std::lock_guard<std::mutex> guard(scanned_runs_lock_);
 	// Newest first: a statement resolves against the scan it just ran.
 	for (auto run = scanned_runs_.rbegin(); run != scanned_runs_.rend(); ++run) {
@@ -151,9 +149,8 @@ const std::vector<duckdb::Value> *MoraineTransaction::ScannedRow(const MetadataT
 	return nullptr;
 }
 
-std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec,
-                                                                       bool live_only,
-                                                                       std::optional<uint64_t> scope) const {
+std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec, bool live_only,
+                                                                        std::optional<uint64_t> scope) const {
 	std::lock_guard<std::mutex> guard(staged_state_lock_);
 	auto it = metadata_rows_.find({&spec, live_only, scope});
 	if (it == metadata_rows_.end()) {
@@ -237,7 +234,9 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
                                                                duckdb::Transaction &transaction) {
 	// Whatever the commit below does — succeed, conflict, or spend its
 	// retry budget — its diagnostics reach DuckDB's logger on the way out.
-	auto drain = [&context]() noexcept { DrainMoraineLogs(context); };
+	auto drain = [&context]() noexcept {
+		DrainMoraineLogs(context);
+	};
 	// A staged tx (opened lazily by the first write this DuckDB
 	// transaction made) is taken out from under the lock and committed
 	// after releasing it — moraine_tx_commit blocks on store I/O, which
@@ -272,13 +271,11 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 		catalog_.RecordCommittedSnapshot(new_snapshot_id);
 	}
 	MoraineMemoryTally memory {};
-	auto measured = code == MORAINE_OK &&
-	                moraine_catalog_memory_tally(catalog_.Handle(), &memory) == MORAINE_OK;
+	auto measured = code == MORAINE_OK && moraine_catalog_memory_tally(catalog_.Handle(), &memory) == MORAINE_OK;
 	constexpr uint64_t ALLOCATOR_FLUSH_INDEX_ENTRIES = 100'000;
 	constexpr uint64_t ALLOCATOR_FLUSH_STAGED_BYTES = 64ULL * 1024ULL * 1024ULL;
-	if (code != MORAINE_OK ||
-	    (measured && (memory.last_commit_index_entries >= ALLOCATOR_FLUSH_INDEX_ENTRIES ||
-	                  memory.last_commit_staged_bytes >= ALLOCATOR_FLUSH_STAGED_BYTES))) {
+	if (code != MORAINE_OK || (measured && (memory.last_commit_index_entries >= ALLOCATOR_FLUSH_INDEX_ENTRIES ||
+	                                        memory.last_commit_staged_bytes >= ALLOCATOR_FLUSH_STAGED_BYTES))) {
 		duckdb::Allocator::FlushAll();
 	}
 	drain();

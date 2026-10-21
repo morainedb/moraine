@@ -229,6 +229,26 @@ pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
 pub fn build_and_package_extension(
     bundled: &ducklake_patch::PatchedDuckLake,
 ) -> anyhow::Result<PathBuf> {
+    run_extension_make(bundled, "release")?;
+    let artifact =
+        workspace_root().join("build/release/extension/moraine/moraine.duckdb_extension");
+    ensure!(
+        artifact.exists(),
+        "`make release` finished but the loadable extension is missing at {}",
+        artifact.display()
+    );
+    Ok(artifact)
+}
+
+/// Generates the release compilation database without building the extension.
+pub fn configure_extension(bundled: &ducklake_patch::PatchedDuckLake) -> anyhow::Result<()> {
+    run_extension_make(bundled, "configure-cpp")
+}
+
+fn run_extension_make(
+    bundled: &ducklake_patch::PatchedDuckLake,
+    target: &str,
+) -> anyhow::Result<()> {
     // Stamp the artifact with the pinned DuckDB version explicitly.
     let override_describe = format!("OVERRIDE_GIT_DESCRIBE={}", duckdb_pin());
     // The bundled DuckLake: the prepared checkout instead of a fetch, and
@@ -262,7 +282,7 @@ pub fn build_and_package_extension(
     for _ in 0..2 {
         let mut build = Command::new("make");
         build
-            .args(["release", "GEN=ninja", &override_describe, &vcpkg_toolchain])
+            .args([target, "GEN=ninja", &override_describe, &vcpkg_toolchain])
             .arg(format!("EXT_FLAGS={extension_flags}"))
             .current_dir(workspace_root());
         if let Some(compilers) = &compilers {
@@ -270,14 +290,7 @@ pub fn build_and_package_extension(
         }
         run(&mut build)?;
     }
-    let artifact =
-        workspace_root().join("build/release/extension/moraine/moraine.duckdb_extension");
-    ensure!(
-        artifact.exists(),
-        "`make release` finished but the loadable extension is missing at {}",
-        artifact.display()
-    );
-    Ok(artifact)
+    Ok(())
 }
 
 /// Downloads `url` to `dest` via the system `curl`, removing any partial

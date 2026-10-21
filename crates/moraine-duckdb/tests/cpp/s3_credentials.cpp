@@ -27,7 +27,8 @@ static unique_ptr<BaseSecret> Refresh(ClientContext &, CreateSecretInput &input)
 	secret->secret_map["key_id"] = Value("key-" + std::to_string(++generation));
 	secret->secret_map["secret"] = Value("secret");
 	secret->secret_map["session_token"] = Value("token");
-	secret->secret_map["expiration_epoch_ms"] = Value::BIGINT(Timestamp::GetEpochMs(Timestamp::GetCurrentTimestamp()) + 60000);
+	secret->secret_map["expiration_epoch_ms"] =
+	    Value::BIGINT(Timestamp::GetEpochMs(Timestamp::GetCurrentTimestamp()) + 60000);
 	return secret;
 }
 
@@ -70,7 +71,7 @@ int main() {
 				function.function = Refresh;
 				manager.RegisterSecretFunction(function, OnCreateConflict::ERROR_ON_CONFLICT);
 				auto secret = make_uniq<KeyValueSecret>(vector<string> {"s3://lake/"}, Identifier("s3"),
-				                                      Identifier("rotation_test"), Identifier("rotating"));
+				                                        Identifier("rotation_test"), Identifier("rotating"));
 				secret->secret_map["key_id"] = Value("expired");
 				secret->secret_map["secret"] = Value("expired");
 				secret->secret_map["refresh_info"] = Value::STRUCT({{"marker", Value::INTEGER(42)}});

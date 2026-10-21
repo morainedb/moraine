@@ -306,7 +306,8 @@ duckdb::CreateTableInfo BuildInlineDataTableInfo(duckdb::SchemaCatalogEntry &sch
 	info.columns.AddColumn(duckdb::ColumnDefinition(duckdb::Identifier(names.row_id), duckdb::LogicalType::BIGINT));
 	info.columns.AddColumn(
 	    duckdb::ColumnDefinition(duckdb::Identifier(names.begin_snapshot), duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition(duckdb::Identifier(names.end_snapshot), duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(
+	    duckdb::ColumnDefinition(duckdb::Identifier(names.end_snapshot), duckdb::LogicalType::BIGINT));
 	for (auto &col : user_columns) {
 		info.columns.AddColumn(duckdb::ColumnDefinition(duckdb::Identifier(col.name), col.type));
 	}
@@ -429,8 +430,7 @@ struct InlineDataScanGlobalState : public duckdb::GlobalTableFunctionState {
 // that version decode against its schema-only stream. A flushed table has
 // no body left to touch — its registration outlives its rows, so every
 // read of the base table scans it.
-const DecodedInlineSchema &InlineScanSchema(duckdb::ClientContext &context,
-                                            const InlineDataScanBindData &bind_data,
+const DecodedInlineSchema &InlineScanSchema(duckdb::ClientContext &context, const InlineDataScanBindData &bind_data,
                                             InlineDataScanGlobalState &state) {
 	if (state.decoded_schema) {
 		return *state.decoded_schema;
@@ -467,9 +467,9 @@ bool RefillInlineWindow(duckdb::ClientContext &context, const InlineDataScanBind
 		}
 	} window;
 	MoraineError err {};
-	auto code = moraine_inline_scan_next(state.cursor, kInlineScanWindowRows, &window.rows, &window.rows_len,
-	                                     &window.chunks, &window.chunks_len, moraine_shim_is_interrupted, &context,
-	                                     &err);
+	auto code =
+	    moraine_inline_scan_next(state.cursor, kInlineScanWindowRows, &window.rows, &window.rows_len, &window.chunks,
+	                             &window.chunks_len, moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -829,8 +829,8 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
 	if (auto table_id = ParseInlinedDeleteTableName(name)) {
 		bool exists = false;
 		MoraineError err {};
-		auto code = moraine_inline_file_delete_table_exists(read_handle, *table_id, &exists, moraine_shim_is_interrupted,
-		                                                    &context, &err);
+		auto code = moraine_inline_file_delete_table_exists(read_handle, *table_id, &exists,
+		                                                    moraine_shim_is_interrupted, &context, &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
@@ -885,13 +885,11 @@ namespace {
 
 // The ledger of the statement's own source scan, so physical rowids
 // resolve without store I/O.
-std::shared_ptr<InlineRowLedger> FindInlineRowLedger(const duckdb::PhysicalOperator &op,
-                                                     MoraineCatalogHandle *handle, uint64_t table_id,
-                                                     uint64_t schema_version) {
+std::shared_ptr<InlineRowLedger> FindInlineRowLedger(const duckdb::PhysicalOperator &op, MoraineCatalogHandle *handle,
+                                                     uint64_t table_id, uint64_t schema_version) {
 	if (auto *table_scan = dynamic_cast<const duckdb::PhysicalTableScan *>(&op)) {
 		auto *data = dynamic_cast<const InlineDataScanBindData *>(table_scan->bind_data.get());
-		if (data && data->handle == handle && data->table_id == table_id &&
-		    data->schema_version == schema_version) {
+		if (data && data->handle == handle && data->table_id == table_id && data->schema_version == schema_version) {
 			return data->ledger;
 		}
 	}
@@ -1065,8 +1063,7 @@ public:
 		// The appended physical rowid identifies the version being ended.
 		auto row_id_col = chunk.ColumnCount() - 1;
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto old_row = ResolveRow(state, handle_, table_id_, schema_version_,
-			                          chunk.GetValue(row_id_col, row));
+			auto old_row = ResolveRow(state, handle_, table_id_, schema_version_, chunk.GetValue(row_id_col, row));
 			auto end_snapshot = CellAsU64(chunk.GetValue(set_ref_, row));
 			MoraineError err {};
 			auto code = moraine_tx_stage_inline_inline_delete(tx, table_id_, old_row.row_id, end_snapshot, &err);
@@ -1098,8 +1095,8 @@ public:
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<InlineDmlState>();
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto old_row = ResolveRow(state, handle_, table_id_, schema_version_,
-			                          chunk.GetValue(row_id_chunk_index_, row));
+			auto old_row =
+			    ResolveRow(state, handle_, table_id_, schema_version_, chunk.GetValue(row_id_chunk_index_, row));
 			auto begin_snapshot = old_row.begin_snapshot;
 			if (!state.max_begin_snapshot.has_value() || begin_snapshot > *state.max_begin_snapshot) {
 				state.max_begin_snapshot = begin_snapshot;
@@ -1211,8 +1208,8 @@ public:
 				code = moraine_tx_stage_inline_file_delete_clear(tx, table_id_, &err);
 			} else {
 				for (auto &matched : state.matched_file_deletes) {
-					code = moraine_tx_stage_inline_file_delete_remove(tx, table_id_, matched.first,
-					                                                  matched.second, &err);
+					code =
+					    moraine_tx_stage_inline_file_delete_remove(tx, table_id_, matched.first, matched.second, &err);
 					if (code != MORAINE_OK) {
 						break;
 					}
@@ -1273,9 +1270,9 @@ duckdb::PhysicalOperator &PlanInlineDataDelete(duckdb::PhysicalPlanGenerator &pl
 		                                op.table.name);
 	}
 	auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
-	return planner.Make<MoraineInlineDataDeleteOp>(
-	    op.types, op.table.catalog, op.estimated_cardinality, table_entry.Handle(), table_entry.TableId(),
-	    table_entry.SchemaVersion(), bound_ref.Index());
+	return planner.Make<MoraineInlineDataDeleteOp>(op.types, op.table.catalog, op.estimated_cardinality,
+	                                               table_entry.Handle(), table_entry.TableId(),
+	                                               table_entry.SchemaVersion(), bound_ref.Index());
 }
 
 duckdb::PhysicalOperator &PlanInlineDeleteInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,

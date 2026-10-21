@@ -109,7 +109,6 @@ public:
 
 private:
 	duckdb::ColumnList columns_;
-
 };
 
 // A moraine-backed view entry. Cataloging (name/schema lookup, `DESCRIBE`)
@@ -186,8 +185,8 @@ private:
 // duckdb::NotImplementedException.
 class MoraineCatalog : public duckdb::Catalog {
 public:
-	MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientContext &context,
-	               MoraineCatalogHandle *handle, std::string path, MaintenanceConfig maintenance);
+	MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientContext &context, MoraineCatalogHandle *handle,
+	               std::string path, MaintenanceConfig maintenance);
 	~MoraineCatalog() override;
 
 	// The attach_function_t the storage extension registers.
@@ -264,8 +263,7 @@ public:
 	// replacing whatever it held. Shared by every connection on the
 	// attach, so it is guarded.
 	void HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
-	                      std::shared_ptr<const MetadataRows> rows,
-	                      std::optional<uint64_t> scope = std::nullopt);
+	                      std::shared_ptr<const MetadataRows> rows, std::optional<uint64_t> scope = std::nullopt);
 
 	// What this attach's held rows weigh, estimated as each set was held.
 	// Nothing else accounts for them: they are the shim's own allocation,
@@ -327,6 +325,5 @@ private:
 // reports `<store path>`, so the fallback matches on that. Throws
 // `InvalidInputException` when neither names a moraine catalog.
 MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std::string &catalog_name);
-
 
 } // namespace moraine_duckdb

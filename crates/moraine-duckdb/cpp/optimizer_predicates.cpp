@@ -137,7 +137,7 @@ bool TupleChoices(duckdb::ClientContext &context, const duckdb::Expression &expr
 				return false;
 			}
 		}
-		return true;
+		return subject != nullptr && !values.empty();
 	}
 	const duckdb::Expression *candidate = nullptr;
 	duckdb::vector<const duckdb::Expression *> constants;

@@ -50,8 +50,7 @@ void MoraineMetadataManager::RecordDrivingContext() {
 	if (registered.Get<ParentContextState>(ParentContextState::KEY)) {
 		return;
 	}
-	registered.Insert(ParentContextState::KEY,
-	                  duckdb::make_shared_ptr<ParentContextState>(transaction.context));
+	registered.Insert(ParentContextState::KEY, duckdb::make_shared_ptr<ParentContextState>(transaction.context));
 }
 
 duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::Query(duckdb::string &query) {
@@ -65,9 +64,9 @@ duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::AttachMetadata(c
 }
 
 bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,
-                                                 const duckdb::string &inlined_table_name,
-                                                 const duckdb::DuckLakeInlinedDataInfo &entry,
-                                                 bool has_preserved_row_ids) {
+                                                  const duckdb::string &inlined_table_name,
+                                                  const duckdb::DuckLakeInlinedDataInfo &entry,
+                                                  bool has_preserved_row_ids) {
 	using duckdb::Allocator;
 	using duckdb::Appender;
 	using duckdb::ConstantVector;
@@ -93,8 +92,8 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 		append_types.push_back(type);
 	}
 
-	Appender appender(connection, duckdb::Identifier(catalog.MetadataDatabaseName()),
-	                  duckdb::Identifier(schema_name), duckdb::Identifier(inlined_table_name));
+	Appender appender(connection, duckdb::Identifier(catalog.MetadataDatabaseName()), duckdb::Identifier(schema_name),
+	                  duckdb::Identifier(inlined_table_name));
 	DataChunk append_chunk;
 	append_chunk.Initialize(Allocator::DefaultAllocator(), append_types);
 
@@ -111,7 +110,7 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 			if (has_preserved_row_ids) {
 				int64_t staged_rid = entry.data->row_ids[position];
 				emit_rid = DuckLakeConstants::IsTransactionLocalRowId(staged_rid) ? static_cast<int64_t>(row_id++)
-				                                                                 : staged_rid;
+				                                                                  : staged_rid;
 			} else {
 				emit_rid = static_cast<int64_t>(row_id++);
 			}

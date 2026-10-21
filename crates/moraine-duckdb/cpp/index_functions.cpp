@@ -69,8 +69,7 @@ struct IndexesBindData : public duckdb::FunctionData {
 	}
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		auto &other = other_p.Cast<IndexesBindData>();
-		return catalog_name == other.catalog_name && schema_name == other.schema_name &&
-		       table_name == other.table_name;
+		return catalog_name == other.catalog_name && schema_name == other.schema_name && table_name == other.table_name;
 	}
 };
 
@@ -86,18 +85,17 @@ duckdb::unique_ptr<duckdb::FunctionData> IndexesBind(duckdb::ClientContext &cont
 	auto handle = ResolveHandle(context, bind_data->catalog_name);
 	OwnedArray<MoraineIndexDesc> descs(moraine_indexes_free);
 	MoraineError err {};
-	auto code = moraine_indexes(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
-	                            descs.OutItems(), descs.OutLen(), moraine_shim_is_interrupted, &context, &err);
+	auto code = moraine_indexes(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(), descs.OutItems(),
+	                            descs.OutLen(), moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
 	for (auto &desc : descs) {
 		bind_data->rows.push_back({static_cast<int64_t>(desc.index_id), std::string(desc.name), desc.unique,
-		                           desc.building, IndexStateName(desc.state), desc.certified_at,
-		                           desc.has_certificate});
+		                           desc.building, IndexStateName(desc.state), desc.certified_at, desc.has_certificate});
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,
+	return_types = {duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,
 	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT};
 	names = {"index_id", "index_name", "is_unique", "is_building", "state", "certified_at"};
 	return bind_data;
@@ -130,8 +128,9 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 		output.SetValue(2, i, duckdb::Value::BOOLEAN(row.unique));
 		output.SetValue(3, i, duckdb::Value::BOOLEAN(row.building));
 		output.SetValue(4, i, duckdb::Value(row.state));
-		output.SetValue(5, i, row.has_certificate ? duckdb::Value::UBIGINT(row.certified_at)
-		                                          : duckdb::Value(duckdb::LogicalType::UBIGINT));
+		output.SetValue(5, i,
+		                row.has_certificate ? duckdb::Value::UBIGINT(row.certified_at)
+		                                    : duckdb::Value(duckdb::LogicalType::UBIGINT));
 	}
 	state.offset += count;
 	output.SetChildCardinality(count);
@@ -162,8 +161,8 @@ void FinishIndexBind(duckdb::ClientContext &context, BindData &data) {
 	const auto bytes = data.rows.capacity() * sizeof(MoraineRowId);
 	data.cacheable = data.cacheable && bytes <= 8 * 1024 * 1024;
 	WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
-	                 "index bind resolved rows=" + std::to_string(data.rows.size()) +
-	                 " retained_bytes=" + std::to_string(data.cacheable ? bytes : 0));
+	                "index bind resolved rows=" + std::to_string(data.rows.size()) +
+	                    " retained_bytes=" + std::to_string(data.cacheable ? bytes : 0));
 }
 
 struct LookupBindData : public IndexReadBindData {
@@ -269,8 +268,7 @@ MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueArena
 		break;
 	}
 	default:
-		throw duckdb::InvalidInputException("%s: unsupported value type \"%s\"", caller,
-		                                    value.type().ToString());
+		throw duckdb::InvalidInputException("%s: unsupported value type \"%s\"", caller, value.type().ToString());
 	}
 	return lookup;
 }
@@ -303,9 +301,8 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 	OwnedArray<MoraineRowId> row_ids(moraine_index_lookup_free);
 	MoraineError err {};
 	auto code = moraine_index_lookup(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
-	                                 bind_data->index_name.c_str(), values.data(), values.size(),
-	                                 row_ids.OutItems(), row_ids.OutLen(), moraine_shim_is_interrupted, &context,
-	                                 &err);
+	                                 bind_data->index_name.c_str(), values.data(), values.size(), row_ids.OutItems(),
+	                                 row_ids.OutLen(), moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -322,8 +319,7 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 // moraine_index_in: resolves a list of complete equality keys under one
 // catalog read. A scalar list addresses a one-column index; a list of
 // STRUCT/row values addresses a composite index.
-duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
-                                                duckdb::TableFunctionBindInput &input,
+duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
                                                 duckdb::vector<duckdb::LogicalType> &return_types,
                                                 duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<LookupBindData>();
@@ -368,8 +364,7 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
 	MoraineError err {};
 	auto code = moraine_index_in(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
 	                             bind_data->index_name.c_str(), keys.data(), keys.size(), row_ids.OutItems(),
-	                             row_ids.OutLen(),
-	                             moraine_shim_is_interrupted, &context, &err);
+	                             row_ids.OutLen(), moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -458,8 +453,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	LookupValueArena upper_backing;
 	std::vector<MoraineLookupValue> lower_values;
 	std::vector<MoraineLookupValue> upper_values;
-	auto build_bound = [](const duckdb::Value &value, LookupValueArena &backing,
-	                      std::vector<MoraineLookupValue> &out) {
+	auto build_bound = [](const duckdb::Value &value, LookupValueArena &backing, std::vector<MoraineLookupValue> &out) {
 		// A whole-bound NULL is an open side, not a value: it names no column.
 		if (value.IsNull()) {
 			return;
@@ -481,8 +475,8 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	// Optional `reverse := true` returns the rows in the opposite of the
 	// index's declared order.
 	auto reverse_it = input.named_parameters.find("reverse");
-	const bool reverse =
-	    reverse_it != input.named_parameters.end() && !reverse_it->second.IsNull() && reverse_it->second.GetValue<bool>();
+	const bool reverse = reverse_it != input.named_parameters.end() && !reverse_it->second.IsNull() &&
+	                     reverse_it->second.GetValue<bool>();
 	bind_data->bounds_repr += reverse ? "|rev" : "";
 
 	auto handle = BindIndexRead(context, input, bind_data->cacheable);
@@ -583,8 +577,8 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 
 	// Optional `reverse := true` returns the rows in the opposite order.
 	auto reverse_it = input.named_parameters.find("reverse");
-	const bool reverse =
-	    reverse_it != input.named_parameters.end() && !reverse_it->second.IsNull() && reverse_it->second.GetValue<bool>();
+	const bool reverse = reverse_it != input.named_parameters.end() && !reverse_it->second.IsNull() &&
+	                     reverse_it->second.GetValue<bool>();
 	bind_data->prefix_repr += reverse ? "rev" : "";
 
 	auto handle = BindIndexRead(context, input, bind_data->cacheable);
@@ -666,8 +660,8 @@ void CopyIndexTable(const duckdb::FunctionData &data, std::string &catalog, std:
 	table = bound.table_name;
 }
 
-bool IndexReadTable(const duckdb::TableFunction &function, const duckdb::FunctionData *data,
-                    std::string &catalog, std::string &schema, std::string &table) {
+bool IndexReadTable(const duckdb::TableFunction &function, const duckdb::FunctionData *data, std::string &catalog,
+                    std::string &schema, std::string &table) {
 	if (!data) {
 		return false;
 	}
@@ -718,15 +712,15 @@ struct IndexVerifyGlobalState : public duckdb::GlobalTableFunctionState {
 
 // The pass runs once, at execution start, so a cancelled statement stops it
 // rather than a later chunk.
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexVerifyInitGlobal(
-    duckdb::ClientContext &context, duckdb::TableFunctionInitInput &input) {
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexVerifyInitGlobal(duckdb::ClientContext &context,
+                                                                           duckdb::TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<IndexVerifyBindData>();
 	auto handle = ResolveHandle(context, bind_data.catalog_name);
 	auto state = duckdb::make_uniq<IndexVerifyGlobalState>();
 	MoraineError err {};
-	auto code = moraine_index_verify(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
-	                                 bind_data.index_name.c_str(), &state->report,
-	                                 moraine_shim_is_interrupted, &context, &err);
+	auto code =
+	    moraine_index_verify(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
+	                         bind_data.index_name.c_str(), &state->report, moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -744,8 +738,9 @@ void IndexVerifyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 	for (duckdb::idx_t column = 0; column < 5; column++) {
 		output.SetValue(column, 0, duckdb::Value::UBIGINT(counts[column]));
 	}
-	output.SetValue(5, 0, report.has_certificate ? duckdb::Value::UBIGINT(report.certified_at)
-	                                             : duckdb::Value(duckdb::LogicalType::UBIGINT));
+	output.SetValue(5, 0,
+	                report.has_certificate ? duckdb::Value::UBIGINT(report.certified_at)
+	                                       : duckdb::Value(duckdb::LogicalType::UBIGINT));
 	output.SetChildCardinality(1);
 	state.emitted = true;
 }
@@ -758,9 +753,8 @@ duckdb::unique_ptr<duckdb::FunctionData> VerifyBind(duckdb::ClientContext &, duc
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
 	bind_data->table_name = input.inputs[2].GetValue<std::string>();
 	bind_data->index_name = input.inputs[3].GetValue<std::string>();
-	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
-	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
-	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
+	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
 	names = {"stored", "expected", "missing", "dead", "mismatched", "certified_at"};
 	return bind_data;
 }
@@ -768,17 +762,16 @@ duckdb::unique_ptr<duckdb::FunctionData> VerifyBind(duckdb::ClientContext &, duc
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	using duckdb::LogicalType;
 
-	duckdb::TableFunction list("moraine_indexes",
-	                           {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, IndexesImpl,
-	                           IndexesBind, IndexesInitGlobal);
+	duckdb::TableFunction list("moraine_indexes", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                           IndexesImpl, IndexesBind, IndexesInitGlobal);
 	loader.RegisterFunction(list);
 
 	// (catalog, schema, table, index, then the equality key as variadic args
 	// — one value per indexed column, in the index's column order.)
-	duckdb::TableFunction lookup("moraine_index_lookup",
-	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                              LogicalType::VARCHAR},
-	                             LookupImpl, LookupBind, LookupInitGlobal);
+	duckdb::TableFunction lookup(
+	    "moraine_index_lookup",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LookupImpl,
+	    LookupBind, LookupInitGlobal);
 	lookup.GetSignature().AddArgs("keys", LogicalType::ANY);
 	lookup.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(lookup);
@@ -786,41 +779,37 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	// A homogeneous scalar list addresses a one-column index. A list of
 	// `row(...)` structs carries complete composite keys.
 	duckdb::TableFunction in("moraine_index_in",
-	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                          LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                          LogicalType::LIST(LogicalType::ANY)},
 	                         LookupImpl, InBind, LookupInitGlobal);
 	in.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(in);
 
-	duckdb::TableFunction verify("moraine_index_verify",
-	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                              LogicalType::VARCHAR},
-	                             IndexVerifyImpl, VerifyBind, IndexVerifyInitGlobal);
+	duckdb::TableFunction verify(
+	    "moraine_index_verify",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, IndexVerifyImpl,
+	    VerifyBind, IndexVerifyInitGlobal);
 	loader.RegisterFunction(verify);
 
 	// (catalog, schema, table, index, lower, upper, lower_inclusive,
 	// upper_inclusive); a NULL bound is an open side.
 	duckdb::TableFunction range("moraine_index_range",
-	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY,
-	                             LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::ANY, LogicalType::ANY, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	                            RangeImpl, RangeBind, RangeInitGlobal);
-	range.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
-		options.Add("reverse", LogicalType::BOOLEAN);
-	});
+	range.GetSignature().WithTypedKwargs(
+	    "options", [](duckdb::TypedKwargs &options) { options.Add("reverse", LogicalType::BOOLEAN); });
 	range.cardinality = ExactIndexCardinality<RangeBindData>;
 	loader.RegisterFunction(range);
 
 	// (catalog, schema, table, index, then a leading prefix of predicates as
 	// variadic args — a NULL arg is IS NULL, any other is = value).
-	duckdb::TableFunction nulls("moraine_index_nulls",
-	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR},
-	                            NullsImpl, NullsBind, NullsInitGlobal);
+	duckdb::TableFunction nulls(
+	    "moraine_index_nulls", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    NullsImpl, NullsBind, NullsInitGlobal);
 	nulls.GetSignature().AddArgs("keys", LogicalType::ANY);
-	nulls.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
-		options.Add("reverse", LogicalType::BOOLEAN);
-	});
+	nulls.GetSignature().WithTypedKwargs(
+	    "options", [](duckdb::TypedKwargs &options) { options.Add("reverse", LogicalType::BOOLEAN); });
 	nulls.cardinality = ExactIndexCardinality<NullsBindData>;
 	loader.RegisterFunction(nulls);
 }

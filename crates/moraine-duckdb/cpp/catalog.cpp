@@ -161,16 +161,16 @@ extern "C" bool moraine_shim_is_interrupted(void *client_context) {
 	// context's own flag is one nobody can set. The metadata manager records
 	// the caller driving it; interrupting the caller has to reach this far or
 	// a stalled commit cannot be cancelled at all.
-    auto parent_state = context.registered_state->Get<ParentContextState>(ParentContextState::KEY);
-    auto parent = parent_state ? parent_state->parent.lock() : nullptr;
-    if (parent && parent->IsInterrupted()) {
-        return true;
-    }
-    auto stall = TakeMoraineReadStall(parent ? *parent : context);
-    if (stall) {
-        moraine_fault_stall_next_read(stall);
-    }
-    return false;
+	auto parent_state = context.registered_state->Get<ParentContextState>(ParentContextState::KEY);
+	auto parent = parent_state ? parent_state->parent.lock() : nullptr;
+	if (parent && parent->IsInterrupted()) {
+		return true;
+	}
+	auto stall = TakeMoraineReadStall(parent ? *parent : context);
+	if (stall) {
+		moraine_fault_stall_next_read(stall);
+	}
+	return false;
 }
 
 namespace {
@@ -614,9 +614,9 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 			throw duckdb::InternalException("moraine: CREATE TABLE without a client context");
 		}
 		auto &moraine_tx = transaction.transaction->Cast<MoraineTransaction>();
-		auto entry = CreateInlineDataTable(*transaction.context, catalog, *this, moraine_catalog.Handle(),
-		                                   moraine_tx.StagedTxForInline(), info, parsed->table_id,
-		                                   parsed->schema_version);
+		auto entry =
+		    CreateInlineDataTable(*transaction.context, catalog, *this, moraine_catalog.Handle(),
+		                          moraine_tx.StagedTxForInline(), info, parsed->table_id, parsed->schema_version);
 		if (!entry) {
 			// IF NOT EXISTS against an already-registered schema version.
 			return nullptr;
@@ -766,8 +766,7 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientConte
 	try {
 		extended_catalog_ = MoraineServesExtendedCatalog(handle_);
 		scheduler_ = duckdb::make_shared_ptr<MaintenanceScheduler>(db.GetDatabase(), db.GetName().GetIdentifierName(),
-		                                                           path_, handle_,
-		                                                           std::move(maintenance));
+		                                                           path_, handle_, std::move(maintenance));
 		// A read-only attach never schedules — maintenance mutates, and
 		// a `DbReader` never opens a writer. The trigger refuses too.
 		if (!db.IsReadOnly()) {
@@ -819,9 +818,9 @@ MoraineCatalog::~MoraineCatalog() {
 }
 
 duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<duckdb::StorageExtensionInfo>,
-                                                           duckdb::ClientContext &context,
-                                                           duckdb::AttachedDatabase &db, const std::string &,
-                                                           duckdb::AttachInfo &info, duckdb::AttachOptions &options) {
+                                                           duckdb::ClientContext &context, duckdb::AttachedDatabase &db,
+                                                           const std::string &, duckdb::AttachInfo &info,
+                                                           duckdb::AttachOptions &options) {
 	MoraineCatalogHandle *handle = nullptr;
 	MoraineError err {};
 	// DuckDB resolves the attach's `READ_ONLY` flag into this access mode
@@ -971,15 +970,13 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// the machine on top of DuckDB's. The ABI clamps it; read once here,
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
-	auto code = moraine_attach_with_commit_log(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted,
-	                                           flush_interval_ms, flush_on_commit, reader_poll_interval_ms,
-	                                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes,
-	                                           cache_memory_bytes, static_cast<uint32_t>(cache_auxiliary_percent),
-	                                           cache_preload, cache_puts, cache_compaction_puts,
-	                                           data_path.empty() ? nullptr : data_path.c_str(),
-	                                           wal_path.empty() ? nullptr : &wal, commit_log_given ? &commit_log : nullptr,
-	                                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
-	                                           moraine_shim_is_interrupted, &context, &handle, &err);
+	auto code = moraine_attach_with_commit_log(
+	    info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms, flush_on_commit,
+	    reader_poll_interval_ms, cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
+	    static_cast<uint32_t>(cache_auxiliary_percent), cache_preload, cache_puts, cache_compaction_puts,
+	    data_path.empty() ? nullptr : data_path.c_str(), wal_path.empty() ? nullptr : &wal,
+	    commit_log_given ? &commit_log : nullptr, checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
+	    moraine_shim_is_interrupted, &context, &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.
@@ -1212,8 +1209,8 @@ void MoraineCatalog::HoldMetadataRows(const MetadataTableSpec &spec, uint64_t sn
 	// scopes accumulated under it go with the move rather than living as
 	// long as the attach.
 	for (auto it = held_rows_.begin(); it != held_rows_.end();) {
-		const bool stale = it->first.first == &spec &&
-		                   (it->second.snapshot_id != snapshot_id || it->second.batch_seq != batch_seq);
+		const bool stale =
+		    it->first.first == &spec && (it->second.snapshot_id != snapshot_id || it->second.batch_seq != batch_seq);
 		it = stale ? held_rows_.erase(it) : std::next(it);
 	}
 	auto bytes = rows == nullptr ? 0 : MetadataRowsBytes(*rows);
@@ -1237,7 +1234,5 @@ void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {
 void MoraineCatalog::DropSchema(duckdb::ClientContext &, duckdb::DropInfo &) {
 	throw duckdb::NotImplementedException("moraine: dropping a schema is not supported (read-only catalog)");
 }
-
-
 
 } // namespace moraine_duckdb

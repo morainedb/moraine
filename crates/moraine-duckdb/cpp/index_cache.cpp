@@ -48,9 +48,9 @@ bool LiteralArgument(duckdb::ClientContext &context, const duckdb::ParsedExpress
 		return false;
 	}
 	duckdb::EntryLookupInfo lookup(duckdb::CatalogType::SCALAR_FUNCTION_ENTRY, function_name);
-	auto entry = duckdb::Catalog::GetEntry(context, function.GetQualifiedName().Catalog(),
-	                                       function.GetQualifiedName().Schema(), lookup,
-	                                       duckdb::OnEntryNotFound::RETURN_NULL);
+	auto entry =
+	    duckdb::Catalog::GetEntry(context, function.GetQualifiedName().Catalog(), function.GetQualifiedName().Schema(),
+	                              lookup, duckdb::OnEntryNotFound::RETURN_NULL);
 	if (!entry || entry->type != duckdb::CatalogType::SCALAR_FUNCTION_ENTRY || !entry->internal) {
 		return false;
 	}
@@ -70,7 +70,8 @@ bool LiteralIndexStatement(duckdb::ClientContext &context, duckdb::SQLStatement 
 	bool supported = true;
 	bool found = false;
 	auto expression = [&](duckdb::unique_ptr<duckdb::ParsedExpression> &expression) {
-		duckdb::ParsedExpressionIterator::VisitExpressionClass(*expression, duckdb::ExpressionClass::SUBQUERY,
+		duckdb::ParsedExpressionIterator::VisitExpressionClass(
+		    *expression, duckdb::ExpressionClass::SUBQUERY,
 		    [&](const duckdb::ParsedExpression &) { supported = false; });
 	};
 	auto reference = [&](duckdb::TableRef &reference) {
@@ -93,7 +94,7 @@ bool LiteralIndexStatement(duckdb::ClientContext &context, duckdb::SQLStatement 
 				auto literal = LiteralArgument(context, argument.GetExpression());
 				if (!literal) {
 					WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
-					    "index plan requires argument rebinding");
+					                "index plan requires argument rebinding");
 				}
 				supported = literal && supported;
 			}
@@ -110,7 +111,7 @@ bool LiteralIndexStatement(duckdb::ClientContext &context, duckdb::SQLStatement 
 	};
 	try {
 		duckdb::ParsedExpressionIterator::EnumerateQueryNodeChildren(*statement.Cast<duckdb::SelectStatement>().node,
-		                                                            expression, reference);
+		                                                             expression, reference);
 	} catch (duckdb::NotImplementedException &) {
 		return false;
 	}
@@ -144,7 +145,8 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 		for (auto &read : prepared.properties.read_databases) {
 			dependent = dependent || catalogs.count(read.first.GetIdentifierName()) != 0;
 		}
-		if (dependent && (!prepared.unbound_statement || !LiteralIndexStatement(context, *prepared.unbound_statement))) {
+		if (dependent &&
+		    (!prepared.unbound_statement || !LiteralIndexStatement(context, *prepared.unbound_statement))) {
 			return duckdb::RebindQueryInfo::ATTEMPT_TO_REBIND;
 		}
 		for (auto &read : prepared.properties.read_databases) {
@@ -165,7 +167,8 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 				}
 			}
 			bool clean = true;
-			auto &transaction = ReadTransaction(context, catalog->Cast<MoraineCatalog>(), association->second.lake, clean);
+			auto &transaction =
+			    ReadTransaction(context, catalog->Cast<MoraineCatalog>(), association->second.lake, clean);
 			uint64_t revision = 0;
 			if (!clean || !moraine_snapshot_read_revision(transaction.Snapshot(), &revision) ||
 			    read.second.catalog_version != duckdb::optional_idx(revision)) {
@@ -176,7 +179,8 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 	}
 
 	duckdb::RebindQueryInfo OnRebindPreparedStatement(duckdb::ClientContext &context,
-	    duckdb::BindPreparedStatementCallbackInfo &info, duckdb::RebindQueryInfo) override {
+	                                                  duckdb::BindPreparedStatementCallbackInfo &info,
+	                                                  duckdb::RebindQueryInfo) override {
 		// A PREPARE or EXECUTE statement reads no index itself, so neither
 		// one is a reason to rebind.
 		if (info.prepared_statement.statement_type == duckdb::StatementType::PREPARE_STATEMENT ||
@@ -196,7 +200,8 @@ MoraineTransaction &ReadTransaction(duckdb::ClientContext &context, MoraineCatal
                                     const std::string &lake_name, bool &clean) {
 	auto *metadata_context = &context;
 	if (!lake_name.empty()) {
-		auto &lake = duckdb::Catalog::GetCatalog(context, duckdb::Identifier(lake_name)).Cast<duckdb::DuckLakeCatalog>();
+		auto &lake =
+		    duckdb::Catalog::GetCatalog(context, duckdb::Identifier(lake_name)).Cast<duckdb::DuckLakeCatalog>();
 		auto &transaction = duckdb::DuckLakeTransaction::Get(context, lake);
 		clean = !lake.CatalogSnapshot();
 		metadata_context = transaction.GetConnection().context.get();
@@ -235,8 +240,8 @@ MoraineCatalogHandle *BindIndexReadFor(duckdb::ClientContext &context, const std
                                        duckdb::optional_ptr<duckdb::Binder> binder, bool &cacheable) {
 	auto named = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(name));
 	auto &catalog = named && named->GetCatalogType() == "ducklake"
-	    ? ResolveMoraineCatalog(context, named->Cast<duckdb::DuckLakeCatalog>().MetadataDatabaseName())
-	    : ResolveMoraineCatalog(context, name);
+	                    ? ResolveMoraineCatalog(context, named->Cast<duckdb::DuckLakeCatalog>().MetadataDatabaseName())
+	                    : ResolveMoraineCatalog(context, name);
 	std::string lake_name;
 	bool ambiguous = false;
 	if (named && named->GetCatalogType() == "ducklake") {
@@ -273,8 +278,8 @@ MoraineCatalogHandle *BindIndexReadFor(duckdb::ClientContext &context, const std
 	            moraine_snapshot_read_revision(transaction.Snapshot(), &revision);
 	if (binder) {
 		auto &properties = binder->GetStatementProperties();
-		duckdb::StatementProperties::CatalogIdentity identity {catalog.GetOid(),
-		    cacheable ? duckdb::optional_idx(revision) : duckdb::optional_idx()};
+		duckdb::StatementProperties::CatalogIdentity identity {
+		    catalog.GetOid(), cacheable ? duckdb::optional_idx(revision) : duckdb::optional_idx()};
 		auto existing_read = properties.read_databases.find(catalog.GetName());
 		if (existing_read != properties.read_databases.end() && existing_read->second != identity) {
 			cacheable = false;

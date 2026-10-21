@@ -28,6 +28,13 @@ jobs:
       # Match the dated formatter used by workspace setup and local hooks.
       - run: rustup toolchain install nightly-2026-08-29 --profile minimal --component rustfmt
       - run: cargo +nightly-2026-08-29 fmt --check
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: |
+          python3 -m venv target/clang-tools
+          target/clang-tools/bin/python -m pip install "clang-format==$(cat .clang-tools-version)"
+      - run: cargo xtask fmt-cpp --check
 
   # moraine-duckdb is a pure Rust static library (the C++ shim and DuckDB
   # link are owned by the extension toolchain, exercised only by the e2e
@@ -118,6 +125,12 @@ jobs:
           submodules: recursive
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache gcc-14 g++-14
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: |
+          python3 -m venv target/clang-tools
+          target/clang-tools/bin/python -m pip install "clang-tidy==$(cat .clang-tools-version)"
       # The C++ half of the build. Caching ninja's build tree instead does
       # nothing: a checkout stamps every source with the current time, so
       # ninja sees restored objects as stale and recompiles all ~550 of
@@ -150,6 +163,7 @@ jobs:
         with:
           path: target/duckdb-extensions
           key: duckdb-extensions-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
+      - run: cargo xtask tidy-cpp
       - run: cargo xtask e2e
         env:
           # Room for the whole DuckDB object set with headroom for a few

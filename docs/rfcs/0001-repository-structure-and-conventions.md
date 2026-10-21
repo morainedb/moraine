@@ -132,18 +132,26 @@ Lives in `[workspace.lints]`, inherited by every crate:
 - `unsafe_code` **forbidden in `moraine`**; allowed in `moraine-duckdb` (FFI), where every `unsafe` block carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` at deny).
 - `rustfmt.toml`: near-defaults plus `imports_granularity = "Crate"` and grouped import ordering.
 
+C/C++ formatting and analysis use the LLVM version in `.clang-tools-version`.
+`cargo xtask fmt-cpp [--check]` applies or checks `.clang-format` on handwritten
+sources and headers; dependencies and the generated ABI header are excluded.
+`cargo xtask tidy-cpp` configures the release build and applies the explicit
+checks in `.clang-tidy` to both shim configurations and the standalone drivers.
+Formatting runs in pre-commit and CI; static analysis runs in CI and the full
+local gate. Both commands reject mismatched tool versions.
+
 ## CI
 
 One workflow (`ci.yml`), parallel jobs, all required:
 
 | Job | Enforces |
 |---|---|
-| `fmt` | `cargo +nightly-2026-08-29 fmt --check` |
+| `fmt` | `cargo +nightly-2026-08-29 fmt --check`, `cargo xtask fmt-cpp --check` |
 | `clippy` | `cargo clippy --workspace --all-targets`, warnings denied |
 | `test` | `cargo test --workspace --locked` (Unit + Integration, doctests, examples) |
 | `doc` | `cargo doc` with `RUSTDOCFLAGS="-D warnings"` |
 | `deny` | `cargo deny check -D advisory-not-detected` — a stale `ignore` (one whose advisory no longer matches any crate) is otherwise only a warning and still exits 0, so a suppression can outlive the vulnerability it was written for |
-| `e2e` | `cargo xtask e2e` (E2E; separate job so it doesn't gate fast feedback) |
+| `e2e` | `cargo xtask tidy-cpp`, `cargo xtask e2e` (C/C++ analysis and E2E; separate job so it doesn't gate fast feedback) |
 
 A `fuzz/` directory holds the `cargo-fuzz` targets: `key_decode` and
 `record_decode` over the `store` codecs and the read path, and

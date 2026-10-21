@@ -114,8 +114,7 @@ protected:
 	// commit landing under this statement, or a narrowed scan reading a
 	// different list from the one a re-dump would build, cannot move what a
 	// rowid names.
-	const std::vector<duckdb::Value> &ResolveRow(const duckdb::Value &row_id,
-	                                             duckdb::ClientContext &client) const {
+	const std::vector<duckdb::Value> &ResolveRow(const duckdb::Value &row_id, duckdb::ClientContext &client) const {
 		if (row_id.IsNull()) {
 			throw duckdb::InternalException("moraine: staged write received a NULL rowid");
 		}

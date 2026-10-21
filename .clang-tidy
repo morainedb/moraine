@@ -1,0 +1,19 @@
+InheritParentConfig: false
+# UndefReturn loses DuckDB's checked unique_ptr guard during recursive EXPLAIN analysis.
+# NewDeleteLeaks loses ownership of std::function callbacks in static metadata specs.
+Checks: >-
+  -*,
+  clang-analyzer-core.*,
+  -clang-analyzer-core.uninitialized.UndefReturn,
+  clang-analyzer-cplusplus.NewDelete,
+  bugprone-use-after-move,
+  bugprone-dangling-handle,
+  bugprone-sizeof-expression,
+  bugprone-suspicious-memset-usage,
+  performance-for-range-copy,
+  performance-unnecessary-copy-initialization
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(^|/)(crates/moraine-duckdb/(cpp|tests/cpp)|xtask/cpp)/'
+ExcludeHeaderFilterRegex: '(^|/)moraine_abi\.h$'
+SystemHeaders: false
+FormatStyle: none

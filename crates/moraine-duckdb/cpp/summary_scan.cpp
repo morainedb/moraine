@@ -78,7 +78,9 @@ double Milliseconds(ScanClock::time_point start) {
 // Optional filters are pruning hints; their exact predicates remain above
 // the scan. Re-evaluating a wide IN hint here repeats the hash join's work.
 duckdb::unique_ptr<duckdb::Expression> RequiredPredicate(const duckdb::Expression &expression) {
-    if (duckdb::ExpressionFilter::IsRootOptionalExpression(expression)) { return nullptr; }
+	if (duckdb::ExpressionFilter::IsRootOptionalExpression(expression)) {
+		return nullptr;
+	}
 	if (expression.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_AND) {
 		return expression.Copy();
 	}
@@ -285,10 +287,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 		throw duckdb::InvalidInputException("moraine: selective scan snapshot changed after binding");
 	}
 	auto exclusions = CollectLocalExclusions(context, transaction, bound);
-	auto code = moraine_row_scan_open(handle, snapshot, bound.schema.c_str(), bound.table.c_str(),
-	                                  exclusions.pairs.data(), exclusions.pairs.size(), requested.data(),
-	                                  requested.size(), exclusions.entries.data(), exclusions.entries.size(),
-	                                  &state->scan, moraine_shim_is_interrupted, &context, &error);
+	auto code =
+	    moraine_row_scan_open(handle, snapshot, bound.schema.c_str(), bound.table.c_str(), exclusions.pairs.data(),
+	                          exclusions.pairs.size(), requested.data(), requested.size(), exclusions.entries.data(),
+	                          exclusions.entries.size(), &state->scan, moraine_shim_is_interrupted, &context, &error);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(error);
 	}
@@ -506,10 +508,10 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		// Coverage is estimated over the committed positions alone: the
 		// transaction's own deletions only remove rows, so they are gathered
 		// once, at execution.
-		auto code = moraine_row_scan_open(moraine_snapshot_read_handle(snapshot), snapshot, schema.c_str(),
-		                                  table.c_str(), file_pairs.data(), file_pairs.size(), columns.data(),
-		                                  columns.size(), nullptr, 0, &estimate.scan, moraine_shim_is_interrupted,
-		                                  &context, &error);
+		auto code =
+		    moraine_row_scan_open(moraine_snapshot_read_handle(snapshot), snapshot, schema.c_str(), table.c_str(),
+		                          file_pairs.data(), file_pairs.size(), columns.data(), columns.size(), nullptr, 0,
+		                          &estimate.scan, moraine_shim_is_interrupted, &context, &error);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(error);
 		}
@@ -543,7 +545,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		}
 		auto metrics = moraine_row_scan_metrics(state.scan);
 		input.operator_metrics.AddExtraInfo("Total Files Read",
-		                                   std::to_string(moraine_row_scan_files_read(state.scan)));
+		                                    std::to_string(moraine_row_scan_files_read(state.scan)));
 		input.operator_metrics.AddExtraInfo("Positioning ms", std::to_string(state.positioning_ms));
 		input.operator_metrics.AddExtraInfo("Read and decode ms", std::to_string(state.batch_ms));
 		input.operator_metrics.AddExtraInfo("Arrow import ms", std::to_string(state.conversion_ms));
