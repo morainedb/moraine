@@ -137,10 +137,18 @@ Each attach owns one worker for warming and publishing. While a pass runs,
 requests merge into one pending batch: touched tables are deduplicated, and the
 oldest snapshot boundary is retained even when commits enqueue out of order.
 An attach backfill covers every file and takes precedence over commit cutoffs.
-More than 1,024 pending table IDs becomes an all-table warm, bounding the queue
-without dropping work. Detach cancels and joins the worker before closing the
+Commit batches publish only files in their deduplicated table set, after the
+earliest retained snapshot boundary. More than 1,024 pending table IDs promotes
+both warming and publishing to all tables, bounding the queue without dropping
+work. Attach backfill still publishes every table, including with preload disabled. Detach cancels and joins the worker before closing the
 catalog. Publishing remains best effort; failed or interrupted files can be
 retried by a later attach or an explicit publishing call.
+
+The core exposes `ReadOnlyCatalog::publish_selected_row_summaries_since(data_store,
+data_prefix, tables, since)` for this path. The cutoff is exclusive and an empty
+table list does no publishing. Existing whole-catalog and selected-table APIs
+remain available. A pass resolves one catalog snapshot and accumulates outcomes
+as files finish, without retaining a result per file or per table.
 
 Neither can live inside the commit, and not for want of trying: the commit
 protocol holds no data store, by design, so it cannot read the file it just

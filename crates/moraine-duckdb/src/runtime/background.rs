@@ -49,26 +49,31 @@ impl Pass {
     }
 
     async fn run(self, catalog: &ReadOnlyCatalog, store: Option<&DataStore>, prefix: &str) {
-        match self.tables {
+        let tables = self
+            .tables
+            .map(|tables| tables.into_iter().collect::<Vec<_>>());
+        match &tables {
             None => warm_all_tables(catalog).await,
             Some(tables) if !tables.is_empty() => {
-                if let Err(error) = catalog
-                    .warm_tables(&tables.into_iter().collect::<Vec<_>>())
-                    .await
-                {
+                if let Err(error) = catalog.warm_tables(tables).await {
                     warn!(%error, "table warming skipped this pass");
                 }
             }
             Some(_) => {}
         }
         let Some(store) = store else { return };
-        let published = match self.since {
-            Some(since) => {
+        let published = match (self.since, tables) {
+            (Some(since), Some(tables)) => {
+                catalog
+                    .publish_selected_row_summaries_since(store.clone(), prefix, tables, since)
+                    .await
+            }
+            (Some(since), None) => {
                 catalog
                     .publish_row_summaries_since(store.clone(), prefix, since)
                     .await
             }
-            None => {
+            (None, _) => {
                 catalog
                     .publish_all_row_summaries(store.clone(), prefix)
                     .await

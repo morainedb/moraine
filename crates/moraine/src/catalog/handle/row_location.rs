@@ -629,7 +629,7 @@ impl ReadOnlyCatalog {
     ) -> Result<RowSummaryPublish> {
         let snapshot = self.snapshot().await?;
 
-        self.publish_table(&snapshot, &data_store, data_prefix, table)
+        self.publish_tables(&snapshot, &data_store, data_prefix, vec![table], None)
             .await
     }
 
@@ -654,23 +654,8 @@ impl ReadOnlyCatalog {
             .map(|table| table.id)
             .collect::<Vec<_>>();
 
-        let mut total = RowSummaryPublish::default();
-        for table in tables {
-            let table_total = self
-                .summarize_table_since(&snapshot, &data_store, data_prefix, table, since)
-                .await?;
-            total = RowSummaryPublish {
-                files_considered: total
-                    .files_considered
-                    .saturating_add(table_total.files_considered),
-                summaries_built: total
-                    .summaries_built
-                    .saturating_add(table_total.summaries_built),
-                files_failed: total.files_failed.saturating_add(table_total.files_failed),
-            };
-        }
-
-        Ok(total)
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, Some(since))
+            .await
     }
 
     /// Deletes published row summaries whose data file is no longer under
@@ -715,12 +700,11 @@ impl ReadOnlyCatalog {
             .map(|table| table.id)
             .collect::<Vec<_>>();
 
-        self.publish_selected_row_summaries(data_store, data_prefix, tables)
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, None)
             .await
     }
 
-    /// Builds and caches the summaries a lookup would otherwise build cold,
-    /// for the given tables.
+    /// Publishes summaries for the given tables without filling summary caches.
     ///
     /// # Errors
     ///
@@ -733,60 +717,62 @@ impl ReadOnlyCatalog {
         tables: Vec<TableId>,
     ) -> Result<RowSummaryPublish> {
         let snapshot = self.snapshot().await?;
-        let total = stream::iter(tables)
-            .map(|table| self.publish_table(&snapshot, &data_store, data_prefix, table))
-            .buffer_unordered(WARM_TABLE_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await?
-            .into_iter()
-            .fold(RowSummaryPublish::default(), |acc, table| {
-                RowSummaryPublish {
-                    files_considered: acc.files_considered.saturating_add(table.files_considered),
-                    summaries_built: acc.summaries_built.saturating_add(table.summaries_built),
-                    files_failed: acc.files_failed.saturating_add(table.files_failed),
-                }
-            });
-
-        Ok(total)
-    }
-
-    /// One table's publishing pass against an already-resolved head view.
-    async fn publish_table(
-        &self,
-        snapshot: &CatalogSnapshot,
-        data_store: &DataStore,
-        data_prefix: &str,
-        table: TableId,
-    ) -> Result<RowSummaryPublish> {
-        let files = snapshot.data_files_of(table);
-        self.summarize_files(snapshot, data_store, data_prefix, table, files)
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, None)
             .await
     }
 
-    /// One table's files registered after `since`, which is what a commit
-    /// just landed rather than everything the table holds.
-    async fn summarize_table_since(
+    /// Publishes files in `tables` registered strictly after `since`.
+    /// An empty table list publishes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the snapshot cannot be read. Per-file
+    /// failures are counted in [`RowSummaryPublish::files_failed`].
+    pub async fn publish_selected_row_summaries_since(
         &self,
-        snapshot: &CatalogSnapshot,
-        data_store: &DataStore,
+        data_store: DataStore,
         data_prefix: &str,
-        table: TableId,
+        tables: Vec<TableId>,
         since: SnapshotId,
     ) -> Result<RowSummaryPublish> {
-        let files = snapshot
-            .data_files
-            .get(&table.get())
-            .map(|files| {
-                files
-                    .values()
-                    .filter(|file| file.begin_snapshot > since.get())
-                    .map(data_file_info)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        self.summarize_files(snapshot, data_store, data_prefix, table, files)
+        if tables.is_empty() {
+            return Ok(RowSummaryPublish::default());
+        }
+        let snapshot = self.snapshot().await?;
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, Some(since))
             .await
+    }
+
+    async fn publish_tables(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: &DataStore,
+        data_prefix: &str,
+        tables: Vec<TableId>,
+        since: Option<SnapshotId>,
+    ) -> Result<RowSummaryPublish> {
+        let mut outcomes = stream::iter(tables)
+            .map(|table| {
+                let files = snapshot
+                    .data_files
+                    .get(&table.get())
+                    .into_iter()
+                    .flat_map(|files| files.values())
+                    .filter(|file| since.is_none_or(|since| file.begin_snapshot > since.get()))
+                    .map(data_file_info)
+                    .collect();
+                self.summarize_files(snapshot, data_store, data_prefix, table, files)
+            })
+            .buffer_unordered(WARM_TABLE_CONCURRENCY);
+        let mut total = RowSummaryPublish::default();
+        while let Some(table) = outcomes.try_next().await? {
+            total.files_considered = total
+                .files_considered
+                .saturating_add(table.files_considered);
+            total.summaries_built = total.summaries_built.saturating_add(table.summaries_built);
+            total.files_failed = total.files_failed.saturating_add(table.files_failed);
+        }
+        Ok(total)
     }
 
     /// Publishes `files`' summaries, skipping those already published and
@@ -812,7 +798,7 @@ impl ReadOnlyCatalog {
             ..RowSummaryPublish::default()
         };
 
-        let outcomes = stream::iter(files.into_iter().map(|file| {
+        let mut outcomes = stream::iter(files.into_iter().map(|file| {
             let resolved = resolve_data_path(
                 data_prefix,
                 &table_prefix,
@@ -844,11 +830,9 @@ impl ReadOnlyCatalog {
                 (file.id, written)
             }
         }))
-        .buffer_unordered(SUMMARY_READ_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(SUMMARY_READ_CONCURRENCY);
 
-        for (data_file_id, written) in outcomes {
+        while let Some((data_file_id, written)) = outcomes.next().await {
             match written {
                 Ok(true) => {
                     published.summaries_built = published.summaries_built.saturating_add(1);

@@ -8,7 +8,7 @@ use crate::{IndexId, TableId, store::index_encoding::CanonicalKey};
 const CAPACITY: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum Probe {
     Many(Vec<CanonicalKey>),
     Range(Bound<CanonicalKey>, Bound<CanonicalKey>, bool),
@@ -54,11 +54,12 @@ impl IndexProbeCache {
         index: IndexId,
         probe: &Probe,
     ) -> Option<Vec<u64>> {
-        let rows = self
-            .0
-            .get_matching(revision, table, |(candidate_index, candidate)| {
-                *candidate_index == index && candidate == probe
-            })?;
+        let rows = self.0.get_matching(
+            revision,
+            table,
+            &(index, probe),
+            |(candidate_index, candidate)| *candidate_index == index && candidate == probe,
+        )?;
         tracing::debug!(
             table_id = table.get(),
             index_id = index.get(),
@@ -128,6 +129,37 @@ impl super::ReadOnlyCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_probes_find_every_owned_mode() {
+        let cache = IndexProbeCache::default();
+        let key = CanonicalKey::empty();
+        let probes = [
+            Probe::Many(vec![key.clone()]),
+            Probe::Range(Bound::Included(key.clone()), Bound::Unbounded, false),
+            Probe::Range(Bound::Excluded(key.clone()), Bound::Unbounded, false),
+            Probe::Range(Bound::Included(key.clone()), Bound::Unbounded, true),
+            Probe::Nulls(key.clone(), false),
+            Probe::Nulls(key, true),
+            Probe::Limited(Box::new(Probe::Many(vec![])), 1),
+            Probe::Limited(Box::new(Probe::Many(vec![])), 2),
+        ];
+        for (position, probe) in probes.iter().enumerate() {
+            cache.put(
+                1,
+                TableId::new(1),
+                IndexId::new(1),
+                probe.clone(),
+                &[position as u64],
+            );
+        }
+        for (position, probe) in probes.iter().enumerate() {
+            assert_eq!(
+                cache.get(1, TableId::new(1), IndexId::new(1), probe),
+                Some(vec![position as u64])
+            );
+        }
+    }
 
     #[test]
     fn identities_modes_and_eviction_do_not_alias() {

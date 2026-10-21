@@ -724,7 +724,12 @@ memory or total process memory.
 Index probes use the same revision-keyed memo as other scoped results. Hits
 clone only an Arc under the mutex; copying the result rows happens after the
 lock is released. Composite-key lookups borrow probe arguments without copying
-them. The memo retains its existing linear search and count/byte limits.
+them. A hash index points into an LRU slab, so lookup and recency updates do
+not scan or shift all retained entries. Full revision/table/key equality checks
+resolve hash collisions. Entry charges include the slab node and occupied hash
+bucket; diagnostics also count spare slab capacity and hash-table allocation
+slack. The existing count and byte ceilings still govern admission. These are
+retention limits, not a process memory budget.
 
 Their storage engines remain separate because their entries have different
 identity, value, and tiering contracts:

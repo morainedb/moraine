@@ -24,9 +24,9 @@ async fn bursts_keep_every_table_and_the_earliest_snapshot() {
 
 #[tokio::test]
 async fn attach_backfill_and_preload_cover_merged_commits_in_either_order() {
-    for attach_first in [false, true] {
+    for (attach_first, preload) in [(false, false), (false, true), (true, false), (true, true)] {
         let pending = Pending::default();
-        let mut passes = [Pass::attach(true), commit(1, 20)];
+        let mut passes = [Pass::attach(preload), commit(1, 20)];
         if !attach_first {
             passes.reverse();
         }
@@ -34,7 +34,14 @@ async fn attach_backfill_and_preload_cover_merged_commits_in_either_order() {
             pending.push(pass);
         }
         let pass = pending.next().await;
-        assert!(pass.tables.is_none());
+        if preload {
+            assert!(pass.tables.is_none());
+        } else {
+            assert_eq!(
+                pass.tables.unwrap(),
+                [TableId::new(1)].into_iter().collect()
+            );
+        }
         assert!(pass.since.is_none());
     }
 }

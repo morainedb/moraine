@@ -23,6 +23,8 @@ bytes = { workspace = true }
 fastbloom = { workspace = true }
 futures = { workspace = true }
 imbl = { workspace = true }
+hashbrown = { workspace = true }
+lru-slab = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 prost = { workspace = true }

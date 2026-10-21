@@ -367,6 +367,71 @@ async fn warming_counts_a_file_it_cannot_read_rather_than_failing() {
 }
 
 #[tokio::test]
+async fn publishing_selected_tables_respects_the_snapshot_cutoff() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
+    let table = table_with(&catalog, vec![datafile(3)]).await;
+    let since = catalog.commit(|_| Ok(())).await.unwrap();
+    let (file_size_bytes, footer_size) = write(
+        &data,
+        "main/orders/data-2.parquet",
+        &batch_with_row_ids(&[40, 50], &[21, 22]),
+    )
+    .await;
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    file_size_bytes,
+                    footer_size,
+                    ..datafile(2)
+                },
+                &[],
+            )?;
+            let main = tx.schema_by_name("main").unwrap().id;
+            let other = tx.create_table(main, "other", &[col("a")])?;
+            tx.register_data_file(other, datafile(9), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let published = catalog
+        .publish_selected_row_summaries_since(store.clone(), "", vec![table], since)
+        .await
+        .unwrap();
+    assert_eq!(published.files_considered, 1);
+    assert_eq!(published.summaries_built, 1);
+    assert_eq!(
+        published.files_failed, 0,
+        "old and unselected missing files were not read"
+    );
+    let empty = catalog
+        .publish_selected_row_summaries_since(store.clone(), "", vec![], since)
+        .await
+        .unwrap();
+    assert_eq!(empty.files_considered, 0);
+    let repeated = catalog
+        .publish_selected_row_summaries_since(store.clone(), "", vec![table], since)
+        .await
+        .unwrap();
+    assert_eq!(repeated.files_considered, 1);
+    assert_eq!(repeated.summaries_built, 0);
+    let all = catalog
+        .publish_row_summaries_since(store, "", since)
+        .await
+        .unwrap();
+    assert_eq!(all.files_considered, 2);
+    assert_eq!(
+        all.files_failed, 1,
+        "the all-table pass still visits the other table"
+    );
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn warming_every_table_reaches_tables_outside_the_first_schema() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
