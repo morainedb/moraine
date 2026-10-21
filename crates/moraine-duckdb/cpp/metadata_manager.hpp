@@ -55,7 +55,8 @@ public:
 	WriteNewInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,
 	                    const duckdb::vector<duckdb::DuckLakeInlinedDataInfo> &new_data,
 	                    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_tables,
-	                    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_inlined_data_tables_result) override;
+	                    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_inlined_data_tables_result,
+	                    duckdb::vector<duckdb::unique_ptr<duckdb::SQLStatement>> &inlined_inserts) override;
 
 private:
 	//! One table's rows through the Appender. False means the caller must

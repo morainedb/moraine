@@ -344,10 +344,12 @@ View-column tags carry their own begin/end lifecycle inside the view record.
 Tag-only updates rewrite that record in place, without minting a view version;
 transaction reads apply staged tag inserts, ends, and deletions in order.
 
-This build serves two shapes. `1.1-dev1` adds the `ducklake_view_column_tag`
+This build serves two shapes. `1.1` adds the `ducklake_view_column_tag`
 table, `row_group_count` on `ducklake_data_file` and `ducklake_delete_file`,
-and `min_is_exact`/`max_is_exact` on `ducklake_file_column_stats` and
-`ducklake_table_column_stats`. The shape is selected **once per attach**,
+`min_is_exact`/`max_is_exact` on `ducklake_file_column_stats` and
+`ducklake_table_column_stats`, and `parent_schema_id` on `ducklake_schema`
+— always NULL, since moraine nests no schemas. The shape is selected
+**once per attach**,
 when the catalog entries are registered, and the entries carry that choice
 for the life of the attach — so a raise shows up in sessions that attach
 after it, never in the one that made it.
@@ -365,10 +367,16 @@ newer build's, and the raise **refuses** it rather than lowering the shape
 a store serves, the same way RFC 0015's format raise refuses to move a
 store already at or above its ceiling.
 
+`1.1` was published as `1.1-dev1` while DuckLake still called it that. A
+store raised then records that label and is served the same shape, and the
+recorded version a store reports is the shape it serves — so such a store
+attaches as `1.1` without DuckLake's automatic migration, which would
+otherwise be required of any catalog on a development label.
+
 The raise is **one way, and out of an older DuckLake's reach**. The
-bundled DuckLake orders both versions (`DuckLakeVersion::V1_1_DEV_1`) and
+bundled DuckLake orders both versions (`DuckLakeVersion::V1_1`) and
 reads a store on either, so a raised store stays a usable lake here. One
-that predates `1.1-dev1` compares the recorded tag against a bare `1.0`
+that predates `1.1` compares the recorded tag against a bare `1.0`
 literal and throws `InvalidInputException` on anything else; under
 `AUTOMATIC_MIGRATION` it instead walks a migration ladder whose rungs stop
 at `1.0` and throws `NotImplementedException`. Either way the refusal lands

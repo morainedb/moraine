@@ -134,7 +134,8 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 duckdb::string MoraineMetadataManager::WriteNewInlinedData(
     duckdb::DuckLakeSnapshot &commit_snapshot, const duckdb::vector<duckdb::DuckLakeInlinedDataInfo> &new_data,
     const duckdb::vector<duckdb::DuckLakeTableInfo> &new_tables,
-    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_inlined_data_tables_result) {
+    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_inlined_data_tables_result,
+    duckdb::vector<duckdb::unique_ptr<duckdb::SQLStatement>> &inlined_inserts) {
 	using duckdb::DuckLakeTableEntry;
 	using duckdb::DuckLakeTableInfo;
 	using duckdb::DuckLakeUtil;
@@ -145,8 +146,6 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 		return batch_query;
 	}
 
-	auto context_ptr = transaction.context.lock();
-	auto &context = *context_ptr;
 	// Appends run now; the batch this builds runs later. A table the batch
 	// still has to CREATE is therefore not appendable yet, and those rows keep
 	// taking the SQL path.
@@ -168,7 +167,7 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 		}
 		if (inlined_table_name.empty()) {
 			auto query = LatestInlinedTableQuery(entry.table_id.index) + ";";
-			auto result = transaction.Query(commit_snapshot, query);
+			auto result = Query(commit_snapshot, query);
 			for (auto &row : *result) {
 				inlined_table_name = row.GetValue<duckdb::string>(0);
 				insert_inlined_table_name_cache[entry.table_id.index] = inlined_table_name;
@@ -199,12 +198,12 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 				}
 			}
 			// write the new inlined table
-			duckdb::string inlined_tables;
+			duckdb::vector<duckdb::string> inlined_tables;
 			duckdb::string inlined_table_queries;
 			commit_snapshot.schema_version++;
 			inlined_table_name =
 			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries);
-			batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_inlined_data_tables VALUES " + inlined_tables + ";";
+			batch_query += InsertValuesSql("ducklake_inlined_data_tables", inlined_tables);
 			batch_query += inlined_table_queries;
 			created_in_batch.insert(inlined_table_name);
 		}
@@ -215,13 +214,8 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 			continue;
 		}
 
-		// Build one cell list per row, then defer formatting to the shared helper.
-		duckdb::vector<duckdb::string> cells_per_row;
-		for (auto &chunk : entry.data->data->Chunks()) {
-			for (duckdb::idx_t r = 0; r < chunk.size(); r++) {
-				cells_per_row.push_back(DuckLakeUtil::ChunkRowToSQL(*this, context, chunk, r));
-			}
-		}
+		// One cell list per row, then formatting deferred to the shared helper.
+		auto cells_per_row = DuckLakeUtil::InlinedDataToSQL(transaction, *entry.data->data);
 		batch_query += FormatInlinedDataInsert(inlined_table_name, entry.row_id_start, has_preserved_row_ids,
 		                                       has_preserved_row_ids ? &entry.data->row_ids : nullptr, cells_per_row);
 	}

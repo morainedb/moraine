@@ -16,19 +16,20 @@ use crate::{
     pins::{DUCKLAKE_CONFIG, DUCKLAKE_RELEASE_PINS, declared_ducklake_commit},
 };
 
+/// Where DuckDB's releases live upstream: it tags every one of them.
+const TAGS: &str = "refs/tags";
+/// Where extension-ci-tools' releases live upstream: it carries no tags at
+/// all and keeps a branch per DuckDB version, updated in place.
+const BRANCHES: &str = "refs/heads";
+
 /// The submodules the primary entry pins, and the ref namespace each
-/// release lives in upstream. DuckDB tags its releases; extension-ci-tools
-/// carries no tags at all and keeps a branch per DuckDB version, updated
-/// in place.
-const SUBMODULES: [(&str, &str); 2] = [
-    ("duckdb", "refs/tags"),
-    ("extension-ci-tools", "refs/heads"),
-];
+/// release lives in upstream.
+const SUBMODULES: [(&str, &str); 2] = [("duckdb", TAGS), ("extension-ci-tools", BRANCHES)];
 
 /// Files naming the primary DuckDB version, its abbreviated commit, or
 /// the DuckLake commit that rides with it. Every one of them is checked
 /// by `check-pins`, which is what makes rewriting them mechanical.
-const PINNED_FILES: [&str; 7] = [
+const PINNED_FILES: [&str; 8] = [
     ".gitmodules",
     ".github/workflows/extension.yml",
     ".github/workflows/release.yml",
@@ -36,11 +37,8 @@ const PINNED_FILES: [&str; 7] = [
     "crates/moraine-duckdb/README.md",
     "docs/rfcs/0006-extension-surface.md",
     "xtask/src/ducklake_patch.rs",
+    "crates/moraine-duckdb/tests/ducklake_load/wire_contract.rs",
 ];
-
-/// The wire-contract suite, which carries the DuckLake commit but no
-/// DuckDB version.
-const WIRE_CONTRACT: &str = "crates/moraine-duckdb/tests/ducklake_load/wire_contract.rs";
 
 const MANIFEST: &str = ".github/duckdb-versions";
 
@@ -60,12 +58,15 @@ pub fn bump_duckdb(arguments: &[String]) -> anyhow::Result<()> {
     );
 
     let previous = duckdb_pin().to_owned();
-    let previous_duckdb = submodule_head("duckdb")?;
+    let previous_submodules: Vec<(&str, String)> = SUBMODULES
+        .iter()
+        .map(|(path, _)| submodule_head(path).map(|head| (*path, head)))
+        .collect::<anyhow::Result<_>>()?;
     let previous_ducklake = current_ducklake_commit()?;
 
     let mut pins = Vec::new();
     for (path, namespace) in SUBMODULES {
-        let commit = resolve(path, &format!("{namespace}/{version}"))?;
+        let commit = resolve_release(path, namespace, version)?;
         println!("{path}: {version} is {commit}");
         checkout(path, &commit)?;
         pins.push((path, commit));
@@ -82,25 +83,19 @@ pub fn bump_duckdb(arguments: &[String]) -> anyhow::Result<()> {
         &rewrite_source_pins(&read(DUCKLAKE_RELEASE_PINS)?, version, &ducklake),
     )?;
 
-    let duckdb_commit = pins
+    let mut commits: Vec<(&str, &str)> = previous_submodules
         .iter()
-        .find(|(path, _)| *path == "duckdb")
-        .map(|(_, commit)| commit.clone())
-        .unwrap_or_default();
+        .filter_map(|(path, head)| {
+            let pinned = pins.iter().find(|(pinned, _)| pinned == path)?;
+            Some((head.as_str(), pinned.1.as_str()))
+        })
+        .collect();
+    commits.push((previous_ducklake.as_str(), ducklake.as_str()));
+
     for file in PINNED_FILES {
-        let contents = read(file)?
-            .replace(&previous, version)
-            .replace(&previous_ducklake, &ducklake);
-        write(
-            file,
-            &abbreviations(&contents, &previous_duckdb, &duckdb_commit),
-        )?;
+        let carried = carry_pins(&read(file)?, (&previous, version), &commits);
+        write(file, &carried)?;
     }
-    let contract = read(WIRE_CONTRACT)?.replace(&previous, version);
-    write(
-        WIRE_CONTRACT,
-        &abbreviations(&contract, &previous_ducklake, &ducklake),
-    )?;
 
     println!("\nbumped {previous} -> {version}");
     if ducklake == previous_ducklake {
@@ -191,6 +186,17 @@ fn rewrite_source_pins(current: &str, version: &str, commit: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+/// `contents` with the version renamed and every pinned commit carried
+/// forward, at whatever length the file writes each of them.
+fn carry_pins(contents: &str, version: (&str, &str), commits: &[(&str, &str)]) -> String {
+    let (previous, current) = version;
+    let mut out = contents.replace(previous, current);
+    for (previous, commit) in commits {
+        out = abbreviations(&out, previous, commit);
+    }
+    out
+}
+
 /// `contents` with every abbreviation of `previous` replaced by the same
 /// length of `commit`.
 ///
@@ -208,8 +214,48 @@ fn abbreviations(contents: &str, previous: &str, commit: &str) -> String {
     out
 }
 
-/// The commit `reference` names in the submodule's upstream.
-fn resolve(path: &str, reference: &str) -> anyhow::Result<String> {
+/// The commit `version` names in the submodule's upstream, by its own ref
+/// or by the series branch it belongs to.
+fn resolve_release(path: &str, namespace: &str, version: &str) -> anyhow::Result<String> {
+    let own = format!("{namespace}/{version}");
+    if let Some(commit) = resolve(path, &own)? {
+        return Ok(commit);
+    }
+
+    let series = series_reference(namespace, version)
+        .with_context(|| format!("{path} upstream has no `{own}`"))?;
+    let commit = resolve(path, &series)?.with_context(|| {
+        format!("{path} upstream has neither `{own}` nor a branch matching `{series}`")
+    })?;
+    println!("{path}: no {version} branch upstream, so the series branch {series} it is");
+    Ok(commit)
+}
+
+/// The ref pattern matching the branch `version`'s series keeps: `v2.0.0`
+/// and `v2.0.1` both sit on `refs/heads/v2.0-*`.
+///
+/// Upstream names that branch for the series codename, which no version
+/// string carries, so it is matched rather than derived. `None` where
+/// there is no series to fall back to: a tag namespace, where a release
+/// that was never tagged does not exist, and a version naming no patch
+/// release, which would otherwise match every branch of its major.
+fn series_reference(namespace: &str, version: &str) -> Option<String> {
+    if namespace != BRANCHES {
+        return None;
+    }
+    let components: Vec<&str> = version.strip_prefix('v')?.split('.').collect();
+    let [major, minor, _patch] = components.as_slice() else {
+        return None;
+    };
+    Some(format!("{namespace}/v{major}.{minor}-*"))
+}
+
+/// The commit `reference` names in the submodule's upstream, or `None`
+/// where upstream has no such ref.
+///
+/// `reference` may be a pattern, which has to match one ref: a pin that
+/// two branches answer is no pin at all.
+fn resolve(path: &str, reference: &str) -> anyhow::Result<Option<String>> {
     // Peeled first: an annotated tag's own object is not the commit.
     let peeled = format!("{reference}^{{}}");
     let output = Command::new("git")
@@ -227,11 +273,23 @@ fn resolve(path: &str, reference: &str) -> anyhow::Result<String> {
     let listing = String::from_utf8_lossy(&output.stdout);
     let mut lines: Vec<&str> = listing.lines().collect();
     lines.sort_by_key(|line| !line.ends_with("^{}"));
-    let commit = lines
+
+    let named: Vec<&str> = lines
+        .iter()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter(|name| !name.ends_with("^{}"))
+        .collect();
+    ensure!(
+        named.len() <= 1,
+        "`{reference}` matches {} refs in {path} upstream: {}",
+        named.len(),
+        named.join(", ")
+    );
+
+    Ok(lines
         .first()
         .and_then(|line| line.split_whitespace().next())
-        .map(str::to_owned);
-    commit.with_context(|| format!("{path} upstream has no `{reference}`"))
+        .map(str::to_owned))
 }
 
 fn checkout(path: &str, commit: &str) -> anyhow::Result<()> {
@@ -286,6 +344,44 @@ mod tests {
             ("duckdb", "aaaa1111".repeat(5)),
             ("extension-ci-tools", "bbbb2222".repeat(5)),
         ]
+    }
+
+    /// A release upstream has cut no branch for resolves through the
+    /// branch its series keeps, whose codename the version does not carry.
+    #[test]
+    fn a_branch_release_falls_back_to_its_series() {
+        assert_eq!(
+            series_reference(BRANCHES, "v2.0.0").as_deref(),
+            Some("refs/heads/v2.0-*")
+        );
+    }
+
+    /// A tag namespace has no series to fall back to: a release DuckDB
+    /// never tagged is a release that does not exist.
+    #[test]
+    fn a_tag_release_has_no_series() {
+        assert_eq!(series_reference(TAGS, "v2.0.0"), None);
+    }
+
+    /// A version naming no patch release names no series either, rather
+    /// than matching every branch of a whole major.
+    #[test]
+    fn a_series_branch_is_not_itself_in_a_series() {
+        assert_eq!(series_reference(BRANCHES, "v2.0-cyanoptera"), None);
+    }
+
+    /// Every commit the bump moves is carried forward at whatever length
+    /// a file writes it, not DuckDB's alone.
+    #[test]
+    fn an_abbreviated_commit_of_any_pin_is_carried_forward() {
+        let previous_ducklake = "e8924cfc".repeat(5);
+        let ducklake = "417a9117".repeat(5);
+        let carried = carry_pins(
+            "pinned at v1.5.5, DuckLake `e8924cfc`",
+            ("v1.5.5", "v2.0.0"),
+            &[(&previous_ducklake, &ducklake)],
+        );
+        assert_eq!(carried, "pinned at v2.0.0, DuckLake `417a9117`");
     }
 
     #[test]

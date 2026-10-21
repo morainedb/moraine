@@ -280,7 +280,7 @@ DecodeInlineChunkPieces(duckdb::ClientContext &context, const DecodedInlineSchem
 namespace {
 
 // The lifecycle column names an inlined table declares. Catalog version
-// 1.1-dev1 moves them behind the prefix DuckLake reserves for its own
+// 1.1 moves them behind the prefix DuckLake reserves for its own
 // columns, so a user column can never collide with one.
 struct InlinedColumnNames {
 	static constexpr const char *PREFIX = "_ducklake_";
@@ -1240,7 +1240,7 @@ duckdb::PhysicalOperator &PlanInlineDataUpdate(duckdb::PhysicalPlanGenerator &pl
 		throw duckdb::NotImplementedException("moraine: UPDATE ... RETURNING is not supported on \"%s\"",
 		                                      op.table.name);
 	}
-	// Catalog version 1.0 declares `end_snapshot`, 1.1-dev1 the prefixed
+	// Catalog version 1.0 declares `end_snapshot`, 1.1 the prefixed
 	// name; a table carries one or the other, never both.
 	const auto is_end_snapshot = [&](const duckdb::Identifier &name) {
 		return name == "end_snapshot" ||

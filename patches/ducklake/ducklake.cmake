@@ -54,7 +54,7 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0004-fix-retain-files-after-unknown-commit-outcomes.patch
             ${CMAKE_CURRENT_LIST_DIR}/0005-feat-change-DuckLake-rows-by-position.patch
             ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0007-fix-write-row-ids-when-merging.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0007-fix-keep-the-row-ids-a-merged-file-carries.patch
     )
     FetchContent_GetProperties(moraine_patched_ducklake)
     if(NOT moraine_patched_ducklake_POPULATED)

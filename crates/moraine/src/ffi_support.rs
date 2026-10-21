@@ -1294,10 +1294,10 @@ pub struct FileVariantStatsRow {
     pub shredded_type: String,
     /// `column_size_bytes`.
     pub column_size_bytes: u64,
-    /// `value_count`.
-    pub value_count: u64,
-    /// `null_count`.
-    pub null_count: u64,
+    /// `value_count`, absent when unknown.
+    pub value_count: Option<u64>,
+    /// `null_count`, absent when unknown.
+    pub null_count: Option<u64>,
     /// `min_value`, absent when unknown.
     pub min_value: Option<String>,
     /// `max_value`, absent when unknown.
@@ -1478,8 +1478,8 @@ mod tests {
                         column_stats: vec![FileColumnStats {
                             column_id: column,
                             column_size_bytes: 100,
-                            value_count: 10,
-                            null_count: 0,
+                            value_count: Some(10),
+                            null_count: Some(0),
                             min_value: Some("1".into()),
                             max_value: Some("10".into()),
                             contains_nan: None,
@@ -2222,8 +2222,8 @@ mod tests {
                             column_stats: vec![FileColumnStats {
                                 column_id: column,
                                 column_size_bytes: 10,
-                                value_count: 4,
-                                null_count: 0,
+                                value_count: Some(4),
+                                null_count: Some(0),
                                 min_value: Some(ordinal.to_string()),
                                 max_value: Some("9".into()),
                                 contains_nan: None,

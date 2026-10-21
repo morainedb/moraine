@@ -194,10 +194,9 @@ fn cli_binary_name() -> &'static str {
 /// The CLI for the primary pin: the one `make release` builds beside the
 /// extension, verified to report the pinned version.
 ///
-/// The pin is a development revision with no release assets, so there is
-/// nothing to download — and no other binary carries its version string,
-/// which is what decides whether the extension loads at all. Callers build
-/// the extension first.
+/// Built rather than downloaded: the build stamps the pinned version
+/// string, which is what decides whether the extension loads at all.
+/// Callers build the extension first.
 pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
     let cli = workspace_root()
         .join("build/release")

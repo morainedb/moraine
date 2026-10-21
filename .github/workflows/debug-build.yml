@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       duckdb_ref:
-        description: "DuckDB tag, branch or commit to build against; the default is the pinned v2.0.0-alpha46057 commit"
+        description: "DuckDB tag, branch or commit to build against; the default is the pinned v2.0.0 commit"
         required: true
-        default: "b15358c371daf10dad799a43b6167f6ccdce84d8"
+        default: "d54cbbe3df17e8e5ce68312f483b4155836112aa"
       duckdb_tag:
         description: "Version string the build stamps, which the CLI loading it must report"
         required: true
-        default: "v2.0.0-alpha46057"
+        default: "v2.0.0"
       debug_level:
         description: "Rust debug info: line-tables-only names frames, full adds locals"
         required: true

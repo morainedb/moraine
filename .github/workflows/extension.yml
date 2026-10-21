@@ -2,12 +2,8 @@ name: Extension
 # Build the extension for every published platform and prove the bundled
 # DuckLake in the same container that built it.
 #
-# Publishing stays off here: a C++-ABI extension only loads into the exact
-# version stamped in its footer, and the primary pin in
-# .github/duckdb-versions is a development revision whose label moves with
-# DuckDB's own builds. A build from this workflow does load — DuckDB
-# publishes that label's libraries and CLI — so consumers take the artifact
-# from a run. Turning the ext-v* release job back on is its own decision.
+# Publishing stays off here: consumers take the artifact from a run.
+# Turning the ext-v* release job back on is its own decision.
 on:
   workflow_dispatch:
 
@@ -17,11 +13,11 @@ jobs:
     # Omit duckdb_version to build the pinned submodule. The Makefile stamps
     # duckdb_tag explicitly; test_config forwards it into Linux containers.
     # ci_tools_version must match the reusable workflow's ref.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@969bc76276acec1c0a3922ff500d2ec3a1a3b037
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@78bd1e4abbd543822166d5b07644751ba1fc6e8d
     with:
       extension_name: moraine
-      ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
-      duckdb_tag: v2.0.0-alpha46057
+      ci_tools_version: 78bd1e4abbd543822166d5b07644751ba1fc6e8d
+      duckdb_tag: v2.0.0
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
@@ -33,8 +29,8 @@ jobs:
       # own because the only CLI that can load the artifact is the one this
       # container just built beside it.
       post_build_command: >-
-        cargo run -q -p xtask -- validate-release-artifact v2.0.0-alpha46057
+        cargo run -q -p xtask -- validate-release-artifact v2.0.0
         build/release/extension/moraine/moraine.duckdb_extension
       # Point ccache at the directory the Linux container already mounts and
       # caches; without it every build recompiles DuckDB from scratch.
-      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0-alpha46057"}}'
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0"}}'

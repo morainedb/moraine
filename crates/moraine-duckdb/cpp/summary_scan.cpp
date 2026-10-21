@@ -194,7 +194,8 @@ LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::D
 		auto path = bound.file_paths.find(file_id);
 		if (path != bound.file_paths.end() && transaction.HasLocalDeleteForFile(table_id, path->second)) {
 			duckdb::DuckLakeFileData pending;
-			transaction.GetLocalDeleteForFile(table_id, path->second, pending);
+			duckdb::optional_idx pending_begin_snapshot;
+			transaction.GetLocalDeleteForFile(table_id, path->second, pending, pending_begin_snapshot);
 			auto scanned = duckdb::DuckLakeDeleteFilter::ScanDeleteFile(context, pending);
 			deleted.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
 		}

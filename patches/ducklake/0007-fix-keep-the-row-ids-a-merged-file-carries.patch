@@ -1,0 +1,20 @@
+diff --git a/src/functions/ducklake_compaction_functions.cpp b/src/functions/ducklake_compaction_functions.cpp
+index f99cc1a2..2c41e634 100644
+--- a/src/functions/ducklake_compaction_functions.cpp
++++ b/src/functions/ducklake_compaction_functions.cpp
+@@ -743,10 +743,12 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+ 	copy->per_thread_output = false;
+ 	copy->children.push_back(std::move(root));
+ 
++	// Registered without a dense start, so the row ids written into the
++	// merged file stand. A file's start says nothing about the ids its rows
++	// carry: a flush output's start is only the lowest of ids that may have
++	// gaps, so chaining two files by start arithmetic renumbers every row
++	// after a gap onto ids other rows hold.
+ 	optional_idx target_row_id_start;
+-	if (merge_in_order) {
+-		target_row_id_start = source_files[0].file.row_id_start;
+-	}
+ 
+ 	// followed by the compaction operator (that writes the results back to the
+ 	auto compaction = make_uniq<DuckLakeLogicalCompaction>(

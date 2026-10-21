@@ -1,8 +1,8 @@
 diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
-index d1460897..e6aa92a9 100644
+index 85140476..38c9b52b 100644
 --- a/src/storage/ducklake_transaction_state.cpp
 +++ b/src/storage/ducklake_transaction_state.cpp
-@@ -1990,6 +1990,16 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
+@@ -2696,11 +2696,22 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
  			break;
  		} catch (std::exception &ex) {
  			ErrorData error(ex);
@@ -13,9 +13,15 @@ index d1460897..e6aa92a9 100644
 +			if (outcome_unknown) {
 +				// The metadata commit may reference these files. Later rollback must retain them too.
 +				local_changes.Clear();
-+				context.try_rollback();
++			}
+ 			// keep the commit error when the rollback fails too
+ 			try {
+ 				context.try_rollback();
+ 			} catch (std::exception &) { // NOLINT
+ 			}
++			if (outcome_unknown) {
 +				error.Throw("DuckLake commit outcome unknown; files retained for reconciliation. ");
 +			}
- 			// rollback if there is an active transaction
- 			context.try_rollback();
  			retryable_metadata_error = retryable_metadata_error || context.is_retryable_metadata_error(error.Message());
+ 			// a retryable metadata error in the conflict check is retried, a conflict that it finds is not
+ 			bool retry_on_error =

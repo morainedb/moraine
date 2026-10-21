@@ -49,7 +49,7 @@ message ViewValue {
   string dialect = 7;
   string sql = 8;
   optional string column_aliases = 9;
-  // Written from catalog version 1.1-dev1 on.
+  // Written from catalog version 1.1 on.
   repeated ViewColumnTag column_tags = 10;
 }
 
@@ -233,7 +233,7 @@ message DataFileValue {
   optional uint64 mapping_id = 15;
   optional uint64 partial_max = 16;
   repeated FilePartitionValue partition_values = 17;
-  // Written from catalog version 1.1-dev1 on; absent for a file an older
+  // Written from catalog version 1.1 on; absent for a file an older
   // writer registered.
   optional uint64 row_group_count = 18;
 }
@@ -253,7 +253,7 @@ message DeleteFileValue {
   uint64 footer_size = 11;
   optional string encryption_key = 12;
   optional uint64 partial_max = 13;
-  // Written from catalog version 1.1-dev1 on; absent for a file an older
+  // Written from catalog version 1.1 on; absent for a file an older
   // writer registered.
   optional uint64 row_group_count = 14;
 }
@@ -284,8 +284,9 @@ message FileVariantStats {
   string variant_path = 1;
   string shredded_type = 2;
   uint64 column_size_bytes = 3;
-  uint64 value_count = 4;
-  uint64 null_count = 5;
+  // Absent where DuckLake has no null or value counts for the field.
+  optional uint64 value_count = 4;
+  optional uint64 null_count = 5;
   optional string min_value = 6;
   optional string max_value = 7;
   optional bool contains_nan = 8;
@@ -299,15 +300,16 @@ message FileColumnStatsValue {
   uint64 table_id = 2;
   uint64 column_id = 3;
   uint64 column_size_bytes = 4;
-  uint64 value_count = 5;
-  uint64 null_count = 6;
+  // Absent where DuckLake has no null or value counts for the column.
+  optional uint64 value_count = 5;
+  optional uint64 null_count = 6;
   optional string min_value = 7;
   optional string max_value = 8;
   optional bool contains_nan = 9;
   optional string extra_stats = 10;
   repeated FileVariantStats variant_stats = 11;
   // Whether the recorded bound is the exact value rather than a widened
-  // one. Written from catalog version 1.1-dev1 on.
+  // one. Written from catalog version 1.1 on.
   optional bool min_is_exact = 12;
   optional bool max_is_exact = 13;
 }
@@ -330,7 +332,7 @@ message TableColumnStatsValue {
   optional string max_value = 6;
   optional string extra_stats = 7;
   // Whether the recorded bound is the exact value rather than a widened
-  // one. Written from catalog version 1.1-dev1 on.
+  // one. Written from catalog version 1.1 on.
   optional bool min_is_exact = 8;
   optional bool max_is_exact = 9;
 }

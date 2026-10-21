@@ -79,10 +79,7 @@ async fn raising_the_catalog_version_records_the_newest_shape() {
         .unwrap();
 
     let planned = catalog.raise_catalog_version(true).await.unwrap();
-    assert_eq!(
-        (planned.from.as_str(), planned.to.as_str()),
-        ("1.0", "1.1-dev1")
-    );
+    assert_eq!((planned.from.as_str(), planned.to.as_str()), ("1.0", "1.1"));
     assert_eq!(
         catalog
             .snapshot()
@@ -95,10 +92,7 @@ async fn raising_the_catalog_version_records_the_newest_shape() {
     );
 
     let raised = catalog.raise_catalog_version(false).await.unwrap();
-    assert_eq!(
-        (raised.from.as_str(), raised.to.as_str()),
-        ("1.0", "1.1-dev1")
-    );
+    assert_eq!((raised.from.as_str(), raised.to.as_str()), ("1.0", "1.1"));
     assert_eq!(
         catalog
             .snapshot()
@@ -106,7 +100,7 @@ async fn raising_the_catalog_version_records_the_newest_shape() {
             .unwrap()
             .option(OptionScope::Global, "version")
             .as_deref(),
-        Some("1.1-dev1")
+        Some("1.1")
     );
 
     // Nothing left to raise; the report says so rather than failing.

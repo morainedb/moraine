@@ -238,7 +238,7 @@ public:
 		return path_;
 	}
 
-	// Whether this attach serves the shape catalog version 1.1-dev1
+	// Whether this attach serves the shape catalog version 1.1
 	// declares, read once when it attached. Every entry the attach
 	// registers declares that one shape, so a raise under a live attach
 	// moves the store without mixing shapes in a session that is already

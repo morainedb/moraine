@@ -1,10 +1,10 @@
 diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
-index 23cb9db5..ff9ca843 100644
+index f4945d5c..d4bccd9d 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -650,10 +650,13 @@ private:
- 	                                                                         DuckLakeSnapshot start_snapshot,
- 	                                                                         DuckLakeSnapshot end_snapshot);
+@@ -730,10 +730,13 @@ private:
+ 	                                               const vector<string> &columns_to_read,
+ 	                                               const string &snapshot_column);
  
 -	unordered_map<idx_t, string> insert_inlined_table_name_cache;
  	unordered_set<idx_t> delete_inlined_table_cache;
@@ -16,4 +16,4 @@ index 23cb9db5..ff9ca843 100644
 +	unordered_map<idx_t, string> insert_inlined_table_name_cache;
  	DuckLakeTransaction &transaction;
  	mutex paths_lock;
- 	map<SchemaIndex, string> schema_paths;
+ 	map<TableIndex, string> table_paths;
