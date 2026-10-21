@@ -1,7 +1,9 @@
-//! One worker per attach, with one bounded batch waiting behind it.
+//! One worker per attach drives backfill and bounded commit batches
+//! independently.
 
 use std::{
     collections::BTreeSet,
+    future::Future,
     sync::{Arc, Mutex},
 };
 
@@ -35,7 +37,6 @@ impl Pass {
     }
 
     fn merge(&mut self, next: Self) {
-        // A full backfill (`None`) dominates every snapshot cutoff.
         self.since = self.since.min(next.since);
         match (&mut self.tables, next.tables) {
             (Some(tables), Some(next)) => {
@@ -104,6 +105,12 @@ impl Pending {
         self.ready.notify_one();
     }
 
+    async fn run<F: Future<Output = ()>>(&self, run: &impl Fn(Pass) -> F) {
+        loop {
+            run(self.next().await).await;
+        }
+    }
+
     async fn next(&self) -> Pass {
         loop {
             self.ready.notified().await;
@@ -119,8 +126,29 @@ impl Pending {
     }
 }
 
+#[derive(Default)]
+struct Schedule {
+    commits: Pending,
+    backfill: Pending,
+}
+
+impl Schedule {
+    fn push(&self, pass: Pass) {
+        if pass.since.is_some() {
+            self.commits.push(pass);
+        } else {
+            self.backfill.push(pass);
+        }
+    }
+
+    async fn run<F: Future<Output = ()>>(&self, run: impl Fn(Pass) -> F) {
+        // Keep polling backfill so it can release shared I/O permits.
+        tokio::join!(self.commits.run(&run), self.backfill.run(&run));
+    }
+}
+
 pub(super) struct Worker {
-    pending: Arc<Pending>,
+    pending: Arc<Schedule>,
     task: JoinHandle<()>,
 }
 
@@ -131,16 +159,10 @@ impl Worker {
         store: Option<DataStore>,
         prefix: String,
     ) -> Self {
-        let pending = Arc::new(Pending::default());
+        let pending = Arc::new(Schedule::default());
         let queue = Arc::clone(&pending);
         let task = runtime.spawn(async move {
-            loop {
-                queue
-                    .next()
-                    .await
-                    .run(&catalog, store.as_ref(), &prefix)
-                    .await;
-            }
+            Box::pin(queue.run(|pass| pass.run(&catalog, store.as_ref(), &prefix))).await;
         });
         Self { pending, task }
     }

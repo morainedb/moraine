@@ -23,26 +23,22 @@ async fn bursts_keep_every_table_and_the_earliest_snapshot() {
 }
 
 #[tokio::test]
-async fn attach_backfill_and_preload_cover_merged_commits_in_either_order() {
+async fn attach_and_commit_requests_stay_separate_in_either_order() {
     for (attach_first, preload) in [(false, false), (false, true), (true, false), (true, true)] {
-        let pending = Pending::default();
+        let schedule = super::Schedule::default();
         let mut passes = [Pass::attach(preload), commit(1, 20)];
         if !attach_first {
             passes.reverse();
         }
         for pass in passes {
-            pending.push(pass);
+            schedule.push(pass);
         }
-        let pass = pending.next().await;
-        if preload {
-            assert!(pass.tables.is_none());
-        } else {
-            assert_eq!(
-                pass.tables.unwrap(),
-                [TableId::new(1)].into_iter().collect()
-            );
-        }
-        assert!(pass.since.is_none());
+        let backfill = schedule.backfill.next().await;
+        assert_eq!(backfill.tables, (!preload).then(Default::default));
+        assert!(backfill.since.is_none());
+        let commit = schedule.commits.next().await;
+        assert_eq!(commit.tables.unwrap(), [TableId::new(1)].into());
+        assert_eq!(commit.since, Some(SnapshotId::new(19)));
     }
 }
 
@@ -93,34 +89,94 @@ async fn concurrent_producers_do_not_lose_tables() {
 }
 
 #[test]
-fn shutdown_waits_for_the_running_future_to_drop() {
+fn commits_progress_during_backfill_and_shutdown_drops_both_passes() {
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
     };
 
-    struct Running(Arc<AtomicBool>);
+    struct Running(Arc<AtomicUsize>);
     impl Drop for Running {
         fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
+            self.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .unwrap();
-    let running = Arc::new(AtomicBool::new(true));
-    let held = Running(Arc::clone(&running));
-    let (started, ready) = tokio::sync::oneshot::channel();
+    let running = Arc::new(AtomicUsize::new(0));
+    let permits = Arc::new(tokio::sync::Semaphore::new(0));
+    let backfill_permits = Arc::new(tokio::sync::Semaphore::new(0));
+    let (finished, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let pending = Arc::new(super::Schedule::default());
+    pending.push(Pass::attach(false));
+    let queue = Arc::clone(&pending);
+    let active = Arc::clone(&running);
+    let available = Arc::clone(&permits);
+    let backfill_available = Arc::clone(&backfill_permits);
     let worker = super::Worker {
-        pending: Arc::new(Pending::default()),
+        pending,
         task: runtime.spawn(async move {
-            let _held = held;
-            started.send(()).unwrap();
-            std::future::pending::<()>().await;
+            queue
+                .run(|pass| {
+                    let active = Arc::clone(&active);
+                    let available = Arc::clone(&available);
+                    let backfill_available = Arc::clone(&backfill_available);
+                    let started = started.clone();
+                    let finished = finished.clone();
+                    async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _running = Running(active);
+                        let backfill = pass.since.is_none();
+                        started.send(pass).unwrap();
+                        let gate = if backfill {
+                            backfill_available
+                        } else {
+                            available
+                        };
+                        gate.acquire().await.unwrap().forget();
+                        finished.send(backfill).unwrap();
+                    }
+                })
+                .await;
         }),
     };
-    runtime.block_on(ready).unwrap();
+    runtime.block_on(async {
+        assert!(starts.recv().await.unwrap().since.is_none());
+        worker.push(commit(1, 20));
+        let first = tokio::time::timeout(Duration::from_secs(1), starts.recv())
+            .await
+            .expect("commit must start while backfill is blocked")
+            .unwrap();
+        assert_eq!(first.since, Some(SnapshotId::new(19)));
+        assert_eq!(running.load(Ordering::SeqCst), 2);
+        backfill_permits.add_permits(1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), completions.recv())
+                .await
+                .expect("backfill must progress while a commit is blocked")
+                .unwrap()
+        );
+        assert_eq!(running.load(Ordering::SeqCst), 1);
+        worker.push(Pass::attach(false));
+        assert!(starts.recv().await.unwrap().since.is_none());
+
+        worker.push(commit(2, 40));
+        worker.push(commit(3, 30));
+        tokio::task::yield_now().await;
+        assert!(starts.try_recv().is_err(), "only one commit batch runs");
+        permits.add_permits(1);
+        let merged = tokio::time::timeout(Duration::from_secs(1), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.since, Some(SnapshotId::new(29)));
+        assert_eq!(merged.tables.unwrap(), [2, 3].map(TableId::new).into());
+        assert_eq!(running.load(Ordering::SeqCst), 2);
+    });
     worker.stop(&runtime);
-    assert!(!running.load(Ordering::SeqCst));
+    assert_eq!(running.load(Ordering::SeqCst), 0);
 }

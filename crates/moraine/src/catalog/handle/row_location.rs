@@ -752,17 +752,7 @@ impl ReadOnlyCatalog {
         since: Option<SnapshotId>,
     ) -> Result<RowSummaryPublish> {
         let mut outcomes = stream::iter(tables)
-            .map(|table| {
-                let files = snapshot
-                    .data_files
-                    .get(&table.get())
-                    .into_iter()
-                    .flat_map(|files| files.values())
-                    .filter(|file| since.is_none_or(|since| file.begin_snapshot > since.get()))
-                    .map(data_file_info)
-                    .collect();
-                self.summarize_files(snapshot, data_store, data_prefix, table, files)
-            })
+            .map(|table| self.publish_table(snapshot, data_store, data_prefix, table, since))
             .buffer_unordered(WARM_TABLE_CONCURRENCY);
         let mut total = RowSummaryPublish::default();
         while let Some(table) = outcomes.try_next().await? {
@@ -775,30 +765,32 @@ impl ReadOnlyCatalog {
         Ok(total)
     }
 
-    /// Publishes `files`' summaries, skipping those already published and
-    /// those whose ids the catalog already describes.
-    ///
-    /// Concurrency matches a lookup's, and nothing here enters the summary
-    /// caches: a pass over a lake must not evict the working set of the
-    /// process running it.
-    async fn summarize_files(
+    /// Publishes missing summaries without filling the reader's summary caches.
+    async fn publish_table(
         &self,
         snapshot: &CatalogSnapshot,
         data_store: &DataStore,
         data_prefix: &str,
         table: TableId,
-        files: Vec<DataFileInfo>,
+        since: Option<SnapshotId>,
     ) -> Result<RowSummaryPublish> {
-        if files.is_empty() {
+        let Some(files) = snapshot.data_files.get(&table.get()) else {
+            return Ok(RowSummaryPublish::default());
+        };
+        let mut files = files.values();
+        let mut files = std::iter::from_fn(|| {
+            files
+                .find(|file| since.is_none_or(|since| file.begin_snapshot > since.get()))
+                .map(data_file_info)
+        })
+        .peekable();
+        if files.peek().is_none() {
             return Ok(RowSummaryPublish::default());
         }
         let table_prefix = snapshot.table_data_prefix(table)?;
-        let mut published = RowSummaryPublish {
-            files_considered: u64::try_from(files.len()).unwrap_or(u64::MAX),
-            ..RowSummaryPublish::default()
-        };
+        let mut published = RowSummaryPublish::default();
 
-        let mut outcomes = stream::iter(files.into_iter().map(|file| {
+        let mut outcomes = stream::iter(files.map(|file| {
             let resolved = resolve_data_path(
                 data_prefix,
                 &table_prefix,
@@ -833,6 +825,7 @@ impl ReadOnlyCatalog {
         .buffer_unordered(SUMMARY_READ_CONCURRENCY);
 
         while let Some((data_file_id, written)) = outcomes.next().await {
+            published.files_considered = published.files_considered.saturating_add(1);
             match written {
                 Ok(true) => {
                     published.summaries_built = published.summaries_built.saturating_add(1);
