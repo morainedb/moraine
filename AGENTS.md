@@ -76,6 +76,7 @@ this file is the operational summary.
 
 ```bash
 cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
+  && cargo xtask fmt-cpp --check && cargo xtask tidy-cpp \
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
   && cargo deny check -D advisory-not-detected \
@@ -86,9 +87,14 @@ cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets 
 `sccache` off `PATH` on its own. Installing one is the difference between
 a ten-minute and a one-minute rebuild in a fresh worktree.
 
-The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`,
+The Rust/C/C++ formatting and Clippy checks also run as a pre-commit hook from `.githooks/`,
 and a commit-msg hook there rejects non-conventional commit subjects (the
 changelog is generated from them; CI validates PR titles the same way).
 Conductor workspaces enable those hooks from `.conductor/settings.toml`,
 which also installs the toolchain a cloud workspace starts without. A plain
 clone needs it once: `git config core.hooksPath .githooks`.
+
+C/C++ tools are pinned in `.clang-tools-version`; installation is documented
+in `CONTRIBUTING.md`. `cargo xtask fmt-cpp` applies the formatting.
+`cargo xtask tidy-cpp` configures the C++ build and checks handwritten sources;
+it runs in CI and the full local gate, outside the commit hook.

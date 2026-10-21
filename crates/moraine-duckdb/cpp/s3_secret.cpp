@@ -95,7 +95,9 @@ static void Release(void *context) {
 static bool Load(void *context, MoraineS3CredentialReceiver receive, void *output) {
 	try {
 		auto &source = *static_cast<CredentialSource *>(context);
-		auto retire = [](DatabaseReaper::Entry *entry) { Reaper().Retire(entry); };
+		auto retire = [](DatabaseReaper::Entry *entry) {
+			Reaper().Retire(entry);
+		};
 		std::unique_ptr<DatabaseReaper::Entry, decltype(retire)> lease(new DatabaseReaper::Entry, retire);
 		lease->database = source.database.lock();
 		if (!lease->database) {
@@ -143,7 +145,8 @@ static void ResolveCredentialSource(duckdb::ClientContext &context, const duckdb
 	source->input.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
 	const auto &children = duckdb::StructValue::GetChildren(refresh);
 	for (duckdb::idx_t index = 0; index < children.size(); ++index) {
-		source->input.options[duckdb::StructType::GetChildName(refresh.type(), index).GetIdentifierName()] = children[index];
+		source->input.options[duckdb::StructType::GetChildName(refresh.type(), index).GetIdentifierName()] =
+		    children[index];
 	}
 	for (const auto &function : duckdb::SecretManager::Get(context).AllSecretFunctions()) {
 		if (duckdb::Identifier(function.secret_type) == secret.GetType() && function.provider == secret.GetProvider()) {

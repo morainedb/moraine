@@ -1,5 +1,9 @@
 //! Repo automation. Invoked as `cargo xtask <command>`.
 //!
+//! - `fmt-cpp [--check]` formats or checks handwritten C/C++ sources.
+//! - `tidy-cpp` configures the extension and runs clang-tidy on handwritten
+//!   sources.
+//!
 //! `session-bench` compares the pinned pre-review, post-review, and SlateDB
 //! upgrade revisions with shared core and SQL workloads.
 //!
@@ -38,6 +42,7 @@ mod bump;
 mod catalog_target;
 mod clickbench;
 mod commit_bench;
+mod cpp;
 mod duckdb;
 mod ducklake_patch;
 mod e2e;
@@ -53,6 +58,8 @@ fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(2).collect();
     let task = std::env::args().nth(1);
     match task.as_deref() {
+        Some("fmt-cpp") => cpp::format(&arguments),
+        Some("tidy-cpp") => cpp::tidy(&arguments),
         Some("e2e") => e2e::e2e(),
         Some("build-extension") => e2e::build_extension(),
         Some("bench") => bench::bench(&arguments),
@@ -72,13 +79,13 @@ fn main() -> anyhow::Result<()> {
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+                "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
                  check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
                  bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
              check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
              bump-duckdb, ducklake-patch"
         ),

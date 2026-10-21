@@ -132,8 +132,7 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 		if (rest == "compact_store_timeout") {
 			if (option.second.type().id() == duckdb::LogicalTypeId::INTERVAL) {
 				auto interval = option.second.GetValue<duckdb::interval_t>();
-				config.compact_store_timeout_ms =
-				    static_cast<uint64_t>(duckdb::Interval::GetMicro(interval) / 1000);
+				config.compact_store_timeout_ms = static_cast<uint64_t>(duckdb::Interval::GetMicro(interval) / 1000);
 			} else {
 				config.compact_store_timeout_ms = option.second.GetValue<uint64_t>() * 1000;
 			}
@@ -165,9 +164,8 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			}
 			auto parameter = rest.substr(step.size() + 1);
 			auto &accepted = spec.parameters;
-			if (std::find_if(accepted.begin(), accepted.end(), [&](const char *candidate) {
-				    return parameter == candidate;
-			    }) == accepted.end()) {
+			if (std::find_if(accepted.begin(), accepted.end(),
+			                 [&](const char *candidate) { return parameter == candidate; }) == accepted.end()) {
 				throw duckdb::BinderException(
 				    "ducklake_%s takes no parameter named \"%s\"; MAINTENANCE_%s_<parameter> passes "
 				    "DuckLake's own parameters through unchanged",
@@ -187,8 +185,7 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 				// one needs the `icu` extension. Casting to TIMESTAMP uses
 				// an operator that is always available, and DuckLake
 				// accepts either for this parameter.
-				pending[i].arguments.push_back(parameter + " => now()::TIMESTAMP - " +
-				                               option.second.ToSQLString());
+				pending[i].arguments.push_back(parameter + " => now()::TIMESTAMP - " + option.second.ToSQLString());
 			} else {
 				pending[i].arguments.push_back(parameter + " => " + option.second.ToSQLString());
 			}
@@ -235,8 +232,7 @@ constexpr const char *METADATA_PREFIX = "__ducklake_metadata_";
 constexpr const char *MAINTENANCE_CLOSE_STATE = "moraine_maintenance_close";
 constexpr const char *MAINTENANCE_CONNECTION_STATE = "moraine_maintenance_connection";
 
-class MaintenanceConnectionState : public duckdb::ClientContextState {
-};
+class MaintenanceConnectionState : public duckdb::ClientContextState {};
 
 class MaintenanceLifecycle;
 
@@ -350,8 +346,8 @@ MaintenanceCloseState::~MaintenanceCloseState() {
 MaintenanceScheduler::MaintenanceScheduler(duckdb::DatabaseInstance &db, std::string attached_name,
                                            std::string store_path, MoraineCatalogHandle *handle,
                                            MaintenanceConfig config)
-    : db_(db), attached_name_(std::move(attached_name)), store_path_(std::move(store_path)),
-      handle_(handle), config_(std::move(config)) {
+    : db_(db), attached_name_(std::move(attached_name)), store_path_(std::move(store_path)), handle_(handle),
+      config_(std::move(config)) {
 }
 
 std::string MaintenanceScheduler::ResolveLakeName(duckdb::Connection &connection) {
@@ -472,8 +468,7 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	std::string aborted_by;
 	for (auto &spec : StepSpecs()) {
 		if (!aborted_by.empty()) {
-			report.push_back(
-			    MaintenanceStep {spec.name, "skipped", "not attempted: " + aborted_by + " failed"});
+			report.push_back(MaintenanceStep {spec.name, "skipped", "not attempted: " + aborted_by + " failed"});
 			continue;
 		}
 		auto configured = std::find_if(config_.ducklake_steps.begin(), config_.ducklake_steps.end(),
@@ -494,24 +489,21 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	// expiry suppress it would stop the reclamation this pass exists for
 	// on every future pass too, for as long as the misconfiguration
 	// stands, while the leak it fixes kept growing.
-	report.push_back(config_.sweep_indexes
-	                     ? RunSweep()
-	                     : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
+	report.push_back(config_.sweep_indexes ? RunSweep()
+	                                       : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
 
 	// Reported separately from the pass that does the work, because what
 	// orphans file column statistics is DuckLake's expiry above rather
 	// than anything moraine's own reclamation did — reading one number
 	// against the other is how a leak here gets noticed.
-	report.push_back(config_.sweep_indexes
-	                     ? RunFileStatsSweep()
-	                     : MaintenanceStep {"sweep_file_stats", "skipped", "disabled at attach"});
+	report.push_back(config_.sweep_indexes ? RunFileStatsSweep()
+	                                       : MaintenanceStep {"sweep_file_stats", "skipped", "disabled at attach"});
 
 	// Reported separately for the same reason: what strands inlined rows
 	// is a table dropped above, not anything moraine's own reclamation
 	// did.
-	report.push_back(config_.sweep_indexes
-	                     ? RunInlineTableSweep()
-	                     : MaintenanceStep {"sweep_inline_tables", "skipped", "disabled at attach"});
+	report.push_back(config_.sweep_indexes ? RunInlineTableSweep()
+	                                       : MaintenanceStep {"sweep_inline_tables", "skipped", "disabled at attach"});
 
 	// After DuckLake's cleanup above, which is what removes the data
 	// files that strand them. Its orphan scan cannot: it matches
@@ -523,9 +515,8 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	// expiry tombstones rows and the sweep deletes index ranges, so
 	// merging earlier would leave exactly the tombstones this pass just
 	// created for the next pass to reclaim.
-	report.push_back(config_.compact_store
-	                     ? RunStoreMerge()
-	                     : MaintenanceStep {"compact_store", "skipped", "not configured at attach"});
+	report.push_back(config_.compact_store ? RunStoreMerge()
+	                                       : MaintenanceStep {"compact_store", "skipped", "not configured at attach"});
 
 	RecordPass(started_at, trigger, report);
 
@@ -546,8 +537,7 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 		WriteMoraineLog(db_, duckdb::LogLevel::LOG_WARNING,
 		                std::string("maintenance pass (") + trigger + ") had failures — " + failed);
 	} else {
-		WriteMoraineLog(db_, duckdb::LogLevel::LOG_INFO,
-		                std::string("maintenance pass (") + trigger + ") completed");
+		WriteMoraineLog(db_, duckdb::LogLevel::LOG_INFO, std::string("maintenance pass (") + trigger + ") completed");
 	}
 	return report;
 }
@@ -562,8 +552,8 @@ void MaintenanceScheduler::RecordPass(duckdb::timestamp_t started_at, const char
 		// work for a later pass to look at.
 		bool work_pending = false;
 		for (auto &step : report) {
-			steps.push_back(MoraineMaintenanceStatusStepInput {step.step.c_str(), step.status.c_str(),
-			                                                   step.detail.c_str()});
+			steps.push_back(
+			    MoraineMaintenanceStatusStepInput {step.step.c_str(), step.status.c_str(), step.detail.c_str()});
 			work_pending = work_pending || step.status == "failed" || step.work_pending;
 		}
 
@@ -581,7 +571,8 @@ void MaintenanceScheduler::RecordPass(duckdb::timestamp_t started_at, const char
 		                "maintenance pass completed but its status could not be persisted: " + message);
 	} catch (const std::exception &error) {
 		WriteMoraineLog(db_, duckdb::LogLevel::LOG_WARNING,
-		                "maintenance pass completed but its status could not be persisted: " + std::string(error.what()));
+		                "maintenance pass completed but its status could not be persisted: " +
+		                    std::string(error.what()));
 	} catch (...) {
 		WriteMoraineLog(db_, duckdb::LogLevel::LOG_WARNING,
 		                "maintenance pass completed but its status could not be persisted: unknown error");
@@ -589,7 +580,7 @@ void MaintenanceScheduler::RecordPass(duckdb::timestamp_t started_at, const char
 }
 
 MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
-                                                     const DuckLakeStep &step) {
+                                                      const DuckLakeStep &step) {
 	std::string sql = "CALL ducklake_" + step.name + "(" + duckdb::KeywordHelper::WriteQuoted(lake, '\'');
 	for (auto &argument : step.arguments) {
 		sql += ", " + argument;
@@ -627,9 +618,8 @@ MaintenanceStep MaintenanceScheduler::RunSweep() {
 	}
 	file_stats_swept_ = true;
 	return MaintenanceStep {"sweep_indexes", "ran",
-	                        "reclaimed " + std::to_string(entries) + (entries == 1 ? " entry" : " entries") +
-	                            " from " + std::to_string(indexes) +
-	                            (indexes == 1 ? " dropped index" : " dropped indexes")};
+	                        "reclaimed " + std::to_string(entries) + (entries == 1 ? " entry" : " entries") + " from " +
+	                            std::to_string(indexes) + (indexes == 1 ? " dropped index" : " dropped indexes")};
 }
 
 MaintenanceStep MaintenanceScheduler::RunFileStatsSweep() {
@@ -680,12 +670,9 @@ MaintenanceStep MaintenanceScheduler::RunStoreMerge() {
 	MoraineError err {};
 	// No interrupt probe: the pass runs on the scheduler's own thread,
 	// which stops through the stop flag rather than a query interrupt.
-	auto code = moraine_compact_store(handle_,
-	                                  config_.compact_store_subspace.empty()
-	                                      ? nullptr
-	                                      : config_.compact_store_subspace.c_str(),
-	                                  config_.compact_store_timeout_ms, false, merges.OutItems(), merges.OutLen(),
-	                                  nullptr, nullptr, &err);
+	auto code = moraine_compact_store(
+	    handle_, config_.compact_store_subspace.empty() ? nullptr : config_.compact_store_subspace.c_str(),
+	    config_.compact_store_timeout_ms, false, merges.OutItems(), merges.OutLen(), nullptr, nullptr, &err);
 	if (code != MORAINE_OK) {
 		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
 		if (err.message != nullptr) {
@@ -780,8 +767,7 @@ duckdb::unique_ptr<duckdb::FunctionData> StatusBind(duckdb::ClientContext &conte
 	bind_data->Cast<MaintenanceBindData>().status_only = true;
 	// Retained passes carry when they ran, what drove them, and whether
 	// they left work for a later one.
-	return_types.insert(return_types.begin(),
-	                    {duckdb::LogicalType::TIMESTAMP, duckdb::LogicalType::VARCHAR});
+	return_types.insert(return_types.begin(), {duckdb::LogicalType::TIMESTAMP, duckdb::LogicalType::VARCHAR});
 	names.insert(names.begin(), {"started_at", "trigger"});
 	return_types.push_back(duckdb::LogicalType::BOOLEAN);
 	names.push_back("work_pending");
@@ -804,10 +790,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckd
 			ThrowMoraineError(err);
 		}
 		for (auto &row : rows) {
-			state->rows.push_back(ReportRow {
-			    duckdb::timestamp_t(row.started_at_micros), std::string(row.trigger),
-			    MaintenanceStep {std::string(row.step), std::string(row.status), std::string(row.detail)},
-			    row.work_pending});
+			state->rows.push_back(
+			    ReportRow {duckdb::timestamp_t(row.started_at_micros), std::string(row.trigger),
+			               MaintenanceStep {std::string(row.step), std::string(row.status), std::string(row.detail)},
+			               row.work_pending});
 		}
 		return state;
 	}
@@ -870,8 +856,8 @@ struct CompactBindData : public duckdb::FunctionData {
 	}
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		auto &other = other_p.Cast<CompactBindData>();
-		return catalog_name == other.catalog_name && subspace == other.subspace &&
-		       timeout_ms == other.timeout_ms && require_completed == other.require_completed;
+		return catalog_name == other.catalog_name && subspace == other.subspace && timeout_ms == other.timeout_ms &&
+		       require_completed == other.require_completed;
 	}
 };
 
@@ -886,8 +872,7 @@ struct CompactRow {
 	uint64_t bytes_after;
 };
 
-duckdb::unique_ptr<duckdb::FunctionData> CompactBind(duckdb::ClientContext &,
-                                                     duckdb::TableFunctionBindInput &input,
+duckdb::unique_ptr<duckdb::FunctionData> CompactBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                      duckdb::vector<duckdb::LogicalType> &return_types,
                                                      duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<CompactBindData>();
@@ -966,10 +951,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CompactInitGlobal(duckdb::C
 
 	OwnedArray<MoraineSubspaceMerge> merges(moraine_compact_store_free);
 	MoraineError err {};
-	auto code = moraine_compact_store(catalog.Handle(), bind_data.subspace.empty() ? nullptr
-	                                                                               : bind_data.subspace.c_str(),
-	                                  bind_data.timeout_ms, bind_data.require_completed, merges.OutItems(), merges.OutLen(),
-	                                  moraine_shim_is_interrupted, &context, &err);
+	auto code = moraine_compact_store(
+	    catalog.Handle(), bind_data.subspace.empty() ? nullptr : bind_data.subspace.c_str(), bind_data.timeout_ms,
+	    bind_data.require_completed, merges.OutItems(), merges.OutLen(), moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -977,8 +961,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CompactInitGlobal(duckdb::C
 	auto state = duckdb::make_uniq<CompactGlobalState>();
 	for (auto &merge : merges) {
 		state->rows.push_back({std::string(merge.subspace), std::string(merge.outcome),
-		                       merge.detail != nullptr ? std::string(merge.detail) : std::string(),
-		                       merge.bytes_before, merge.has_bytes_after, merge.bytes_after});
+		                       merge.detail != nullptr ? std::string(merge.detail) : std::string(), merge.bytes_before,
+		                       merge.has_bytes_after, merge.bytes_after});
 	}
 	return state;
 }
@@ -1033,8 +1017,7 @@ struct RaiseFormatBindData : public duckdb::FunctionData {
 	}
 };
 
-duckdb::unique_ptr<duckdb::FunctionData> RaiseFormatBind(duckdb::ClientContext &,
-                                                         duckdb::TableFunctionBindInput &input,
+duckdb::unique_ptr<duckdb::FunctionData> RaiseFormatBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
                                                          duckdb::vector<duckdb::Identifier> &names) {
 	names = {"from_format", "to_format"};
@@ -1064,7 +1047,7 @@ struct RaiseFormatGlobalState : public duckdb::GlobalTableFunctionState {
 };
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RaiseFormatInitGlobal(duckdb::ClientContext &,
-                                                                          duckdb::TableFunctionInitInput &) {
+                                                                           duckdb::TableFunctionInitInput &) {
 	return duckdb::make_uniq<RaiseFormatGlobalState>();
 }
 
@@ -1102,8 +1085,8 @@ void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
 	                             StatusBind, MaintenanceInitGlobal);
 	loader.RegisterFunction(status);
 
-	duckdb::TableFunction compact("moraine_compact_store", {duckdb::LogicalType::VARCHAR}, CompactImpl,
-	                              CompactBind, CompactInitGlobal);
+	duckdb::TableFunction compact("moraine_compact_store", {duckdb::LogicalType::VARCHAR}, CompactImpl, CompactBind,
+	                              CompactInitGlobal);
 	compact.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
 		options.Add("subspace", duckdb::LogicalType::VARCHAR);
 		options.Add("timeout", duckdb::LogicalType::ANY);
@@ -1113,9 +1096,8 @@ void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
 
 	duckdb::TableFunction raise_format("moraine_raise_format", {duckdb::LogicalType::VARCHAR}, RaiseFormatImpl,
 	                                   RaiseFormatBind, RaiseFormatInitGlobal);
-	raise_format.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
-		options.Add("dry_run", duckdb::LogicalType::BOOLEAN);
-	});
+	raise_format.GetSignature().WithTypedKwargs(
+	    "options", [](duckdb::TypedKwargs &options) { options.Add("dry_run", duckdb::LogicalType::BOOLEAN); });
 	loader.RegisterFunction(raise_format);
 }
 

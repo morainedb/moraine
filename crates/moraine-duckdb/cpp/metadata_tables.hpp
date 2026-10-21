@@ -246,7 +246,6 @@ public:
 
 private:
 	duckdb::ColumnList columns_;
-
 };
 
 // Builds a `MoraineMetadataTableEntry` for every table in

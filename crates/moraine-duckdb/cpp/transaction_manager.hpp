@@ -155,8 +155,7 @@ private:
 	// Keyed by scope as well as kind: a set narrowed to one table must
 	// never answer a read of the kind, and one table's narrowed set must
 	// never answer another's.
-	std::map<std::tuple<const MetadataTableSpec *, bool, std::optional<uint64_t>>,
-	         std::shared_ptr<const MetadataRows>>
+	std::map<std::tuple<const MetadataTableSpec *, bool, std::optional<uint64_t>>, std::shared_ptr<const MetadataRows>>
 	    metadata_rows_;
 	// Bumped by every drop from the map above, so a Put that raced the
 	// drop is refused rather than resurrecting what it removed.

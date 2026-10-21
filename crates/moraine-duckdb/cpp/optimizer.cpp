@@ -177,8 +177,7 @@ bool ResolvedValues(const std::vector<MoraineRowId> &rows, duckdb::idx_t column,
                     bool &any_null) {
 	std::set<uint64_t> seen;
 	any_null = false;
-	auto most_values =
-	    column == INDEX_READ_ROW_ID_COLUMN ? MAX_DERIVED_ROW_ID_VALUES : MAX_DERIVED_FILE_ID_VALUES;
+	auto most_values = column == INDEX_READ_ROW_ID_COLUMN ? MAX_DERIVED_ROW_ID_VALUES : MAX_DERIVED_FILE_ID_VALUES;
 	for (auto &row : rows) {
 		if (column == INDEX_READ_ROW_ID_COLUMN) {
 			if (seen.insert(row.value).second) {
@@ -312,34 +311,43 @@ void PushRowPruning(duckdb::LogicalOperator &op, RowPruning &pruning) {
 }
 
 duckdb::LogicalGet *ScanBeneath(duckdb::LogicalOperator &op) {
-	if (op.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION || op.type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
+	if (op.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
+	    op.type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
 		return ScanBeneath(*op.children[0]);
 	}
 	return op.type == duckdb::LogicalOperatorType::LOGICAL_GET ? &op.Cast<duckdb::LogicalGet>() : nullptr;
 }
 
-bool TrySummaryJoin(duckdb::ClientContext &context, duckdb::LogicalComparisonJoin &join,
-                    duckdb::idx_t index_side, duckdb::LogicalGet &index, const std::vector<MoraineRowId> &rows) {
+bool TrySummaryJoin(duckdb::ClientContext &context, duckdb::LogicalComparisonJoin &join, duckdb::idx_t index_side,
+                    duckdb::LogicalGet &index, const std::vector<MoraineRowId> &rows) {
 	auto &other = *join.children[1 - index_side];
 	auto scan = ScanBeneath(other);
-	if (!scan) { return false; }
+	if (!scan) {
+		return false;
+	}
 	bool row_id = false, file_id = false;
 	for (auto &condition : join.conditions) {
 		if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
-		    condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { continue; }
+		    condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			continue;
+		}
 		auto &index_expression = index_side == 0 ? condition.GetLHS() : condition.GetRHS();
 		auto &scan_expression = index_side == 0 ? condition.GetRHS() : condition.GetLHS();
 		duckdb::idx_t index_column, scan_column;
 		if (!ReferencedColumnBeneath(index_expression, *join.children[index_side], index, index_column) ||
-		    !ReferencedColumnBeneath(scan_expression, other, *scan, scan_column)) { continue; }
-		row_id = row_id || (index_column == INDEX_READ_ROW_ID_COLUMN && scan_column == duckdb::COLUMN_IDENTIFIER_ROW_ID);
+		    !ReferencedColumnBeneath(scan_expression, other, *scan, scan_column)) {
+			continue;
+		}
+		row_id =
+		    row_id || (index_column == INDEX_READ_ROW_ID_COLUMN && scan_column == duckdb::COLUMN_IDENTIFIER_ROW_ID);
 		file_id = file_id || (index_column == INDEX_READ_DATA_FILE_ID_COLUMN &&
-		    scan_column == duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID);
+		                      scan_column == duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID);
 	}
 	return row_id && file_id && UseSummaryScan(context, *scan, index, rows);
 }
 
-void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimizer &optimizer, duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
+void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
+                                  duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
 		FilterJoinsAgainstIndexReads(context, optimizer, child);
 	}
@@ -376,7 +384,9 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 	if (!rows || rows->empty()) {
 		return;
 	}
-	if (TrySummaryJoin(context, join, index_side, *index_get, *rows)) { return; }
+	if (TrySummaryJoin(context, join, index_side, *index_get, *rows)) {
+		return;
+	}
 
 	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filters;
 	std::vector<RowPruning> row_pruning;
@@ -466,10 +476,9 @@ struct ResolvedPredicate {
 
 // Resolves supported predicates through a ready index. A declined probe
 // leaves the scan unchanged.
-std::optional<ResolvedPredicate> ResolveIndexedPredicate(duckdb::ClientContext &context,
-                                                       duckdb::Optimizer &optimizer,
-                                                       duckdb::LogicalGet &get,
-                                                       duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
+std::optional<ResolvedPredicate>
+ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer, duckdb::LogicalGet &get,
+                        duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
 	if (!get.function.GetDefinition() || get.function.GetDefinition()->name != "ducklake_scan") {
 		return std::nullopt;
 	}
@@ -597,7 +606,7 @@ std::optional<ResolvedPredicate> ResolveIndexedPredicate(duckdb::ClientContext &
 // over whatever is read, so a pushed filter can only narrow the reading, and
 // only an index that is complete for the scan's snapshot may narrow it.
 void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::LogicalGet &get,
-                                const ResolvedPredicate &found) {
+                                 const ResolvedPredicate &found) {
 	auto &table = *found.table;
 	auto &schema_name = found.schema_name;
 	auto &table_name = found.table_name;
@@ -629,15 +638,16 @@ void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::Logical
 	if (!file_ids.empty() || any_unplaced) {
 		duckdb::unique_ptr<duckdb::Expression> file_filter;
 		if (!file_ids.empty()) {
-			file_filter = duckdb::ExpressionFilter::CreateInExpression(ScanColumn(duckdb::LogicalType::UBIGINT), file_ids);
+			file_filter =
+			    duckdb::ExpressionFilter::CreateInExpression(ScanColumn(duckdb::LogicalType::UBIGINT), file_ids);
 		}
 		if (any_unplaced) {
 			auto unplaced = duckdb::ExpressionFilter::CreateNullCheckExpression(
 			    ScanColumn(duckdb::LogicalType::UBIGINT), duckdb::ExpressionType::OPERATOR_IS_NULL);
-			file_filter = file_filter ? duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
-			                                duckdb::ExpressionType::CONJUNCTION_OR, std::move(file_filter),
-			                                std::move(unplaced))
-			                          : std::move(unplaced);
+			file_filter = file_filter
+			                  ? duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
+			                        duckdb::ExpressionType::CONJUNCTION_OR, std::move(file_filter), std::move(unplaced))
+			                  : std::move(unplaced);
 		}
 		get.table_filters.PushFilter(
 		    FilterOnlyColumn(get, duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID),
@@ -664,8 +674,7 @@ void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::Logical
 duckdb::optional_ptr<duckdb::LogicalGet> DeleteSourceScan(duckdb::LogicalOperator &op) {
 	auto *current = &op;
 	while (current->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
-		if (current->children.size() != 1 ||
-		    current->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (current->children.size() != 1 || current->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
 			return nullptr;
 		}
 		current = current->children[0].get();
@@ -702,8 +711,7 @@ duckdb::Value PositionalFiles(const OwnedArray<MoraineLocatedFile> &files) {
 		    {"data_file_id", duckdb::Value::UBIGINT(file.data_file_id)},
 		    {"positions", duckdb::Value::LIST(duckdb::LogicalType::UBIGINT, std::move(positions))},
 		    {"existing_positions",
-		     file.has_existing_delete ? duckdb::Value::BLOB_RAW(packed)
-		                              : duckdb::Value(duckdb::LogicalType::BLOB)}};
+		     file.has_existing_delete ? duckdb::Value::BLOB_RAW(packed) : duckdb::Value(duckdb::LogicalType::BLOB)}};
 		entries.push_back(duckdb::Value::STRUCT(std::move(values)));
 	}
 	return duckdb::Value::LIST(duckdb::LogicalType::STRUCT(fields), std::move(entries));
@@ -712,8 +720,8 @@ duckdb::Value PositionalFiles(const OwnedArray<MoraineLocatedFile> &files) {
 // Replace an exactly answered, certified delete with positional deletion.
 // Residual predicates and unsupported delete formats retain the scan.
 bool RewriteDeleteByIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
-                                    duckdb::unique_ptr<duckdb::LogicalOperator> &plan,
-                                    const ResolvedPredicate &found) {
+                                     duckdb::unique_ptr<duckdb::LogicalOperator> &plan,
+                                     const ResolvedPredicate &found) {
 	auto &deletion = plan->Cast<duckdb::LogicalDelete>();
 	if (deletion.return_chunk) {
 		return false;
@@ -760,8 +768,7 @@ bool RewriteDeleteByIndexedPredicate(duckdb::ClientContext &context, duckdb::Opt
 	}
 
 	duckdb::DuckLakeDeletePositionsFunction function;
-	duckdb::vector<duckdb::Value> inputs {duckdb::Value(found.catalog_name),
-	                                      duckdb::Value(found.schema_name),
+	duckdb::vector<duckdb::Value> inputs {duckdb::Value(found.catalog_name), duckdb::Value(found.schema_name),
 	                                      duckdb::Value(found.table_name), PositionalFiles(files)};
 	duckdb::named_argument_map_t named;
 	// Positions were resolved against the scan's snapshot; naming it makes
@@ -771,16 +778,14 @@ bool RewriteDeleteByIndexedPredicate(duckdb::ClientContext &context, duckdb::Opt
 	duckdb::vector<duckdb::Identifier> input_names;
 	duckdb::BoundTableFunction bound_function(function);
 	duckdb::TableFunctionRef reference;
-	duckdb::TableFunctionBindInput bind_input(inputs, named, input_types, input_names,
-	                                          function.function_info, &optimizer.binder,
-	                                          bound_function, reference);
+	duckdb::TableFunctionBindInput bind_input(inputs, named, input_types, input_names, function.function_info,
+	                                          &optimizer.binder, bound_function, reference);
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::vector<duckdb::Identifier> names;
 	auto bind_data = function.bind(context, bind_input, types, names);
 
-	auto replacement = duckdb::make_uniq<duckdb::LogicalGet>(optimizer.binder.GenerateTableIndex(),
-	                                                         std::move(bound_function),
-	                                                         std::move(bind_data), types, names);
+	auto replacement = duckdb::make_uniq<duckdb::LogicalGet>(
+	    optimizer.binder.GenerateTableIndex(), std::move(bound_function), std::move(bind_data), types, names);
 	for (duckdb::idx_t column = 0; column < types.size(); column++) {
 		replacement->AddColumnId(column);
 	}
@@ -789,10 +794,8 @@ bool RewriteDeleteByIndexedPredicate(duckdb::ClientContext &context, duckdb::Opt
 	// count is projected there and the parent's binding still resolves.
 	auto bindings = replacement->GetColumnBindings();
 	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> projected;
-	projected.push_back(
-	    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(duckdb::LogicalType::BIGINT, bindings[0]));
-	auto projection =
-	    duckdb::make_uniq<duckdb::LogicalProjection>(deletion.table_index, std::move(projected));
+	projected.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(duckdb::LogicalType::BIGINT, bindings[0]));
+	auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(deletion.table_index, std::move(projected));
 	projection->children.push_back(std::move(replacement));
 	plan = std::move(projection);
 	return true;
@@ -812,9 +815,9 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 		}
 	}
 	for (auto &child : plan->children) {
-		OptimizeIndexedPredicates(context, optimizer, child,
-		                          plan->type == duckdb::LogicalOperatorType::LOGICAL_FILTER
-		                              ? &plan->Cast<duckdb::LogicalFilter>() : nullptr);
+		OptimizeIndexedPredicates(
+		    context, optimizer, child,
+		    plan->type == duckdb::LogicalOperatorType::LOGICAL_FILTER ? &plan->Cast<duckdb::LogicalFilter>() : nullptr);
 	}
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
 		auto &get = plan->Cast<duckdb::LogicalGet>();
@@ -847,8 +850,8 @@ public:
 } // namespace
 
 void RegisterMoraineOptimizer(duckdb::DBConfig &config) {
-	config.AddExtensionOption("moraine_summary_scan_threads", "Maximum concurrent located-scan read units", duckdb::LogicalType::UBIGINT,
-	                          duckdb::Value::UBIGINT(4));
+	config.AddExtensionOption("moraine_summary_scan_threads", "Maximum concurrent located-scan read units",
+	                          duckdb::LogicalType::UBIGINT, duckdb::Value::UBIGINT(4));
 	duckdb::OptimizerExtension::Register(config, MoraineOptimizer());
 }
 

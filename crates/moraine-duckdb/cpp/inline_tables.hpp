@@ -155,7 +155,6 @@ public:
 
 private:
 	duckdb::ColumnList columns_;
-
 };
 
 // A synthesized `ducklake_inlined_delete_<t>` entry: fixed columns
@@ -197,7 +196,6 @@ public:
 
 private:
 	duckdb::ColumnList columns_;
-
 };
 
 // Builds a fresh data-table entry's full column list (system three +

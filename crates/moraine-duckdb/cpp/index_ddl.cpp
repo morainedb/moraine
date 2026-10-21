@@ -51,13 +51,11 @@ struct IndexDdlBindData : public duckdb::FunctionData {
 	}
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		auto &other = other_p.Cast<IndexDdlBindData>();
-		return is_create == other.is_create &&
-		       ignore_missing_or_existing == other.ignore_missing_or_existing && catalog_name == other.catalog_name &&
-		       schema_name == other.schema_name && table_name == other.table_name &&
-		       index_name == other.index_name && columns == other.columns &&
-		       descending == other.descending && nulls_first == other.nulls_first &&
-		       unique == other.unique && deferred_maintenance == other.deferred_maintenance &&
-		       staged == other.staged &&
+		return is_create == other.is_create && ignore_missing_or_existing == other.ignore_missing_or_existing &&
+		       catalog_name == other.catalog_name && schema_name == other.schema_name &&
+		       table_name == other.table_name && index_name == other.index_name && columns == other.columns &&
+		       descending == other.descending && nulls_first == other.nulls_first && unique == other.unique &&
+		       deferred_maintenance == other.deferred_maintenance && staged == other.staged &&
 		       step_entries == other.step_entries && step_bytes == other.step_bytes;
 	}
 };
@@ -74,7 +72,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexDdlInitGlobal(duckdb::
                                                                         duckdb::TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<IndexDdlBindData>();
 	if (!context.transaction.IsAutoCommit()) {
-		throw duckdb::TransactionException("Moraine index DDL requires autocommit; commit or roll back the transaction first");
+		throw duckdb::TransactionException(
+		    "Moraine index DDL requires autocommit; commit or roll back the transaction first");
 	}
 	auto handle = ResolveMoraineCatalog(context, bind_data.catalog_name).Handle();
 	MoraineError err {};
@@ -91,16 +90,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexDdlInitGlobal(duckdb::
 		const uint8_t *directions = bind_data.descending.empty() ? nullptr : bind_data.descending.data();
 		const uint8_t *nulls_first = bind_data.nulls_first.empty() ? nullptr : bind_data.nulls_first.data();
 		code = moraine_index_create(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
-		                            bind_data.index_name.c_str(), column_ptrs.data(), column_ptrs.size(),
-		                            directions, nulls_first, bind_data.unique,
-		                            bind_data.deferred_maintenance, bind_data.staged,
-		                            bind_data.step_entries, bind_data.step_bytes,
-		                            bind_data.ignore_missing_or_existing,
+		                            bind_data.index_name.c_str(), column_ptrs.data(), column_ptrs.size(), directions,
+		                            nulls_first, bind_data.unique, bind_data.deferred_maintenance, bind_data.staged,
+		                            bind_data.step_entries, bind_data.step_bytes, bind_data.ignore_missing_or_existing,
 		                            moraine_shim_is_interrupted, &context, &err);
 	} else {
-		code = moraine_index_drop(handle, bind_data.schema_name.c_str(),
-		                          bind_data.index_name.c_str(), bind_data.ignore_missing_or_existing,
-		                          moraine_shim_is_interrupted, &context, &err);
+		code = moraine_index_drop(handle, bind_data.schema_name.c_str(), bind_data.index_name.c_str(),
+		                          bind_data.ignore_missing_or_existing, moraine_shim_is_interrupted, &context, &err);
 	}
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -150,8 +146,8 @@ void BindCreateOptions(IndexDdlBindData &data, const duckdb::named_argument_map_
 			} else if (duckdb::StringUtil::CIEquals(value, default_order)) {
 				result.push_back(0);
 			} else {
-				throw duckdb::InvalidInputException("CREATE INDEX: %s entries must be '%s' or '%s', got '%s'",
-				                                    name, default_order, other_order, value);
+				throw duckdb::InvalidInputException("CREATE INDEX: %s entries must be '%s' or '%s', got '%s'", name,
+				                                    default_order, other_order, value);
 			}
 		}
 		if (result.size() != data.columns.size()) {
@@ -174,9 +170,8 @@ void BindCreateOptions(IndexDdlBindData &data, const duckdb::named_argument_map_
 		}
 		const int64_t value = found->second.GetValue<int64_t>();
 		if (value <= 0) {
-			throw duckdb::InvalidInputException(
-			    "CREATE INDEX: `%s` must be greater than zero, got %lld", name,
-			    static_cast<long long>(value));
+			throw duckdb::InvalidInputException("CREATE INDEX: `%s` must be greater than zero, got %lld", name,
+			                                    static_cast<long long>(value));
 		}
 		return static_cast<uint64_t>(value);
 	};
@@ -185,10 +180,11 @@ void BindCreateOptions(IndexDdlBindData &data, const duckdb::named_argument_map_
 }
 
 duckdb::BoundStatement BindNativeIndexDdl(duckdb::ClientContext &context, duckdb::Binder &binder,
-                                         duckdb::unique_ptr<IndexDdlBindData> data,
-                                         duckdb::named_argument_map_t options = {}) {
+                                          duckdb::unique_ptr<IndexDdlBindData> data,
+                                          duckdb::named_argument_map_t options = {}) {
 	if (!context.transaction.IsAutoCommit()) {
-		throw duckdb::TransactionException("Moraine index DDL requires autocommit; commit or roll back the transaction first");
+		throw duckdb::TransactionException(
+		    "Moraine index DDL requires autocommit; commit or roll back the transaction first");
 	}
 	for (auto &option : options) {
 		duckdb::LogicalType type;
@@ -211,14 +207,14 @@ duckdb::BoundStatement BindNativeIndexDdl(duckdb::ClientContext &context, duckdb
 	if (data->is_create) {
 		BindCreateOptions(*data, options);
 	}
-	duckdb::TableFunction function(data->is_create ? "CREATE_INDEX" : "DROP_INDEX", {},
-	                               IndexDdlImpl, nullptr, IndexDdlInitGlobal);
+	duckdb::TableFunction function(data->is_create ? "CREATE_INDEX" : "DROP_INDEX", {}, IndexDdlImpl, nullptr,
+	                               IndexDdlInitGlobal);
 	duckdb::BoundTableFunction bound_function(function);
 	duckdb::BoundStatement result;
 	result.types = {duckdb::LogicalType::BOOLEAN};
 	result.names = {"Success"};
 	auto get = duckdb::make_uniq<duckdb::LogicalGet>(binder.GenerateTableIndex(), std::move(bound_function),
-	                                                std::move(data), result.types, result.names);
+	                                                 std::move(data), result.types, result.names);
 	get->AddColumnId(0);
 	result.plan = std::move(get);
 	auto &properties = binder.GetStatementProperties();
@@ -245,8 +241,8 @@ void RequireWritableLake(ClientContext &context, Binder &binder, Catalog &catalo
 }
 
 BoundStatement BindCreate(ClientContext &context, Binder &binder, CreateIndexInfo &info) {
-	auto table = Catalog::GetEntry<TableCatalogEntry>(context,
-	    info.GetQualifiedName().WithName(info.table), OnEntryNotFound::RETURN_NULL);
+	auto table = Catalog::GetEntry<TableCatalogEntry>(context, info.GetQualifiedName().WithName(info.table),
+	                                                  OnEntryNotFound::RETURN_NULL);
 	if (!table || !IsMoraineLake(context, table->ParentCatalog())) {
 		return {};
 	}

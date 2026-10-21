@@ -12,8 +12,8 @@ namespace moraine_duckdb {
 namespace {
 
 struct ReadStallState : public duckdb::ClientContextState {
-    static constexpr const char *KEY = "moraine_read_stall";
-    std::atomic<uint64_t> milliseconds {0};
+	static constexpr const char *KEY = "moraine_read_stall";
+	std::atomic<uint64_t> milliseconds {0};
 };
 
 struct StallBindData : public duckdb::FunctionData {
@@ -56,12 +56,12 @@ duckdb::unique_ptr<duckdb::FunctionData> StallBind(duckdb::ClientContext &, duck
 // would otherwise arm the seam without running it.
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> StallInitGlobal(duckdb::ClientContext &context,
                                                                      duckdb::TableFunctionInitInput &input) {
-    auto state = context.registered_state->Get<ReadStallState>(ReadStallState::KEY);
-    if (!state) {
-        state = duckdb::make_shared_ptr<ReadStallState>();
-        context.registered_state->Insert(ReadStallState::KEY, state);
-    }
-    state->milliseconds.store(input.bind_data->Cast<StallBindData>().milliseconds);
+	auto state = context.registered_state->Get<ReadStallState>(ReadStallState::KEY);
+	if (!state) {
+		state = duckdb::make_shared_ptr<ReadStallState>();
+		context.registered_state->Insert(ReadStallState::KEY, state);
+	}
+	state->milliseconds.store(input.bind_data->Cast<StallBindData>().milliseconds);
 	return duckdb::make_uniq<StallGlobalState>();
 }
 
@@ -80,8 +80,8 @@ void StallImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 } // namespace
 
 uint64_t TakeMoraineReadStall(duckdb::ClientContext &context) {
-    auto state = context.registered_state->Get<ReadStallState>(ReadStallState::KEY);
-    return state ? state->milliseconds.exchange(0) : 0;
+	auto state = context.registered_state->Get<ReadStallState>(ReadStallState::KEY);
+	return state ? state->milliseconds.exchange(0) : 0;
 }
 
 void RegisterMoraineFaultFunctions(duckdb::ExtensionLoader &loader) {

@@ -91,8 +91,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MigrateInitGlobal(duckdb::C
 	// transaction invites a self-deadlock — the same reason maintenance
 	// refuses one.
 	if (!context.transaction.IsAutoCommit()) {
-		throw duckdb::TransactionException(
-		    "moraine_migrate cannot run inside an explicit transaction; COMMIT first");
+		throw duckdb::TransactionException("moraine_migrate cannot run inside an explicit transaction; COMMIT first");
 	}
 
 	MoraineS3Config s3 {};
@@ -109,8 +108,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MigrateInitGlobal(duckdb::C
 	MoraineMigrationReport report {};
 	MoraineError err {};
 	auto code = moraine_migrate_with_wal_store(bind_data.path.c_str(), is_s3 ? &s3 : nullptr,
-	                            bind_data.wal_path.empty() ? nullptr : &wal, 0, nullptr, 0, 0, false,
-	                            bind_data.checkpoint, &report, &err);
+	                                           bind_data.wal_path.empty() ? nullptr : &wal, 0, nullptr, 0, 0, false,
+	                                           bind_data.checkpoint, &report, &err);
 	// Drained on both exits: a failed migration's events would otherwise sit
 	// buffered behind a commit that never comes.
 	DrainMoraineLogs(context);

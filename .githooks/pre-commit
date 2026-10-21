@@ -2,4 +2,5 @@
 # Local gate: block commits that fail formatting or lints.
 set -e
 cargo +nightly-2026-08-29 fmt --check
+cargo xtask fmt-cpp --check
 cargo clippy --workspace --all-targets -- -D warnings

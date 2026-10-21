@@ -74,28 +74,27 @@ duckdb::unique_ptr<duckdb::FunctionData> CensusBind(duckdb::ClientContext &conte
 	auto handle = ResolveMoraineCatalog(context, bind_data->catalog_name).Handle();
 	OwnedArray<MoraineSubspaceCensus> measured(moraine_store_census_free);
 	MoraineError err {};
-	auto code = moraine_store_census(handle, bind_data->count_live_entries, measured.OutItems(), measured.OutLen(),
-	                                 &bind_data->manifest_id, &bind_data->objects, moraine_shim_is_interrupted,
-	                                 &context, &err);
+	auto code =
+	    moraine_store_census(handle, bind_data->count_live_entries, measured.OutItems(), measured.OutLen(),
+	                         &bind_data->manifest_id, &bind_data->objects, moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
 	for (auto &row : measured) {
 		bind_data->rows.push_back({std::string(row.subspace), row.bytes, row.filter_bytes, row.index_bytes,
-		                           row.stats_bytes, row.l0_ssts, row.sorted_runs,
-		                           row.sorted_run_ssts, row.has_live, row.live_keys, row.live_key_bytes,
-		                           row.live_value_bytes, row.scheduled_files});
+		                           row.stats_bytes, row.l0_ssts, row.sorted_runs, row.sorted_run_ssts, row.has_live,
+		                           row.live_keys, row.live_key_bytes, row.live_value_bytes, row.scheduled_files});
 	}
 
 	using duckdb::LogicalType;
-	return_types = {LogicalType::UBIGINT,  LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UINTEGER, LogicalType::UINTEGER,
-	                LogicalType::UINTEGER, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	return_types = {LogicalType::UBIGINT,  LogicalType::VARCHAR, LogicalType::UBIGINT,  LogicalType::UBIGINT,
+	                LogicalType::UBIGINT,  LogicalType::UBIGINT, LogicalType::UINTEGER, LogicalType::UINTEGER,
+	                LogicalType::UINTEGER, LogicalType::UBIGINT, LogicalType::UBIGINT,  LogicalType::UBIGINT,
+	                LogicalType::UBIGINT,  LogicalType::UBIGINT, LogicalType::UBIGINT,  LogicalType::UBIGINT,
 	                LogicalType::UBIGINT};
-	names = {"manifest_id", "subspace", "bytes", "filter_bytes", "index_bytes", "stats_bytes",
-	         "l0_ssts", "sorted_runs", "sorted_run_ssts", "live_keys", "live_key_bytes",
-	         "live_value_bytes", "scheduled_files", "store_total_bytes", "store_wal_bytes",
+	names = {"manifest_id",          "subspace",         "bytes",           "filter_bytes",      "index_bytes",
+	         "stats_bytes",          "l0_ssts",          "sorted_runs",     "sorted_run_ssts",   "live_keys",
+	         "live_key_bytes",       "live_value_bytes", "scheduled_files", "store_total_bytes", "store_wal_bytes",
 	         "store_manifest_bytes", "store_sst_bytes"};
 	return bind_data;
 }
@@ -148,8 +147,7 @@ void CensusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 		// "not measured".
 		auto &objects = bind_data.objects;
 		auto store = [&](uint64_t value) {
-			return objects.listed ? duckdb::Value::UBIGINT(value)
-			                      : duckdb::Value(duckdb::LogicalType::UBIGINT);
+			return objects.listed ? duckdb::Value::UBIGINT(value) : duckdb::Value(duckdb::LogicalType::UBIGINT);
 		};
 		output.SetValue(13, i, store(objects.total_bytes));
 		output.SetValue(14, i, store(objects.wal_bytes));
@@ -185,10 +183,20 @@ struct TallyBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
                                                    duckdb::vector<duckdb::Identifier> &names) {
-	names = {"metadata_hits",  "metadata_misses",       "metadata_hit_rate",       "block_hits",
-	         "block_misses",   "block_hit_rate",        "errors",                  "preload_metadata_hits",
-	         "preload_metadata_misses", "preload_block_hits", "preload_block_misses", "preload_failures",
-	         "metadata_disk_hits", "block_disk_hits"};
+	names = {"metadata_hits",
+	         "metadata_misses",
+	         "metadata_hit_rate",
+	         "block_hits",
+	         "block_misses",
+	         "block_hit_rate",
+	         "errors",
+	         "preload_metadata_hits",
+	         "preload_metadata_misses",
+	         "preload_block_hits",
+	         "preload_block_misses",
+	         "preload_failures",
+	         "metadata_disk_hits",
+	         "block_disk_hits"};
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
@@ -238,9 +246,9 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	                                      &preload_metadata_hits, &preload_metadata_misses, &preload_block_hits,
 	                                      &preload_block_misses, &preload_failures)
 	                : moraine_catalog_cache_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(),
-	                                              &metadata_hits, &metadata_misses, &block_hits, &block_misses,
-	                                              &errors, &preload_metadata_hits, &preload_metadata_misses,
-	                                              &preload_block_hits, &preload_block_misses, &preload_failures);
+	                                              &metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors,
+	                                              &preload_metadata_hits, &preload_metadata_misses, &preload_block_hits,
+	                                              &preload_block_misses, &preload_failures);
 	if (code != MORAINE_OK) {
 		throw duckdb::InternalException("moraine_cache_tally: could not read the cache counters");
 	}
@@ -283,8 +291,7 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 // moraine_sidecar_tally: what published row summaries have done for this
 // process. Read alongside `moraine_object_store_tally`: the bytes that
 // tally reports are the ones these hits avoided.
-duckdb::unique_ptr<duckdb::FunctionData> SidecarTallyBind(duckdb::ClientContext &,
-                                                          duckdb::TableFunctionBindInput &,
+duckdb::unique_ptr<duckdb::FunctionData> SidecarTallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &,
                                                           duckdb::vector<duckdb::LogicalType> &return_types,
                                                           duckdb::vector<duckdb::Identifier> &names) {
 	names = {"hits", "misses", "refused", "published", "publish_failures"};
@@ -311,14 +318,19 @@ void SidecarTallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data,
 	output.SetChildCardinality(1);
 }
 
-duckdb::unique_ptr<duckdb::FunctionData> CacheStatusBind(duckdb::ClientContext &,
-                                                         duckdb::TableFunctionBindInput &,
+duckdb::unique_ptr<duckdb::FunctionData> CacheStatusBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
                                                          duckdb::vector<duckdb::Identifier> &names) {
 	using duckdb::LogicalType;
-	names = {"metadata_capacity_bytes", "metadata_occupancy_bytes", "metadata_evictions",
-	         "block_capacity_bytes", "block_occupancy_bytes", "block_evictions", "block_disk_capacity_bytes",
-	         "auxiliary_metadata_capacity_bytes", "auxiliary_metadata_occupancy_bytes",
+	names = {"metadata_capacity_bytes",
+	         "metadata_occupancy_bytes",
+	         "metadata_evictions",
+	         "block_capacity_bytes",
+	         "block_occupancy_bytes",
+	         "block_evictions",
+	         "block_disk_capacity_bytes",
+	         "auxiliary_metadata_capacity_bytes",
+	         "auxiliary_metadata_occupancy_bytes",
 	         "auxiliary_metadata_evictions"};
 	return_types.assign(names.size(), LogicalType::UBIGINT);
 	return nullptr;
@@ -341,16 +353,16 @@ void CacheStatusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 	output.SetValue(3, 0, duckdb::Value::UBIGINT(status.block_capacity_bytes));
 	output.SetValue(4, 0, duckdb::Value::UBIGINT(status.block_occupancy_bytes));
 	output.SetValue(5, 0, duckdb::Value::UBIGINT(status.block_evictions));
-	output.SetValue(6, 0, status.has_block_disk ? duckdb::Value::UBIGINT(status.block_disk_capacity_bytes)
-	                                         : duckdb::Value(duckdb::LogicalType::UBIGINT));
+	output.SetValue(6, 0,
+	                status.has_block_disk ? duckdb::Value::UBIGINT(status.block_disk_capacity_bytes)
+	                                      : duckdb::Value(duckdb::LogicalType::UBIGINT));
 	output.SetValue(7, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_capacity_bytes));
 	output.SetValue(8, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_occupancy_bytes));
 	output.SetValue(9, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_evictions));
 	output.SetChildCardinality(1);
 }
 
-duckdb::unique_ptr<duckdb::FunctionData> MemoryTallyBind(duckdb::ClientContext &,
-                                                         duckdb::TableFunctionBindInput &input,
+duckdb::unique_ptr<duckdb::FunctionData> MemoryTallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
                                                          duckdb::vector<duckdb::Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
@@ -358,15 +370,14 @@ duckdb::unique_ptr<duckdb::FunctionData> MemoryTallyBind(duckdb::ClientContext &
 	}
 	auto bind_data = duckdb::make_uniq<TallyBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
-	names = {"slatedb_unflushed_bytes", "projection_bytes",  "cache_metadata_bytes",
+	names = {"slatedb_unflushed_bytes",  "projection_bytes",         "cache_metadata_bytes",
 	         "cache_block_bytes",        "auxiliary_metadata_bytes", "last_commit_index_entries",
 	         "last_commit_staged_bytes", "held_metadata_bytes"};
 	return_types.assign(names.size(), duckdb::LogicalType::UBIGINT);
 	return bind_data;
 }
 
-void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
-                     duckdb::DataChunk &output) {
+void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<TallyBindData>();
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
@@ -407,10 +418,9 @@ duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientCont
 	// `data_*` count the Parquet store, which the `main_`/`wal_` columns do
 	// not reach: a statement can read data files while showing no main-store
 	// request at all.
-	names = {"main_gets",          "main_get_ms",     "main_puts",          "main_put_ms",
-	         "main_deletes",       "main_delete_ms",  "wal_gets",           "wal_get_ms",
-	         "wal_puts",           "wal_put_ms",      "wal_deletes",        "wal_delete_ms",
-	         "errors",             "data_gets",       "data_bytes"};
+	names = {"main_gets",      "main_get_ms",   "main_puts",  "main_put_ms", "main_deletes",
+	         "main_delete_ms", "wal_gets",      "wal_get_ms", "wal_puts",    "wal_put_ms",
+	         "wal_deletes",    "wal_delete_ms", "errors",     "data_gets",   "data_bytes"};
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
 	                duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
@@ -419,8 +429,7 @@ duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientCont
 	return bind_data;
 }
 
-void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
-                          duckdb::DataChunk &output) {
+void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<TallyBindData>();
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
@@ -430,8 +439,8 @@ void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionI
 	state.emitted = true;
 
 	MoraineObjectStoreTally tally {};
-	auto code = moraine_catalog_object_store_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(),
-	                                                &tally);
+	auto code =
+	    moraine_catalog_object_store_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(), &tally);
 	if (code != MORAINE_OK) {
 		throw duckdb::InternalException("moraine_object_store_tally: could not read the object-store counters");
 	}
@@ -462,19 +471,16 @@ void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionI
 void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction census("moraine_store_census", {duckdb::LogicalType::VARCHAR}, CensusImpl, CensusBind,
 	                             CensusInitGlobal);
-	census.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
-		options.Add("live", duckdb::LogicalType::BOOLEAN);
-	});
+	census.GetSignature().WithTypedKwargs(
+	    "options", [](duckdb::TypedKwargs &options) { options.Add("live", duckdb::LogicalType::BOOLEAN); });
 	loader.RegisterFunction(census);
 
 	duckdb::TableFunctionSet tally("moraine_cache_tally");
 	tally.AddFunction(duckdb::TableFunction({}, TallyImpl, TallyBind, TallyInitGlobal));
-	tally.AddFunction(
-	    duckdb::TableFunction({duckdb::LogicalType::VARCHAR}, TallyImpl, TallyBind, TallyInitGlobal));
+	tally.AddFunction(duckdb::TableFunction({duckdb::LogicalType::VARCHAR}, TallyImpl, TallyBind, TallyInitGlobal));
 	loader.RegisterFunction(tally);
 
-	duckdb::TableFunction cache_status("moraine_cache_status", {}, CacheStatusImpl, CacheStatusBind,
-	                                  TallyInitGlobal);
+	duckdb::TableFunction cache_status("moraine_cache_status", {}, CacheStatusImpl, CacheStatusBind, TallyInitGlobal);
 	loader.RegisterFunction(cache_status);
 
 	duckdb::TableFunction sidecar_tally("moraine_sidecar_tally", {}, SidecarTallyImpl, SidecarTallyBind,
@@ -482,7 +488,7 @@ void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	loader.RegisterFunction(sidecar_tally);
 
 	duckdb::TableFunction memory_tally("moraine_memory_tally", {duckdb::LogicalType::VARCHAR}, MemoryTallyImpl,
-	                                  MemoryTallyBind, TallyInitGlobal);
+	                                   MemoryTallyBind, TallyInitGlobal);
 	loader.RegisterFunction(memory_tally);
 
 	duckdb::TableFunction object_store_tally("moraine_object_store_tally", {duckdb::LogicalType::VARCHAR},

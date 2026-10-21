@@ -68,7 +68,6 @@ duckdb::Value Varchar(const char *s) {
 constexpr const char *kExtendedCatalogVersion = "1.1";
 constexpr const char *kSupersededExtendedCatalogVersion = "1.1-dev1";
 
-
 duckdb::Value Bigint(uint64_t v) {
 	return duckdb::Value::BIGINT(static_cast<int64_t>(v));
 }
@@ -543,8 +542,9 @@ std::vector<duckdb::Value> DataFileShapeAt(const MoraineDataFileRow &r, bool ext
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideExtendedDataFiles(MoraineCatalogHandle *handle,
-                                                   MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineDataFileRow>(handle, probe, probe_ctx, moraine_dump_data_files, moraine_dump_data_files_free, ExtendedDataFileShape);
+                                                                 MoraineInterruptProbe probe, void *probe_ctx) {
+	return DumpRows<MoraineDataFileRow>(handle, probe, probe_ctx, moraine_dump_data_files, moraine_dump_data_files_free,
+	                                    ExtendedDataFileShape);
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
@@ -601,8 +601,9 @@ std::vector<duckdb::Value> DeleteFileShapeAt(const MoraineDeleteFileRow &r, bool
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideExtendedDeleteFiles(MoraineCatalogHandle *handle,
-                                                   MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineDeleteFileRow>(handle, probe, probe_ctx, moraine_dump_delete_files, moraine_dump_delete_files_free, ExtendedDeleteFileShape);
+                                                                   MoraineInterruptProbe probe, void *probe_ctx) {
+	return DumpRows<MoraineDeleteFileRow>(handle, probe, probe_ctx, moraine_dump_delete_files,
+	                                      moraine_dump_delete_files_free, ExtendedDeleteFileShape);
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideDeleteFiles(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
@@ -658,8 +659,9 @@ std::vector<duckdb::Value> TableColumnStatsShapeAt(const MoraineTableColumnStats
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideExtendedTableColumnStats(MoraineCatalogHandle *handle,
-                                                   MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineTableColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_table_column_stats, moraine_dump_table_column_stats_free, ExtendedTableColumnStatsShape);
+                                                                        MoraineInterruptProbe probe, void *probe_ctx) {
+	return DumpRows<MoraineTableColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_table_column_stats,
+	                                            moraine_dump_table_column_stats_free, ExtendedTableColumnStatsShape);
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideTableColumnStats(MoraineCatalogHandle *handle,
@@ -682,11 +684,15 @@ std::vector<duckdb::Value> ExtendedFileColumnStatsShape(const MoraineFileColumnS
 
 std::vector<duckdb::Value> FileColumnStatsShapeAt(const MoraineFileColumnStatsRow &r, bool extended) {
 	std::vector<duckdb::Value> values = {
-	    Bigint(r.data_file_id),      Bigint(r.table_id),      Bigint(r.column_id),
+	    Bigint(r.data_file_id),
+	    Bigint(r.table_id),
+	    Bigint(r.column_id),
 	    Bigint(r.column_size_bytes),
 	    OptBigint(r.has_value_count, r.value_count),
 	    OptBigint(r.has_null_count, r.null_count),
-	    OptVarchar(r.min_value),     OptVarchar(r.max_value), OptBoolean(r.has_contains_nan, r.contains_nan),
+	    OptVarchar(r.min_value),
+	    OptVarchar(r.max_value),
+	    OptBoolean(r.has_contains_nan, r.contains_nan),
 	    OptVarchar(r.extra_stats),
 	};
 	if (extended) {
@@ -700,12 +706,17 @@ std::vector<duckdb::Value> FileColumnStatsShapeAt(const MoraineFileColumnStatsRo
 // committed dump and the transaction-aware one.
 std::vector<duckdb::Value> FileVariantStatsShape(const MoraineFileVariantStatsRow &r) {
 	return {
-	    Bigint(r.data_file_id),     Bigint(r.table_id),       Bigint(r.column_id),
-	    Varchar(r.variant_path),    Varchar(r.shredded_type), Bigint(r.column_size_bytes),
+	    Bigint(r.data_file_id),
+	    Bigint(r.table_id),
+	    Bigint(r.column_id),
+	    Varchar(r.variant_path),
+	    Varchar(r.shredded_type),
+	    Bigint(r.column_size_bytes),
 	    OptBigint(r.has_value_count, r.value_count),
 	    OptBigint(r.has_null_count, r.null_count),
 	    OptVarchar(r.min_value),
-	    OptVarchar(r.max_value),    OptBoolean(r.has_contains_nan, r.contains_nan),
+	    OptVarchar(r.max_value),
+	    OptBoolean(r.has_contains_nan, r.contains_nan),
 	    OptVarchar(r.extra_stats),
 	};
 }
@@ -721,13 +732,13 @@ std::vector<std::vector<duckdb::Value>> ProvideFileVariantStats(MoraineCatalogHa
 std::vector<std::vector<duckdb::Value>> ProvideFileVariantStatsOf(MoraineCatalogHandle *handle, uint64_t table_id,
                                                                   MoraineInterruptProbe probe, void *probe_ctx) {
 	return DumpRows<MoraineFileVariantStatsRow>(handle, probe, probe_ctx, moraine_dump_file_variant_stats_of,
-	                                            moraine_dump_file_variant_stats_free, FileVariantStatsShape,
-	                                            table_id);
+	                                            moraine_dump_file_variant_stats_free, FileVariantStatsShape, table_id);
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideExtendedFileColumnStats(MoraineCatalogHandle *handle,
-                                                   MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineFileColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_file_column_stats, moraine_dump_file_column_stats_free, ExtendedFileColumnStatsShape);
+                                                                       MoraineInterruptProbe probe, void *probe_ctx) {
+	return DumpRows<MoraineFileColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_file_column_stats,
+	                                           moraine_dump_file_column_stats_free, ExtendedFileColumnStatsShape);
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHandle *handle,
@@ -906,8 +917,8 @@ std::vector<duckdb::Value> ViewColumnTagShape(const MoraineViewColumnTagRow &r) 
 	};
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideViewColumnTags(MoraineCatalogHandle *handle,
-                                                              MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideViewColumnTags(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                              void *probe_ctx) {
 	return DumpRows<MoraineViewColumnTagRow>(handle, probe, probe_ctx, moraine_dump_view_column_tags,
 	                                         moraine_dump_view_column_tags_free, ViewColumnTagShape);
 }
@@ -1540,10 +1551,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"extra_stats", "VARCHAR", false},
 	        },
 	        ProvideFileVariantStats,
-	        UnversionedTxProviders<MoraineFileVariantStatsRow>(moraine_dump_file_variant_stats_free,
-	                                                          FileVariantStatsShape,
-	                                                          moraine_tx_dump_file_variant_stats,
-	                                                          moraine_tx_dump_file_variant_stats_of),
+	        UnversionedTxProviders<MoraineFileVariantStatsRow>(
+	            moraine_dump_file_variant_stats_free, FileVariantStatsShape, moraine_tx_dump_file_variant_stats,
+	            moraine_tx_dump_file_variant_stats_of),
 	        27,
 	        {},
 	        0,
@@ -1745,8 +1755,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 	if (EmitsRowIds(state->column_ids)) {
 		auto catalog_transaction = catalog.GetCatalogTransaction(context);
 		auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
-		state->row_id_base = transaction.RegisterScannedRows(
-		    *bind_data.spec, state->rows != nullptr ? state->rows : bind_data.rows);
+		state->row_id_base =
+		    transaction.RegisterScannedRows(*bind_data.spec, state->rows != nullptr ? state->rows : bind_data.rows);
 	}
 	auto &materialized = state->rows != nullptr ? state->rows : bind_data.rows;
 	state->row_count = materialized == nullptr ? 0 : materialized->size();
@@ -1839,8 +1849,7 @@ duckdb::optional_idx LiveBoundOf(const duckdb::Expression &filter, const duckdb:
 			continue;
 		}
 		auto type = child->GetExpressionType();
-		if (type != duckdb::ExpressionType::COMPARE_LESSTHAN &&
-		    type != duckdb::ExpressionType::COMPARE_GREATERTHAN) {
+		if (type != duckdb::ExpressionType::COMPARE_LESSTHAN && type != duckdb::ExpressionType::COMPARE_GREATERTHAN) {
 			continue;
 		}
 		auto &comparison = child->Cast<duckdb::BoundFunctionExpression>();
@@ -1873,8 +1882,7 @@ void MetadataScanPushdownLiveBound(duckdb::LogicalGet &get, MetadataScanBindData
 	// `end_snapshot_column` only names a column on a kind that declares an
 	// end key, so a kind marked narrowable without one narrows nothing
 	// rather than reading column zero as a lifecycle.
-	if (!bind_data.spec->live_narrowable || bind_data.spec->end_key_columns.empty() ||
-	    bind_data.live_bound.IsValid()) {
+	if (!bind_data.spec->live_narrowable || bind_data.spec->end_key_columns.empty() || bind_data.live_bound.IsValid()) {
 		return;
 	}
 	auto projected = ProjectedColumn(get, bind_data.spec->end_snapshot_column);
@@ -2068,8 +2076,8 @@ bool MetadataScanBindData::Equals(const duckdb::FunctionData &other_p) const {
 	// `spec` and `scope` carry the identity `rows` does elsewhere: a
 	// deferred scan has no row set at bind to compare, and two scans of one
 	// kind narrowed to different tables are not interchangeable.
-	auto same_scope = scope.IsValid() == other.scope.IsValid() &&
-	                  (!scope.IsValid() || scope.GetIndex() == other.scope.GetIndex());
+	auto same_scope =
+	    scope.IsValid() == other.scope.IsValid() && (!scope.IsValid() || scope.GetIndex() == other.scope.GetIndex());
 	auto same_live_bound = live_bound.IsValid() == other.live_bound.IsValid() &&
 	                       (!live_bound.IsValid() || live_bound.GetIndex() == other.live_bound.GetIndex());
 	return rows == other.rows && spec == other.spec && same_scope && same_live_bound &&
@@ -2197,8 +2205,7 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineMetadataTableEntry::GetStatist
 }
 
 std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                    const MetadataTableSpec &spec,
-                                                    duckdb::optional_idx live_bound) {
+                                                    const MetadataTableSpec &spec, duckdb::optional_idx live_bound) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
 	auto *handle = catalog.Cast<MoraineCatalog>().Handle();

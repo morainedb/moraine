@@ -50,8 +50,7 @@ struct RaiseBindData : public duckdb::FunctionData {
 	}
 };
 
-duckdb::unique_ptr<duckdb::FunctionData> RaiseBind(duckdb::ClientContext &,
-                                                   duckdb::TableFunctionBindInput &input,
+duckdb::unique_ptr<duckdb::FunctionData> RaiseBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
                                                    duckdb::vector<duckdb::Identifier> &names) {
 	names = {"from_version", "to_version"};
