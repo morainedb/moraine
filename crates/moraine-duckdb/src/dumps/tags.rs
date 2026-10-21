@@ -28,7 +28,7 @@ pub struct MoraineTagRow {
 }
 
 dump_row! {
-    tag_rows(moraine::ffi_support::TagRow) -> MoraineTagRow {
+    moraine::ffi_support::TagRow => MoraineTagRow {
         values { object_id, begin_snapshot }
         optional { end_snapshot => has_end_snapshot }
         strings { key, value }
@@ -64,7 +64,6 @@ pub unsafe extern "C" fn moraine_dump_tags(
             probe_ctx,
             err,
             moraine::ffi_support::dump_tags,
-            tag_rows,
         )
     }
 }
@@ -106,7 +105,7 @@ pub struct MoraineColumnTagRow {
 }
 
 dump_row! {
-    column_tag_rows(moraine::ffi_support::ColumnTagRow) -> MoraineColumnTagRow {
+    moraine::ffi_support::ColumnTagRow => MoraineColumnTagRow {
         values { table_id, column_id, begin_snapshot }
         optional { end_snapshot => has_end_snapshot }
         strings { key, value }
@@ -142,7 +141,6 @@ pub unsafe extern "C" fn moraine_dump_column_tags(
             probe_ctx,
             err,
             moraine::ffi_support::dump_column_tags,
-            column_tag_rows,
         )
     }
 }
@@ -187,7 +185,7 @@ pub struct MoraineViewColumnTagRow {
 }
 
 dump_row! {
-    view_column_tag_rows(moraine::ffi_support::ViewColumnTagRow) -> MoraineViewColumnTagRow {
+    moraine::ffi_support::ViewColumnTagRow => MoraineViewColumnTagRow {
         values { view_id, begin_snapshot }
         optional { end_snapshot => has_end_snapshot }
         strings { column_name, key, value }
@@ -224,7 +222,6 @@ pub unsafe extern "C" fn moraine_dump_view_column_tags(
             probe_ctx,
             err,
             moraine::ffi_support::dump_view_column_tags,
-            view_column_tag_rows,
         )
     }
 }

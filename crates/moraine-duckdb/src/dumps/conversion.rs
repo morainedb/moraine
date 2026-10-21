@@ -8,7 +8,7 @@ use crate::error::AbiError;
 ///
 /// `convert` must return independently owned rows and clean up on failure.
 /// `release` must free their resources without unwinding.
-pub(super) unsafe trait DumpRow: Sized {
+pub(crate) unsafe trait DumpRow: Sized {
     type Record;
 
     fn convert(record: Self::Record) -> Result<Self, AbiError>;
@@ -21,7 +21,7 @@ pub(super) unsafe trait DumpRow: Sized {
     unsafe fn release(&mut self);
 }
 
-pub(super) fn convert_rows<Row: DumpRow>(records: Vec<Row::Record>) -> Result<Vec<Row>, AbiError> {
+pub(crate) fn convert_rows<Row: DumpRow>(records: Vec<Row::Record>) -> Result<Vec<Row>, AbiError> {
     let mut pending = PendingRows(Vec::with_capacity(records.len()));
     for record in records {
         pending.0.push(Row::convert(record)?);
@@ -45,7 +45,7 @@ impl<Row: DumpRow> Drop for PendingRows<Row> {
 /// exported functions stay explicit so cbindgen can read them without
 /// expansion.
 macro_rules! dump_row {
-    ($convert:ident($record:ty) -> $row:ty {
+    ($record:ty => $row:ty {
         values { $($value:ident),* $(,)? }
         optional { $($optional:ident => $present:ident),* $(,)? }
         strings { $($string:ident),* $(,)? }
@@ -76,10 +76,6 @@ macro_rules! dump_row {
                 // SAFETY: absent strings are null; present strings belong to this row.
                 $(unsafe { $crate::abi::free_c_string(self.$optional_string) };)*
             }
-        }
-
-        pub(crate) fn $convert(rows: Vec<$record>) -> Result<Vec<$row>, $crate::error::AbiError> {
-            $crate::dumps::conversion::convert_rows(rows)
         }
     };
 }

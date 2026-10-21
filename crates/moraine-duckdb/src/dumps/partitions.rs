@@ -29,7 +29,7 @@ pub struct MorainePartitionInfoRow {
 }
 
 dump_row! {
-    partition_info_rows(moraine::ffi_support::PartitionRecord) -> MorainePartitionInfoRow {
+    moraine::ffi_support::PartitionRecord => MorainePartitionInfoRow {
         values { partition_id, table_id, begin_snapshot }
         optional { end_snapshot => has_end_snapshot }
         strings {}
@@ -66,7 +66,6 @@ pub unsafe extern "C" fn moraine_dump_partition_info(
             probe_ctx,
             err,
             moraine::ffi_support::dump_partition_info,
-            partition_info_rows,
         )
     }
 }
@@ -106,7 +105,7 @@ pub struct MorainePartitionColumnRow {
 }
 
 dump_row! {
-    partition_column_rows(moraine::ffi_support::PartitionColumnRow) -> MorainePartitionColumnRow {
+    moraine::ffi_support::PartitionColumnRow => MorainePartitionColumnRow {
         values { partition_id, table_id, partition_key_index, column_id }
         optional {}
         strings { transform }
@@ -144,7 +143,6 @@ pub unsafe extern "C" fn moraine_dump_partition_columns(
             probe_ctx,
             err,
             moraine::ffi_support::dump_partition_column_rows,
-            partition_column_rows,
         )
     }
 }
@@ -185,7 +183,7 @@ pub struct MoraineSortInfoRow {
 }
 
 dump_row! {
-    sort_info_rows(moraine::ffi_support::SortRecord) -> MoraineSortInfoRow {
+    moraine::ffi_support::SortRecord => MoraineSortInfoRow {
         values { sort_id, table_id, begin_snapshot }
         optional { end_snapshot => has_end_snapshot }
         strings {}
@@ -222,7 +220,6 @@ pub unsafe extern "C" fn moraine_dump_sort_info(
             probe_ctx,
             err,
             moraine::ffi_support::dump_sort_info,
-            sort_info_rows,
         )
     }
 }
@@ -263,7 +260,7 @@ pub struct MoraineSortExpressionRow {
 }
 
 dump_row! {
-    sort_expression_rows(moraine::ffi_support::SortExpressionRow) -> MoraineSortExpressionRow {
+    moraine::ffi_support::SortExpressionRow => MoraineSortExpressionRow {
         values { sort_id, table_id, sort_key_index }
         optional {}
         strings { expression, dialect, sort_direction, null_order }
@@ -301,7 +298,6 @@ pub unsafe extern "C" fn moraine_dump_sort_expressions(
             probe_ctx,
             err,
             moraine::ffi_support::dump_sort_expression_rows,
-            sort_expression_rows,
         )
     }
 }

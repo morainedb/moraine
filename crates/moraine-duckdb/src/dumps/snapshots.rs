@@ -36,7 +36,7 @@ pub struct MoraineSnapshotRow {
 }
 
 dump_row! {
-    snapshot_rows(moraine::ffi_support::SnapshotRecord) -> MoraineSnapshotRow {
+    moraine::ffi_support::SnapshotRecord => MoraineSnapshotRow {
         values { snapshot_id, snapshot_time_micros, schema_version, next_catalog_id, next_file_id }
         optional {}
         strings { changes_made }
@@ -74,7 +74,6 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
             probe_ctx,
             err,
             moraine::ffi_support::dump_snapshots,
-            snapshot_rows,
         )
     }
 }
@@ -108,7 +107,7 @@ pub struct MoraineSchemaVersionRow {
 }
 
 dump_row! {
-    schema_version_rows(moraine::ffi_support::SchemaVersionRow) -> MoraineSchemaVersionRow {
+    moraine::ffi_support::SchemaVersionRow => MoraineSchemaVersionRow {
         values { begin_snapshot, schema_version, table_id }
         optional {}
         strings {}
@@ -145,7 +144,6 @@ pub unsafe extern "C" fn moraine_dump_schema_versions(
             probe_ctx,
             err,
             moraine::ffi_support::dump_schema_versions,
-            schema_version_rows,
         )
     }
 }

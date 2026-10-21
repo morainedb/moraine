@@ -68,7 +68,7 @@ pub struct MoraineDataFileRow {
 }
 
 dump_row! {
-    data_file_rows(moraine::ffi_support::DataFileRecord) -> MoraineDataFileRow {
+    moraine::ffi_support::DataFileRecord => MoraineDataFileRow {
         values {
             data_file_id,
             table_id,
@@ -121,7 +121,6 @@ pub unsafe extern "C" fn moraine_dump_data_files(
             probe_ctx,
             err,
             moraine::ffi_support::dump_data_files,
-            data_file_rows,
         )
     }
 }
@@ -153,7 +152,6 @@ pub unsafe extern "C" fn moraine_dump_data_files_of(
             probe_ctx,
             err,
             async |catalog| moraine::ffi_support::dump_data_files_of(catalog, table_id).await,
-            data_file_rows,
         )
     }
 }
@@ -213,7 +211,7 @@ pub struct MoraineDeleteFileRow {
 }
 
 dump_row! {
-    delete_file_rows(moraine::ffi_support::DeleteFileRecord) -> MoraineDeleteFileRow {
+    moraine::ffi_support::DeleteFileRecord => MoraineDeleteFileRow {
         values {
             delete_file_id,
             table_id,
@@ -263,7 +261,6 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
             probe_ctx,
             err,
             moraine::ffi_support::dump_delete_files,
-            delete_file_rows,
         )
     }
 }
@@ -295,7 +292,6 @@ pub unsafe extern "C" fn moraine_dump_delete_files_of(
             probe_ctx,
             err,
             async |catalog| moraine::ffi_support::dump_delete_files_of(catalog, table_id).await,
-            delete_file_rows,
         )
     }
 }
@@ -333,7 +329,7 @@ pub struct MoraineFilePartitionValueRow {
 }
 
 dump_row! {
-    file_partition_value_rows(moraine::ffi_support::FilePartitionValueRow) -> MoraineFilePartitionValueRow {
+    moraine::ffi_support::FilePartitionValueRow => MoraineFilePartitionValueRow {
         values { data_file_id, table_id, partition_key_index }
         optional {}
         strings { partition_value }
@@ -371,7 +367,6 @@ pub unsafe extern "C" fn moraine_dump_file_partition_values(
             probe_ctx,
             err,
             moraine::ffi_support::dump_file_partition_value_rows,
-            file_partition_value_rows,
         )
     }
 }
@@ -408,7 +403,7 @@ pub struct MoraineScheduledDeletionRow {
 }
 
 dump_row! {
-    scheduled_deletion_rows(moraine::ffi_support::GcFileRecord) -> MoraineScheduledDeletionRow {
+    moraine::ffi_support::GcFileRecord => MoraineScheduledDeletionRow {
         values { data_file_id, path_is_relative, schedule_start_micros }
         optional {}
         strings { path }
@@ -445,7 +440,6 @@ pub unsafe extern "C" fn moraine_dump_scheduled_deletions(
             probe_ctx,
             err,
             moraine::ffi_support::dump_scheduled_deletions,
-            scheduled_deletion_rows,
         )
     }
 }

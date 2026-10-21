@@ -27,7 +27,7 @@ pub struct MoraineMacroRow {
 }
 
 dump_row! {
-    macro_rows(moraine::ffi_support::MacroRecord) -> MoraineMacroRow {
+    moraine::ffi_support::MacroRecord => MoraineMacroRow {
         values { schema_id, macro_id, begin_snapshot }
         optional { end_snapshot => has_end_snapshot }
         strings { macro_name }
@@ -64,7 +64,6 @@ pub unsafe extern "C" fn moraine_dump_macros(
             probe_ctx,
             err,
             moraine::ffi_support::dump_macros,
-            macro_rows,
         )
     }
 }
@@ -100,7 +99,7 @@ pub struct MoraineMacroImplRow {
 }
 
 dump_row! {
-    macro_impl_rows(moraine::ffi_support::MacroImplRow) -> MoraineMacroImplRow {
+    moraine::ffi_support::MacroImplRow => MoraineMacroImplRow {
         values { macro_id, impl_id }
         optional {}
         strings { dialect, sql, macro_type }
@@ -139,7 +138,6 @@ pub unsafe extern "C" fn moraine_dump_macro_impls(
             probe_ctx,
             err,
             moraine::ffi_support::dump_macro_impl_rows,
-            macro_impl_rows,
         )
     }
 }
@@ -182,7 +180,7 @@ pub struct MoraineMacroParameterRow {
 }
 
 dump_row! {
-    macro_parameter_rows(moraine::ffi_support::MacroParameterRow) -> MoraineMacroParameterRow {
+    moraine::ffi_support::MacroParameterRow => MoraineMacroParameterRow {
         values { macro_id, impl_id, column_id }
         optional {}
         strings { parameter_name, parameter_type, default_value_type }
@@ -221,7 +219,6 @@ pub unsafe extern "C" fn moraine_dump_macro_parameters(
             probe_ctx,
             err,
             moraine::ffi_support::dump_macro_parameter_rows,
-            macro_parameter_rows,
         )
     }
 }

@@ -29,6 +29,7 @@ mod tags;
 use std::ffi::c_void;
 
 pub use catalog::*;
+pub(crate) use conversion::{DumpRow, convert_rows};
 pub use files::*;
 pub use macros::*;
 pub use mappings::*;
@@ -45,7 +46,7 @@ use crate::{
 };
 
 /// The shared shell of every dump entry point: null checks, the
-/// cancellable bridge into the core `fetch`, `convert` to C rows, and
+/// cancellable bridge into the core `fetch`, conversion to C rows, and
 /// `write_array`, all under [`guard`](crate::abi). Each `moraine_dump_*`
 /// signature stays written out for cbindgen.
 ///
@@ -61,16 +62,14 @@ use crate::{
 /// pointers. `probe`, if non-null, must be safe to call with `probe_ctx` from
 /// any thread. `err`, if non-null, must be a valid, writable [`MoraineError`].
 /// All for the duration of the call.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn dump_rows<Row, Rows>(
+pub(crate) unsafe fn dump_rows<Row: DumpRow>(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut Row,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
-    fetch: impl AsyncFnOnce(&moraine::ReadOnlyCatalog) -> Result<Rows, moraine::Error>,
-    convert: impl FnOnce(Rows) -> Result<Vec<Row>, AbiError>,
+    fetch: impl AsyncFnOnce(&moraine::ReadOnlyCatalog) -> Result<Vec<Row::Record>, moraine::Error>,
 ) -> i32 {
     let attempt = || -> Result<Vec<Row>, AbiError> {
         if handle.is_null() {
@@ -85,7 +84,7 @@ pub(crate) unsafe fn dump_rows<Row, Rows>(
         let rows = unsafe {
             handle_ref.block_on_cancellable(probe, probe_ctx, fetch(handle_ref.catalog.reads()))
         }?;
-        convert(rows)
+        convert_rows(rows)
     };
 
     // SAFETY: `err` validity is the caller's contract.

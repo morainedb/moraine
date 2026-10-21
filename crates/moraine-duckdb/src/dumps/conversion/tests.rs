@@ -65,3 +65,62 @@ fn successful_conversion_transfers_ownership_to_the_caller() {
     assert_eq!(releases.get(), 2);
     assert!(convert_rows::<Row>(Vec::new()).unwrap().is_empty());
 }
+
+#[test]
+fn dump_failure_keeps_outputs_untouched_and_releases_converted_rows() {
+    use std::{ptr, sync::Arc};
+
+    use crate::{
+        abi::moraine_error_free,
+        error::{MoraineError, codes},
+        runtime::{AttachedCatalog, MoraineCatalogHandle},
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let catalog = runtime
+        .block_on(moraine::Catalog::open(
+            Arc::new(object_store::memory::InMemory::new()),
+            moraine::CatalogOptions::default(),
+        ))
+        .unwrap();
+    let mut handle = MoraineCatalogHandle::new(runtime, AttachedCatalog::Writer(catalog), 0);
+    for (failure, expected_code) in [
+        (Input::Error, codes::INVALID_ARGUMENT),
+        (Input::Panic, codes::INTERNAL),
+    ] {
+        let releases = Rc::new(Cell::new(0));
+        let completed = Input::Row(Rc::clone(&releases));
+        let mut output: *mut Row = ptr::null_mut();
+        let mut len = 99;
+        let mut error = MoraineError::default();
+        // SAFETY: the handle is open and all outputs are writable local slots.
+        let code = unsafe {
+            crate::dumps::dump_rows(
+                &raw mut handle,
+                &raw mut output,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut error,
+                async move |catalog: &moraine::ReadOnlyCatalog| {
+                    catalog.snapshot().await?;
+                    Ok(vec![completed, failure])
+                },
+            )
+        };
+        assert_eq!(code, expected_code);
+        assert_eq!(error.code, expected_code);
+        assert!(output.is_null());
+        assert_eq!(len, 99);
+        assert_eq!(releases.get(), 1);
+        // SAFETY: the error was just populated and has not been freed.
+        unsafe { moraine_error_free(error.message) };
+    }
+    handle
+        .runtime
+        .block_on(handle.catalog.writer().unwrap().close())
+        .unwrap();
+}

@@ -22,7 +22,7 @@ pub struct MoraineColumnMappingRow {
 }
 
 dump_row! {
-    mapping_rows(moraine::ffi_support::MappingRecord) -> MoraineColumnMappingRow {
+    moraine::ffi_support::MappingRecord => MoraineColumnMappingRow {
         values { mapping_id, table_id }
         optional {}
         strings { map_type }
@@ -60,7 +60,6 @@ pub unsafe extern "C" fn moraine_dump_column_mappings(
             probe_ctx,
             err,
             moraine::ffi_support::dump_mappings,
-            mapping_rows,
         )
     }
 }
@@ -103,7 +102,7 @@ pub struct MoraineNameMappingRow {
 }
 
 dump_row! {
-    name_mapping_rows(moraine::ffi_support::NameMappingRow) -> MoraineNameMappingRow {
+    moraine::ffi_support::NameMappingRow => MoraineNameMappingRow {
         values { mapping_id, column_id, target_field_id, is_partition }
         optional { parent_column => has_parent_column }
         strings { source_name }
@@ -141,7 +140,6 @@ pub unsafe extern "C" fn moraine_dump_name_mappings(
             probe_ctx,
             err,
             moraine::ffi_support::dump_name_mapping_rows,
-            name_mapping_rows,
         )
     }
 }

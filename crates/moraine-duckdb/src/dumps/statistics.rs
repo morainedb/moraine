@@ -24,7 +24,7 @@ pub struct MoraineTableStatsRow {
 }
 
 dump_row! {
-    table_stats_rows(moraine::ffi_support::TableStatsRecord) -> MoraineTableStatsRow {
+    moraine::ffi_support::TableStatsRecord => MoraineTableStatsRow {
         values { table_id, record_count, next_row_id, file_size_bytes }
         optional {}
         strings {}
@@ -61,7 +61,6 @@ pub unsafe extern "C" fn moraine_dump_table_stats(
             probe_ctx,
             err,
             moraine::ffi_support::dump_table_stats,
-            table_stats_rows,
         )
     }
 }
@@ -116,7 +115,7 @@ pub struct MoraineTableColumnStatsRow {
 }
 
 dump_row! {
-    table_column_stats_rows(moraine::ffi_support::TableColumnStatsRecord) -> MoraineTableColumnStatsRow {
+    moraine::ffi_support::TableColumnStatsRecord => MoraineTableColumnStatsRow {
         values { table_id, column_id }
         optional {
             contains_null => has_contains_null,
@@ -158,7 +157,6 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
             probe_ctx,
             err,
             moraine::ffi_support::dump_table_column_stats,
-            table_column_stats_rows,
         )
     }
 }
@@ -223,7 +221,7 @@ pub struct MoraineFileColumnStatsRow {
 }
 
 dump_row! {
-    file_column_stats_rows(moraine::ffi_support::FileColumnStatsRecord) -> MoraineFileColumnStatsRow {
+    moraine::ffi_support::FileColumnStatsRecord => MoraineFileColumnStatsRow {
         values { data_file_id, table_id, column_id, column_size_bytes }
         optional {
             value_count => has_value_count,
@@ -266,7 +264,6 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
             probe_ctx,
             err,
             moraine::ffi_support::dump_file_column_stats,
-            file_column_stats_rows,
         )
     }
 }
@@ -304,7 +301,6 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats_of(
             async |catalog| {
                 moraine::ffi_support::dump_file_column_stats_of(catalog, table_id).await
             },
-            file_column_stats_rows,
         )
     }
 }
@@ -364,7 +360,7 @@ pub struct MoraineFileVariantStatsRow {
 }
 
 dump_row! {
-    file_variant_stats_rows(moraine::ffi_support::FileVariantStatsRow) -> MoraineFileVariantStatsRow {
+    moraine::ffi_support::FileVariantStatsRow => MoraineFileVariantStatsRow {
         values { data_file_id, table_id, column_id, column_size_bytes }
         optional {
             value_count => has_value_count,
@@ -405,7 +401,6 @@ pub unsafe extern "C" fn moraine_dump_file_variant_stats(
             probe_ctx,
             err,
             moraine::ffi_support::dump_file_variant_stats_rows,
-            file_variant_stats_rows,
         )
     }
 }
@@ -440,7 +435,6 @@ pub unsafe extern "C" fn moraine_dump_file_variant_stats_of(
             async |catalog| {
                 moraine::ffi_support::dump_file_variant_stats_rows_of(catalog, table_id).await
             },
-            file_variant_stats_rows,
         )
     }
 }

@@ -35,7 +35,7 @@ pub struct MoraineSchemaRow {
 }
 
 dump_row! {
-    schema_rows(moraine::ffi_support::SchemaRecord) -> MoraineSchemaRow {
+    moraine::ffi_support::SchemaRecord => MoraineSchemaRow {
         values { schema_id, begin_snapshot, path_is_relative }
         optional { end_snapshot => has_end_snapshot, parent_schema_id => has_parent_schema_id }
         strings { schema_uuid, schema_name, path }
@@ -72,7 +72,6 @@ pub unsafe extern "C" fn moraine_dump_schemas(
             probe_ctx,
             err,
             moraine::ffi_support::dump_schemas,
-            schema_rows,
         )
     }
 }
@@ -117,7 +116,7 @@ pub struct MoraineTableRow {
 }
 
 dump_row! {
-    table_rows(moraine::ffi_support::TableRecord) -> MoraineTableRow {
+    moraine::ffi_support::TableRecord => MoraineTableRow {
         values { table_id, begin_snapshot, schema_id, path_is_relative }
         optional { end_snapshot => has_end_snapshot }
         strings { table_uuid, table_name, path }
@@ -154,7 +153,6 @@ pub unsafe extern "C" fn moraine_dump_tables(
             probe_ctx,
             err,
             moraine::ffi_support::dump_tables,
-            table_rows,
         )
     }
 }
@@ -199,7 +197,7 @@ pub struct MoraineViewRow {
 }
 
 dump_row! {
-    view_rows(moraine::ffi_support::ViewRecord) -> MoraineViewRow {
+    moraine::ffi_support::ViewRecord => MoraineViewRow {
         values { view_id, begin_snapshot, schema_id }
         optional { end_snapshot => has_end_snapshot }
         strings { view_uuid, view_name, dialect, sql }
@@ -236,7 +234,6 @@ pub unsafe extern "C" fn moraine_dump_views(
             probe_ctx,
             err,
             moraine::ffi_support::dump_views,
-            view_rows,
         )
     }
 }
@@ -293,7 +290,7 @@ pub struct MoraineColumnRow {
 }
 
 dump_row! {
-    column_rows(moraine::ffi_support::ColumnRecord) -> MoraineColumnRow {
+    moraine::ffi_support::ColumnRecord => MoraineColumnRow {
         values { column_id, begin_snapshot, table_id, column_order, nulls_allowed }
         optional { end_snapshot => has_end_snapshot, parent_column => has_parent_column }
         strings { column_name, column_type }
@@ -335,7 +332,6 @@ pub unsafe extern "C" fn moraine_dump_columns(
             probe_ctx,
             err,
             moraine::ffi_support::dump_columns,
-            column_rows,
         )
     }
 }

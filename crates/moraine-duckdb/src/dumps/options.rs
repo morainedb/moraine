@@ -28,7 +28,7 @@ pub struct MoraineOptionRow {
 }
 
 dump_row! {
-    option_rows(moraine::ffi_support::OptionRow) -> MoraineOptionRow {
+    moraine::ffi_support::OptionRow => MoraineOptionRow {
         values {}
         optional { scope_id => has_scope_id }
         strings { key, value }
@@ -65,7 +65,6 @@ pub unsafe extern "C" fn moraine_dump_options(
             probe_ctx,
             err,
             moraine::ffi_support::dump_options,
-            option_rows,
         )
     }
 }
