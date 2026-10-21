@@ -67,18 +67,19 @@ fn main() -> anyhow::Result<()> {
         Some("check-pins") => pins::check_pins(),
         Some("check-patch-pins") => ducklake_patch::check_pins(),
         Some("check-release-assets") => release::check_release_assets(&arguments),
+        Some("stage-release-assets") => release::stage_release_assets(&arguments),
         Some("validate-release-artifact") => release::validate_release_artifact(&arguments),
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some(other) => {
             bail!(
                 "unknown task `{other}`; available: e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
-                 check-patch-pins, check-release-assets, validate-release-artifact, \
+                 check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
                  bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
             "usage: cargo xtask <task>; available: e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
-             check-patch-pins, check-release-assets, validate-release-artifact, \
+             check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
              bump-duckdb, ducklake-patch"
         ),
     }
