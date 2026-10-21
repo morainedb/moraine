@@ -112,10 +112,9 @@ build stays complete on the single-writer path without it.
 - [x] Arbitrary-bytes decode proptests for store codecs (never panic on garbage)
 - [x] Release pipeline: versioned tags drive crate publishing and extension artifacts
 - [x] Extension distribution: per-DuckDB-version, per-platform builds attached to GitHub releases (unsigned)
-- [ ] Turn the `ext-v*` extension release back on. It came off while DuckDB
-  2.0 carried no tag, when no released DuckDB reported the version string a
-  build of the pin carried; 2.0.0 tags and publishes, so what is left is to
-  call the `publish-extension-release` action from `release.yml` again.
+- [x] The `ext-v*` extension release, back on: it came off while DuckDB 2.0
+  carried no tag, when no released DuckDB reported the version string a
+  build of the pin carried.
 - [ ] Signed distribution via a duckdb/community-extensions submission
 - [ ] Resume crates.io publishing, held while the workspace patches slatedb:
   a registry build resolves the published slatedb, which has no

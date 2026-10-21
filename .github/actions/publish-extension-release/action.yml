@@ -16,21 +16,15 @@ runs:
     - uses: actions/download-artifact@v4
       with:
         path: artifacts
+    # The token an artifact's name carries is whatever the build resolved
+    # DUCKDB_VERSION to -- the release when it was given one, the checkout's
+    # commit when it built the pinned submodule -- so the release version is
+    # looked up rather than cut out of the name.
     - name: Stage per-version, per-arch assets
       shell: bash
       run: |
         set -euo pipefail
-        mkdir -p dist
-        shopt -s nullglob
-        for d in artifacts/moraine-*-extension-*/; do
-          name=${d%/}
-          name=${name##*/}
-          arch=${name##*-extension-}
-          duckdb_version=${name#moraine-}
-          duckdb_version=${duckdb_version%-extension-*}
-          cp "$d/moraine.duckdb_extension" \
-             "dist/moraine.${duckdb_version}.${arch}.duckdb_extension"
-        done
+        cargo run -q -p xtask -- stage-release-assets artifacts dist
         ls -l dist
     # The last check that a release is whole, and the only one that says
     # which build is missing: a leg the upstream matrix never starts leaves

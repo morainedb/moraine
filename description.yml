@@ -11,7 +11,7 @@ extension:
     - alexpropp
 
 repo:
-  github: alexpropp/moraine
+  github: morainedb/moraine
   ref: 69e188c2987e41d0d0bd96d5dcfc16ff95ff7820
 
 docs:

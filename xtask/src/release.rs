@@ -9,7 +9,11 @@
 //! version that cannot load moraine on that platform at all, since a
 //! C++-ABI extension is refused by any DuckDB but the one it names.
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, bail, ensure};
 
@@ -160,6 +164,94 @@ fn directory_entries(directory: &str) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
+/// The release version an uploaded artifact's directory name carries.
+///
+/// The reusable build names each artifact `moraine-<token>-extension-<arch>`,
+/// where `<token>` is whatever it resolved `DUCKDB_VERSION` to: the release
+/// when it was given one, and the checkout's commit when it built the pinned
+/// submodule instead. Both have to land on the release the manifest names,
+/// since that is the version a loadable's footer carries and the one the
+/// asset is named for.
+fn asset_version(token: &str, pins: &[(String, String)]) -> Option<String> {
+    pins.iter()
+        .find(|(version, commit)| token == version || token == commit)
+        .map(|(version, _)| version.clone())
+}
+
+/// Stages every uploaded artifact under the name a release asset takes.
+///
+/// Replaces deriving the name in shell: the token an artifact carries is not
+/// always the version, and a mis-derived name reads as a missing build rather
+/// than a wrong one.
+pub fn stage_release_assets(arguments: &[String]) -> anyhow::Result<()> {
+    let (Some(artifacts), Some(destination)) = (arguments.first(), arguments.get(1)) else {
+        bail!(
+            "usage: cargo xtask stage-release-assets <artifacts-dir> <dist-dir>, \
+             e.g. `… stage-release-assets artifacts dist`"
+        );
+    };
+    fs::create_dir_all(destination)
+        .with_context(|| format!("creating the staging directory {destination}"))?;
+
+    let pins = release_pins();
+    let mut staged = 0;
+    for entry in directory_entries(artifacts)? {
+        let Some((token, architecture)) = parse_artifact_directory(&entry) else {
+            continue;
+        };
+        let version = asset_version(token, &pins).with_context(|| {
+            format!(
+                "artifact {entry} names DuckDB `{token}`, which is neither a supported \
+                 release nor the commit one of them pins"
+            )
+        })?;
+        let from = Path::new(artifacts)
+            .join(&entry)
+            .join("moraine.duckdb_extension");
+        let to = Path::new(destination)
+            .join(format!("moraine.{version}.{architecture}.duckdb_extension"));
+        fs::copy(&from, &to)
+            .with_context(|| format!("staging {} to {}", from.display(), to.display()))?;
+        staged += 1;
+    }
+
+    ensure!(
+        staged > 0,
+        "{artifacts} holds no moraine extension artifact"
+    );
+    println!("ok: staged {staged} artifacts into {destination}");
+    Ok(())
+}
+
+/// The `(token, architecture)` an artifact directory name carries.
+fn parse_artifact_directory(entry: &str) -> Option<(&str, &str)> {
+    let rest = entry.strip_prefix("moraine-")?;
+    let (token, architecture) = rest.split_once("-extension-")?;
+    (!token.is_empty() && !architecture.is_empty()).then_some((token, architecture))
+}
+
+/// Every supported release and the DuckDB commit it pins, where it names
+/// one. Only the primary entry carries commits.
+fn release_pins() -> Vec<(String, String)> {
+    let primary = crate::duckdb::primary_submodule_pins()
+        .into_iter()
+        .find(|(path, _)| path == "duckdb")
+        .map(|(_, commit)| commit)
+        .unwrap_or_default();
+    supported_duckdb_versions()
+        .into_iter()
+        .enumerate()
+        .map(|(index, version)| {
+            let commit = if index == 0 {
+                primary.clone()
+            } else {
+                String::new()
+            };
+            (version, commit)
+        })
+        .collect()
+}
+
 /// Every asset a release must carry, in the name the publish step gives it.
 fn expected_assets(versions: &[String]) -> Vec<String> {
     versions
@@ -202,6 +294,38 @@ fn excluded_architectures(contents: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An artifact built from the pinned submodule carries the commit, not
+    /// the release, and still has to land on the release's asset name.
+    #[test]
+    fn an_artifact_named_for_the_pinned_commit_resolves_to_its_release() {
+        let pins = vec![("v2.0.0".to_owned(), "d54cbbe3".to_owned())];
+
+        assert_eq!(asset_version("d54cbbe3", &pins).as_deref(), Some("v2.0.0"));
+        assert_eq!(asset_version("v2.0.0", &pins).as_deref(), Some("v2.0.0"));
+    }
+
+    /// A token naming neither is a build of something nobody asked for,
+    /// which must not be staged under a supported release's name.
+    #[test]
+    fn an_unrecognized_artifact_token_resolves_to_nothing() {
+        let pins = vec![("v2.0.0".to_owned(), "d54cbbe3".to_owned())];
+
+        assert_eq!(asset_version("v2.0.0-alpha49307", &pins), None);
+    }
+
+    #[test]
+    fn an_artifact_directory_yields_its_token_and_architecture() {
+        assert_eq!(
+            parse_artifact_directory("moraine-d54cbbe3-extension-linux_amd64"),
+            Some(("d54cbbe3", "linux_amd64"))
+        );
+        assert_eq!(parse_artifact_directory("something-else"), None);
+        assert_eq!(
+            parse_artifact_directory("moraine--extension-linux_amd64"),
+            None
+        );
+    }
 
     fn versions() -> Vec<String> {
         vec!["v1.5.5".to_owned(), "v1.5.4".to_owned()]
