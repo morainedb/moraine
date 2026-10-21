@@ -352,6 +352,7 @@ fn stage_bootstrap(
             schema_name: "main".to_string(),
             path: "main/".to_string(),
             path_is_relative: true,
+            parent_schema_id: None,
         }),
     );
     let mut options = std::collections::HashMap::from([

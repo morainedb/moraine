@@ -765,6 +765,7 @@ mod tests {
             schema_name: "main".into(),
             path: "main/".into(),
             path_is_relative: true,
+            parent_schema_id: None,
         };
         let ended = SchemaValue {
             schema_id: 0,

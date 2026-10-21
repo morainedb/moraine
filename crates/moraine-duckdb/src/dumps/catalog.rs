@@ -29,6 +29,10 @@ pub struct MoraineSchemaRow {
     pub path: *mut c_char,
     /// `path_is_relative`.
     pub path_is_relative: bool,
+    /// Whether `parent_schema_id` is present (`false` at the top level).
+    pub has_parent_schema_id: bool,
+    /// `parent_schema_id`, valid iff `has_parent_schema_id`.
+    pub parent_schema_id: u64,
 }
 
 /// Converts core `ducklake_schema` records into the C row shape. Shared by the
@@ -51,6 +55,7 @@ pub(crate) fn schema_rows(
         .into_iter()
         .map(|(v, schema_uuid, schema_name, path)| {
             let (has_end, end) = opt_u64(v.end_snapshot);
+            let (has_parent_schema_id, parent_schema_id) = opt_u64(v.parent_schema_id);
             MoraineSchemaRow {
                 schema_id: v.schema_id,
                 schema_uuid: schema_uuid.into_raw(),
@@ -60,6 +65,8 @@ pub(crate) fn schema_rows(
                 schema_name: schema_name.into_raw(),
                 path: path.into_raw(),
                 path_is_relative: v.path_is_relative,
+                has_parent_schema_id,
+                parent_schema_id,
             }
         })
         .collect())

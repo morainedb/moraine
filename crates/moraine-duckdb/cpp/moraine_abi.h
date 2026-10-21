@@ -638,6 +638,10 @@ typedef struct MoraineSchemaRow {
   char *path;
   // `path_is_relative`.
   bool path_is_relative;
+  // Whether `parent_schema_id` is present (`false` at the top level).
+  bool has_parent_schema_id;
+  // `parent_schema_id`, valid iff `has_parent_schema_id`.
+  uint64_t parent_schema_id;
 } MoraineSchemaRow;
 
 // One `ducklake_table` row, as returned by [`moraine_dump_tables`].

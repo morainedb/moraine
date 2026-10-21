@@ -144,6 +144,7 @@ pub(super) fn decode_schema(cells: &[Cell]) -> Result<proto::SchemaValue> {
         schema_name: c.string()?,
         path: c.string()?,
         path_is_relative: c.bool()?,
+        parent_schema_id: c.trailing_opt_u64()?,
     };
     c.finish()?;
     Ok(value)
