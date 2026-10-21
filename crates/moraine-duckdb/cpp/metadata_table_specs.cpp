@@ -1,6 +1,7 @@
 #include "metadata_tables.hpp"
 
 #include <algorithm>
+#include <initializer_list>
 #include <set>
 #include <string>
 
@@ -65,19 +66,13 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 	if (sql_type == nullptr) {
 		return duckdb::Value(duckdb::LogicalType::VARCHAR);
 	}
-	// A nested type is stored as its DuckLake marker ("list"/"struct"/"map")
-	// with the element/field types carried by child `ducklake_column` rows
-	// (linked by `parent_column`). Pass the marker through unchanged so
-	// DuckLake reconstructs the type from the hierarchy; there is no scalar
-	// `LogicalType` to normalize it against.
+	// Nested markers name the container; child columns carry its element/field types.
 	if (duckdb::StringUtil::CIEquals(sql_type, "list") || duckdb::StringUtil::CIEquals(sql_type, "struct") ||
 	    duckdb::StringUtil::CIEquals(sql_type, "map")) {
 		return duckdb::Value(duckdb::StringUtil::Lower(sql_type));
 	}
 	auto type = MapColumnType(sql_type);
-	// `JSON` is a VARCHAR carrying a `JSON` alias, so it must be named before
-	// the id switch would collapse it to "varchar" (matches DuckLake's own
-	// `DuckLakeTypes::ToString`, which checks the alias first).
+	// Check JSON's alias before its VARCHAR type ID.
 	if (type.IsJSONType()) {
 		return duckdb::Value("json");
 	}
@@ -142,9 +137,7 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 	case duckdb::LogicalTypeId::GEOMETRY:
 		return duckdb::Value("geometry");
 	default:
-		// `MapColumnType` only ever returns one of the ids above (it
-		// throws NotImplementedException for anything else), so this is
-		// unreachable by construction, not a silent fallback.
+		// MapColumnType rejects types outside this switch.
 		throw duckdb::InternalException("moraine: unmapped DuckLake type for \"%s\"", sql_type);
 	}
 }
@@ -253,18 +246,17 @@ std::vector<duckdb::Value> SnapshotChangesShape(const MoraineSnapshotRow &r) {
 	};
 }
 
+template <bool EXTENDED>
 std::vector<duckdb::Value> SchemaShape(const MoraineSchemaRow &r) {
-	return {
+	std::vector<duckdb::Value> values = {
 	    Bigint(r.schema_id),         Uuid(r.schema_uuid),
 	    Bigint(r.begin_snapshot),    OptBigint(r.has_end_snapshot, r.end_snapshot),
 	    Varchar(r.schema_name),      Varchar(r.path),
 	    Boolean(r.path_is_relative),
 	};
-}
-
-std::vector<duckdb::Value> ExtendedSchemaShape(const MoraineSchemaRow &r) {
-	auto values = SchemaShape(r);
-	values.push_back(OptBigint(r.has_parent_schema_id, r.parent_schema_id));
+	if constexpr (EXTENDED) {
+		values.push_back(OptBigint(r.has_parent_schema_id, r.parent_schema_id));
+	}
 	return values;
 }
 
@@ -358,8 +350,9 @@ std::vector<duckdb::Value> ColumnShape(const MoraineColumnRow &r) {
 	};
 }
 
+template <bool EXTENDED>
 std::vector<duckdb::Value> DataFileShape(const MoraineDataFileRow &r) {
-	return {
+	std::vector<duckdb::Value> values = {
 	    Bigint(r.data_file_id),
 	    Bigint(r.table_id),
 	    Bigint(r.begin_snapshot),
@@ -377,16 +370,15 @@ std::vector<duckdb::Value> DataFileShape(const MoraineDataFileRow &r) {
 	    OptBigint(r.has_mapping_id, r.mapping_id),
 	    OptBigint(r.has_partial_max, r.partial_max),
 	};
-}
-
-std::vector<duckdb::Value> ExtendedDataFileShape(const MoraineDataFileRow &r) {
-	auto values = DataFileShape(r);
-	values.push_back(OptBigint(r.has_row_group_count, r.row_group_count));
+	if constexpr (EXTENDED) {
+		values.push_back(OptBigint(r.has_row_group_count, r.row_group_count));
+	}
 	return values;
 }
 
+template <bool EXTENDED>
 std::vector<duckdb::Value> DeleteFileShape(const MoraineDeleteFileRow &r) {
-	return {
+	std::vector<duckdb::Value> values = {
 	    Bigint(r.delete_file_id),
 	    Bigint(r.table_id),
 	    Bigint(r.begin_snapshot),
@@ -401,11 +393,9 @@ std::vector<duckdb::Value> DeleteFileShape(const MoraineDeleteFileRow &r) {
 	    OptVarchar(r.encryption_key),
 	    OptBigint(r.has_partial_max, r.partial_max),
 	};
-}
-
-std::vector<duckdb::Value> ExtendedDeleteFileShape(const MoraineDeleteFileRow &r) {
-	auto values = DeleteFileShape(r);
-	values.push_back(OptBigint(r.has_row_group_count, r.row_group_count));
+	if constexpr (EXTENDED) {
+		values.push_back(OptBigint(r.has_row_group_count, r.row_group_count));
+	}
 	return values;
 }
 
@@ -418,8 +408,9 @@ std::vector<duckdb::Value> TableStatsShape(const MoraineTableStatsRow &r) {
 	};
 }
 
+template <bool EXTENDED>
 std::vector<duckdb::Value> TableColumnStatsShape(const MoraineTableColumnStatsRow &r) {
-	return {
+	std::vector<duckdb::Value> values = {
 	    Bigint(r.table_id),
 	    Bigint(r.column_id),
 	    OptBoolean(r.has_contains_null, r.contains_null),
@@ -428,17 +419,16 @@ std::vector<duckdb::Value> TableColumnStatsShape(const MoraineTableColumnStatsRo
 	    OptVarchar(r.max_value),
 	    OptVarchar(r.extra_stats),
 	};
-}
-
-std::vector<duckdb::Value> ExtendedTableColumnStatsShape(const MoraineTableColumnStatsRow &r) {
-	auto values = TableColumnStatsShape(r);
-	values.push_back(OptBoolean(r.has_min_is_exact, r.min_is_exact));
-	values.push_back(OptBoolean(r.has_max_is_exact, r.max_is_exact));
+	if constexpr (EXTENDED) {
+		values.push_back(OptBoolean(r.has_min_is_exact, r.min_is_exact));
+		values.push_back(OptBoolean(r.has_max_is_exact, r.max_is_exact));
+	}
 	return values;
 }
 
+template <bool EXTENDED>
 std::vector<duckdb::Value> FileColumnStatsShape(const MoraineFileColumnStatsRow &r) {
-	return {
+	std::vector<duckdb::Value> values = {
 	    Bigint(r.data_file_id),
 	    Bigint(r.table_id),
 	    Bigint(r.column_id),
@@ -450,12 +440,10 @@ std::vector<duckdb::Value> FileColumnStatsShape(const MoraineFileColumnStatsRow 
 	    OptBoolean(r.has_contains_nan, r.contains_nan),
 	    OptVarchar(r.extra_stats),
 	};
-}
-
-std::vector<duckdb::Value> ExtendedFileColumnStatsShape(const MoraineFileColumnStatsRow &r) {
-	auto values = FileColumnStatsShape(r);
-	values.push_back(OptBoolean(r.has_min_is_exact, r.min_is_exact));
-	values.push_back(OptBoolean(r.has_max_is_exact, r.max_is_exact));
+	if constexpr (EXTENDED) {
+		values.push_back(OptBoolean(r.has_min_is_exact, r.min_is_exact));
+		values.push_back(OptBoolean(r.has_max_is_exact, r.max_is_exact));
+	}
 	return values;
 }
 
@@ -541,8 +529,7 @@ std::vector<duckdb::Value> ColumnTagShape(const MoraineColumnTagRow &r) {
 	};
 }
 
-// One `ducklake_view_column_tag` record's column list. Catalog version
-// 1.1 adds the table, so only the extended shape declares it.
+// Catalog version 1.1 adds view-column tags.
 std::vector<duckdb::Value> ViewColumnTagShape(const MoraineViewColumnTagRow &r) {
 	return {
 	    Bigint(r.view_id),        Varchar(r.column_name),
@@ -578,18 +565,14 @@ MetadataRows FixedMetadataRows(MoraineCatalogHandle *handle, MoraineInterruptPro
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
 	    {Varchar("encrypted"), Varchar(encrypted ? "true" : "false"), null_varchar, null_bigint},
 	};
-	// The recorded data root, when the store has one, so DuckLake reads it
-	// back on attach instead of requiring DATA_PATH again.
+	// Reuse the recorded data root when a later attach omits DATA_PATH.
 	char *data_path = nullptr;
 	MoraineError dp_err {};
 	if (moraine_data_path(handle, probe, probe_ctx, &data_path, &dp_err) != MORAINE_OK) {
 		ThrowMoraineError(dp_err);
 	}
 	if (data_path != nullptr) {
-		// DuckLake normalizes a data path to a single trailing separator and
-		// compares that to this served value (or adopts it verbatim when no
-		// DATA_PATH is given), so serve the same normalized form. moraine's
-		// supported stores (local, s3://) all use `/`.
+		// Match DuckLake's single trailing separator for local and S3 paths.
 		std::string served(data_path);
 		moraine_string_free(data_path);
 		while (!served.empty() && served.back() == '/') {
@@ -616,15 +599,11 @@ std::vector<duckdb::Value> OptionShape(const MoraineOptionRow &r) {
 void MergeStoredMetadataRows(MetadataRows &rows, MetadataRows stored) {
 	static const std::set<std::string> kServedByMoraine = {"version", "created_by", "encrypted", "data_path"};
 	for (auto &row : stored) {
-		// Only the global scope: a table-scoped option of the same name is
-		// a user setting, not one of these store facts.
 		if (row[2].IsNull() && kServedByMoraine.count(row[0].GetValue<std::string>()) > 0) {
 			continue;
 		}
 		auto same_key = [&row](const std::vector<duckdb::Value> &existing) {
-			// Null-aware: a global option's scope and scope_id are both
-			// NULL, and duckdb::Value's operator== throws on those rather
-			// than returning false.
+			// Global scope keys are NULL; Value::operator== rejects NULLs.
 			auto same = [](const duckdb::Value &a, const duckdb::Value &b) {
 				if (a.IsNull() || b.IsNull()) {
 					return a.IsNull() && b.IsNull();
@@ -670,9 +649,19 @@ MetadataRows ProvideInlinedDataTables(MoraineCatalogHandle *handle, MoraineInter
 	                                       });
 }
 
-// Match DuckLake's declared column order, types, and nullability, including nullable IDs.
-const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
-	static const std::vector<MetadataTableSpec> specs = {
+template <bool EXTENDED>
+std::vector<MetadataColumnSpec> VersionedColumns(std::vector<MetadataColumnSpec> columns,
+                                                 std::initializer_list<MetadataColumnSpec> additions) {
+	if constexpr (EXTENDED) {
+		columns.insert(columns.end(), additions.begin(), additions.end());
+	}
+	return columns;
+}
+
+// Match DuckLake's column order, types, and nullability, including nullable IDs.
+template <bool EXTENDED>
+std::vector<MetadataTableSpec> MetadataTableSpecsImpl() {
+	std::vector<MetadataTableSpec> specs = {
 	    {
 	        "ducklake_snapshot",
 	        {
@@ -708,17 +697,19 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	    },
 	    {
 	        "ducklake_schema",
-	        {
-	            {"schema_id", "BIGINT", true},
-	            {"schema_uuid", "UUID", false},
-	            {"begin_snapshot", "BIGINT", false},
-	            {"end_snapshot", "BIGINT", false},
-	            {"schema_name", "VARCHAR", false},
-	            {"path", "VARCHAR", false},
-	            {"path_is_relative", "BOOLEAN", false},
-	        },
-	        ProvideRows<moraine_dump_schemas, moraine_dump_schemas_free, SchemaShape>,
-	        TxProviders<MoraineSchemaRow>(moraine_dump_schemas_free, SchemaShape, moraine_tx_dump_schemas),
+	        VersionedColumns<EXTENDED>(
+	            {
+	                {"schema_id", "BIGINT", true},
+	                {"schema_uuid", "UUID", false},
+	                {"begin_snapshot", "BIGINT", false},
+	                {"end_snapshot", "BIGINT", false},
+	                {"schema_name", "VARCHAR", false},
+	                {"path", "VARCHAR", false},
+	                {"path_is_relative", "BOOLEAN", false},
+	            },
+	            {{"parent_schema_id", "BIGINT", false}}),
+	        ProvideRows<moraine_dump_schemas, moraine_dump_schemas_free, SchemaShape<EXTENDED>>,
+	        TxProviders<MoraineSchemaRow>(moraine_dump_schemas_free, SchemaShape<EXTENDED>, moraine_tx_dump_schemas),
 	        2,
 	        /* end key: schema_id */ {0},
 	        /* end_snapshot col */ 3,
@@ -801,27 +792,30 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	    },
 	    {
 	        "ducklake_data_file",
-	        {
-	            {"data_file_id", "BIGINT", true},
-	            {"table_id", "BIGINT", false},
-	            {"begin_snapshot", "BIGINT", false},
-	            {"end_snapshot", "BIGINT", false},
-	            {"file_order", "BIGINT", false},
-	            {"path", "VARCHAR", false},
-	            {"path_is_relative", "BOOLEAN", false},
-	            {"file_format", "VARCHAR", false},
-	            {"record_count", "BIGINT", false},
-	            {"file_size_bytes", "BIGINT", false},
-	            {"footer_size", "BIGINT", false},
-	            {"row_id_start", "BIGINT", false},
-	            {"partition_id", "BIGINT", false},
-	            {"encryption_key", "VARCHAR", false},
-	            {"mapping_id", "BIGINT", false},
-	            {"partial_max", "BIGINT", false},
-	        },
-	        ProvideRows<moraine_dump_data_files, moraine_dump_data_files_free, DataFileShape>,
-	        TxProviders<MoraineDataFileRow>(moraine_dump_data_files_free, DataFileShape, moraine_tx_dump_data_files,
-	                                        moraine_tx_dump_data_files_live_at, moraine_tx_dump_data_files_of),
+	        VersionedColumns<EXTENDED>(
+	            {
+	                {"data_file_id", "BIGINT", true},
+	                {"table_id", "BIGINT", false},
+	                {"begin_snapshot", "BIGINT", false},
+	                {"end_snapshot", "BIGINT", false},
+	                {"file_order", "BIGINT", false},
+	                {"path", "VARCHAR", false},
+	                {"path_is_relative", "BOOLEAN", false},
+	                {"file_format", "VARCHAR", false},
+	                {"record_count", "BIGINT", false},
+	                {"file_size_bytes", "BIGINT", false},
+	                {"footer_size", "BIGINT", false},
+	                {"row_id_start", "BIGINT", false},
+	                {"partition_id", "BIGINT", false},
+	                {"encryption_key", "VARCHAR", false},
+	                {"mapping_id", "BIGINT", false},
+	                {"partial_max", "BIGINT", false},
+	            },
+	            {{"row_group_count", "BIGINT", false}}),
+	        ProvideRows<moraine_dump_data_files, moraine_dump_data_files_free, DataFileShape<EXTENDED>>,
+	        TxProviders<MoraineDataFileRow>(moraine_dump_data_files_free, DataFileShape<EXTENDED>,
+	                                        moraine_tx_dump_data_files, moraine_tx_dump_data_files_live_at,
+	                                        moraine_tx_dump_data_files_of),
 	        6,
 	        /* end key: table_id, data_file_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
@@ -829,27 +823,29 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* overlay_updatable */ false,
 	        /* scope column: table_id */ 1,
 	        /* live_narrowable */ true,
-	        ProvideScopedRows<moraine_dump_data_files_of, moraine_dump_data_files_free, DataFileShape>,
+	        ProvideScopedRows<moraine_dump_data_files_of, moraine_dump_data_files_free, DataFileShape<EXTENDED>>,
 	    },
 	    {
 	        "ducklake_delete_file",
-	        {
-	            {"delete_file_id", "BIGINT", true},
-	            {"table_id", "BIGINT", false},
-	            {"begin_snapshot", "BIGINT", false},
-	            {"end_snapshot", "BIGINT", false},
-	            {"data_file_id", "BIGINT", false},
-	            {"path", "VARCHAR", false},
-	            {"path_is_relative", "BOOLEAN", false},
-	            {"format", "VARCHAR", false},
-	            {"delete_count", "BIGINT", false},
-	            {"file_size_bytes", "BIGINT", false},
-	            {"footer_size", "BIGINT", false},
-	            {"encryption_key", "VARCHAR", false},
-	            {"partial_max", "BIGINT", false},
-	        },
-	        ProvideRows<moraine_dump_delete_files, moraine_dump_delete_files_free, DeleteFileShape>,
-	        TxProviders<MoraineDeleteFileRow>(moraine_dump_delete_files_free, DeleteFileShape,
+	        VersionedColumns<EXTENDED>(
+	            {
+	                {"delete_file_id", "BIGINT", true},
+	                {"table_id", "BIGINT", false},
+	                {"begin_snapshot", "BIGINT", false},
+	                {"end_snapshot", "BIGINT", false},
+	                {"data_file_id", "BIGINT", false},
+	                {"path", "VARCHAR", false},
+	                {"path_is_relative", "BOOLEAN", false},
+	                {"format", "VARCHAR", false},
+	                {"delete_count", "BIGINT", false},
+	                {"file_size_bytes", "BIGINT", false},
+	                {"footer_size", "BIGINT", false},
+	                {"encryption_key", "VARCHAR", false},
+	                {"partial_max", "BIGINT", false},
+	            },
+	            {{"row_group_count", "BIGINT", false}}),
+	        ProvideRows<moraine_dump_delete_files, moraine_dump_delete_files_free, DeleteFileShape<EXTENDED>>,
+	        TxProviders<MoraineDeleteFileRow>(moraine_dump_delete_files_free, DeleteFileShape<EXTENDED>,
 	                                          moraine_tx_dump_delete_files, moraine_tx_dump_delete_files_live_at,
 	                                          moraine_tx_dump_delete_files_of),
 	        7,
@@ -859,7 +855,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* overlay_updatable */ false,
 	        /* scope column: table_id */ 1,
 	        /* live_narrowable */ true,
-	        ProvideScopedRows<moraine_dump_delete_files_of, moraine_dump_delete_files_free, DeleteFileShape>,
+	        ProvideScopedRows<moraine_dump_delete_files_of, moraine_dump_delete_files_free, DeleteFileShape<EXTENDED>>,
 	    },
 	    {
 	        "ducklake_table_stats",
@@ -880,17 +876,21 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	    },
 	    {
 	        "ducklake_table_column_stats",
-	        {
-	            {"table_id", "BIGINT", false},
-	            {"column_id", "BIGINT", false},
-	            {"contains_null", "BOOLEAN", false},
-	            {"contains_nan", "BOOLEAN", false},
-	            {"min_value", "VARCHAR", false},
-	            {"max_value", "VARCHAR", false},
-	            {"extra_stats", "VARCHAR", false},
-	        },
-	        ProvideRows<moraine_dump_table_column_stats, moraine_dump_table_column_stats_free, TableColumnStatsShape>,
-	        TxProviders<MoraineTableColumnStatsRow>(moraine_dump_table_column_stats_free, TableColumnStatsShape,
+	        VersionedColumns<EXTENDED>(
+	            {
+	                {"table_id", "BIGINT", false},
+	                {"column_id", "BIGINT", false},
+	                {"contains_null", "BOOLEAN", false},
+	                {"contains_nan", "BOOLEAN", false},
+	                {"min_value", "VARCHAR", false},
+	                {"max_value", "VARCHAR", false},
+	                {"extra_stats", "VARCHAR", false},
+	            },
+	            {{"min_is_exact", "BOOLEAN", false}, {"max_is_exact", "BOOLEAN", false}}),
+	        ProvideRows<moraine_dump_table_column_stats, moraine_dump_table_column_stats_free,
+	                    TableColumnStatsShape<EXTENDED>>,
+	        TxProviders<MoraineTableColumnStatsRow>(moraine_dump_table_column_stats_free,
+	                                                TableColumnStatsShape<EXTENDED>,
 	                                                moraine_tx_dump_table_column_stats),
 	        9,
 	        {},
@@ -900,22 +900,25 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	    },
 	    {
 	        "ducklake_file_column_stats",
-	        {
-	            {"data_file_id", "BIGINT", false},
-	            {"table_id", "BIGINT", false},
-	            {"column_id", "BIGINT", false},
-	            {"column_size_bytes", "BIGINT", false},
-	            {"value_count", "BIGINT", false},
-	            {"null_count", "BIGINT", false},
-	            {"min_value", "VARCHAR", false},
-	            {"max_value", "VARCHAR", false},
-	            {"contains_nan", "BOOLEAN", false},
-	            {"extra_stats", "VARCHAR", false},
-	        },
-	        ProvideRows<moraine_dump_file_column_stats, moraine_dump_file_column_stats_free, FileColumnStatsShape>,
-	        UnversionedTxProviders<MoraineFileColumnStatsRow>(moraine_dump_file_column_stats_free, FileColumnStatsShape,
-	                                                          moraine_tx_dump_file_column_stats,
-	                                                          moraine_tx_dump_file_column_stats_of),
+	        VersionedColumns<EXTENDED>(
+	            {
+	                {"data_file_id", "BIGINT", false},
+	                {"table_id", "BIGINT", false},
+	                {"column_id", "BIGINT", false},
+	                {"column_size_bytes", "BIGINT", false},
+	                {"value_count", "BIGINT", false},
+	                {"null_count", "BIGINT", false},
+	                {"min_value", "VARCHAR", false},
+	                {"max_value", "VARCHAR", false},
+	                {"contains_nan", "BOOLEAN", false},
+	                {"extra_stats", "VARCHAR", false},
+	            },
+	            {{"min_is_exact", "BOOLEAN", false}, {"max_is_exact", "BOOLEAN", false}}),
+	        ProvideRows<moraine_dump_file_column_stats, moraine_dump_file_column_stats_free,
+	                    FileColumnStatsShape<EXTENDED>>,
+	        UnversionedTxProviders<MoraineFileColumnStatsRow>(
+	            moraine_dump_file_column_stats_free, FileColumnStatsShape<EXTENDED>, moraine_tx_dump_file_column_stats,
+	            moraine_tx_dump_file_column_stats_of),
 	        10,
 	        {},
 	        0,
@@ -924,7 +927,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* scope column: table_id */ 1,
 	        /* live_narrowable */ false,
 	        ProvideScopedRows<moraine_dump_file_column_stats_of, moraine_dump_file_column_stats_free,
-	                          FileColumnStatsShape>,
+	                          FileColumnStatsShape<EXTENDED>>,
 	    },
 	    {
 	        // Three-column form: (begin_snapshot, schema_version, table_id).
@@ -1219,14 +1222,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"scope", "VARCHAR", false},
 	            {"scope_id", "BIGINT", false},
 	        },
-	        ProvideMetadata<false>,
-	        {TxProvideMetadata<false>},
-	        // Options are unversioned and outside the snapshot protocol.
-	        // `set_option` counts the rows already holding the key at that
-	        // scope and writes an INSERT only when there are none, so every
-	        // later set arrives as `SET value` on the matched row — the
-	        // overlay below. A key moraine serves a default for takes that
-	        // branch on the first set, since a synthesized row counts.
+	        ProvideMetadata<EXTENDED>,
+	        {TxProvideMetadata<EXTENDED>},
+	        // Options are unversioned. DuckLake updates existing keys, including synthesized defaults.
 	        25,
 	        {},
 	        0,
@@ -1234,64 +1232,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* overlay_updatable */ true,
 	    },
 	};
-	return specs;
-}
-
-// Extend the 1.0 definitions with 1.1 columns and tables. Keep separate static specs:
-// entries and row caches retain their addresses across attaches at different versions.
-const std::vector<MetadataTableSpec> &ExtendedMetadataTableSpecsImpl() {
-	static const std::vector<MetadataTableSpec> specs = [] {
-		std::vector<MetadataTableSpec> extended = MetadataTableSpecsImpl();
-		for (auto &spec : extended) {
-			std::string name(spec.name);
-			if (name == "ducklake_schema") {
-				spec.columns.push_back({"parent_schema_id", "BIGINT", false});
-				spec.provider = ProvideRows<moraine_dump_schemas, moraine_dump_schemas_free, ExtendedSchemaShape>;
-				spec.tx = TxProviders<MoraineSchemaRow>(moraine_dump_schemas_free, ExtendedSchemaShape,
-				                                        moraine_tx_dump_schemas);
-			} else if (name == "ducklake_metadata") {
-				spec.provider = ProvideMetadata<true>;
-				spec.tx.provider = TxProvideMetadata<true>;
-			} else if (name == "ducklake_data_file") {
-				spec.columns.push_back({"row_group_count", "BIGINT", false});
-				spec.provider =
-				    ProvideRows<moraine_dump_data_files, moraine_dump_data_files_free, ExtendedDataFileShape>;
-				spec.scoped_provider =
-				    ProvideScopedRows<moraine_dump_data_files_of, moraine_dump_data_files_free, ExtendedDataFileShape>;
-				spec.tx = TxProviders<MoraineDataFileRow>(
-				    moraine_dump_data_files_free, ExtendedDataFileShape, moraine_tx_dump_data_files,
-				    moraine_tx_dump_data_files_live_at, moraine_tx_dump_data_files_of);
-			} else if (name == "ducklake_delete_file") {
-				spec.columns.push_back({"row_group_count", "BIGINT", false});
-				spec.provider =
-				    ProvideRows<moraine_dump_delete_files, moraine_dump_delete_files_free, ExtendedDeleteFileShape>;
-				spec.scoped_provider = ProvideScopedRows<moraine_dump_delete_files_of, moraine_dump_delete_files_free,
-				                                         ExtendedDeleteFileShape>;
-				spec.tx = TxProviders<MoraineDeleteFileRow>(
-				    moraine_dump_delete_files_free, ExtendedDeleteFileShape, moraine_tx_dump_delete_files,
-				    moraine_tx_dump_delete_files_live_at, moraine_tx_dump_delete_files_of);
-			} else if (name == "ducklake_file_column_stats") {
-				spec.columns.push_back({"min_is_exact", "BOOLEAN", false});
-				spec.columns.push_back({"max_is_exact", "BOOLEAN", false});
-				spec.provider = ProvideRows<moraine_dump_file_column_stats, moraine_dump_file_column_stats_free,
-				                            ExtendedFileColumnStatsShape>;
-				spec.scoped_provider =
-				    ProvideScopedRows<moraine_dump_file_column_stats_of, moraine_dump_file_column_stats_free,
-				                      ExtendedFileColumnStatsShape>;
-				spec.tx = UnversionedTxProviders<MoraineFileColumnStatsRow>(
-				    moraine_dump_file_column_stats_free, ExtendedFileColumnStatsShape,
-				    moraine_tx_dump_file_column_stats, moraine_tx_dump_file_column_stats_of);
-			} else if (name == "ducklake_table_column_stats") {
-				spec.columns.push_back({"min_is_exact", "BOOLEAN", false});
-				spec.columns.push_back({"max_is_exact", "BOOLEAN", false});
-				spec.provider = ProvideRows<moraine_dump_table_column_stats, moraine_dump_table_column_stats_free,
-				                            ExtendedTableColumnStatsShape>;
-				spec.tx = TxProviders<MoraineTableColumnStatsRow>(moraine_dump_table_column_stats_free,
-				                                                  ExtendedTableColumnStatsShape,
-				                                                  moraine_tx_dump_table_column_stats);
-			}
-		}
-		extended.push_back({
+	if constexpr (EXTENDED) {
+		specs.push_back({
 		    "ducklake_view_column_tag",
 		    {
 		        {"view_id", "BIGINT", false},
@@ -1309,8 +1251,7 @@ const std::vector<MetadataTableSpec> &ExtendedMetadataTableSpecsImpl() {
 		    /* end_snapshot col */ 3,
 		    /* delete key: view_id, column_name, key, begin_snapshot */ {0, 1, 4, 2},
 		});
-		return extended;
-	}();
+	}
 	return specs;
 }
 
@@ -1328,7 +1269,13 @@ bool MoraineServesExtendedCatalog(MoraineCatalogHandle *handle) {
 }
 
 const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs(bool extended) {
-	return extended ? ExtendedMetadataTableSpecsImpl() : MetadataTableSpecsImpl();
+	// Entries and row caches retain spec addresses; each version needs stable storage.
+	if (extended) {
+		static const auto specs = MetadataTableSpecsImpl<true>();
+		return specs;
+	}
+	static const auto specs = MetadataTableSpecsImpl<false>();
+	return specs;
 }
 
 } // namespace moraine_duckdb
