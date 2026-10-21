@@ -292,10 +292,11 @@ pub use catalog::{
     MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
     MaintenanceStatusPass, MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome,
     MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId, PartitionSpec,
-    ReadOnlyCatalog, RecentRow, RowSummaryPublish, ScheduledDeletion, SchemaId, SchemaInfo,
-    SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus, StoreCheckpoint,
-    StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats,
-    TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, store_paths_overlap,
+    ReadOnlyCatalog, RecentRow, RowSummaryPublish, SUPERSEDED_CATALOG_VERSION, ScheduledDeletion,
+    SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus,
+    StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
+    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, serves_catalog_version,
+    store_paths_overlap,
 };
 pub use commit_log::{
     CommitLogProvider, SlotAdoption, SlotCommit, SlotCommitter, SlotEnvelope, SlotOffer, SlotWrite,

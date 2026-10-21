@@ -59,7 +59,7 @@ pub use types::{
     IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState, InlineChunk, MAX_CATALOG_VERSION,
     MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId, MappingInfo,
     NameMappingDef, OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, RecentRow,
-    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
-    SortSpec, StoreCheckpoint, TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp,
-    ViewId, ViewInfo,
+    SUPERSEDED_CATALOG_VERSION, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo,
+    SortId, SortKeyDef, SortSpec, StoreCheckpoint, TableId, TableInfo, TableStats, TagEntry,
+    TagTarget, Timestamp, ViewId, ViewInfo, serves_catalog_version,
 };

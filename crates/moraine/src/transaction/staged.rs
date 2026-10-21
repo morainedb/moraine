@@ -176,7 +176,7 @@ pub enum TableKind {
     /// scope's option record in place, last write wins.
     Metadata,
     /// `ducklake_view_column_tag` — an entry embedded in its view's
-    /// record, keyed within it by column name. Catalog version 1.1-dev1
+    /// record, keyed within it by column name. Catalog version 1.1
     /// adds it, so it is last: a kind's position is its wire
     /// discriminant.
     ViewColumnTag,

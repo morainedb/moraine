@@ -416,8 +416,8 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
                 column_stats: vec![FileColumnStats {
                     column_id: column,
                     column_size_bytes: 10,
-                    value_count: 10,
-                    null_count: 0,
+                    value_count: Some(10),
+                    null_count: Some(0),
                     min_value: Some("1".into()),
                     max_value: Some("2".into()),
                     contains_nan: None,
@@ -4495,8 +4495,8 @@ async fn measure_changelog_read_cost() {
                         .map(|column| crate::catalog::FileColumnStats {
                             column_id: column.id,
                             column_size_bytes: 128,
-                            value_count: 10,
-                            null_count: 0,
+                            value_count: Some(10),
+                            null_count: Some(0),
                             min_value: Some("0".into()),
                             max_value: Some("9".into()),
                             contains_nan: None,

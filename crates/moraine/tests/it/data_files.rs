@@ -188,8 +188,8 @@ async fn column_stats_round_trip_verbatim() {
                     column_stats: vec![FileColumnStats {
                         column_id: ColumnId::new(1),
                         column_size_bytes: 10,
-                        value_count: 100,
-                        null_count: 0,
+                        value_count: Some(100),
+                        null_count: Some(0),
                         min_value: Some("9".into()),
                         max_value: Some("10".into()),
                         contains_nan: None,
@@ -295,8 +295,8 @@ async fn expiry_keeps_file_column_stats_the_past_still_resolves() {
                     column_stats: vec![FileColumnStats {
                         column_id: ColumnId::new(1),
                         column_size_bytes: 10,
-                        value_count: 100,
-                        null_count: 0,
+                        value_count: Some(100),
+                        null_count: Some(0),
                         min_value: Some("1".into()),
                         max_value: Some("99".into()),
                         contains_nan: None,

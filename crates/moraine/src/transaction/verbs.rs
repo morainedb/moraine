@@ -3186,8 +3186,8 @@ mod tests {
         let bad_stats = vec![FileColumnStats {
             column_id: ColumnId::new(99),
             column_size_bytes: 1,
-            value_count: 1,
-            null_count: 0,
+            value_count: Some(1),
+            null_count: Some(0),
             min_value: None,
             max_value: None,
             contains_nan: None,
@@ -3594,7 +3594,7 @@ mod tests {
         let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
 
         assert!(matches!(
-            transaction.set_option(OptionScope::Global, "version", "1.1-dev1"),
+            transaction.set_option(OptionScope::Global, "version", "1.1"),
             Err(Error::Constraint(_))
         ));
         assert!(matches!(

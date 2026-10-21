@@ -1017,11 +1017,10 @@ transcription no one has to make by hand. It covers the DuckLake commit
 too, which DuckDB chooses rather than moraine — otherwise a DuckDB bump
 moves it silently and only e2e says so.
 
-**A development pin publishes nothing.** The current entry names a DuckDB
-commit rather than a release: 2.0 has no tag and no assets, so no released
-DuckDB reports the version string a build of it carries, and nothing could
-load one. The workflows still build and smoke every platform, which is what
-says the pin is whole; the publishing steps return when the tag does.
+**What a pin has to be: a published release.** An extension stamped with a
+version string no released DuckDB reports has nothing to load it, which is
+why the entry named a bare commit for as long as 2.0 carried no tag. 2.0.0
+tags and publishes, so a build of this pin loads into a stock CLI.
 
 **Which releases are listed** is a judgement, and a short list is the default.
 Each entry multiplies the release build by five platforms, and only the
@@ -1051,10 +1050,10 @@ consequence of DuckDB's design rather than an unbuilt piece of moraine's.
 
 | What | Pinned at | Notes |
 |---|---|---|
-| DuckDB | **v2.0.0-alpha46057** | the only entry of `.github/duckdb-versions`; both submodules sit on the commits it names, and it is the version the e2e suite proves the chain against. A development revision: DuckDB 2.0 carries no tag, so the build stamps the version string onto the pinned commit -- but DuckDB publishes that label's shared libraries, CLI and core extensions, which is why the pin follows its labels rather than naming one of ours |
-| DuckLake extension | **`e8924cfc`** | the DuckLake source moraine bundles: what `INSTALL ducklake` resolves to against the pinned DuckDB, which hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. DuckDB patches that commit itself before building it, and moraine's build applies those patches before the `patches/ducklake` series. Verified by running, not assumed |
+| DuckDB | **v2.0.0** | the only entry of `.github/duckdb-versions`; both submodules sit on the commits it names, and it is the version the e2e suite proves the chain against. DuckDB's 2.0 LTS release, supported upstream until at least October 2027 |
+| DuckLake extension | **`417a9117`** | the DuckLake source moraine bundles: what `INSTALL ducklake` resolves to against the pinned DuckDB, which hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. DuckDB patches that commit itself before building it, and moraine's build applies those patches before the `patches/ducklake` series. Verified by running, not assumed |
 | DuckLake branch | **`main`** | DuckLake publishes no release tags — it versions by DuckDB-series branches (`v1.3-ossivalis`, `v1.4-andium`, `v1.5-variegata`), and the 2.0 series has none yet, so the commit DuckDB pins is on `main` |
-| DuckLake catalog format | **`1.0`** by default, **`1.1-dev1`** on a raised store | `DuckLakeVersion::V1_0` and `V1_1_DEV_1`; a store records which it serves and `moraine_raise_catalog_version` moves it, as RFC 0012 describes |
+| DuckLake catalog format | **`1.0`** by default, **`1.1`** on a raised store | `DuckLakeVersion::V1_0` and `V1_1`; a store records which it serves and `moraine_raise_catalog_version` moves it, as RFC 0012 describes |
 
 **ABI friction between the two does not appear.** The concern was that
 objects crossing the extension↔host boundary by pointer between a DuckLake

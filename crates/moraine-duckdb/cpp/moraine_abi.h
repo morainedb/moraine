@@ -1105,9 +1105,13 @@ typedef struct MoraineFileColumnStatsRow {
   uint64_t column_id;
   // `column_size_bytes`.
   uint64_t column_size_bytes;
-  // `value_count`.
+  // Whether `value_count` is present.
+  bool has_value_count;
+  // `value_count`, valid iff `has_value_count`.
   uint64_t value_count;
-  // `null_count`.
+  // Whether `null_count` is present.
+  bool has_null_count;
+  // `null_count`, valid iff `has_null_count`.
   uint64_t null_count;
   // `min_value`, owned, null if absent.
   char *min_value;
@@ -1145,9 +1149,13 @@ typedef struct MoraineFileVariantStatsRow {
   char *shredded_type;
   // `column_size_bytes`.
   uint64_t column_size_bytes;
-  // `value_count`.
+  // Whether `value_count` is present.
+  bool has_value_count;
+  // `value_count`, valid iff `has_value_count`.
   uint64_t value_count;
-  // `null_count`.
+  // Whether `null_count` is present.
+  bool has_null_count;
+  // `null_count`, valid iff `has_null_count`.
   uint64_t null_count;
   // `min_value`, owned, null if absent.
   char *min_value;

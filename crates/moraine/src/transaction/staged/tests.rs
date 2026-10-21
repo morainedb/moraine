@@ -5418,7 +5418,7 @@ fn a_view_column_tag_row_decodes_to_its_view_and_tag() {
     assert_eq!((tag.key.as_str(), tag.value.as_str()), ("unit", "cents"));
 }
 
-/// Every column catalog version 1.1-dev1 appends decodes whether the
+/// Every column catalog version 1.1 appends decodes whether the
 /// writer sends it or not, so one build serves a writer on either version.
 #[test]
 fn appended_catalog_columns_decode_from_either_writer() {
@@ -5447,8 +5447,22 @@ fn appended_catalog_columns_decode_from_either_writer() {
     );
 }
 
+/// DuckLake leaves `value_count` and `null_count` null for a column whose
+/// null and value counts it does not have, so both decode as absent rather
+/// than as a count of zero.
+#[test]
+fn file_column_stats_without_counts_decode_as_absent() {
+    let mut cells = file_column_stats_row(3, 1, 0, "1", "9");
+    cells[4] = Cell::Null;
+    cells[5] = Cell::Null;
+
+    let decoded = decode::decode_file_column_stats(&cells).unwrap();
+
+    assert_eq!((decoded.value_count, decoded.null_count), (None, None));
+}
+
 /// A writer on catalog version 1.0 omits `row_group_count`; one on
-/// 1.1-dev1 appends it. Both shapes decode, and only the later one carries
+/// 1.1 appends it. Both shapes decode, and only the later one carries
 /// a count.
 #[test]
 fn a_data_file_row_decodes_with_or_without_its_row_group_count() {

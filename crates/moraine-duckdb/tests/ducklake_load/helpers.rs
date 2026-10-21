@@ -231,9 +231,6 @@ pub fn run_session_with_env(
     let mut command = Command::new(cli_path());
     command.envs(environment.iter().copied());
     command.arg("-unsigned").arg("-csv");
-    if !matches!(attach, Attach::Standalone { .. }) {
-        command.arg("-c").arg("SET threads=1;");
-    }
     // One load serves every shape: the reference attach runs on the bundled
     // DuckLake with no moraine in its chain.
     command.arg("-c").arg(load_statement());
@@ -304,8 +301,7 @@ pub fn kill_ducklake_session_after(
         .expect("failed to spawn duckdb CLI");
 
     let preamble = format!(
-        "SET threads=1;\n\
-         {}\n\
+        "{}\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');\n",
         load_statement(),
         store_dir.display(),
@@ -359,8 +355,7 @@ pub fn run_ducklake_sql_with_pause(
         .expect("failed to spawn duckdb CLI");
 
     let preamble = format!(
-        "SET threads=1;\n\
-         {}\n\
+        "{}\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{attach_options});\n",
         load_statement(),
         store_dir.display(),
@@ -440,8 +435,7 @@ pub fn run_ducklake_sql_around(
         .expect("failed to spawn duckdb CLI");
 
     let preamble = format!(
-        "SET threads=1;\n\
-         {}\n\
+        "{}\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');\n",
         load_statement(),
         store_dir.display(),

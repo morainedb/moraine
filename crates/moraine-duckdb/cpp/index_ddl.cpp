@@ -223,7 +223,6 @@ duckdb::BoundStatement BindNativeIndexDdl(duckdb::ClientContext &context, duckdb
 	result.plan = std::move(get);
 	auto &properties = binder.GetStatementProperties();
 	properties.return_type = duckdb::StatementReturnType::NOTHING;
-	properties.result_eagerness = duckdb::ResultEagerness::FORCED;
 	properties.always_require_rebind = true;
 	return result;
 }

@@ -1,8 +1,8 @@
 diff --git a/src/storage/ducklake_insert.cpp b/src/storage/ducklake_insert.cpp
-index 3546339f..2ea93572 100644
+index c02a20d4..13d99656 100644
 --- a/src/storage/ducklake_insert.cpp
 +++ b/src/storage/ducklake_insert.cpp
-@@ -189,13 +189,15 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
+@@ -208,13 +208,15 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
  				continue;
  			}
  			if (column_names[0] == "_ducklake_internal_row_id") {
@@ -20,10 +20,10 @@ index 3546339f..2ea93572 100644
  			}
  
 diff --git a/src/storage/ducklake_multi_file_list.cpp b/src/storage/ducklake_multi_file_list.cpp
-index 9e85a1c4..2b1e7b42 100644
+index 400f9b0a..a41d9f6e 100644
 --- a/src/storage/ducklake_multi_file_list.cpp
 +++ b/src/storage/ducklake_multi_file_list.cpp
-@@ -152,6 +152,13 @@ unique_ptr<DuckLakeFilterNode> DuckLakeMultiFileList::GetExpressionFilterNode(Mu
+@@ -171,6 +171,13 @@ unique_ptr<DuckLakeFilterNode> DuckLakeMultiFileList::GetExpressionFilterNode(Mu
  
  void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
                                                      unique_ptr<TableFilter> filter) const {
@@ -38,45 +38,45 @@ index 9e85a1c4..2b1e7b42 100644
  	if (node) {
  		AddFilterNodeToPushdownInfo(pushdown_info, *node);
 diff --git a/src/storage/ducklake_server_side_commit.cpp b/src/storage/ducklake_server_side_commit.cpp
-index 404eed36..68022304 100644
+index dfb21e48..6ed817f3 100644
 --- a/src/storage/ducklake_server_side_commit.cpp
 +++ b/src/storage/ducklake_server_side_commit.cpp
 @@ -4,6 +4,7 @@
- #include "common/ducklake_types.hpp"
  #include "common/ducklake_util.hpp"
+ #include "common/ducklake_types.hpp"
  #include "common/ducklake_version.hpp"
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
  #include "duckdb/common/string_util.hpp"
  #include "duckdb/main/client_context.hpp"
  #include "duckdb/main/database.hpp"
-@@ -275,6 +276,11 @@ void DuckLakeServerSideCommit::ReadColumnTypes() {
- 		column_types.emplace(ColumnKey {TableIndex(AsIdx(row, 0)), FieldIndex(AsIdx(row, 1))},
+@@ -224,6 +225,11 @@ void DuckLakeServerSideCommit::ReadColumnTypes() {
+ 		column_types.emplace(make_pair(TableIndex(AsIdx(row, 0)), FieldIndex(AsIdx(row, 1))),
  		                     DuckLakeTypes::FromString(row.GetValue<string>(2)));
  	}
 +	for (auto table_id : table_ids) {
 +		column_types.emplace(
-+		    ColumnKey {TableIndex(table_id), FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID))},
++		    make_pair(TableIndex(table_id), FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID))),
 +		    LogicalType::BIGINT);
 +	}
  }
  
  void DuckLakeServerSideCommit::ReadStagedDataFiles() {
 diff --git a/src/storage/ducklake_stats.cpp b/src/storage/ducklake_stats.cpp
-index 218b4f35..a04a8562 100644
+index 7d7cdf16..c2e77dc1 100644
 --- a/src/storage/ducklake_stats.cpp
 +++ b/src/storage/ducklake_stats.cpp
-@@ -8,6 +8,7 @@
+@@ -10,6 +10,7 @@
  #include "duckdb/storage/statistics/base_statistics.hpp"
  #include "duckdb/common/helper.hpp"
  #include "duckdb/common/limits.hpp"
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
  
- #include "yyjson.hpp"
+ namespace duckdb {
  
-@@ -250,6 +251,9 @@ void DuckLakeTableStats::MergeFileStats(const DuckLakeDataFile &file) {
+@@ -366,6 +367,9 @@ void DuckLakeTableStats::MergeFileStats(const DuckLakeDataFile &file,
  	}
  	table_size_bytes += file.file_size_bytes;
- 	for (auto &entry : file.column_stats) {
+ 	for (auto &entry : column_stats) {
 +		if (entry.first.index == static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID)) {
 +			continue;
 +		}
@@ -84,10 +84,10 @@ index 218b4f35..a04a8562 100644
  	}
  }
 diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
-index af0c22f6..9822d55d 100644
+index 77f92ffd..4278f3ba 100644
 --- a/src/storage/ducklake_transaction.cpp
 +++ b/src/storage/ducklake_transaction.cpp
-@@ -8,8 +8,8 @@
+@@ -10,8 +10,8 @@
  #include "common/ducklake_types.hpp"
  #include "common/ducklake_util.hpp"
  #include "duckdb/common/sql_identifier.hpp"
@@ -97,7 +97,7 @@ index af0c22f6..9822d55d 100644
  #include "duckdb/common/vector_operations/vector_operations.hpp"
  #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
  #include "duckdb/common/types/uuid.hpp"
-@@ -1338,6 +1338,24 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
+@@ -1357,6 +1357,24 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
  		partition_info.partition_value = partition_entry.partition_value;
  		data_file.partition_values.push_back(std::move(partition_info));
  	}

@@ -199,11 +199,11 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
                                                           duckdb::optional_idx live_bound = duckdb::optional_idx());
 
 // Whether this store records the catalog version whose shape adds
-// 1.1-dev1's columns and tables. One read of the store's recorded version.
+// 1.1's columns and tables. One read of the store's recorded version.
 bool MoraineServesExtendedCatalog(MoraineCatalogHandle *handle);
 
 // The synthesized tables, in the order they're registered. `extended`
-// selects the shape catalog version 1.1-dev1 declares. Built once per
+// selects the shape catalog version 1.1 declares. Built once per
 // shape; returns the same static instance every call for a given shape.
 const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs(bool extended = false);
 

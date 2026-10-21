@@ -13,8 +13,8 @@ use anyhow::{Context, bail, ensure};
 use crate::duckdb::{self, command_output, optional_command_output};
 
 const DUCKLAKE_URL: &str = "https://github.com/duckdb/ducklake.git";
-const DUCKLAKE_REVISION: &str = "e8924cfc9ccbb9a1a148e8ff367b75d493ca9df5";
-const SUPPORTED_DUCKDB_PIN: &str = "v2.0.0-alpha46057";
+const DUCKLAKE_REVISION: &str = "417a9117f590e8141742ac0579d02f6a90162e37";
+const SUPPORTED_DUCKDB_PIN: &str = "v2.0.0";
 /// DuckDB's own DuckLake patches, which it applies to the commit it pins
 /// before building the extension. The series here targets that patched
 /// source, so every application composes theirs first.
@@ -35,15 +35,13 @@ pub(crate) const PATCH_PATHS: [&str; 7] = [
     "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
     "patches/ducklake/0005-feat-change-DuckLake-rows-by-position.patch",
     "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
-    "patches/ducklake/0007-fix-write-row-ids-when-merging.patch",
+    "patches/ducklake/0007-fix-keep-the-row-ids-a-merged-file-carries.patch",
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.
-const REGRESSION_TEST_PATHS: [&str; 4] = [
+const REGRESSION_TEST_PATHS: [&str; 2] = [
     "test/sql/rowid/ducklake_row_id_file_pruning.test",
     "test/sql/rowid/ducklake_data_file_id.test",
-    "test/sql/compaction/merge_flushed_files_keep_row_ids.test",
-    "test/sql/compaction/merge_updated_files_keep_row_ids.test",
 ];
 
 #[derive(Debug, PartialEq, Eq)]

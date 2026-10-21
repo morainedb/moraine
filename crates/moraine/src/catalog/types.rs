@@ -11,7 +11,22 @@ pub const CATALOG_VERSION: &str = "1.0";
 /// newest shape it serves. Raising is one-way — a DuckLake that requires
 /// an older version refuses the raised store — so it is never the version
 /// a store is created with.
-pub const MAX_CATALOG_VERSION: &str = "1.1-dev1";
+pub const MAX_CATALOG_VERSION: &str = "1.1";
+
+/// The development label `MAX_CATALOG_VERSION` superseded. A store raised
+/// while it was current records it and is served the same shape; DuckLake
+/// itself attaches such a store only with automatic migration, which
+/// rewrites the recorded version to `1.1`.
+pub const SUPERSEDED_CATALOG_VERSION: &str = "1.1-dev1";
+
+/// Whether this build serves the shape a store recording `version` wants.
+#[must_use]
+pub fn serves_catalog_version(version: &str) -> bool {
+    matches!(
+        version,
+        CATALOG_VERSION | MAX_CATALOG_VERSION | SUPERSEDED_CATALOG_VERSION
+    )
+}
 
 /// Declares a newtype id over the catalog's `u64` id space.
 macro_rules! id_type {
@@ -182,10 +197,11 @@ pub struct FileColumnStats {
     pub column_id: ColumnId,
     /// Compressed size of this column in the file.
     pub column_size_bytes: u64,
-    /// Number of values (rows) for this column.
-    pub value_count: u64,
-    /// Number of NULLs.
-    pub null_count: u64,
+    /// Number of values (rows) for this column, absent where DuckLake
+    /// records none.
+    pub value_count: Option<u64>,
+    /// Number of NULLs, absent where DuckLake records none.
+    pub null_count: Option<u64>,
     /// Minimum value, verbatim.
     pub min_value: Option<String>,
     /// Maximum value, verbatim.

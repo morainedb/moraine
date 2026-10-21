@@ -65,17 +65,17 @@ applies them) and then the series below, in file-name order:
    positions directly. Rollback, repeated deletes, prepared statements,
    and autocommit are covered by `cargo xtask e2e`.
 
-`0007-fix-write-row-ids-when-merging.patch` makes
-`ducklake_merge_adjacent_files` write the row-id column into every merged
-file. Stock DuckLake judges two files adjacent from `row_id_start +
-record_count` alone, drops the column when they are, and numbers the merged
-file by position. A file's registered start says nothing about the ids its
-rows carry: a flushed file whose batch straddled two partitions holds ids
-with gaps and a start that is only the lowest of them, and an update's
-output holds its rows' original ids under a start at the next free id, so
-either chains onto a neighbour and every row after a gap is renumbered
-onto ids other rows hold. The `merge_flushed_files_keep_row_ids` and
-`merge_updated_files_keep_row_ids` sqllogictests pin both shapes.
+`0007-fix-keep-the-row-ids-a-merged-file-carries.patch` stops
+`ducklake_merge_adjacent_files` registering the merged file at a dense
+`row_id_start`. DuckLake writes the row-id column into every merged file,
+then judges two files adjacent from `row_id_start + record_count` and
+registers the merge at the first file's start, which discards those ids. A
+file's start says nothing about the ids its rows carry: a flushed file
+whose batch straddled two partitions holds ids with gaps under a start that
+is only the lowest of them, and an update's output holds its rows' original
+ids under a start at the next free id. Either chains onto a neighbour, and
+every row after a gap is renumbered onto ids other rows hold. Covered by
+`cargo xtask e2e`, which merges both shapes and reads the ids back.
 
 `0005` supplies the positional DELETE used by the optimizer when a certified
 index answers the entire equality predicate. The public located-change SQL
@@ -211,6 +211,3 @@ the bundle for the version in `.github/duckdb-versions` on the four native
 platforms, each build running the row-ID statistics, one-file pruning, and
 positional-delete smoke (`release-smoke.sql`) against itself, through
 `cargo xtask validate-release-artifact`.
-Nothing is published while that version is a development revision of
-DuckDB: no released DuckDB reports its version string, so no build of it
-would load anywhere.

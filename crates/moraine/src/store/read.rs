@@ -1065,7 +1065,7 @@ mod tests {
                         data_file_id,
                         table_id: 1,
                         column_id,
-                        value_count: 1_000,
+                        value_count: Some(1_000),
                         min_value: Some("0".to_owned()),
                         max_value: Some("999".to_owned()),
                         ..FileColumnStatsValue::default()

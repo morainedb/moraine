@@ -3,7 +3,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_bool, opt_c_string, opt_into_raw, to_c_string};
+use super::{dump_rows, free_rows, opt_bool, opt_c_string, opt_into_raw, opt_u64, to_c_string};
 use crate::{
     abi::free_c_string,
     error::{AbiError, MoraineError},
@@ -238,9 +238,13 @@ pub struct MoraineFileColumnStatsRow {
     pub column_id: u64,
     /// `column_size_bytes`.
     pub column_size_bytes: u64,
-    /// `value_count`.
+    /// Whether `value_count` is present.
+    pub has_value_count: bool,
+    /// `value_count`, valid iff `has_value_count`.
     pub value_count: u64,
-    /// `null_count`.
+    /// Whether `null_count` is present.
+    pub has_null_count: bool,
+    /// `null_count`, valid iff `has_null_count`.
     pub null_count: u64,
     /// `min_value`, owned, null if absent.
     pub min_value: *mut c_char,
@@ -281,6 +285,8 @@ pub(crate) fn file_column_stats_rows(
         .into_iter()
         .map(|(v, min_value, max_value, extra_stats)| {
             let (has_nan, contains_nan) = opt_bool(v.contains_nan);
+            let (has_value_count, value_count) = opt_u64(v.value_count);
+            let (has_null_count, null_count) = opt_u64(v.null_count);
             let (has_min_is_exact, min_is_exact) = opt_bool(v.min_is_exact);
             let (has_max_is_exact, max_is_exact) = opt_bool(v.max_is_exact);
             MoraineFileColumnStatsRow {
@@ -288,8 +294,10 @@ pub(crate) fn file_column_stats_rows(
                 table_id: v.table_id,
                 column_id: v.column_id,
                 column_size_bytes: v.column_size_bytes,
-                value_count: v.value_count,
-                null_count: v.null_count,
+                has_value_count,
+                value_count,
+                has_null_count,
+                null_count,
                 min_value: opt_into_raw(min_value),
                 max_value: opt_into_raw(max_value),
                 has_contains_nan: has_nan,
@@ -414,9 +422,13 @@ pub struct MoraineFileVariantStatsRow {
     pub shredded_type: *mut c_char,
     /// `column_size_bytes`.
     pub column_size_bytes: u64,
-    /// `value_count`.
+    /// Whether `value_count` is present.
+    pub has_value_count: bool,
+    /// `value_count`, valid iff `has_value_count`.
     pub value_count: u64,
-    /// `null_count`.
+    /// Whether `null_count` is present.
+    pub has_null_count: bool,
+    /// `null_count`, valid iff `has_null_count`.
     pub null_count: u64,
     /// `min_value`, owned, null if absent.
     pub min_value: *mut c_char,
@@ -460,6 +472,8 @@ pub(crate) fn file_variant_stats_rows(
         .map(
             |(row, variant_path, shredded_type, min_value, max_value, extra_stats)| {
                 let (has_contains_nan, contains_nan) = opt_bool(row.contains_nan);
+                let (has_value_count, value_count) = opt_u64(row.value_count);
+                let (has_null_count, null_count) = opt_u64(row.null_count);
                 MoraineFileVariantStatsRow {
                     data_file_id: row.data_file_id,
                     table_id: row.table_id,
@@ -467,8 +481,10 @@ pub(crate) fn file_variant_stats_rows(
                     variant_path: variant_path.into_raw(),
                     shredded_type: shredded_type.into_raw(),
                     column_size_bytes: row.column_size_bytes,
-                    value_count: row.value_count,
-                    null_count: row.null_count,
+                    has_value_count,
+                    value_count,
+                    has_null_count,
+                    null_count,
                     min_value: opt_into_raw(min_value),
                     max_value: opt_into_raw(max_value),
                     has_contains_nan,

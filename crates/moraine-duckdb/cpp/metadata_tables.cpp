@@ -62,6 +62,13 @@ duckdb::Value Varchar(const char *s) {
 	return OptVarchar(s);
 }
 
+// The catalog version whose shape adds 1.1's columns and tables, and the
+// development label it superseded: a store raised under either is served
+// the same shape and reports the stable one.
+constexpr const char *kExtendedCatalogVersion = "1.1";
+constexpr const char *kSupersededExtendedCatalogVersion = "1.1-dev1";
+
+
 duckdb::Value Bigint(uint64_t v) {
 	return duckdb::Value::BIGINT(static_cast<int64_t>(v));
 }
@@ -323,6 +330,18 @@ std::vector<duckdb::Value> SchemaShape(const MoraineSchemaRow &r) {
 	    Varchar(r.schema_name),      Varchar(r.path),
 	    Boolean(r.path_is_relative),
 	};
+}
+
+std::vector<duckdb::Value> ExtendedSchemaShape(const MoraineSchemaRow &r) {
+	auto values = SchemaShape(r);
+	values.push_back(duckdb::Value(duckdb::LogicalType::BIGINT));
+	return values;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideExtendedSchemas(MoraineCatalogHandle *handle,
+                                                               MoraineInterruptProbe probe, void *probe_ctx) {
+	return DumpRows<MoraineSchemaRow>(handle, probe, probe_ctx, moraine_dump_schemas, moraine_dump_schemas_free,
+	                                  ExtendedSchemaShape);
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideSchemas(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
@@ -664,7 +683,9 @@ std::vector<duckdb::Value> ExtendedFileColumnStatsShape(const MoraineFileColumnS
 std::vector<duckdb::Value> FileColumnStatsShapeAt(const MoraineFileColumnStatsRow &r, bool extended) {
 	std::vector<duckdb::Value> values = {
 	    Bigint(r.data_file_id),      Bigint(r.table_id),      Bigint(r.column_id),
-	    Bigint(r.column_size_bytes), Bigint(r.value_count),   Bigint(r.null_count),
+	    Bigint(r.column_size_bytes),
+	    OptBigint(r.has_value_count, r.value_count),
+	    OptBigint(r.has_null_count, r.null_count),
 	    OptVarchar(r.min_value),     OptVarchar(r.max_value), OptBoolean(r.has_contains_nan, r.contains_nan),
 	    OptVarchar(r.extra_stats),
 	};
@@ -681,7 +702,9 @@ std::vector<duckdb::Value> FileVariantStatsShape(const MoraineFileVariantStatsRo
 	return {
 	    Bigint(r.data_file_id),     Bigint(r.table_id),       Bigint(r.column_id),
 	    Varchar(r.variant_path),    Varchar(r.shredded_type), Bigint(r.column_size_bytes),
-	    Bigint(r.value_count),      Bigint(r.null_count),     OptVarchar(r.min_value),
+	    OptBigint(r.has_value_count, r.value_count),
+	    OptBigint(r.has_null_count, r.null_count),
+	    OptVarchar(r.min_value),
 	    OptVarchar(r.max_value),    OptBoolean(r.has_contains_nan, r.contains_nan),
 	    OptVarchar(r.extra_stats),
 	};
@@ -874,7 +897,7 @@ std::vector<std::vector<duckdb::Value>> ProvideColumnTags(MoraineCatalogHandle *
 }
 
 // One `ducklake_view_column_tag` record's column list. Catalog version
-// 1.1-dev1 adds the table, so only the extended shape declares it.
+// 1.1 adds the table, so only the extended shape declares it.
 std::vector<duckdb::Value> ViewColumnTagShape(const MoraineViewColumnTagRow &r) {
 	return {
 	    Bigint(r.view_id),        Varchar(r.column_name),
@@ -944,7 +967,7 @@ std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *
 	auto null_bigint = duckdb::Value(duckdb::LogicalType::BIGINT);
 
 	std::vector<std::vector<duckdb::Value>> rows = {
-	    {Varchar("version"), Varchar(extended ? "1.1-dev1" : "1.0"), null_varchar, null_bigint},
+	    {Varchar("version"), Varchar(extended ? kExtendedCatalogVersion : "1.0"), null_varchar, null_bigint},
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
 	    {Varchar("encrypted"), Varchar(encrypted ? "true" : "false"), null_varchar, null_bigint},
 	};
@@ -1080,8 +1103,6 @@ std::vector<std::vector<duckdb::Value>> ProvideInlinedDataTables(MoraineCatalogH
 // only for columns DuckLake declares `NOT NULL` or `PRIMARY KEY`; every
 // other column is left nullable to match DuckLake's literal schema, even ids
 // it always populates in practice.
-constexpr const char *kExtendedCatalogVersion = "1.1-dev1";
-
 const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	static const std::vector<MetadataTableSpec> specs = {
 	    {
@@ -2075,7 +2096,7 @@ duckdb::TableFunction MetadataScanTableFunction() {
 	return function;
 }
 
-// The 1.0 list with catalog version 1.1-dev1's additions applied: the
+// The 1.0 list with catalog version 1.1's additions applied: the
 // columns it appends, the providers that emit them, and the table it adds.
 // Built by extending the 1.0 list so the two can never disagree about
 // anything 1.0 declares, and held as its own static because a spec is
@@ -2086,7 +2107,12 @@ const std::vector<MetadataTableSpec> &ExtendedMetadataTableSpecsImpl() {
 		std::vector<MetadataTableSpec> extended = MetadataTableSpecsImpl();
 		for (auto &spec : extended) {
 			std::string name(spec.name);
-			if (name == "ducklake_metadata") {
+			if (name == "ducklake_schema") {
+				spec.columns.push_back({"parent_schema_id", "BIGINT", false});
+				spec.provider = ProvideExtendedSchemas;
+				spec.tx = TxProviders<MoraineSchemaRow>(moraine_dump_schemas_free, ExtendedSchemaShape,
+				                                        moraine_tx_dump_schemas);
+			} else if (name == "ducklake_metadata") {
 				spec.provider = ProvideMetadata<true>;
 				spec.tx.provider = TxProvideMetadata<true>;
 			} else if (name == "ducklake_data_file") {
@@ -2151,7 +2177,7 @@ bool MoraineServesExtendedCatalog(MoraineCatalogHandle *handle) {
 	}
 	std::string recorded(version == nullptr ? "" : version);
 	moraine_string_free(version);
-	return recorded == kExtendedCatalogVersion;
+	return recorded == kExtendedCatalogVersion || recorded == kSupersededExtendedCatalogVersion;
 }
 
 const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs(bool extended) {

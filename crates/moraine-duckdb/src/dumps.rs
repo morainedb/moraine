@@ -209,8 +209,8 @@ pub(crate) mod test_support {
                             column_stats: vec![FileColumnStats {
                                 column_id: column,
                                 column_size_bytes: 100,
-                                value_count: 10,
-                                null_count: 0,
+                                value_count: Some(10),
+                                null_count: Some(0),
                                 min_value: Some("1".into()),
                                 max_value: Some("10".into()),
                                 contains_nan: None,

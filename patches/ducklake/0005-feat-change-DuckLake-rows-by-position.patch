@@ -1,7 +1,8 @@
 diff --git a/src/ducklake_extension.cpp b/src/ducklake_extension.cpp
+index d26cc7cd..e14e0afe 100644
 --- a/src/ducklake_extension.cpp
 +++ b/src/ducklake_extension.cpp
-@@ -83,6 +83,7 @@
+@@ -83,6 +83,7 @@ static void LoadInternal(ExtensionLoader &loader) {
  	DuckLakeSetOptionFunction set_options;
  	loader.RegisterFunction(set_options);
  
@@ -10,9 +11,10 @@ diff --git a/src/ducklake_extension.cpp b/src/ducklake_extension.cpp
  	loader.RegisterFunction(options);
  
 diff --git a/src/functions/CMakeLists.txt b/src/functions/CMakeLists.txt
+index 18778f49..fadf9e43 100644
 --- a/src/functions/CMakeLists.txt
 +++ b/src/functions/CMakeLists.txt
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,7 @@ add_library(
    ducklake_functions OBJECT
    base_metadata_function.cpp
    ducklake_add_data_files.cpp
@@ -22,9 +24,10 @@ diff --git a/src/functions/CMakeLists.txt b/src/functions/CMakeLists.txt
    ducklake_expire_snapshots.cpp
 diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklake_delete_positions.cpp
 new file mode 100644
+index 00000000..583c4e2a
 --- /dev/null
 +++ b/src/functions/ducklake_delete_positions.cpp
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,335 @@
 +#include "functions/ducklake_table_functions.hpp"
 +#include "duckdb/common/enums/database_modification_type.hpp"
 +#include "duckdb/common/map.hpp"
@@ -157,7 +160,7 @@ new file mode 100644
 +	if (name.empty()) {
 +		return;
 +	}
-+	auto result = transaction.Query(
++	auto result = transaction.GetMetadataManager().Query(
 +	    snapshot, StringUtil::Format(
 +	                  "SELECT row_id FROM {METADATA_CATALOG}.%s WHERE file_id = %d AND begin_snapshot <= {SNAPSHOT_ID}",
 +	                  name, file_id));
@@ -235,7 +238,8 @@ new file mode 100644
 +			auto known = request.existing_positions.find(requested.first);
 +			if (transaction.HasLocalDeleteForFile(table_id, file.file.path)) {
 +				DuckLakeFileData pending;
-+				transaction.GetLocalDeleteForFile(table_id, file.file.path, pending);
++				optional_idx pending_begin_snapshot;
++				transaction.GetLocalDeleteForFile(table_id, file.file.path, pending, pending_begin_snapshot);
 +				auto scanned = DuckLakeDeleteFilter::ScanDeleteFile(context, pending);
 +				positions.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
 +			} else if (known != request.existing_positions.end()) {
@@ -320,7 +324,7 @@ new file mode 100644
 +
 +static unique_ptr<FunctionData> DeletePositionsBind(ClientContext &context, TableFunctionBindInput &input,
 +                                                    vector<LogicalType> &types, vector<Identifier> &names) {
-+	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]).Cast<DuckLakeCatalog>();
++	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input);
 +	auto &table = LookupTable(context, catalog, input.inputs[1], input.inputs[2]);
 +	auto result = make_uniq<DeletePositionsBindData>(catalog, table,
 +	                                                 ParsePositionalDeletes(input, "ducklake_delete_positions"));
@@ -360,9 +364,10 @@ new file mode 100644
 +
 +} // namespace duckdb
 diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/functions/ducklake_table_functions.hpp
+index 352cf7fd..57188fe9 100644
 --- a/src/include/functions/ducklake_table_functions.hpp
 +++ b/src/include/functions/ducklake_table_functions.hpp
-@@ -101,6 +101,11 @@
+@@ -124,6 +124,11 @@ public:
  	DuckLakeSetOptionFunction();
  };
  

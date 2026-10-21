@@ -1592,7 +1592,7 @@ impl Catalog {
 
         // Never lower a store: a version this build cannot order is one a
         // newer build recorded, and that shape is not ours to move.
-        if from != crate::catalog::CATALOG_VERSION && from != crate::catalog::MAX_CATALOG_VERSION {
+        if !crate::catalog::serves_catalog_version(&from) {
             return Err(Error::Migration(format!(
                 "store records catalog version {from}, which this build does not serve"
             )));
@@ -1611,9 +1611,7 @@ impl Catalog {
             let recorded = tx
                 .catalog_version()
                 .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
-            if recorded != crate::catalog::CATALOG_VERSION
-                && recorded != crate::catalog::MAX_CATALOG_VERSION
-            {
+            if !crate::catalog::serves_catalog_version(&recorded) {
                 return Err(Error::Migration(format!(
                     "store records catalog version {recorded}, which this build does not serve"
                 )));

@@ -12,7 +12,7 @@ use std::{fmt::Write as _, path::Path};
 
 use crate::helpers::*;
 
-/// A table the 1.1-dev1 shape declares and the 1.0 shape does not.
+/// A table the 1.1 shape declares and the 1.0 shape does not.
 const EXTENDED_ONLY_TABLE: &str = "ducklake_view_column_tag";
 
 /// The `from_version`/`to_version` row one raise reports.
@@ -99,7 +99,7 @@ fn raising_the_catalog_version_widens_the_shape_for_later_sessions() {
     // any way is still a dry run, never a one-way raise.
     assert_eq!(
         raise(store.path(), ", DRY_RUN => true"),
-        vec![vec!["1.0", "1.1-dev1"]]
+        vec![vec!["1.0", "1.1"]]
     );
     assert!(
         !serves_extended_shape(store.path()),
@@ -117,7 +117,7 @@ fn raising_the_catalog_version_widens_the_shape_for_later_sessions() {
              INSERT INTO seen SELECT 3, value FROM m.ducklake_metadata WHERE key = 'version';
              COMMIT;
              SELECT value FROM seen ORDER BY step;")),
-        vec![vec!["1.0"], vec!["1.0->1.1-dev1"], vec!["1.0"], vec!["1.0"]]
+        vec![vec!["1.0"], vec!["1.0->1.1"], vec!["1.0"], vec!["1.0"]]
     );
     assert!(
         serves_extended_shape(store.path()),
@@ -135,7 +135,7 @@ fn raising_the_catalog_version_widens_the_shape_for_later_sessions() {
     // Nothing left to raise; the report says so rather than failing.
     assert_eq!(
         raise(store.path(), ", confirm => true"),
-        vec![vec!["1.1-dev1", "1.1-dev1"]]
+        vec![vec!["1.1", "1.1"]]
     );
 }
 
@@ -168,7 +168,7 @@ fn a_raised_store_still_serves_the_lake() {
 
     assert_eq!(
         raise(store.path(), ", confirm => true"),
-        vec![vec!["1.0", "1.1-dev1"]]
+        vec![vec!["1.0", "1.1"]]
     );
     assert!(serves_extended_shape(store.path()));
 
@@ -277,11 +277,11 @@ fn a_recording_raise_takes_an_acknowledgement() {
     // The pre-flight itself is unacknowledged, and still reports the move.
     assert_eq!(
         raise(store.path(), ", dry_run => true"),
-        vec![vec!["1.0", "1.1-dev1"]]
+        vec![vec!["1.0", "1.1"]]
     );
 }
 
-/// 1.1-dev1 moves an inlined table's lifecycle columns behind the
+/// 1.1 moves an inlined table's lifecycle columns behind the
 /// `_ducklake_` prefix, rows inlined under the old shape read back under
 /// the new one, and the staged-row lifecycle UPDATE takes the prefixed
 /// spelling while any other UPDATE is still refused.
@@ -312,7 +312,7 @@ fn raising_prefixes_the_lifecycle_columns_of_an_inlined_table() {
 
     assert_eq!(
         raise(store.path(), ", confirm => true"),
-        vec![vec!["1.0", "1.1-dev1"]]
+        vec![vec!["1.0", "1.1"]]
     );
 
     assert_eq!(
@@ -322,7 +322,7 @@ fn raising_prefixes_the_lifecycle_columns_of_an_inlined_table() {
             "_ducklake_begin_snapshot",
             "_ducklake_end_snapshot"
         ],
-        "1.1-dev1 moves them behind the prefix DuckLake reserves"
+        "1.1 moves them behind the prefix DuckLake reserves"
     );
     assert_eq!(
         csv_rows(&run_standalone_sql(
