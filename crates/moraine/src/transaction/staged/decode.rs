@@ -150,22 +150,9 @@ pub(super) fn decode_schema(cells: &[Cell]) -> Result<proto::SchemaValue> {
     Ok(value)
 }
 
-/// `ducklake_table`'s row shape, minus `next_column_id` — moraine-internal
-/// bookkeeping DuckLake never authors (see [`table_value`]).
-pub(super) struct TableCells {
-    pub(super) table_id: u64,
-    pub(super) table_uuid: String,
-    pub(super) begin_snapshot: u64,
-    pub(super) end_snapshot: Option<u64>,
-    pub(super) schema_id: u64,
-    pub(super) table_name: String,
-    pub(super) path: String,
-    pub(super) path_is_relative: bool,
-}
-
-pub(super) fn decode_table(cells: &[Cell]) -> Result<TableCells> {
+pub(super) fn decode_table(cells: &[Cell]) -> Result<proto::TableValue> {
     let mut c = Cursor::new(TableKind::Table, cells);
-    let value = TableCells {
+    let value = proto::TableValue {
         table_id: c.u64()?,
         table_uuid: c.string()?,
         begin_snapshot: c.u64()?,
@@ -174,29 +161,21 @@ pub(super) fn decode_table(cells: &[Cell]) -> Result<TableCells> {
         table_name: c.string()?,
         path: c.string()?,
         path_is_relative: c.bool()?,
+        next_column_id: 1,
     };
     c.finish()?;
     Ok(value)
 }
 
-/// Builds the full `TableValue`, carrying `next_column_id` forward from
-/// the table's prior version in `base` (floor of 1 for a new id).
-pub(super) fn table_value(base: &CatalogSnapshot, cells: TableCells) -> proto::TableValue {
-    let next_column_id = base
-        .tables
-        .get(&cells.table_id)
-        .map_or(1, |t| t.next_column_id);
-    proto::TableValue {
-        table_id: cells.table_id,
-        table_uuid: cells.table_uuid,
-        begin_snapshot: cells.begin_snapshot,
-        end_snapshot: cells.end_snapshot,
-        schema_id: cells.schema_id,
-        table_name: cells.table_name,
-        path: cells.path,
-        path_is_relative: cells.path_is_relative,
-        next_column_id,
+/// Preserves the field-id counter from the table's prior committed version.
+pub(super) fn table_value(
+    base: &CatalogSnapshot,
+    mut value: proto::TableValue,
+) -> proto::TableValue {
+    if let Some(prior) = base.tables.get(&value.table_id) {
+        value.next_column_id = prior.next_column_id;
     }
+    value
 }
 
 pub(super) fn decode_view(cells: &[Cell]) -> Result<proto::ViewValue> {

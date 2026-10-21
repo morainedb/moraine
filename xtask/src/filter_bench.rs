@@ -10,11 +10,7 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 
-use crate::duckdb;
-
-fn quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
+use crate::{catalog_target::sql_literal, duckdb};
 
 fn execute(cli: &Path, preamble: &str, sql: &str) -> anyhow::Result<String> {
     let child = Command::new(cli)
@@ -93,10 +89,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let data = fixture.join("data");
     let preamble = format!(
         "LOAD {}; SET threads=1; ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, DATA_INLINING_ROW_LIMIT {}, META_CACHE_PUTS false);",
-        quoted(&extension.display().to_string()),
-        quoted(&format!("ducklake:moraine:{}", store.display())),
-        quoted(&data.display().to_string()),
-        quoted(&data.display().to_string()),
+        sql_literal(&extension.display().to_string()),
+        sql_literal(&format!("ducklake:moraine:{}", store.display())),
+        sql_literal(&data.display().to_string()),
+        sql_literal(&data.display().to_string()),
         if embedded { 1_048_576 } else { 0 }
     );
     if options.fixture.is_none() {
@@ -124,8 +120,8 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let mut builds = vec![("candidate", preamble.clone())];
     if let Some(baseline) = baseline {
         let baseline_preamble = preamble.replacen(
-            &format!("LOAD {};", quoted(&extension.display().to_string())),
-            &format!("LOAD {};", quoted(&baseline.display().to_string())),
+            &format!("LOAD {};", sql_literal(&extension.display().to_string())),
+            &format!("LOAD {};", sql_literal(&baseline.display().to_string())),
             1,
         );
         builds.push(("baseline", baseline_preamble));

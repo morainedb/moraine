@@ -3,10 +3,9 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_u64};
+use super::{conversion::dump_row, dump_rows, free_rows};
 use crate::{
-    abi::{free_c_string, to_c_string},
-    error::{AbiError, MoraineError},
+    error::MoraineError,
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -22,28 +21,13 @@ pub struct MoraineColumnMappingRow {
     pub map_type: *mut c_char,
 }
 
-/// Converts core `ducklake_column_mapping` records into the C row shape. Shared
-/// by the committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn mapping_rows(
-    rows: Vec<moraine::ffi_support::MappingRecord>,
-) -> Result<Vec<MoraineColumnMappingRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut m| {
-            let map_type = to_c_string(std::mem::take(&mut m.map_type))?;
-            Ok((m, map_type))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(m, map_type)| MoraineColumnMappingRow {
-            mapping_id: m.mapping_id,
-            table_id: m.table_id,
-            map_type: map_type.into_raw(),
-        })
-        .collect())
+dump_row! {
+    mapping_rows(moraine::ffi_support::MappingRecord) -> MoraineColumnMappingRow {
+        values { mapping_id, table_id }
+        optional {}
+        strings { map_type }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_column_mapping` row into
@@ -94,9 +78,7 @@ pub unsafe extern "C" fn moraine_dump_column_mappings_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.map_type);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -120,35 +102,13 @@ pub struct MoraineNameMappingRow {
     pub is_partition: bool,
 }
 
-/// Converts core `ducklake_name_mapping` records into the C row shape. Shared
-/// by the committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn name_mapping_rows(
-    rows: Vec<moraine::ffi_support::NameMappingRow>,
-) -> Result<Vec<MoraineNameMappingRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let source_name = to_c_string(std::mem::take(&mut row.source_name))?;
-            Ok((row, source_name))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(row, source_name)| {
-            let (has_parent, parent) = opt_u64(row.parent_column);
-            MoraineNameMappingRow {
-                mapping_id: row.mapping_id,
-                column_id: row.column_id,
-                source_name: source_name.into_raw(),
-                target_field_id: row.target_field_id,
-                has_parent_column: has_parent,
-                parent_column: parent,
-                is_partition: row.is_partition,
-            }
-        })
-        .collect())
+dump_row! {
+    name_mapping_rows(moraine::ffi_support::NameMappingRow) -> MoraineNameMappingRow {
+        values { mapping_id, column_id, target_field_id, is_partition }
+        optional { parent_column => has_parent_column }
+        strings { source_name }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_name_mapping` row — flattened from the embedded
@@ -199,8 +159,6 @@ pub unsafe extern "C" fn moraine_dump_name_mappings_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.source_name);
-        });
+        free_rows(items, len);
     }
 }

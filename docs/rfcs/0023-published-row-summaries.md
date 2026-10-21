@@ -130,10 +130,17 @@ Two producers, which between them leave nothing behind:
    before summaries were published. It walks everything, but a file already
    published costs one header read — no summary is fetched to find out — so it
    is expensive exactly once per lake and negligible after.
-2. **A pass over what a commit added**, run once the commit returns and bounded
-   to the files registered after the snapshot that preceded it. Every commit
-   after the backfill publishes its own, so the two together cover the lake
-   without either one re-walking it.
+2. **A pass over what commits added**, queued after a commit returns and bounded
+   to files registered after the earliest preceding snapshot in the batch.
+
+Each attach owns one worker for warming and publishing. While a pass runs,
+requests merge into one pending batch: touched tables are deduplicated, and the
+oldest snapshot boundary is retained even when commits enqueue out of order.
+An attach backfill covers every file and takes precedence over commit cutoffs.
+More than 1,024 pending table IDs becomes an all-table warm, bounding the queue
+without dropping work. Detach cancels and joins the worker before closing the
+catalog. Publishing remains best effort; failed or interrupted files can be
+retried by a later attach or an explicit publishing call.
 
 Neither can live inside the commit, and not for want of trying: the commit
 protocol holds no data store, by design, so it cannot read the file it just
@@ -197,6 +204,14 @@ count sidecar hit, miss, rejected-on-identity and publish outcome, so a
 deployment can tell "none published yet" from "published and refused".
 
 ### Memory
+
+A full summary and membership readers share the same immutable membership
+allocation. Membership-only reads still avoid loading positions. Independently
+decoded cache entries can retain separate copies, and cache weights remain
+conservative when entries share an allocation. File lookup directories can
+retain summaries after shared-cache eviction, under their separate 64 MiB
+accounted-entry limit per catalog. Active readers may retain evicted directories
+until their queries finish; neither budget is a process-wide memory limit.
 
 A resident summary never consults a sidecar, so this adds nothing to a hit. It
 changes the cost of a **miss**, and of an eviction, from 5.21 MB to 1.25 MB for

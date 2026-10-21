@@ -22,7 +22,6 @@ use moraine::ffi_support::inline::{InlineBodies, InlineScanCursor, InlineScanKin
 
 use crate::{
     abi::{free_array, guard, write_array},
-    dumps::opt_u64,
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
@@ -318,7 +317,6 @@ pub unsafe extern "C" fn moraine_inline_scan_next(
             .rows
             .into_iter()
             .map(|row| {
-                let (has_end_snapshot, end_snapshot) = opt_u64(row.end_snapshot);
                 let chunk_index = usize::try_from(row.chunk_index).map_err(|_| {
                     AbiError::invalid_argument("inline scan chunk index exceeds usize")
                 })?;
@@ -326,8 +324,8 @@ pub unsafe extern "C" fn moraine_inline_scan_next(
                     row_id: row.row_id,
                     schema_version: row.schema_version,
                     begin_snapshot: row.begin_snapshot,
-                    has_end_snapshot,
-                    end_snapshot,
+                    has_end_snapshot: row.end_snapshot.is_some(),
+                    end_snapshot: row.end_snapshot.unwrap_or_default(),
                     chunk_index,
                     offset_in_chunk: row.offset_in_chunk,
                 })

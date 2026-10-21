@@ -767,7 +767,7 @@ regardless of the language it is written in.
   the *clone* in `dump_entities`, not the marshalling), and that fix is
   strictly cheaper and strictly prior. Against that, the row structs are
   the schema contract: each is checked field-for-field against
-  `metadata_tables.cpp`'s spec table by the compiler and against
+  `metadata_table_specs.cpp`'s spec table by the compiler and against
   DuckLake's own DDL by review, where an Arrow schema assembled at runtime
   would move both to a runtime failure. Inline chunk bodies are the case
   that genuinely is columnar and where DuckDB owns both export and import,
@@ -778,6 +778,20 @@ regardless of the language it is written in.
   (SlateDB requires tokio, RFC 0001). The C-ABI layer owns the tokio runtime
   and `block_on`s core futures, so the C++ shim only ever calls synchronous C
   functions. This is the "FFI boundary" of RFC 0001's async rule.
+
+### Metadata row conversion
+
+Metadata row structs and exported functions remain explicit Rust declarations
+so cbindgen can generate the C header without expanding macros. Each row has
+one field mapping for scalar values, nullable scalars, owned strings, and
+nullable strings. That mapping defines both record conversion and cleanup.
+
+Conversion validates all strings in a row before transferring their pointers.
+A batch owner releases completed rows if a later conversion fails or unwinds;
+only a successful batch transfers ownership to the caller. This avoids an
+intermediate buffer of records and converted strings. The C row structs have
+no Rust destructor: only the conversion owner and the matching exported free
+function release their pointers.
 
 ### C ABI error mapping (v0)
 

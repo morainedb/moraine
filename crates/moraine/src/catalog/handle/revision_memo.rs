@@ -1,6 +1,4 @@
-//! Bounded results shared by read scopes at the same store revision, for
-//! reads whose answer is fixed once the revision is: the memo is the same
-//! shape as the probe cache, over any key and value.
+//! Byte- and count-bounded results shared at one store revision.
 
 use std::{
     collections::VecDeque,
@@ -48,16 +46,26 @@ impl<K: Eq, V> RevisionMemo<K, V> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let spare = (entries.values.capacity() - entries.values.len()) * size_of::<Entry<K, V>>();
-        u64::try_from(entries.bytes + spare).unwrap_or(u64::MAX)
+        u64::try_from(entries.bytes.saturating_add(spare)).unwrap_or(u64::MAX)
     }
 
     pub(super) fn get(&self, revision: u64, table: TableId, key: &K) -> Option<Arc<V>> {
+        self.get_matching(revision, table, |candidate| candidate == key)
+    }
+
+    /// Looks up a composite key without allocating an owned copy of it.
+    pub(super) fn get_matching(
+        &self,
+        revision: u64,
+        table: TableId,
+        matches: impl Fn(&K) -> bool,
+    ) -> Option<Arc<V>> {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let position = entries.values.iter().position(|entry| {
-            entry.revision == revision && entry.table == table && &entry.key == key
+            entry.revision == revision && entry.table == table && matches(&entry.key)
         })?;
         let entry = entries.values.remove(position)?;
         let value = Arc::clone(&entry.value);
@@ -65,12 +73,20 @@ impl<K: Eq, V> RevisionMemo<K, V> {
         Some(value)
     }
 
+    /// Whether `bytes`, plus the entry header, fits the retention limits.
+    pub(super) fn can_hold(&self, bytes: usize) -> bool {
+        self.max_entries != 0
+            && bytes
+                .checked_add(size_of::<Entry<K, V>>())
+                .is_some_and(|total| total <= self.capacity)
+    }
+
     /// `bytes` is what the entry costs to retain, beyond its header.
     pub(super) fn put(&self, revision: u64, table: TableId, key: K, value: Arc<V>, bytes: usize) {
-        let bytes = size_of::<Entry<K, V>>().saturating_add(bytes);
-        if bytes > self.capacity {
+        if !self.can_hold(bytes) {
             return;
         }
+        let bytes = size_of::<Entry<K, V>>() + bytes;
         let mut entries = self
             .entries
             .lock()
@@ -81,7 +97,7 @@ impl<K: Eq, V> RevisionMemo<K, V> {
         {
             entries.bytes -= previous.bytes;
         }
-        while entries.bytes + bytes > self.capacity || entries.values.len() >= self.max_entries {
+        while entries.bytes > self.capacity - bytes || entries.values.len() >= self.max_entries {
             let Some(oldest) = entries.values.pop_back() else {
                 break;
             };
@@ -101,6 +117,24 @@ impl<K: Eq, V> RevisionMemo<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_entry_limit_disables_retention() {
+        let memo = RevisionMemo::new(1024, 0);
+        memo.put(1, TableId::new(1), 1, Arc::new(7), 8);
+        assert!(memo.get(1, TableId::new(1), &1).is_none());
+    }
+
+    #[test]
+    fn near_limit_weights_do_not_overflow_accounting() {
+        let memo: RevisionMemo<u8, u64> = RevisionMemo::new(usize::MAX, 8);
+        let weight = usize::MAX - size_of::<Entry<u8, u64>>();
+        memo.put(1, TableId::new(1), 1, Arc::new(1), weight);
+        assert_eq!(memo.estimated_bytes(), usize::MAX as u64);
+        memo.put(1, TableId::new(1), 2, Arc::new(2), weight);
+        assert!(memo.get(1, TableId::new(1), &1).is_none());
+        assert!(memo.get(1, TableId::new(1), &2).is_some());
+    }
 
     #[test]
     fn revisions_tables_and_keys_do_not_alias() {

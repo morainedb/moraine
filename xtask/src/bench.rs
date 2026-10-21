@@ -13,6 +13,7 @@ pub mod backends;
 pub mod concurrent;
 pub mod in_process;
 pub mod report;
+pub mod support;
 pub mod timing;
 pub mod workloads;
 

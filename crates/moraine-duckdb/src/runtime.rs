@@ -8,13 +8,12 @@ use std::{
     time::Duration,
 };
 
-use futures::future::join_all;
 use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, SnapshotId, TableId};
-use tokio::{
-    runtime::{Builder, Runtime},
-    task::JoinHandle,
-};
-use tracing::warn;
+use tokio::runtime::{Builder, Runtime};
+
+mod background;
+
+use background::{Pass, Worker};
 
 use crate::{
     error::AbiError,
@@ -55,10 +54,8 @@ pub struct MoraineCatalogHandle {
     /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
     /// bare-bucket store), prepended to a data file's stored path.
     pub(crate) data_prefix: String,
-    /// In-flight row-summary warming passes; ended by
-    /// [`finish_warming`](MoraineCatalogHandle::finish_warming) before the
-    /// catalog closes.
-    warming: Mutex<Vec<JoinHandle<()>>>,
+    /// Stopped before closing the catalog it reads.
+    warming: Mutex<Option<Worker>>,
 }
 
 /// Which mode the attach opened in. A write on a read-only attach is
@@ -97,7 +94,7 @@ impl MoraineCatalogHandle {
             log_id,
             data_store: None,
             data_prefix: String::new(),
-            warming: Mutex::new(Vec::new()),
+            warming: Mutex::new(None),
         }
     }
 
@@ -110,7 +107,7 @@ impl MoraineCatalogHandle {
             log_id: self.log_id,
             data_store: self.data_store.clone(),
             data_prefix: self.data_prefix.clone(),
-            warming: Mutex::new(Vec::new()),
+            warming: Mutex::new(None),
         }
     }
 
@@ -118,88 +115,54 @@ impl MoraineCatalogHandle {
     /// also publish missing row summaries; existing summaries cost one header
     /// read.
     pub(crate) fn spawn_warm_at_attach(&self, preload: bool) {
-        let data_store = match self.catalog {
-            AttachedCatalog::Writer(_) => self.data_store.clone(),
-            AttachedCatalog::Reader(_) => None,
-        };
-        if !preload && data_store.is_none() {
+        let publishes =
+            matches!(self.catalog, AttachedCatalog::Writer(_)) && self.data_store.is_some();
+        if !preload && !publishes {
             return;
         }
-        let catalog = self.catalog.reads().clone();
-        let data_prefix = self.data_prefix.clone();
-
-        self.track(self.runtime.spawn(async move {
-            if preload {
-                warm_all_tables(&catalog).await;
-            }
-            let Some(data_store) = data_store else {
-                return;
-            };
-            if let Err(error) = catalog
-                .publish_all_row_summaries(data_store, &data_prefix)
-                .await
-            {
-                warn!(%error, "row summary publishing skipped this attach");
-            }
-        }));
+        self.enqueue_pass(Pass::attach(preload));
     }
 
-    /// Warms touched tables and publishes summaries of files registered since
-    /// the preceding snapshot, when a data store is available.
+    /// Warms touched tables and publishes files registered by this commit.
     pub(crate) fn spawn_commit_passes(&self, tables: Vec<TableId>, committed: SnapshotId) {
-        if tables.is_empty() {
-            return;
+        if !tables.is_empty() {
+            self.enqueue_pass(Pass::commit(tables, committed));
         }
-        let catalog = self.catalog.reads().clone();
-        let data_store = self.data_store.clone();
-        let data_prefix = self.data_prefix.clone();
+    }
 
-        self.track(self.runtime.spawn(async move {
-            if let Err(error) = catalog.warm_tables(&tables).await {
-                warn!(%error, "table warming skipped this commit");
-            }
-            let Some(data_store) = data_store else {
-                return;
+    fn enqueue_pass(&self, pass: Pass) {
+        let mut warming = self
+            .warming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let worker = warming.get_or_insert_with(|| {
+            let store = match self.catalog {
+                AttachedCatalog::Writer(_) => self.data_store.clone(),
+                AttachedCatalog::Reader(_) => None,
             };
-            // Snapshot ids advance by one per commit, so the snapshot
-            // before this one bounds the pass to its own files.
-            let since = SnapshotId::new(committed.get().saturating_sub(1));
-            if let Err(error) = catalog
-                .publish_row_summaries_since(data_store, &data_prefix, since)
-                .await
-            {
-                warn!(%error, "row summary publishing skipped this commit");
-            }
-        }));
+            Worker::start(
+                &self.runtime,
+                self.catalog.reads().clone(),
+                store,
+                self.data_prefix.clone(),
+            )
+        });
+        worker.push(pass);
     }
 
-    /// Retains `task` so a detach can end it, dropping already-finished
-    /// passes.
-    fn track(&self, task: JoinHandle<()>) {
-        let Ok(mut warming) = self.warming.lock() else {
-            return;
-        };
-        warming.retain(|task| !task.is_finished());
-        warming.push(task);
-    }
-
-    /// Cancels the warming passes still in flight and waits for them to
-    /// end, reporting how many were outstanding. Must precede the close:
-    /// warming holds a catalog handle of its own.
+    /// Cancels and joins the worker before the catalog closes.
     pub(crate) fn finish_warming(&self) -> usize {
-        let tasks = match self.warming.lock() {
-            Ok(mut warming) => std::mem::take(&mut *warming),
-            Err(_) => return 0,
-        };
-
-        for task in &tasks {
-            task.abort();
+        let worker = self
+            .warming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            worker.stop(&self.runtime);
+            1
+        } else {
+            0
         }
-        let outstanding = tasks.len();
-        // A cancelled pass reports `JoinError`, which is the ask here.
-        let _ = self.runtime.block_on(join_all(tasks));
-
-        outstanding
     }
 
     /// Runs `future` on the handle's runtime, attributing events the
@@ -264,28 +227,6 @@ impl MoraineCatalogHandle {
                 error
             }
         })
-    }
-}
-
-/// Warms the probe ranges of every table in the head view; failures are
-/// logged, never returned.
-async fn warm_all_tables(catalog: &ReadOnlyCatalog) {
-    let snapshot = match catalog.snapshot().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            warn!(%error, "table warming skipped this attach");
-            return;
-        }
-    };
-    let tables = snapshot
-        .schemas()
-        .into_iter()
-        .flat_map(|schema| snapshot.tables_in(schema.id))
-        .map(|table| table.id)
-        .collect::<Vec<_>>();
-
-    if let Err(error) = catalog.warm_tables(&tables).await {
-        warn!(%error, "table warming skipped this attach");
     }
 }
 
@@ -496,6 +437,43 @@ mod tests {
         error::{MoraineError, codes},
         test_support::{TempDir, attach_ok, attach_with_data_path},
     };
+
+    #[test]
+    fn commit_bursts_share_one_worker_and_shutdown_is_repeatable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let catalog = runtime
+            .block_on(moraine::Catalog::open(
+                std::sync::Arc::new(object_store::memory::InMemory::new()),
+                moraine::CatalogOptions::default(),
+            ))
+            .unwrap();
+        let handle = MoraineCatalogHandle::new(
+            runtime,
+            super::AttachedCatalog::Writer(catalog),
+            crate::logging::allocate_handle_id(),
+        );
+        // The current-thread runtime leaves every request pending until shutdown.
+        for snapshot in 1..=100 {
+            handle.spawn_commit_passes(
+                vec![moraine::TableId::new(1)],
+                moraine::SnapshotId::new(snapshot),
+            );
+        }
+        let workers = handle.finish_warming();
+        assert_eq!(handle.finish_warming(), 0);
+        handle.spawn_commit_passes(
+            vec![moraine::TableId::new(2)],
+            moraine::SnapshotId::new(101),
+        );
+        assert_eq!(handle.finish_warming(), 1);
+        handle
+            .block_on(handle.catalog.writer().unwrap().close())
+            .unwrap();
+        assert_eq!(workers, 1);
+    }
 
     /// An attach without a `DATA_PATH` store spawns no warming.
     #[test]

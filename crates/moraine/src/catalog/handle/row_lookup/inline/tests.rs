@@ -56,6 +56,22 @@ async fn fixture() -> (Arc<InMemory>, TableId) {
     (store, table)
 }
 
+#[tokio::test]
+async fn inline_lookups_preserve_tombstones_without_directory_retention() {
+    let (store, table) = fixture().await;
+    let catalog = Catalog::open(store, CatalogOptions::default())
+        .await
+        .unwrap();
+    *catalog.row_lookups.inline.write().unwrap() = super::super::Directories::new(0);
+    for _ in 0..2 {
+        assert!(catalog.recent_row(table, 1).await.unwrap().is_some());
+        assert!(catalog.recent_row(table, 2).await.unwrap().is_none());
+        assert!(catalog.recent_row(table, 4).await.unwrap().is_some());
+        assert!(super::super::lookup(&catalog.row_lookups.inline, table).is_none());
+    }
+    catalog.close().await.unwrap();
+}
+
 /// The writer scans a table's chunks once and folds every batch after it
 /// into the set that scan seeded, so no later lookup goes back to the
 /// store -- not for an unrelated table's commit, not for a row delete, and

@@ -3,10 +3,9 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_bool, opt_c_string, opt_into_raw, opt_u64, to_c_string};
+use super::{conversion::dump_row, dump_rows, free_rows};
 use crate::{
-    abi::free_c_string,
-    error::{AbiError, MoraineError},
+    error::MoraineError,
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -24,25 +23,13 @@ pub struct MoraineTableStatsRow {
     pub file_size_bytes: u64,
 }
 
-/// Converts core `ducklake_table_stats` records into the C row shape. Shared by
-/// the committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-// Infallible — this kind's row carries no strings — but it keeps the
-// fallible signature every converter shares, so `dump_rows` and the
-// transaction-aware dumps take them all the same way.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn table_stats_rows(
-    rows: Vec<moraine::ffi_support::TableStatsRecord>,
-) -> Result<Vec<MoraineTableStatsRow>, AbiError> {
-    Ok(rows
-        .into_iter()
-        .map(|v| MoraineTableStatsRow {
-            table_id: v.table_id,
-            record_count: v.record_count,
-            next_row_id: v.next_row_id,
-            file_size_bytes: v.file_size_bytes,
-        })
-        .collect())
+dump_row! {
+    table_stats_rows(moraine::ffi_support::TableStatsRecord) -> MoraineTableStatsRow {
+        values { table_id, record_count, next_row_id, file_size_bytes }
+        optional {}
+        strings {}
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_table_stats` row into
@@ -92,7 +79,7 @@ pub unsafe extern "C" fn moraine_dump_table_stats_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |_row| {});
+        free_rows(items, len);
     }
 }
 
@@ -128,45 +115,18 @@ pub struct MoraineTableColumnStatsRow {
     pub max_is_exact: bool,
 }
 
-/// Converts core `ducklake_table_column_stats` records into the C row shape.
-/// Shared by the committed dump and the transaction-aware one, so the two can
-/// never drift in what they report.
-pub(crate) fn table_column_stats_rows(
-    rows: Vec<moraine::ffi_support::TableColumnStatsRecord>,
-) -> Result<Vec<MoraineTableColumnStatsRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|v| {
-            let min_value = opt_c_string(v.min_value.as_deref())?;
-            let max_value = opt_c_string(v.max_value.as_deref())?;
-            let extra_stats = opt_c_string(v.extra_stats.as_deref())?;
-            Ok((v, min_value, max_value, extra_stats))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-    Ok(owned
-        .into_iter()
-        .map(|(v, min_value, max_value, extra_stats)| {
-            let (has_null, contains_null) = opt_bool(v.contains_null);
-            let (has_nan, contains_nan) = opt_bool(v.contains_nan);
-            let (has_min_is_exact, min_is_exact) = opt_bool(v.min_is_exact);
-            let (has_max_is_exact, max_is_exact) = opt_bool(v.max_is_exact);
-            MoraineTableColumnStatsRow {
-                table_id: v.table_id,
-                column_id: v.column_id,
-                has_contains_null: has_null,
-                contains_null,
-                has_contains_nan: has_nan,
-                contains_nan,
-                min_value: opt_into_raw(min_value),
-                max_value: opt_into_raw(max_value),
-                extra_stats: opt_into_raw(extra_stats),
-                has_min_is_exact,
-                min_is_exact,
-                has_max_is_exact,
-                max_is_exact,
-            }
-        })
-        .collect())
+dump_row! {
+    table_column_stats_rows(moraine::ffi_support::TableColumnStatsRecord) -> MoraineTableColumnStatsRow {
+        values { table_id, column_id }
+        optional {
+            contains_null => has_contains_null,
+            contains_nan => has_contains_nan,
+            min_is_exact => has_min_is_exact,
+            max_is_exact => has_max_is_exact,
+        }
+        strings {}
+        optional_strings { min_value, max_value, extra_stats }
+    }
 }
 
 /// Dumps every `ducklake_table_column_stats` row into
@@ -216,11 +176,7 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.min_value);
-            free_c_string(d.max_value);
-            free_c_string(d.extra_stats);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -266,50 +222,19 @@ pub struct MoraineFileColumnStatsRow {
     pub max_is_exact: bool,
 }
 
-/// Converts core `ducklake_file_column_stats` records into the C row shape.
-/// Shared by the committed dump and the transaction-aware one, so the two can
-/// never drift in what they report.
-pub(crate) fn file_column_stats_rows(
-    rows: Vec<moraine::ffi_support::FileColumnStatsRecord>,
-) -> Result<Vec<MoraineFileColumnStatsRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|v| {
-            let min_value = opt_c_string(v.min_value.as_deref())?;
-            let max_value = opt_c_string(v.max_value.as_deref())?;
-            let extra_stats = opt_c_string(v.extra_stats.as_deref())?;
-            Ok((v, min_value, max_value, extra_stats))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-    Ok(owned
-        .into_iter()
-        .map(|(v, min_value, max_value, extra_stats)| {
-            let (has_nan, contains_nan) = opt_bool(v.contains_nan);
-            let (has_value_count, value_count) = opt_u64(v.value_count);
-            let (has_null_count, null_count) = opt_u64(v.null_count);
-            let (has_min_is_exact, min_is_exact) = opt_bool(v.min_is_exact);
-            let (has_max_is_exact, max_is_exact) = opt_bool(v.max_is_exact);
-            MoraineFileColumnStatsRow {
-                data_file_id: v.data_file_id,
-                table_id: v.table_id,
-                column_id: v.column_id,
-                column_size_bytes: v.column_size_bytes,
-                has_value_count,
-                value_count,
-                has_null_count,
-                null_count,
-                min_value: opt_into_raw(min_value),
-                max_value: opt_into_raw(max_value),
-                has_contains_nan: has_nan,
-                contains_nan,
-                extra_stats: opt_into_raw(extra_stats),
-                has_min_is_exact,
-                min_is_exact,
-                has_max_is_exact,
-                max_is_exact,
-            }
-        })
-        .collect())
+dump_row! {
+    file_column_stats_rows(moraine::ffi_support::FileColumnStatsRecord) -> MoraineFileColumnStatsRow {
+        values { data_file_id, table_id, column_id, column_size_bytes }
+        optional {
+            value_count => has_value_count,
+            null_count => has_null_count,
+            contains_nan => has_contains_nan,
+            min_is_exact => has_min_is_exact,
+            max_is_exact => has_max_is_exact,
+        }
+        strings {}
+        optional_strings { min_value, max_value, extra_stats }
+    }
 }
 
 /// Dumps every `ducklake_file_column_stats` row into
@@ -397,11 +322,7 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.min_value);
-            free_c_string(d.max_value);
-            free_c_string(d.extra_stats);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -442,58 +363,17 @@ pub struct MoraineFileVariantStatsRow {
     pub extra_stats: *mut c_char,
 }
 
-/// Converts core `ducklake_file_variant_stats` rows into the C row shape.
-/// Shared by the committed dump and the transaction-aware one, so the two
-/// can never drift in what they report.
-pub(crate) fn file_variant_stats_rows(
-    rows: Vec<moraine::ffi_support::FileVariantStatsRow>,
-) -> Result<Vec<MoraineFileVariantStatsRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let variant_path = to_c_string(std::mem::take(&mut row.variant_path))?;
-            let shredded_type = to_c_string(std::mem::take(&mut row.shredded_type))?;
-            let min_value = opt_c_string(row.min_value.as_deref())?;
-            let max_value = opt_c_string(row.max_value.as_deref())?;
-            let extra_stats = opt_c_string(row.extra_stats.as_deref())?;
-            Ok((
-                row,
-                variant_path,
-                shredded_type,
-                min_value,
-                max_value,
-                extra_stats,
-            ))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(
-            |(row, variant_path, shredded_type, min_value, max_value, extra_stats)| {
-                let (has_contains_nan, contains_nan) = opt_bool(row.contains_nan);
-                let (has_value_count, value_count) = opt_u64(row.value_count);
-                let (has_null_count, null_count) = opt_u64(row.null_count);
-                MoraineFileVariantStatsRow {
-                    data_file_id: row.data_file_id,
-                    table_id: row.table_id,
-                    column_id: row.column_id,
-                    variant_path: variant_path.into_raw(),
-                    shredded_type: shredded_type.into_raw(),
-                    column_size_bytes: row.column_size_bytes,
-                    has_value_count,
-                    value_count,
-                    has_null_count,
-                    null_count,
-                    min_value: opt_into_raw(min_value),
-                    max_value: opt_into_raw(max_value),
-                    has_contains_nan,
-                    contains_nan,
-                    extra_stats: opt_into_raw(extra_stats),
-                }
-            },
-        )
-        .collect())
+dump_row! {
+    file_variant_stats_rows(moraine::ffi_support::FileVariantStatsRow) -> MoraineFileVariantStatsRow {
+        values { data_file_id, table_id, column_id, column_size_bytes }
+        optional {
+            value_count => has_value_count,
+            null_count => has_null_count,
+            contains_nan => has_contains_nan,
+        }
+        strings { variant_path, shredded_type }
+        optional_strings { min_value, max_value, extra_stats }
+    }
 }
 
 /// Dumps every `ducklake_file_variant_stats` row into
@@ -578,12 +458,6 @@ pub unsafe extern "C" fn moraine_dump_file_variant_stats_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.variant_path);
-            free_c_string(d.shredded_type);
-            free_c_string(d.min_value);
-            free_c_string(d.max_value);
-            free_c_string(d.extra_stats);
-        });
+        free_rows(items, len);
     }
 }

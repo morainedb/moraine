@@ -143,7 +143,7 @@ fn a_repeated_summary_keeps_every_physical_position() {
 #[test]
 fn a_dense_summary_publishes_its_range() {
     let rows = PositionedRowSet {
-        rows: FileRowSet::range(100, 3).unwrap(),
+        rows: FileRowSet::range(100, 3).unwrap().into(),
         order: RowOrder::Ascending,
     };
     let bytes = sidecar::encode(identity(), &rows).unwrap();
@@ -163,7 +163,7 @@ fn malformed_summary_membership_is_rejected() {
         let bytes = sidecar::encode(
             identity(),
             &PositionedRowSet {
-                rows,
+                rows: rows.into(),
                 order: RowOrder::Ascending,
             },
         )
@@ -186,7 +186,7 @@ fn malformed_summary_permutations_are_rejected() {
         let mut bytes = sidecar::encode(
             identity(),
             &PositionedRowSet {
-                rows: FileRowSet::Sorted(vec![10, 30, 70]),
+                rows: FileRowSet::Sorted(vec![10, 30, 70]).into(),
                 order: RowOrder::Permuted(vec![0, 1, 2]),
             },
         )

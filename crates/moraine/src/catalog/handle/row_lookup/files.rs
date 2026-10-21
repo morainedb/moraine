@@ -146,6 +146,14 @@ fn row_id_bounds(
 
 impl FileDirectory {
     fn estimated_bytes(&self) -> u64 {
+        let metadata_bytes = size_of::<Self>()
+            .saturating_add(self.data_prefix.capacity())
+            .saturating_add(self.table_prefix.capacity())
+            .saturating_add(
+                self.deferred
+                    .len()
+                    .saturating_mul(size_of::<(u64, (u64, u64))>()),
+            );
         let summary_bytes = self.summaries.values().fold(0_u64, |bytes, summary| {
             bytes
                 .saturating_add(summary.estimated_bytes())
@@ -160,6 +168,7 @@ impl FileDirectory {
                 u64::try_from(self.failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX),
             )
             .saturating_add(self.file_bytes)
+            .saturating_add(u64::try_from(metadata_bytes).unwrap_or(u64::MAX))
     }
 
     fn retained_summary(

@@ -1,6 +1,6 @@
 //! Adaptive exact membership for one immutable data file's row ids.
 
-use std::mem::size_of;
+use std::{mem::size_of, sync::Arc};
 
 use roaring::RoaringTreemap;
 
@@ -182,7 +182,7 @@ pub(super) enum RowOrder {
 /// A membership set plus how to read file positions off it.
 #[derive(Debug, Clone)]
 pub(super) struct PositionedRowSet {
-    pub(super) rows: FileRowSet,
+    pub(super) rows: Arc<FileRowSet>,
     pub(super) order: RowOrder,
 }
 
@@ -247,7 +247,7 @@ impl PositionedRowSet {
             return None;
         }
 
-        match &self.rows {
+        match &*self.rows {
             FileRowSet::Range { start, .. } => Some(row_id - start),
             FileRowSet::Roaring(rows) => rows.rank(row_id).checked_sub(1),
             FileRowSet::Sorted(rows) => rows.binary_search(&row_id).ok().map(usize_as_u64),
@@ -258,7 +258,7 @@ impl PositionedRowSet {
     pub(super) fn from_file_order(row_ids: Vec<u64>) -> Result<Self> {
         if is_strictly_ascending(&row_ids) {
             return Ok(Self {
-                rows: FileRowSet::from_sorted(row_ids)?,
+                rows: FileRowSet::from_sorted(row_ids)?.into(),
                 order: RowOrder::Ascending,
             });
         }
@@ -293,7 +293,7 @@ impl PositionedRowSet {
         };
 
         Ok(Self {
-            rows,
+            rows: rows.into(),
             order: RowOrder::Permuted(permutation),
         })
     }
@@ -337,7 +337,7 @@ impl PositionedRowSet {
             rows => rows,
         };
         Ok(Self {
-            rows,
+            rows: rows.into(),
             order: RowOrder::Repeated { offsets, positions },
         })
     }

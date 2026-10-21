@@ -339,7 +339,7 @@ pub(super) fn encode_summary_halves(
     // permutation, so writing one here would silently answer positions by
     // arithmetic on decode.
     if matches!(
-        (&positioned.rows, &positioned.order),
+        (&*positioned.rows, &positioned.order),
         (
             FileRowSet::Range { .. },
             RowOrder::Permuted(_) | RowOrder::Repeated { .. }
@@ -582,15 +582,15 @@ pub(super) fn decode_membership(reader: &mut impl Read) -> foyer::Result<FileRow
 fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<PositionedRowSet> {
     let positioned = match tag {
         tag::RANGE_ASCENDING => Ok(PositionedRowSet {
-            rows: decode_row_set(RowSetShape::Range, reader)?,
+            rows: decode_row_set(RowSetShape::Range, reader)?.into(),
             order: RowOrder::Ascending,
         }),
         tag::ROARING_ASCENDING => Ok(PositionedRowSet {
-            rows: decode_row_set(RowSetShape::Roaring, reader)?,
+            rows: decode_row_set(RowSetShape::Roaring, reader)?.into(),
             order: RowOrder::Ascending,
         }),
         tag::SORTED_ASCENDING => Ok(PositionedRowSet {
-            rows: decode_row_set(RowSetShape::Sorted, reader)?,
+            rows: decode_row_set(RowSetShape::Sorted, reader)?.into(),
             order: RowOrder::Ascending,
         }),
         tag::ROARING_PERMUTED => {
@@ -602,7 +602,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let expected_len = usize::try_from(bitmap.len()).unwrap_or(usize::MAX);
             let permutation = read_permutation(expected_len, reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Roaring(bitmap),
+                rows: FileRowSet::Roaring(bitmap).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -610,7 +610,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let row_ids = read_sorted_body(reader)?;
             let permutation = read_permutation(row_ids.len(), reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Sorted(row_ids),
+                rows: FileRowSet::Sorted(row_ids).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -620,7 +620,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let permutation =
                 read_packed_positions(expected_len, usize_as_u64(expected_len), reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Roaring(bitmap),
+                rows: FileRowSet::Roaring(bitmap).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -629,7 +629,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let permutation =
                 read_packed_positions(row_ids.len(), usize_as_u64(row_ids.len()), reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Sorted(row_ids),
+                rows: FileRowSet::Sorted(row_ids).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -711,7 +711,7 @@ fn validated_repeated(
     }
     validate_positions(&positions)?;
     Ok(PositionedRowSet {
-        rows,
+        rows: rows.into(),
         order: RowOrder::Repeated { offsets, positions },
     })
 }
@@ -1287,7 +1287,7 @@ impl AuxiliaryCache {
         Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
     {
         if let Some(positioned) = self.summary(store, key).await {
-            return Ok(Arc::new(positioned.rows.clone()));
+            return Ok(Arc::clone(&positioned.rows));
         }
 
         let fill = fill();
@@ -1658,7 +1658,7 @@ fn summary_of(value: &AuxiliaryValue) -> Option<Arc<PositionedRowSet>> {
 fn membership_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
     match value {
         AuxiliaryValue::Membership(rows) => Some(Arc::clone(rows)),
-        AuxiliaryValue::Summary(positioned) => Some(Arc::new(positioned.rows.clone())),
+        AuxiliaryValue::Summary(positioned) => Some(Arc::clone(&positioned.rows)),
         AuxiliaryValue::Metadata { .. }
         | AuxiliaryValue::Block(_)
         | AuxiliaryValue::DeletePositions(_) => None,

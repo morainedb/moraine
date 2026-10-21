@@ -153,7 +153,7 @@ pub(crate) async fn file_summary(
         && !carries_embedded_row_ids(file.clone()).await?
     {
         let rows = Arc::new(PositionedRowSet {
-            rows: FileRowSet::range(start, record_count)?,
+            rows: FileRowSet::range(start, record_count)?.into(),
             order: RowOrder::Ascending,
         });
         auxiliary_cache::shared().insert_summary(&store, &key, &rows);
@@ -209,7 +209,7 @@ pub(crate) async fn file_summary(
                             },
                             &rows,
                         );
-                        Ok(Arc::new(rows.rows.clone()))
+                        Ok(Arc::clone(&rows.rows))
                     }
                 };
                 let membership = auxiliary_cache::shared()

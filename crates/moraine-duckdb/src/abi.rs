@@ -147,8 +147,7 @@ pub(crate) unsafe fn free_c_string(ptr: *mut c_char) {
 
 /// Hands a `Vec<T>` to C as a heap array: writes the (pointer, length)
 /// pair through `out_items`/`out_len`. Callers build `items` owned-first:
-/// every `CString` in the batch converts before any raw pointer is minted,
-/// so a partial failure leaks nothing.
+/// partially converted batches must release their strings on failure.
 ///
 /// # Safety
 ///

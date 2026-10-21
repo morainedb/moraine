@@ -8,16 +8,18 @@
 use std::{
     env,
     fmt::Write as _,
-    fs,
     io::Write as _,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
 };
 
 use anyhow::{Context, bail, ensure};
 
 use crate::{
-    bench::timing::{median, parse_run_times, spread},
+    bench::{
+        support::TempDir,
+        timing::{median, parse_run_times, spread},
+    },
     catalog_target::{CatalogTarget, sql_literal},
     duckdb, ducklake_patch,
 };
@@ -67,29 +69,6 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         commits,
         flush_milliseconds,
     })
-}
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(files: usize) -> anyhow::Result<Self> {
-        let path = env::temp_dir().join(format!(
-            "moraine-commit-bench-{}-{files}",
-            std::process::id()
-        ));
-        if path.exists() {
-            fs::remove_dir_all(&path).with_context(|| format!("clearing {}", path.display()))?;
-        }
-        fs::create_dir_all(path.join("data"))
-            .with_context(|| format!("creating {}", path.display()))?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -205,8 +184,11 @@ fn run_once(
     commits: usize,
     flush_milliseconds: u64,
 ) -> anyhow::Result<(Vec<f64>, Breakdown)> {
-    let temp = TempDir::new(files)?;
-    let data_path = temp.0.join("data");
+    let temp = TempDir::new(env::temp_dir().join(format!(
+        "moraine-commit-bench-{}-{files}",
+        std::process::id()
+    )))?;
+    let data_path = temp.data();
     let catalog_uri = target.catalog_uri(&format!("commit-breakdown-{files}"))?;
 
     let mut script = String::new();

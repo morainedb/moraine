@@ -657,6 +657,7 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
 | core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size, reported by `projection_bytes` | replaced on stamp move |
+| row-lookup directories | file summaries/ranges and inline chunk locators | catalog + table, validated against file scope or head stamp | 64 MiB accounted entries and 256 tables **per source kind** (file and inline) per catalog; container slack also reported in `projection_bytes` | least-recently-used eviction; oversized directories serve the current lookup without admission |
 | scoped index probes | canonical query and resolved row IDs | attachment + pinned store sequence + table/index + mode/arguments | 8 MiB accounted entries and 4096 entries per catalog; container slack also reported in `projection_bytes` | least-recently-used eviction; oversized results bypass admission |
 | core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary-v2` | byte-bounded LRU (foyer), recovered on restart |
 | SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | one cache per attached store: an even share of the process budget in memory over `CACHE_DIR/<store>/blocks` | LRU-ish (foyer), recovered on restart |
@@ -703,12 +704,27 @@ cache fills them or not. That reservation is why it scales with the budget
 rather than standing at a small host's number, and why it stops scaling
 rather than reserving unboundedly on a large one.
 
-The logical caches take no share of the budget at all. They are per handle,
+The head projections take no share of the budget at all. They are per handle,
 hold one head's decoded state, and are replaced when the stamp moves rather
 than evicted under pressure, so they are bounded by the catalog's own size —
 which is a bound, but not one an operator can set.
 `ReadOnlyCatalog::projection_bytes` reports it, because a cache invisible to
 sizing is what this RFC's goals rule out.
+
+Lookup-directory limits are separate from `CACHE_MEMORY`: at most 64 MiB of
+accounted file entries and 64 MiB of inline entries per catalog. Charges include
+retained summaries, file metadata, deferred ranges, path strings, and entry
+headers. They are estimates, not allocator measurements; shared allocations
+are charged conservatively. Oversized replacements remove the older cached
+directory, serve the current query, and may be rebuilt on later lookups.
+Eviction releases the cache's ownership, while active readers keep their Arcs
+until their queries finish. It does not impose a bound on transient scan/build
+memory or total process memory.
+
+Index probes use the same revision-keyed memo as other scoped results. Hits
+clone only an Arc under the mutex; copying the result rows happens after the
+lock is released. Composite-key lookups borrow probe arguments without copying
+them. The memo retains its existing linear search and count/byte limits.
 
 Their storage engines remain separate because their entries have different
 identity, value, and tiering contracts:

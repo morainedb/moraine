@@ -4,10 +4,9 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_c_string, opt_into_raw, opt_u64};
+use super::{conversion::dump_row, dump_rows, free_rows};
 use crate::{
-    abi::{free_c_string, to_c_string},
-    error::{AbiError, MoraineError},
+    error::MoraineError,
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -68,61 +67,29 @@ pub struct MoraineDataFileRow {
     pub row_group_count: u64,
 }
 
-/// Converts core `ducklake_data_file` records into the C row shape.
-/// Shared by the committed dump and the transaction-aware one, so the
-/// two can never drift in what they report.
-pub(crate) fn data_file_rows(
-    rows: Vec<moraine::ffi_support::DataFileRecord>,
-) -> Result<Vec<MoraineDataFileRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut v| {
-            let path = to_c_string(std::mem::take(&mut v.path))?;
-            let file_format = to_c_string(std::mem::take(&mut v.file_format))?;
-            let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
-            Ok((v, path, file_format, encryption_key))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(v, path, file_format, encryption_key)| {
-            let (has_end, end) = opt_u64(v.end_snapshot);
-            let (has_order, order) = opt_u64(v.file_order);
-            let (has_partition, partition) = opt_u64(v.partition_id);
-            let (has_mapping, mapping) = opt_u64(v.mapping_id);
-            let (has_partial_max, partial_max) = opt_u64(v.partial_max);
-            let (has_row_id_start, row_id_start) = opt_u64(v.row_id_start);
-            let (has_row_group_count, row_group_count) = opt_u64(v.row_group_count);
-
-            MoraineDataFileRow {
-                data_file_id: v.data_file_id,
-                table_id: v.table_id,
-                begin_snapshot: v.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                has_file_order: has_order,
-                file_order: order,
-                path: path.into_raw(),
-                path_is_relative: v.path_is_relative,
-                file_format: file_format.into_raw(),
-                record_count: v.record_count,
-                file_size_bytes: v.file_size_bytes,
-                footer_size: v.footer_size,
-                has_row_id_start,
-                row_id_start,
-                has_partition_id: has_partition,
-                partition_id: partition,
-                encryption_key: opt_into_raw(encryption_key),
-                has_mapping_id: has_mapping,
-                mapping_id: mapping,
-                has_partial_max,
-                partial_max,
-                has_row_group_count,
-                row_group_count,
-            }
-        })
-        .collect())
+dump_row! {
+    data_file_rows(moraine::ffi_support::DataFileRecord) -> MoraineDataFileRow {
+        values {
+            data_file_id,
+            table_id,
+            begin_snapshot,
+            path_is_relative,
+            record_count,
+            file_size_bytes,
+            footer_size,
+        }
+        optional {
+            end_snapshot => has_end_snapshot,
+            file_order => has_file_order,
+            row_id_start => has_row_id_start,
+            partition_id => has_partition_id,
+            mapping_id => has_mapping_id,
+            partial_max => has_partial_max,
+            row_group_count => has_row_group_count,
+        }
+        strings { path, file_format }
+        optional_strings { encryption_key }
+    }
 }
 
 /// Dumps every `ducklake_data_file` row — current and history — into
@@ -201,11 +168,7 @@ pub unsafe extern "C" fn moraine_dump_data_files_of(
 pub unsafe extern "C" fn moraine_dump_data_files_free(items: *mut MoraineDataFileRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.path);
-            free_c_string(d.file_format);
-            free_c_string(d.encryption_key);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -249,48 +212,26 @@ pub struct MoraineDeleteFileRow {
     pub row_group_count: u64,
 }
 
-/// Converts core `ducklake_delete_file` records into the C row shape. Shared by
-/// the committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn delete_file_rows(
-    rows: Vec<moraine::ffi_support::DeleteFileRecord>,
-) -> Result<Vec<MoraineDeleteFileRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut v| {
-            let path = to_c_string(std::mem::take(&mut v.path))?;
-            let format = to_c_string(std::mem::take(&mut v.format))?;
-            let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
-            Ok((v, path, format, encryption_key))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-    Ok(owned
-        .into_iter()
-        .map(|(v, path, format, encryption_key)| {
-            let (has_end, end) = opt_u64(v.end_snapshot);
-            let (has_partial_max, partial_max) = opt_u64(v.partial_max);
-            let (has_row_group_count, row_group_count) = opt_u64(v.row_group_count);
-            MoraineDeleteFileRow {
-                delete_file_id: v.delete_file_id,
-                table_id: v.table_id,
-                begin_snapshot: v.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                data_file_id: v.data_file_id,
-                path: path.into_raw(),
-                path_is_relative: v.path_is_relative,
-                format: format.into_raw(),
-                delete_count: v.delete_count,
-                file_size_bytes: v.file_size_bytes,
-                footer_size: v.footer_size,
-                encryption_key: opt_into_raw(encryption_key),
-                has_partial_max,
-                partial_max,
-                has_row_group_count,
-                row_group_count,
-            }
-        })
-        .collect())
+dump_row! {
+    delete_file_rows(moraine::ffi_support::DeleteFileRecord) -> MoraineDeleteFileRow {
+        values {
+            delete_file_id,
+            table_id,
+            begin_snapshot,
+            data_file_id,
+            path_is_relative,
+            delete_count,
+            file_size_bytes,
+            footer_size,
+        }
+        optional {
+            end_snapshot => has_end_snapshot,
+            partial_max => has_partial_max,
+            row_group_count => has_row_group_count,
+        }
+        strings { path, format }
+        optional_strings { encryption_key }
+    }
 }
 
 /// Dumps every `ducklake_delete_file` row — current and history — into
@@ -372,11 +313,7 @@ pub unsafe extern "C" fn moraine_dump_delete_files_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.path);
-            free_c_string(d.format);
-            free_c_string(d.encryption_key);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -395,29 +332,13 @@ pub struct MoraineFilePartitionValueRow {
     pub partition_value: *mut c_char,
 }
 
-/// Converts core `ducklake_file_partition_value` records into the C row
-/// shape. Shared by the committed dump and the transaction-aware one, so
-/// the two can never drift in what they report.
-pub(crate) fn file_partition_value_rows(
-    rows: Vec<moraine::ffi_support::FilePartitionValueRow>,
-) -> Result<Vec<MoraineFilePartitionValueRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let partition_value = to_c_string(std::mem::take(&mut row.partition_value))?;
-            Ok((row, partition_value))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(row, partition_value)| MoraineFilePartitionValueRow {
-            data_file_id: row.data_file_id,
-            table_id: row.table_id,
-            partition_key_index: row.partition_key_index,
-            partition_value: partition_value.into_raw(),
-        })
-        .collect())
+dump_row! {
+    file_partition_value_rows(moraine::ffi_support::FilePartitionValueRow) -> MoraineFilePartitionValueRow {
+        values { data_file_id, table_id, partition_key_index }
+        optional {}
+        strings { partition_value }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_file_partition_value` row — one per embedded
@@ -468,9 +389,7 @@ pub unsafe extern "C" fn moraine_dump_file_partition_values_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |v| {
-            free_c_string(v.partition_value);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -488,29 +407,13 @@ pub struct MoraineScheduledDeletionRow {
     pub schedule_start_micros: i64,
 }
 
-/// Converts core `ducklake_files_scheduled_for_deletion` records into the C row
-/// shape. Shared by the committed dump and the transaction-aware one, so the
-/// two can never drift in what they report.
-pub(crate) fn scheduled_deletion_rows(
-    rows: Vec<moraine::ffi_support::GcFileRecord>,
-) -> Result<Vec<MoraineScheduledDeletionRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let path = to_c_string(std::mem::take(&mut row.path))?;
-            Ok((row, path))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(row, path)| MoraineScheduledDeletionRow {
-            data_file_id: row.data_file_id,
-            path: path.into_raw(),
-            path_is_relative: row.path_is_relative,
-            schedule_start_micros: row.schedule_start_micros,
-        })
-        .collect())
+dump_row! {
+    scheduled_deletion_rows(moraine::ffi_support::GcFileRecord) -> MoraineScheduledDeletionRow {
+        values { data_file_id, path_is_relative, schedule_start_micros }
+        optional {}
+        strings { path }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_files_scheduled_for_deletion` row into
@@ -560,8 +463,6 @@ pub unsafe extern "C" fn moraine_dump_scheduled_deletions_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |r| {
-            free_c_string(r.path);
-        });
+        free_rows(items, len);
     }
 }

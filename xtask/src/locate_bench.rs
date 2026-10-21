@@ -5,17 +5,11 @@
 //! lookup takes cold and warm, and the files a DuckLake scan reads with and
 //! without the located join.
 
-use std::{
-    fmt::Write as _,
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Instant,
-};
+use std::{fmt::Write as _, path::Path, process::Command, time::Instant};
 
 use anyhow::{Context, bail, ensure};
 
-use crate::{duckdb, ducklake_patch};
+use crate::{bench::support::TempDir, catalog_target::sql_literal, duckdb, ducklake_patch};
 
 /// Files the lake is built with. Enough that a scan reading one instead of
 /// all of them is unambiguous, few enough to stay a minute-scale run.
@@ -84,41 +78,6 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         "`--rows-per-file` must be greater than zero"
     );
     Ok(options)
-}
-
-fn sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-/// A working directory that removes itself, so a run leaves no lake behind.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> anyhow::Result<Self> {
-        let root = duckdb::workspace_root().join("target/locate-bench");
-        fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-        let path = root.join(name);
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(path.join("store"))
-            .with_context(|| format!("creating {}", path.display()))?;
-        fs::create_dir_all(path.join("data"))
-            .with_context(|| format!("creating {}", path.display()))?;
-        Ok(Self(path))
-    }
-
-    fn store(&self) -> PathBuf {
-        self.0.join("store")
-    }
-
-    fn data(&self) -> PathBuf {
-        self.0.join("data")
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 /// The preamble every session needs: both extensions, then the lake.
@@ -354,7 +313,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let moraine = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
     let cli = duckdb::ensure_duckdb_cli()?;
 
-    let temp = TempDir::new("lake")?;
+    let temp = TempDir::new(duckdb::workspace_root().join("target/locate-bench/lake"))?;
     let preamble = preamble(&moraine, &temp);
 
     println!(
