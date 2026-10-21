@@ -125,9 +125,8 @@ pub(super) fn refuse_wal_store_in_data_path(
 /// # Safety
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
-/// point to a valid [`MoraineS3Config`] whose non-null fields are valid
-/// NUL-terminated C strings. `from` and `to`, if non-null, must each point
-/// to a valid [`MoraineWalStore`] under the contract
+/// satisfy [`MoraineS3Config`]'s borrowing contract. `from` and `to`, if
+/// non-null, must each point to a valid [`MoraineWalStore`] under the contract
 /// [`super::moraine_attach_with_wal_store`] states. `out_moved` must be a
 /// valid, writable `*mut bool`, and `err`, if non-null, a valid, writable
 /// [`MoraineError`]. All for the duration of this call.

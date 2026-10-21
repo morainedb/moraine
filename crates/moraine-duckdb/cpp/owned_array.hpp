@@ -1,6 +1,4 @@
-// RAII wrapper for a caller-owned array from a moraine_*_free-paired ABI
-// call. Shared by catalog.cpp (listing ABI) and metadata_tables.cpp (dump
-// ABI) — same ownership shape, one definition.
+// Owns an ABI array and releases it with its matching moraine_*_free function.
 #pragma once
 
 #include <cstddef>

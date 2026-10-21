@@ -17,6 +17,7 @@ rust-version.workspace = true
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+async-trait = { workspace = true }
 arrow = { workspace = true, features = ["ffi", "ipc"] }
 bytes = { workspace = true }
 futures = { workspace = true }

@@ -101,6 +101,7 @@ pub(super) fn encode(identity: SidecarIdentity<'_>, rows: &PositionedRowSet) -> 
 /// fetcher that read only a prefix knows whether it read enough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Layout {
+    cardinality: u64,
     /// Where the membership begins.
     pub(super) set_at: usize,
     pub(super) set_len: usize,
@@ -153,6 +154,7 @@ pub(super) fn layout_of(
     }
 
     Ok(Layout {
+        cardinality: field(36),
         set_at: path_at.saturating_add(path_len),
         set_len: usize::try_from(field(44)).map_err(|_| Rejected::Malformed)?,
         order_len: usize::try_from(field(52)).map_err(|_| Rejected::Malformed)?,
@@ -170,7 +172,11 @@ pub(super) fn membership(
     let set = bytes
         .get(layout.set_at..layout.membership_end())
         .ok_or(Rejected::Malformed)?;
-    decode_membership(&mut &set[..]).map_err(|_| Rejected::Malformed)
+    let rows = decode_membership(&mut &set[..]).map_err(|_| Rejected::Malformed)?;
+    if rows.cardinality() != layout.cardinality {
+        return Err(Rejected::Malformed);
+    }
+    Ok(rows)
 }
 
 /// The whole summary `bytes` describes, given all of it.
@@ -181,7 +187,11 @@ pub(super) fn summary(
     let layout = layout_of(identity, bytes)?;
     let end = layout.membership_end().saturating_add(layout.order_len);
     let body = bytes.get(layout.set_at..end).ok_or(Rejected::Malformed)?;
-    decode_summary(&mut &body[..]).map_err(|_| Rejected::Malformed)
+    let rows = decode_summary(&mut &body[..]).map_err(|_| Rejected::Malformed)?;
+    if rows.rows.cardinality() != layout.cardinality {
+        return Err(Rejected::Malformed);
+    }
+    Ok(rows)
 }
 
 /// The header and a generous path, which one read settles whether a

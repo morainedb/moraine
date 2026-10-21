@@ -34,14 +34,29 @@ jobs:
         run: |
           version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if curl -sf -H "User-Agent: moraine-release (alex@contour.app)" \
-               https://index.crates.io/mo/ra/moraine | grep -q "\"vers\":\"$version\""; then
+          index=$(mktemp)
+          trap 'rm -f "$index"' EXIT
+          status=$(curl -sS --retry 3 --connect-timeout 10 --max-time 60 \
+            -H "User-Agent: moraine-release (alex@contour.app)" \
+            -o "$index" -w '%{http_code}' https://index.crates.io/mo/ra/moraine)
+          case "$status" in
+            200) jq -e -s 'length > 0 and all(.[]; (.vers | type) == "string")' "$index" > /dev/null ;;
+            404) ;;
+            *) echo "crates.io lookup failed (HTTP $status)" >&2; exit 1 ;;
+          esac
+          if [ "$status" = 200 ] && jq -e -s --arg version "$version" \
+               'any(.[]; .vers == $version)' "$index" > /dev/null; then
             echo "release=false" >> "$GITHUB_OUTPUT"
             echo "moraine $version already on crates.io - nothing to release."
           else
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "moraine $version not on crates.io - release pending."
           fi
+  ci:
+    needs: should-release
+    if: needs.should-release.outputs.release == 'true'
+    uses: ./.github/workflows/ci.yml
+
   build-extension:
     needs: should-release
     if: needs.should-release.outputs.release == 'true'
@@ -75,7 +90,7 @@ jobs:
       test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0"}}'
 
   publish:
-    needs: [should-release, build-extension]
+    needs: [should-release, build-extension, ci]
     if: needs.should-release.outputs.release == 'true'
     runs-on: ubuntu-latest
     # Bounded rather than left to hold a runner in silence: the releases

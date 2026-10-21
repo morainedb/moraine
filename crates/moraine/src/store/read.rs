@@ -155,10 +155,10 @@ impl EntityRecordKind {
         }
     }
 
-    /// The table-scoped kind this is, for the three whose row count grows
-    /// with the data. `None` for every other kind, which is read whole.
+    /// Kinds supporting table-scoped scans; other kinds are read whole.
     fn table_scoped(self) -> Option<TableScopedKind> {
         match self {
+            Self::Column => Some(TableScopedKind::Column),
             Self::File => Some(TableScopedKind::File),
             Self::DeleteFile => Some(TableScopedKind::DeleteFile),
             Self::FileColumnStats => Some(TableScopedKind::FileColumnStats),

@@ -18,6 +18,83 @@ use crate::{
 };
 
 #[test]
+fn empty_s3_configuration_uses_the_environment() {
+    use object_store::aws::AmazonS3ConfigKey;
+
+    const CHILD: &str = "MORAINE_TEST_S3_ENVIRONMENT";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "abi::tests::empty_s3_configuration_uses_the_environment",
+            ])
+            .env(CHILD, "1")
+            .env("AWS_REGION", "eu-west-2")
+            .env("AWS_ACCESS_KEY_ID", "environment-key")
+            .env("AWS_SECRET_ACCESS_KEY", "environment-secret")
+            .env("AWS_SESSION_TOKEN", "environment-token")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let mut config = MoraineS3Config {
+        key_id: ptr::null(),
+        secret: ptr::null(),
+        region: ptr::null(),
+        session_token: ptr::null(),
+        endpoint: ptr::null(),
+        url_style: ptr::null(),
+        use_ssl: -1,
+        credential_source: ptr::null(),
+    };
+    // SAFETY: config is live and contains only null string pointers.
+    let credentials = unsafe { borrow_s3_creds(&raw const config) };
+    let builder = s3_builder("lake", credentials.as_ref());
+    assert_eq!(
+        builder
+            .get_config_value(&AmazonS3ConfigKey::Region)
+            .as_deref(),
+        Some("eu-west-2")
+    );
+    assert_eq!(
+        builder
+            .get_config_value(&AmazonS3ConfigKey::AccessKeyId)
+            .as_deref(),
+        Some("environment-key")
+    );
+    assert_eq!(
+        builder
+            .get_config_value(&AmazonS3ConfigKey::Token)
+            .as_deref(),
+        Some("environment-token")
+    );
+
+    config.key_id = c"explicit-key".as_ptr();
+    config.secret = c"explicit-secret".as_ptr();
+    // SAFETY: config is live; its string pointers have static lifetime.
+    let credentials = unsafe { borrow_s3_creds(&raw const config) };
+    let builder = s3_builder("lake", credentials.as_ref());
+    assert_eq!(
+        builder
+            .get_config_value(&AmazonS3ConfigKey::AccessKeyId)
+            .as_deref(),
+        Some("explicit-key")
+    );
+    assert_eq!(
+        builder.get_config_value(&AmazonS3ConfigKey::Token),
+        None,
+        "explicit credentials must not inherit an unrelated session token"
+    );
+}
+
+#[test]
 fn s3_cache_identities_include_endpoint_and_bucket_but_not_credentials() {
     let builder = AmazonS3Builder::new()
         .with_bucket_name("shared-bucket")
@@ -50,6 +127,45 @@ fn s3_cache_identities_include_endpoint_and_bucket_but_not_credentials() {
             object_store::aws::AmazonS3ConfigKey::S3Endpoint,
             "https://override.example"
         ))
+    );
+}
+
+#[test]
+fn explicit_s3_endpoint_and_addressing_are_preserved() {
+    use object_store::aws::AmazonS3ConfigKey;
+
+    let mut config = MoraineS3Config {
+        key_id: ptr::null(),
+        secret: ptr::null(),
+        region: c"us-east-1".as_ptr(),
+        session_token: ptr::null(),
+        endpoint: c"s3.amazonaws.com".as_ptr(),
+        url_style: c"vhost".as_ptr(),
+        use_ssl: -1,
+        credential_source: ptr::null(),
+    };
+    // SAFETY: config is live; all string pointers have static lifetime.
+    let credentials = unsafe { borrow_s3_creds(&raw const config) };
+    assert_eq!(
+        s3_builder("lake", credentials.as_ref()).get_config_value(&AmazonS3ConfigKey::Endpoint),
+        None
+    );
+
+    config.endpoint = c"https://s3-fips.us-east-1.amazonaws.com".as_ptr();
+    // SAFETY: config is live; all string pointers have static lifetime.
+    let credentials = unsafe { borrow_s3_creds(&raw const config) };
+    let builder = s3_builder("lake", credentials.as_ref());
+    assert_eq!(
+        builder
+            .get_config_value(&AmazonS3ConfigKey::Endpoint)
+            .as_deref(),
+        Some("https://s3-fips.us-east-1.amazonaws.com")
+    );
+    assert_eq!(
+        builder
+            .get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest)
+            .as_deref(),
+        Some("true")
     );
 }
 

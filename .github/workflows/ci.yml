@@ -1,12 +1,13 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   # Superseding a push is right on a branch and wrong on `main`: a
   # cancelled job skips every post step, so the run loses the caches it
   # just spent twenty minutes filling — and `main` is the only ref whose

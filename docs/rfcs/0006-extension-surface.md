@@ -128,9 +128,26 @@ For an `s3://` store, credentials resolve through DuckDB's secret manager:
 moraine looks up the `s3`-type secret whose scope matches the `s3://` path —
 one created with `CREATE SECRET (TYPE s3, KEY_ID …, SECRET …, REGION …[,
 ENDPOINT …, URL_STYLE 'path', USE_SSL false])`, the same secret DuckLake and
-httpfs consult for `DATA_PATH`. Fields the secret leaves unset fall back to the
-`AWS_*` process environment. No credentials appear in SQL text or ATTACH
-options.
+httpfs consult for `DATA_PATH`. A matching secret supplies its own settings;
+only an absent or entirely unset configuration uses the `AWS_*` environment.
+Credentials are not ATTACH options.
+
+Secrets with `REFRESH 'auto'` carry provider refresh information. The shim
+captures that recipe and supplies a retained `MoraineS3CredentialSource` in
+`MoraineS3Config`. Rust uses it as the S3 signing provider, refreshing on first
+use and at 80% of the returned credential lifetime, capped at five minutes.
+Unknown expiry is checked every minute. Concurrent requests share one refresh;
+provider failures and expired results fail the request instead of reusing stale
+credentials. Blocking refresh calls retain their state and lock through cancellation.
+
+The shim invokes the registered secret provider in a fresh client context,
+independently of the attaching connection. It holds only a weak database
+reference between refreshes, and releases each refresh's database reference on
+a separate cleanup thread so shutdown cannot wait on its own credential call.
+Callbacks contain exceptions and copy credential strings before returning.
+Refresh changes credentials only: endpoint, region, scope, and the provider
+recipe remain those captured at attach. Changing those settings, or rotating
+explicit keys without refresh information, requires detach/reattach.
 
 **The standalone attach is a metadata-only surface.** Table *data* is
 served through DuckLake, which owns delete-file merging, row lineage, and

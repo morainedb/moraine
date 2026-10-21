@@ -1,13 +1,5 @@
-//! The `check-release-assets` task: a release carries a build for every
-//! supported DuckDB version on every platform the workflows publish.
-//!
-//! A build that never happened leaves almost nothing behind to read. The
-//! matrix is generated inside a reusable upstream workflow, and a leg it
-//! declines to start produces no job, no check run and no annotation: the
-//! run goes red with every visible job green. This is what names the
-//! builds that are missing — and what a release is missing is a DuckDB
-//! version that cannot load moraine on that platform at all, since a
-//! C++-ABI extension is refused by any DuckDB but the one it names.
+//! Checks release coverage across supported DuckDB versions and platforms,
+//! including matrix legs that never produced a build job.
 
 use std::{
     fs,
@@ -293,6 +285,18 @@ fn excluded_architectures(contents: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_requires_the_full_ci_workflow_at_the_release_commit() {
+        let root = crate::duckdb::workspace_root();
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        assert!(ci.contains("  workflow_call:"));
+        assert!(release.contains("    uses: ./.github/workflows/ci.yml"));
+        let publish = release.split("  publish:\n").nth(1).unwrap();
+        assert!(publish.contains("    needs: [should-release, build-extension, ci]"));
+        assert!(!publish.contains("always()"));
+    }
+
     use super::*;
 
     /// An artifact built from the pinned submodule carries the commit, not

@@ -66,7 +66,6 @@ pub struct MoraineArrowBytes {
 
 impl MoraineArrowBytes {
     pub(crate) fn from_vec(mut v: Vec<u8>) -> Self {
-        v.shrink_to_fit();
         let out = Self {
             data: v.as_mut_ptr(),
             len: v.len(),
@@ -447,6 +446,20 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn handing_bytes_to_c_preserves_the_allocation() {
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.extend_from_slice(b"payload");
+        let pointer = bytes.as_ptr();
+        let capacity = bytes.capacity();
+        let handed = MoraineArrowBytes::from_vec(bytes);
+        // SAFETY: handed came from from_vec and has not been consumed.
+        let returned = unsafe { handed.into_vec() };
+        assert_eq!(returned.as_ptr(), pointer);
+        assert_eq!(returned.capacity(), capacity);
+        assert_eq!(returned, b"payload");
+    }
 
     #[test]
     fn encoded_buffer_moves_back_into_rust_without_copying() {

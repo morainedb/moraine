@@ -39,6 +39,51 @@ fn batch_with_embedded_row_ids(row_ids: &[i64]) -> RecordBatch {
     .unwrap()
 }
 
+#[tokio::test]
+async fn an_oversized_sidecar_length_falls_back_without_allocating_it() {
+    use super::{
+        row_set::PositionedRowSet,
+        sidecar::{self, SidecarIdentity},
+    };
+
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("oversized-summary.parquet");
+    let batch = batch_with_embedded_row_ids(&[10, 30, 70]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+    let mut bytes = sidecar::encode(
+        SidecarIdentity {
+            table_id: 1,
+            data_file_id: 1,
+            file_path: path.as_ref(),
+            file_size,
+        },
+        &PositionedRowSet::from_file_order(vec![10, 30, 70]).unwrap(),
+    )
+    .unwrap();
+    bytes[44..52].copy_from_slice(&u64::MAX.to_le_bytes());
+    // Leave a short continuation after the reader's speculative prefix.
+    bytes.resize((4 << 20) + 1, 0);
+    store
+        .put(&sidecar::path_for(&path).unwrap(), bytes.into())
+        .await
+        .unwrap();
+
+    for want in [Want::Membership, Want::Positions] {
+        let summary = file_summary(
+            ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
+            1,
+            1,
+            None,
+            3,
+            want,
+        )
+        .await
+        .unwrap();
+        assert!(summary.built);
+        assert_eq!(summary.matching(&[10, 30, 70]), vec![10, 30, 70]);
+    }
+}
+
 /// A file whose embedded row ids are two ascending runs answers positions
 /// by file order rather than by ascending-id rank.
 #[tokio::test]

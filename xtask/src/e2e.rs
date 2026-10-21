@@ -43,6 +43,8 @@ pub fn e2e() -> anyhow::Result<()> {
     let extension = duckdb::build_and_package_extension(&patched)?;
     println!("ok: packaged {}", extension.display());
 
+    run_credential_bridge_tests()?;
+
     let cli = duckdb::ensure_duckdb_cli()?;
     println!("ok: duckdb CLI at {}", cli.display());
 
@@ -86,6 +88,30 @@ pub fn e2e() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Tests the native credential provider against the DuckDB just built.
+fn run_credential_bridge_tests() -> anyhow::Result<()> {
+    let root = duckdb::workspace_root();
+    let library = root.join("build/release/src");
+    let binary = root.join("target/s3-credentials-test");
+    let compiler = duckdb::cpp_compilers()?.map_or("c++", |compilers| compilers.cxx);
+    duckdb::run(
+        Command::new(compiler)
+            .args(["-std=c++17", "-I"])
+            .arg(root.join("duckdb/src/include"))
+            .arg("-I")
+            .arg(root.join("crates/moraine-duckdb/cpp"))
+            .arg(root.join("crates/moraine-duckdb/tests/cpp/s3_credentials.cpp"))
+            .arg(root.join("crates/moraine-duckdb/cpp/s3_secret.cpp"))
+            .arg("-L")
+            .arg(&library)
+            .args(["-lduckdb", "-pthread"])
+            .arg(format!("-Wl,-rpath,{}", library.display()))
+            .arg("-o")
+            .arg(&binary),
+    )?;
+    duckdb::run(&mut Command::new(binary))
 }
 
 /// Builds and packages the extension without running the suites, and

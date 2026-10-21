@@ -12,7 +12,9 @@ use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, me
 use tracing::{info, warn};
 
 use super::{
-    free_c_string, guard, to_c_string,
+    free_c_string, guard,
+    s3_credentials::{MoraineS3CredentialSource, RefreshingCredentials},
+    to_c_string,
     wal_store::{MoraineWalStore, borrow_wal_store, refuse_wal_store_in_data_path},
 };
 use crate::{
@@ -24,8 +26,14 @@ use crate::{
 };
 
 /// Mirrors the C `MoraineS3Config`: S3 credentials for an `s3://` store,
-/// sourced from a DuckDB secret. Null/empty fields fall back to the AWS_*
-/// environment; `use_ssl` is -1 unset, 0 false, 1 true.
+/// sourced from a DuckDB secret. A null or entirely unset config uses the
+/// AWS_* environment; `use_ssl` is -1 unset, 0 false, 1 true.
+///
+/// # Borrowing contract
+///
+/// The struct and non-null NUL-terminated strings must stay live for the ABI
+/// call. A non-null `credential_source` must stay live for that call and obey
+/// its callback contract; Rust retains its context for the store's lifetime.
 #[repr(C)]
 pub struct MoraineS3Config {
     /// AWS access key id.
@@ -42,10 +50,11 @@ pub struct MoraineS3Config {
     pub url_style: *const c_char,
     /// TLS toggle: -1 unset, 0 plain HTTP, 1 HTTPS.
     pub use_ssl: i32,
+    /// Optional refreshable credentials, retained when borrowed by Rust.
+    pub credential_source: *const MoraineS3CredentialSource,
 }
 
-/// S3 credentials borrowed from a [`MoraineS3Config`]. Every field is
-/// optional; an absent field defers to the AWS_* environment.
+/// Explicit S3 settings borrowed from a [`MoraineS3Config`].
 pub(crate) struct S3Creds<'a> {
     key_id: Option<&'a str>,
     secret: Option<&'a str>,
@@ -54,22 +63,23 @@ pub(crate) struct S3Creds<'a> {
     endpoint: Option<&'a str>,
     url_style: Option<&'a str>,
     use_ssl: Option<bool>,
+    provider: Option<Arc<RefreshingCredentials>>,
 }
 
-/// Borrows the credentials out of a nullable [`MoraineS3Config`]. Null
-/// means "no secret — the environment supplies credentials".
+/// Borrows explicit settings; null or entirely unset uses the environment.
 ///
 /// # Safety
 ///
 /// `s3`, if non-null, must point to a valid [`MoraineS3Config`] whose
 /// non-null string fields are NUL-terminated C strings, all valid for
 /// reads for the duration of the borrow.
+/// A non-null credential source must obey its callback contract.
 pub(crate) unsafe fn borrow_s3_creds<'a>(s3: *const MoraineS3Config) -> Option<S3Creds<'a>> {
     // SAFETY: caller contract above.
     let config = unsafe { s3.as_ref() }?;
     // SAFETY: each string field is null or a NUL-terminated C string valid
     // for the borrow, per the same contract.
-    Some(unsafe {
+    let credentials = unsafe {
         S3Creds {
             key_id: opt_str(config.key_id),
             secret: opt_str(config.secret),
@@ -82,8 +92,25 @@ pub(crate) unsafe fn borrow_s3_creds<'a>(s3: *const MoraineS3Config) -> Option<S
                 1 => Some(true),
                 _ => None,
             },
+            provider: config
+                .credential_source
+                .as_ref()
+                .map(|source| Arc::new(RefreshingCredentials::new(source))),
         }
-    })
+    };
+    let configured = [
+        credentials.key_id,
+        credentials.secret,
+        credentials.region,
+        credentials.session_token,
+        credentials.endpoint,
+        credentials.url_style,
+    ]
+    .iter()
+    .any(Option::is_some)
+        || credentials.use_ssl.is_some()
+        || credentials.provider.is_some();
+    configured.then_some(credentials)
 }
 
 /// Borrows a nullable C string as `Some(&str)`, mapping null, empty, and
@@ -222,6 +249,9 @@ pub(super) fn s3_builder(bucket: &str, s3: Option<&S3Creds>) -> AmazonS3Builder 
         builder = builder.with_s3_express(true);
     }
     if let Some(c) = s3 {
+        if let Some(provider) = &c.provider {
+            builder = builder.with_credentials(provider.clone());
+        }
         if let Some(v) = c.key_id {
             builder = builder.with_access_key_id(v);
         }
@@ -239,12 +269,12 @@ pub(super) fn s3_builder(bucket: &str, s3: Option<&S3Creds>) -> AmazonS3Builder 
         // directory bucket's zonal one.
         if let Some(v) = c.endpoint
             && !v.is_empty()
-            && !v.contains("amazonaws.com")
+            && !matches!(v, "s3.amazonaws.com" | "https://s3.amazonaws.com")
         {
             builder = builder.with_endpoint(v);
         }
-        if c.url_style == Some("path") {
-            builder = builder.with_virtual_hosted_style_request(false);
+        if let Some(style @ ("path" | "vhost")) = c.url_style {
+            builder = builder.with_virtual_hosted_style_request(style == "vhost");
         }
         if c.use_ssl == Some(false) {
             builder = builder.with_allow_http(true);
@@ -573,8 +603,8 @@ pub(super) fn cache_preload_option(
 /// `path`'s scheme selects the store: a local filesystem directory
 /// (created if absent) by default, `memory://` for an in-memory store, or
 /// `s3://<bucket>[/<prefix>]` for S3. For an `s3://` path, `s3` supplies
-/// credentials (any field unset falls back to the AWS_* environment); it
-/// may be null to use the environment alone and is ignored otherwise.
+/// explicit settings; null or entirely unset uses the AWS_* environment.
+/// It is ignored for other schemes.
 ///
 /// `encrypted` requests DuckLake data-file encryption. Recorded when a
 /// fresh store bootstraps; ignored on an already-initialized store, whose
@@ -639,10 +669,9 @@ pub(super) fn cache_preload_option(
 /// # Safety
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null,
-/// must point to a valid [`MoraineS3Config`] whose non-null fields are
-/// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
-/// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-/// `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
+/// must satisfy [`MoraineS3Config`]'s borrowing contract. `cache_dir`,
+/// `data_path`, and `checkpoint`, if non-null, must be valid NUL-terminated C
+/// strings. `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
 /// `path` is null or a NUL-terminated C string and whose `s3` is null or a
 /// valid [`MoraineS3Config`].
 /// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
@@ -1083,9 +1112,8 @@ pub struct MoraineMigrationReport {
 /// # Safety
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
-/// point to a valid [`MoraineS3Config`] whose non-null fields are valid
-/// NUL-terminated C strings. `wal`, if non-null, must point to a valid
-/// [`MoraineWalStore`] under the same contract as
+/// satisfy [`MoraineS3Config`]'s borrowing contract. `wal`, if non-null, must
+/// point to a valid [`MoraineWalStore`] under the same contract as
 /// [`moraine_attach_with_wal_store`]'s. `cache_dir`, if non-null, must be a
 /// valid NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
 /// `cache_puts` are unconstrained. `out`

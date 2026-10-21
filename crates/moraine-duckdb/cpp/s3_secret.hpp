@@ -8,6 +8,7 @@
 #include "moraine_abi.h"
 
 #include <string>
+#include <memory>
 
 namespace moraine_duckdb {
 
@@ -20,12 +21,14 @@ struct S3SecretStrings {
 	std::string session_token;
 	std::string endpoint;
 	std::string url_style;
+	MoraineS3CredentialSource credential_source {};
+	std::shared_ptr<void> credential_owner;
 };
 
 // Fills `config` from the DuckDB secret matching `path` — the same secret
 // DuckLake and httpfs use for DATA_PATH — when `path` is an `s3://` URL.
-// Fields the secret omits are left unset and fall back to the AWS_*
-// environment in the core.
+// With no matching secret, all fields remain unset and the core uses AWS_*
+// environment settings. A matching secret supplies its own configuration.
 //
 // Returns whether `path` is an `s3://` URL, which is what decides whether
 // the caller passes `&config` or null.
