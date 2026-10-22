@@ -55,16 +55,33 @@ jobs:
     if: needs.should-release.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
 
-  build-extension:
+  # Every DuckDB release .github/duckdb-versions supports, read on the
+  # runner that already decided whether to release.
+  versions:
     needs: should-release
     if: needs.should-release.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        run: echo "matrix=$(cargo run -q -p xtask -- version-matrix)" >> "$GITHUB_OUTPUT"
+
+  build-extension:
+    name: Build ${{ matrix.duckdb_version }} (extension-ci-tools)
+    needs: versions
+    strategy:
+      fail-fast: false
+      matrix:
+        duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}
     # duckdb_version checks DuckDB out at that release and stamps every
     # version string from it; ci_tools_version must match the ref above.
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@78bd1e4abbd543822166d5b07644751ba1fc6e8d
     with:
       extension_name: moraine
       ci_tools_version: 78bd1e4abbd543822166d5b07644751ba1fc6e8d
-      duckdb_version: v2.0.0
+      duckdb_version: ${{ matrix.duckdb_version }}
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
@@ -79,9 +96,10 @@ jobs:
       test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
 
   validate:
-    needs: [should-release, build-extension]
-    if: needs.should-release.outputs.release == 'true'
+    needs: [versions, build-extension]
     uses: ./.github/workflows/validate-extension.yml
+    with:
+      duckdb_versions: ${{ needs.versions.outputs.matrix }}
 
   publish:
     needs: [should-release, build-extension, validate, ci]

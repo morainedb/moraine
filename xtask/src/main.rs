@@ -30,6 +30,8 @@
 //! - `validate-release-artifact <version> <platform> <artifact>` loads one
 //!   published extension into the stock CLI for that DuckDB and proves its
 //!   bundled DuckLake records row-ID statistics and prunes files.
+//! - `version-matrix` prints every supported release as a JSON array, which is
+//!   what the build and validation matrices are generated from.
 //! - `bump-duckdb <version>` moves the primary pin to a new DuckDB release,
 //!   writing every place `check-pins` checks (see `bump.rs`).
 //! - `ducklake-patch` builds the repository's DuckLake patch series as a
@@ -75,6 +77,10 @@ fn main() -> anyhow::Result<()> {
         Some("check-pins") => pins::check_pins(),
         Some("check-patch-pins") => ducklake_patch::check_pins(),
         Some("check-release-assets") => release::check_release_assets(&arguments),
+        Some("version-matrix") => {
+            pins::print_version_matrix();
+            Ok(())
+        }
         Some("stage-release-assets") => release::stage_release_assets(&arguments),
         Some("validate-release-artifact") => release::validate_release_artifact(&arguments),
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
@@ -82,6 +88,8 @@ fn main() -> anyhow::Result<()> {
             bail!(
                 "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
                  check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
+             version-matrix, \
+                 version-matrix, \
                  bump-duckdb, ducklake-patch"
             )
         }
