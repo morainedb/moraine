@@ -60,25 +60,42 @@ fn descriptor_limit() -> Option<u64> {
     }
 }
 
-static ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
-    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(in_flight_reads())));
+static ADMISSION: LazyLock<Admission> = LazyLock::new(|| Admission::new(in_flight_reads()));
 
-/// Runs one store read under admission. A retry inside `work` is the same
-/// logical read and keeps its permit; the wait is named because a caller
-/// held by a saturated store is otherwise silent.
-async fn admitted<T>(
-    work: impl Future<Output = object_store::Result<T>>,
-) -> object_store::Result<T> {
-    let _permit = crate::telemetry::reporting_phase(
-        "data-read-admission",
-        Arc::clone(&ADMISSION).acquire_owned(),
-    )
-    .await
-    .map_err(|error| object_store::Error::Generic {
-        store: "moraine data store",
-        source: Box::new(error),
-    })?;
-    work.await
+struct Admission {
+    all: tokio::sync::Semaphore,
+    background: tokio::sync::Semaphore,
+}
+
+impl Admission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            all: tokio::sync::Semaphore::new(capacity),
+            background: tokio::sync::Semaphore::new((capacity / 2).max(1)),
+        }
+    }
+
+    async fn run<T>(
+        &self,
+        background: bool,
+        work: impl Future<Output = object_store::Result<T>>,
+    ) -> object_store::Result<T> {
+        let failure = |error| object_store::Error::Generic {
+            store: "moraine data store",
+            source: Box::new(error),
+        };
+        // Wait outside shared admission so queued background reads leave foreground
+        // slots free.
+        let _background = if background {
+            Some(self.background.acquire().await.map_err(failure)?)
+        } else {
+            None
+        };
+        let _permit = crate::telemetry::reporting_phase("data-read-admission", self.all.acquire())
+            .await
+            .map_err(failure)?;
+        work.await
+    }
 }
 
 /// An object store holding data files, named once for the caches that key
@@ -87,6 +104,7 @@ async fn admitted<T>(
 pub struct DataStore {
     store: Arc<dyn ObjectStore>,
     pub(super) identity: CacheIdentity,
+    background: bool,
 }
 
 impl DataStore {
@@ -101,7 +119,20 @@ impl DataStore {
     /// restarts when the identity names a stable object namespace.
     #[must_use]
     pub fn with_cache_identity(store: Arc<dyn ObjectStore>, identity: CacheIdentity) -> Self {
-        Self { store, identity }
+        Self {
+            store,
+            identity,
+            background: false,
+        }
+    }
+
+    /// Shares caches while reserving half of process I/O admission for
+    /// foreground reads.
+    pub(crate) fn background(&self) -> Self {
+        Self {
+            background: true,
+            ..self.clone()
+        }
     }
 
     /// The store itself, as it was handed over. A read taken from it
@@ -123,10 +154,14 @@ impl DataStore {
         path: &Path,
         range: Range<u64>,
     ) -> object_store::Result<Bytes> {
-        admitted(retry::retrying("a data-file read", path, || {
-            self.store.get_range(path, range.clone())
-        }))
-        .await
+        ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a data-file read", path, || {
+                    self.store.get_range(path, range.clone())
+                }),
+            )
+            .await
     }
 
     /// Reads at most `len` bytes from the start of `path`, returning what
@@ -138,24 +173,32 @@ impl DataStore {
             range: Some(object_store::GetRange::Bounded(0..len)),
             ..object_store::GetOptions::default()
         };
-        admitted(retry::retrying("a sidecar read", path, || async {
-            self.store
-                .get_opts(path, options.clone())
-                .await?
-                .bytes()
-                .await
-        }))
-        .await
+        ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a sidecar read", path, || async {
+                    self.store
+                        .get_opts(path, options.clone())
+                        .await?
+                        .bytes()
+                        .await
+                }),
+            )
+            .await
     }
 
     /// Replaces whatever is at `path`. A sidecar's contents are a function
     /// of the file it describes, so a racing writer writes the same bytes.
     pub(crate) async fn write(&self, path: &Path, bytes: Bytes) -> object_store::Result<()> {
-        retry::retrying("a sidecar write", path, || {
-            self.store.put(path, bytes.clone().into())
-        })
-        .await
-        .map(|_| ())
+        ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a sidecar write", path, || {
+                    self.store.put(path, bytes.clone().into())
+                }),
+            )
+            .await
+            .map(|_| ())
     }
 
     /// [`Self::read_range`] over several ranges in one request, so the
@@ -165,10 +208,14 @@ impl DataStore {
         path: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        admitted(retry::retrying("a data-file read", path, || {
-            self.store.get_ranges(path, ranges)
-        }))
-        .await
+        ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a data-file read", path, || {
+                    self.store.get_ranges(path, ranges)
+                }),
+            )
+            .await
     }
 }
 
@@ -177,3 +224,6 @@ impl std::fmt::Debug for DataStore {
         write!(f, "DataStore({})", self.store)
     }
 }
+
+#[cfg(test)]
+mod tests;

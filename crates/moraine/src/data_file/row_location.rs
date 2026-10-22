@@ -1,8 +1,11 @@
 //! Locating stable row ids within one immutable data file.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, LazyLock, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use futures::TryStreamExt;
@@ -16,6 +19,38 @@ use crate::{
     },
     error::Result,
 };
+
+/// Concurrent summary builds and per-pass table/file fan-out.
+pub(crate) const PUBLISH_CONCURRENCY: usize = 4;
+
+// Bound complete builds, including decoded row IDs and encoded sidecars, across
+// catalogs.
+static PUBLISH_SLOTS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(PUBLISH_CONCURRENCY));
+
+type PublishKey = (crate::CacheIdentity, String, u64, u64, u64);
+static PUBLISHING: LazyLock<Mutex<HashMap<PublishKey, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn publishing_file(file: &ParquetFile, table: u64, data_file: u64) -> Arc<tokio::sync::Mutex<()>> {
+    let mut active = PUBLISHING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    active.retain(|_, lock| lock.strong_count() != 0);
+    let key = (
+        file.store.cache_identity(),
+        file.path.to_string(),
+        file.file_size,
+        table,
+        data_file,
+    );
+    if let Some(lock) = active.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    active.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 /// What a sidecar read asks for before it has a header to size it by,
 /// chosen above the membership a million-row file publishes so the common
@@ -240,13 +275,22 @@ pub(crate) async fn file_summary(
 ///
 /// # Errors
 ///
-/// Returns a store error if the file's row-id column cannot be read.
+/// Returns an error if reading row IDs, encoding, or writing the summary fails.
 pub(crate) async fn publish_if_missing(
-    file: ParquetFile,
+    mut file: ParquetFile,
     table_id: u64,
     data_file_id: u64,
     row_id_start: Option<u64>,
 ) -> Result<bool> {
+    let _permit = PUBLISH_SLOTS.acquire().await.map_err(|error| {
+        crate::Error::Interrupted(format!("summary publishing admission: {error}"))
+    })?;
+    // Take the file lock after admission, bounding the lock registry by active
+    // builders.
+    let _file = publishing_file(&file, table_id, data_file_id)
+        .lock_owned()
+        .await;
+    file.store = file.store.background();
     // Settled before the store is asked anything: a dense file needs no
     // summary, so probing for one would be a guaranteed miss per file per
     // pass.
@@ -260,7 +304,7 @@ pub(crate) async fn publish_if_missing(
     }
 
     let rows = read_row_ids(file.clone(), row_id_start).await?;
-    publish_summary(&file, identity, &rows).await;
+    publish_summary(&file, identity, &rows).await?;
     Ok(true)
 }
 
@@ -391,35 +435,29 @@ fn refused(
     None
 }
 
-/// Publishes a derived summary for whichever process asks next, awaited
-/// so a pass that reports what it published has published it.
-///
-/// A failure is logged and otherwise ignored: the summary is already in
-/// hand for the caller, and the next pass derives it again.
+/// Writes a summary and reports encoding or storage failures to the publishing
+/// pass.
 async fn publish_summary(
     file: &ParquetFile,
     identity: sidecar::SidecarIdentity<'_>,
     rows: &PositionedRowSet,
-) {
-    let published = match sidecar::path_for(&file.path).and_then(|path| {
-        sidecar::encode(identity, rows).map(|bytes| (path, bytes::Bytes::from(bytes)))
-    }) {
-        Ok(published) => published,
-        Err(error) => {
-            debug!(%error, "a row summary would not encode for publishing");
-            metrics::sidecar_published(false);
-            return;
-        }
-    };
-
-    let (path, bytes) = published;
-    match file.store.write(&path, bytes).await {
-        Ok(()) => metrics::sidecar_published(true),
-        Err(error) => {
-            debug!(path = %path, %error, "a row summary could not be published");
-            metrics::sidecar_published(false);
-        }
+) -> Result<()> {
+    let result = async {
+        let path = sidecar::path_for(&file.path)?;
+        let bytes = sidecar::encode(identity, rows)?;
+        file.store
+            .write(&path, bytes.into())
+            .await
+            .map_err(|error| {
+                crate::Error::from(
+                    slatedb::Error::unavailable("publishing row summary".to_owned())
+                        .with_source(Box::new(error)),
+                )
+            })
     }
+    .await;
+    metrics::sidecar_published(result.is_ok());
+    result
 }
 
 async fn read_row_ids(

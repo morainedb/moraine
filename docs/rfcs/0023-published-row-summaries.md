@@ -145,8 +145,28 @@ boundary, even when commits enqueue out of order. They publish only files in
 that table set after the retained boundary. More than 1,024 pending table IDs
 promotes warming and publishing to all tables, bounding the queue without
 dropping work. Attach backfill publishes every table, including with preload
-disabled. Publishing remains best effort; failed or interrupted files can be
-retried by a later attach or an explicit publishing call.
+disabled. Publishing is best effort with automatic retries while attached. Failed reads,
+encodings, writes, and partial passes retain their table set and earliest cutoff;
+new pending work merges into that batch. Retries back off from one second to one
+minute. Each admitted attempt has a five-minute deadline, after which its future
+is cancelled and its batch retried. The deadline excludes waiting for admission.
+Detach cancels attempts and backoff sleeps. Successfully written immutable
+sidecars are durable progress: later attempts and attaches check their headers
+instead of rebuilding them; no extra catalog checkpoint is required.
+
+The process admits four commit passes and four backfills, with separate pools
+so backfill saturation cannot consume commit slots. At most four summary builders
+hold decoded row IDs and encoded sidecars across all catalogs. A pass fans out to
+at most four tables and four files per table. Overlapping builds of the same
+immutable file share a lock and recheck its sidecar before rebuilding. Publishing
+reads and writes use at most half the shared data-I/O admission, leaving the
+remaining permits for foreground reads. This is reserved capacity, not preemption
+of an I/O request already running.
+
+Warming generates prefixes one table at a time and attempts every range, returning
+the first failure to the retry worker. Catalog snapshots and per-file working
+buffers still scale with catalog/file size; the concurrency limits bound how many
+are active, not their individual size.
 
 The core exposes `ReadOnlyCatalog::publish_selected_row_summaries_since(data_store,
 data_prefix, tables, since)` for this path. The cutoff is exclusive and an empty

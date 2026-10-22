@@ -4,15 +4,42 @@
 use std::{
     collections::BTreeSet,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 
 use moraine::{DataStore, ReadOnlyCatalog, SnapshotId, TableId};
-use tokio::{runtime::Runtime, sync::Notify, task::JoinHandle};
+use tokio::{
+    runtime::Runtime,
+    sync::{Notify, Semaphore},
+    task::JoinHandle,
+};
 use tracing::warn;
 
 const MAX_PENDING_TABLES: usize = 1024;
 
+// Separate pools reserve progress for commits while backfills are saturated.
+static COMMIT_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+static BACKFILL_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+
+#[derive(Clone, Copy)]
+struct Policy {
+    deadline: Duration,
+    retry_initial: Duration,
+    retry_maximum: Duration,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_mins(5),
+            retry_initial: Duration::from_secs(1),
+            retry_maximum: Duration::from_mins(1),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct Pass {
     /// `None` warms every table; an empty set skips warming.
     tables: Option<BTreeSet<TableId>>,
@@ -49,20 +76,21 @@ impl Pass {
         }
     }
 
-    async fn run(self, catalog: &ReadOnlyCatalog, store: Option<&DataStore>, prefix: &str) {
+    async fn run(self, catalog: &ReadOnlyCatalog, store: Option<&DataStore>, prefix: &str) -> bool {
         let tables = self
             .tables
             .map(|tables| tables.into_iter().collect::<Vec<_>>());
-        match &tables {
+        let warmed = match &tables {
             None => warm_all_tables(catalog).await,
-            Some(tables) if !tables.is_empty() => {
-                if let Err(error) = catalog.warm_tables(tables).await {
-                    warn!(%error, "table warming skipped this pass");
-                }
-            }
-            Some(_) => {}
+            Some(tables) if !tables.is_empty() => catalog.warm_tables(tables).await,
+            Some(_) => Ok(()),
+        };
+        if let Err(error) = &warmed {
+            warn!(%error, "table warming will retry");
         }
-        let Some(store) = store else { return };
+        let Some(store) = store else {
+            return warmed.is_ok();
+        };
         let published = match (self.since, tables) {
             (Some(since), Some(tables)) => {
                 catalog
@@ -80,8 +108,12 @@ impl Pass {
                     .await
             }
         };
-        if let Err(error) = published {
-            warn!(%error, "row summary publishing skipped this pass");
+        match published {
+            Ok(outcome) => warmed.is_ok() && outcome.files_failed == 0,
+            Err(error) => {
+                warn!(%error, "row summary publishing will retry");
+                false
+            }
         }
     }
 }
@@ -105,9 +137,40 @@ impl Pending {
         self.ready.notify_one();
     }
 
-    async fn run<F: Future<Output = ()>>(&self, run: &impl Fn(Pass) -> F) {
+    async fn run_with<F: Future<Output = bool>>(
+        &self,
+        run: &impl Fn(Pass) -> F,
+        slots: &Semaphore,
+        policy: Policy,
+    ) {
         loop {
-            run(self.next().await).await;
+            let mut pass = self.next().await;
+            let mut delay = policy.retry_initial;
+            loop {
+                let Ok(permit) = slots.acquire().await else {
+                    return;
+                };
+                let completed = tokio::time::timeout(policy.deadline, run(pass.clone())).await;
+                drop(permit);
+                if matches!(completed, Ok(true)) {
+                    break;
+                }
+                warn!(
+                    timed_out = completed.is_err(),
+                    ?delay,
+                    "background pass will retry"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(policy.retry_maximum);
+                if let Some(next) = self
+                    .pass
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    pass.merge(next);
+                }
+            }
         }
     }
 
@@ -141,9 +204,14 @@ impl Schedule {
         }
     }
 
-    async fn run<F: Future<Output = ()>>(&self, run: impl Fn(Pass) -> F) {
+    async fn run<F: Future<Output = bool>>(&self, run: impl Fn(Pass) -> F) {
         // Keep polling backfill so it can release shared I/O permits.
-        tokio::join!(self.commits.run(&run), self.backfill.run(&run));
+        tokio::join!(
+            self.commits
+                .run_with(&run, &COMMIT_SLOTS, Policy::default()),
+            self.backfill
+                .run_with(&run, &BACKFILL_SLOTS, Policy::default()),
+        );
     }
 }
 
@@ -184,14 +252,8 @@ impl Drop for Worker {
 }
 
 /// Warms every table in the current snapshot.
-async fn warm_all_tables(catalog: &ReadOnlyCatalog) {
-    let snapshot = match catalog.snapshot().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            warn!(%error, "table warming skipped this pass");
-            return;
-        }
-    };
+async fn warm_all_tables(catalog: &ReadOnlyCatalog) -> moraine::Result<()> {
+    let snapshot = catalog.snapshot().await?;
     let tables = snapshot
         .schemas()
         .into_iter()
@@ -199,9 +261,7 @@ async fn warm_all_tables(catalog: &ReadOnlyCatalog) {
         .map(|table| table.id)
         .collect::<Vec<_>>();
 
-    if let Err(error) = catalog.warm_tables(&tables).await {
-        warn!(%error, "table warming skipped this pass");
-    }
+    catalog.warm_tables(&tables).await
 }
 
 #[cfg(test)]

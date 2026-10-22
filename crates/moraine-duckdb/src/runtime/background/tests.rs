@@ -139,6 +139,7 @@ fn commits_progress_during_backfill_and_shutdown_drops_both_passes() {
                         };
                         gate.acquire().await.unwrap().forget();
                         finished.send(backfill).unwrap();
+                        true
                     }
                 })
                 .await;
@@ -179,4 +180,97 @@ fn commits_progress_during_backfill_and_shutdown_drops_both_passes() {
     });
     worker.stop(&runtime);
     assert_eq!(running.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_and_timed_out_attempts_retry_without_losing_pending_tables() {
+    use std::sync::{Arc, Mutex};
+
+    let pending = Arc::new(Pending::default());
+    pending.push(commit(1, 20));
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let queue = Arc::clone(&pending);
+    let seen = Arc::clone(&attempts);
+    let task = tokio::spawn(async move {
+        queue
+            .run_with(
+                &|pass: Pass| {
+                    let attempt = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(pass);
+                        seen.len()
+                    };
+                    started.send(attempt).unwrap();
+                    async move {
+                        match attempt {
+                            1 => false,
+                            2 => std::future::pending().await,
+                            _ => true,
+                        }
+                    }
+                },
+                &tokio::sync::Semaphore::new(1),
+                super::Policy {
+                    deadline: Duration::from_secs(5),
+                    retry_initial: Duration::from_secs(1),
+                    retry_maximum: Duration::from_secs(2),
+                },
+            )
+            .await;
+    });
+    assert_eq!(starts.recv().await, Some(1));
+    pending.push(commit(2, 10));
+    assert_eq!(starts.recv().await, Some(2));
+    pending.push(commit(3, 30));
+    assert_eq!(starts.recv().await, Some(3));
+    tokio::task::yield_now().await;
+    assert!(
+        starts.try_recv().is_err(),
+        "a successful pass stops retrying"
+    );
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts[1].since, Some(SnapshotId::new(9)));
+    assert_eq!(
+        attempts[2].tables.as_ref().unwrap(),
+        &[1, 2, 3].map(TableId::new).into()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn admission_limits_active_attempts_and_abort_releases_the_slot() {
+    use std::sync::Arc;
+
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = Vec::new();
+    for table in [1, 2] {
+        let slots = Arc::clone(&slots);
+        let started = started.clone();
+        tasks.push(tokio::spawn(async move {
+            let pending = Pending::default();
+            pending.push(commit(table, 1));
+            pending
+                .run_with(
+                    &|_| {
+                        started.send(table).unwrap();
+                        std::future::pending::<bool>()
+                    },
+                    &slots,
+                    super::Policy::default(),
+                )
+                .await;
+        }));
+    }
+    assert_eq!(starts.recv().await, Some(1));
+    tokio::task::yield_now().await;
+    assert!(starts.try_recv().is_err());
+    tasks[0].abort();
+    assert_eq!(starts.recv().await, Some(2));
+    tasks[1].abort();
+    for task in tasks {
+        let _ = task.await;
+    }
+    assert_eq!(slots.available_permits(), 1);
 }

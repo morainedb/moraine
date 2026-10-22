@@ -68,9 +68,6 @@ use crate::{
     },
 };
 
-/// Tables warmed concurrently, sized for a remote object store.
-pub(crate) const WARM_TABLE_CONCURRENCY: usize = 32;
-
 /// Files whose row-id summaries are read concurrently, sized for a remote
 /// object store.
 pub(crate) const SUMMARY_READ_CONCURRENCY: usize = 64;

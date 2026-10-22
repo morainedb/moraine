@@ -379,3 +379,61 @@ async fn publishing_skips_a_file_whose_ids_are_derivable() {
         "a dense file must not get a summary it does not need"
     );
 }
+
+/// A failed sidecar write is reported and a later pass can finish it.
+#[tokio::test]
+async fn publishing_reports_write_failures_and_recovers() {
+    let memory = Arc::new(InMemory::new());
+    let path = Path::from("retry.parquet");
+    let size = write_fixture(&memory, &path, &batch_with_embedded_row_ids(&[9, 2, 7])).await;
+    let root = std::env::temp_dir().join(format!("moraine-publish-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("retry.parquet.rowsum")).unwrap();
+    let local = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap());
+    local
+        .put(
+            &path,
+            memory
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let file = || ParquetFile::new(DataStore::new(local.clone()), path.clone(), size, 0);
+    let failed = publish_if_missing(file(), 1, 1, None).await;
+    std::fs::remove_dir(root.join("retry.parquet.rowsum")).unwrap();
+    let retried = publish_if_missing(file(), 1, 1, None).await;
+    let checkpoint = publish_if_missing(file(), 1, 1, None).await;
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        failed.is_err(),
+        "a failed write must not count as a published summary"
+    );
+    assert!(retried.unwrap());
+    assert!(
+        !checkpoint.unwrap(),
+        "a successful sidecar is durable retry progress"
+    );
+}
+
+/// Overlapping passes build one sidecar for an immutable file.
+#[tokio::test]
+async fn concurrent_publishing_shares_one_file_build() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("concurrent.parquet");
+    let size = write_fixture(&store, &path, &batch_with_embedded_row_ids(&[9, 2, 7])).await;
+    let store = DataStore::new(store);
+    let file = || ParquetFile::new(store.clone(), path.clone(), size, 0);
+    let (first, second) = tokio::join!(
+        publish_if_missing(file(), 1, 1, None),
+        publish_if_missing(file(), 1, 1, None),
+    );
+    assert_eq!(
+        usize::from(first.unwrap()) + usize::from(second.unwrap()),
+        1
+    );
+}

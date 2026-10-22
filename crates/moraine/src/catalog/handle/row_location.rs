@@ -13,7 +13,7 @@ mod rows_at;
 
 pub use rows_at::{ExcludedPositions, LocatedRowScan};
 
-use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
+use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY};
 use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DataFileInfo, DeleteFileInfo, FileRowCandidate, SnapshotId,
@@ -199,12 +199,10 @@ fn positioned_rows(
 pub struct RowSummaryPublish {
     /// Current data files the pass looked at.
     pub files_considered: u64,
-    /// Files whose row-id column it read, cached and published. The rest
-    /// were already resident, answered from a summary published earlier,
-    /// or answer from their dense range.
+    /// Files whose row-id summaries were successfully written. Other files
+    /// already have a sidecar or derive their IDs from catalog metadata.
     pub summaries_built: u64,
-    /// Files it could not summarize. They stay correct but cold: a later
-    /// lookup leaves every requested row a candidate for them.
+    /// Files whose summary could not be read, encoded, or written.
     pub files_failed: u64,
 }
 
@@ -753,7 +751,7 @@ impl ReadOnlyCatalog {
     ) -> Result<RowSummaryPublish> {
         let mut outcomes = stream::iter(tables)
             .map(|table| self.publish_table(snapshot, data_store, data_prefix, table, since))
-            .buffer_unordered(WARM_TABLE_CONCURRENCY);
+            .buffer_unordered(data_file::PUBLISH_CONCURRENCY);
         let mut total = RowSummaryPublish::default();
         while let Some(table) = outcomes.try_next().await? {
             total.files_considered = total
@@ -822,7 +820,7 @@ impl ReadOnlyCatalog {
                 (file.id, written)
             }
         }))
-        .buffer_unordered(SUMMARY_READ_CONCURRENCY);
+        .buffer_unordered(data_file::PUBLISH_CONCURRENCY);
 
         while let Some((data_file_id, written)) = outcomes.next().await {
             published.files_considered = published.files_considered.saturating_add(1);

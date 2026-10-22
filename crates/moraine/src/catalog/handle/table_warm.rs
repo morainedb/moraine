@@ -43,29 +43,43 @@ impl ReadOnlyCatalog {
     /// Warms the store ranges a lookup on each of `tables` probes — its
     /// indexes' entries and its inlined data — into the block cache, so a
     /// cold table pays one burst of reads rather than a round trip per probe.
-    /// Best-effort: a range that fails to read is skipped and counted in the
-    /// log.
+    /// Attempts every range and returns the first failure so background callers
+    /// can retry.
     ///
     /// # Errors
     ///
-    /// Returns a store error if the head view cannot be read.
+    /// Returns a store error if the head view or any probe range cannot be
+    /// read.
     pub async fn warm_tables(&self, tables: &[TableId]) -> Result<()> {
         let epoch = super::cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let handle = session.handle();
         let view = self.head_view(handle, epoch).await?;
-        let prefixes = tables
-            .iter()
-            .flat_map(|table| probe_prefixes(&view, *table))
-            .collect::<Vec<_>>();
-        let ranges = prefixes.len();
-
-        let failed = stream::iter(prefixes)
+        let mut tables_to_warm = tables.iter();
+        let mut current = Vec::new().into_iter();
+        let prefixes = std::iter::from_fn(|| {
+            loop {
+                if let Some(prefix) = current.next() {
+                    return Some(prefix);
+                }
+                current = probe_prefixes(&view, *tables_to_warm.next()?).into_iter();
+            }
+        });
+        let mut results = stream::iter(prefixes)
             .map(|prefix| warm_prefix(handle, prefix))
-            .buffer_unordered(WARM_RANGE_CONCURRENCY)
-            .filter(|result| std::future::ready(result.is_err()))
-            .count()
-            .await;
+            .buffer_unordered(WARM_RANGE_CONCURRENCY);
+        let (mut ranges, mut failed) = (0, 0);
+        let mut outcome = Ok(());
+        while let Some(result) = results.next().await {
+            ranges += 1;
+            if result.is_err() {
+                failed += 1;
+                if outcome.is_ok() {
+                    outcome = result;
+                }
+            }
+        }
+        drop(results);
         debug!(
             tables = tables.len(),
             ranges, failed, "warmed table probe ranges"
@@ -73,6 +87,6 @@ impl ReadOnlyCatalog {
 
         session.finish();
 
-        Ok(())
+        outcome
     }
 }
