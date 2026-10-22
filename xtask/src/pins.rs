@@ -599,6 +599,34 @@ mod tests {
         }
     }
 
+    /// Stamping the build tag onto a checkout that already carries it succeeds.
+    #[test]
+    #[cfg(unix)]
+    fn the_build_tag_stamps_a_checkout_that_already_carries_it() {
+        // The pins job runs this with submodules; Rust-only checkouts omit them.
+        let root = workspace_root();
+        if !root
+            .join("extension-ci-tools/makefiles/duckdb_extension.Makefile")
+            .is_file()
+            || !root.join("duckdb/.git").exists()
+        {
+            return;
+        }
+        for _ in 0..2 {
+            let output = Command::new("make")
+                .arg("set_duckdb_tag")
+                .env("DUCKDB_TAG", duckdb_pin())
+                .current_dir(&root)
+                .output()
+                .expect("running make");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn the_build_tag_overrides_the_ci_checkout_version() {
