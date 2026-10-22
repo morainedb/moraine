@@ -24,33 +24,28 @@ jobs:
   build:
     name: Build the extension (extension-ci-tools)
     needs: validate-tag
-    # Omit duckdb_version to build the pinned submodule. The Makefile stamps
-    # duckdb_tag explicitly; test_config forwards it into Linux containers.
-    # ci_tools_version must match the reusable workflow's ref.
+    # duckdb_version checks DuckDB out at that release and stamps every
+    # version string from it; ci_tools_version must match the ref above.
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@78bd1e4abbd543822166d5b07644751ba1fc6e8d
     with:
       extension_name: moraine
       ci_tools_version: 78bd1e4abbd543822166d5b07644751ba1fc6e8d
-      duckdb_tag: v2.0.0
+      duckdb_version: v2.0.0
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
-      # The bundled DuckLake carries the patch series: prove the build
-      # records row-ID statistics, prunes a scan by row id, and takes
-      # existing delete positions. It runs here rather than in a job of its
-      # own because the only CLI that can load the artifact is the one this
-      # container just built beside it.
-      post_build_command: >-
-        cargo run -q -p xtask -- validate-release-artifact v2.0.0
-        build/release/extension/moraine/moraine.duckdb_extension
       # Point ccache at the directory the Linux container already mounts and
       # caches; without it every build recompiles DuckDB from scratch.
-      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0"}}'
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
+
+  validate:
+    needs: build
+    uses: ./.github/workflows/validate-extension.yml
 
   release:
-    needs: build
+    needs: [build, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

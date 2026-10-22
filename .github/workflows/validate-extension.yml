@@ -1,0 +1,42 @@
+name: Validate the extension
+# Prove every uploaded build in the engine its users run: load the artifact
+# into the stock CLI for the DuckDB it was built for, on a runner of that
+# platform, and exercise the bundled DuckLake's patch series. Called by the
+# two workflows that publish, each after its build.
+on:
+  workflow_call:
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-24.04
+          - platform: linux_arm64
+            runner: ubuntu-24.04-arm
+          - platform: osx_arm64
+            runner: macos-15
+          # macos-15 is Apple Silicon, so this build and the CLI that loads
+          # it both run under Rosetta.
+          - platform: osx_amd64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: moraine-v2.0.0-extension-${{ matrix.platform }}
+          path: artifact
+      - uses: Swatinem/rust-cache@v2
+      # Declared after rust-cache so this save fires before rust-cache's
+      # post-step cleanup of unrecognized target/ directories.
+      - uses: actions/cache@v6
+        with:
+          path: target/duckdb-cli
+          key: duckdb-cli-${{ matrix.platform }}-${{ hashFiles('.github/duckdb-versions') }}
+      - run: >-
+          cargo run -q -p xtask -- validate-release-artifact v2.0.0
+          ${{ matrix.platform }} artifact/moraine.duckdb_extension

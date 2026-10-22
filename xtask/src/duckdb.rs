@@ -79,6 +79,9 @@ pub fn duckdb_pin() -> &'static str {
         .unwrap_or_default()
 }
 
+/// Where DuckDB publishes a release's assets.
+const DUCKDB_RELEASE_BASE_URL: &str = "https://github.com/duckdb/duckdb/releases/download";
+
 /// Runs `cmd`, failing with its exact invocation and exit status if it
 /// didn't succeed. Stdio is inherited, so the child's own output (e.g.
 /// `curl`'s error text) reaches the caller.
@@ -221,6 +224,97 @@ pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
     Ok(cli)
 }
 
+/// The published CLI for `version` on `platform`, downloaded into
+/// `target/duckdb-cli/<version>/<platform>/` and cached there.
+///
+/// The engine a user loads a published build into. Its reported version is
+/// checked on every call, which also stands in for a checksum: DuckDB
+/// publishes none alongside its releases.
+pub fn ensure_released_duckdb_cli(version: &str, platform: &str) -> anyhow::Result<PathBuf> {
+    ensure!(
+        supported_duckdb_versions()
+            .iter()
+            .any(|supported| supported == version),
+        "DuckDB {version} is not listed in .github/duckdb-versions, so this repository \
+         publishes no build for it"
+    );
+
+    let directory = workspace_root()
+        .join("target/duckdb-cli")
+        .join(version)
+        .join(platform);
+    let cli = directory.join(cli_binary_name());
+    if !cli.exists() {
+        unpack_released_duckdb_cli(version, platform, &directory, &cli)?;
+    }
+
+    let reported = command_output(Command::new(&cli).args([
+        "-csv",
+        "-noheader",
+        "-c",
+        "SELECT version();",
+    ]))
+    .with_context(|| {
+        format!(
+            "running the published CLI for {platform}, which only a machine of that platform can do"
+        )
+    })?;
+    ensure!(
+        reported.trim() == version,
+        "the published CLI at {} reports DuckDB {}, not the {version} it was downloaded for",
+        cli.display(),
+        reported.trim()
+    );
+    Ok(cli)
+}
+
+/// Downloads the release asset and leaves the CLI at `cli`. The unpack
+/// stages elsewhere and renames, so a partial one never looks cached.
+fn unpack_released_duckdb_cli(
+    version: &str,
+    platform: &str,
+    directory: &Path,
+    cli: &Path,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(directory).with_context(|| format!("creating {}", directory.display()))?;
+    let asset = cli_asset(platform);
+    let archive = directory.join(&asset);
+    download(
+        &format!("{DUCKDB_RELEASE_BASE_URL}/{version}/{asset}"),
+        &archive,
+    )?;
+
+    let staged = directory.join("staged");
+    if staged.exists() {
+        fs::remove_dir_all(&staged).with_context(|| format!("clearing {}", staged.display()))?;
+    }
+    fs::create_dir_all(&staged).with_context(|| format!("creating {}", staged.display()))?;
+    run(Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&staged))?;
+
+    let unpacked = staged.join(cli_binary_name());
+    ensure!(
+        unpacked.exists(),
+        "{asset} unpacked without a {} in it",
+        cli_binary_name()
+    );
+    fs::rename(&unpacked, cli).with_context(|| format!("moving the CLI to {}", cli.display()))?;
+    let _ = fs::remove_dir_all(&staged);
+    let _ = fs::remove_file(&archive);
+    #[cfg(unix)]
+    make_executable(cli)?;
+    Ok(())
+}
+
+/// The release asset carrying the CLI for `platform`. DuckDB spells its
+/// assets with hyphens where a platform string uses underscores.
+fn cli_asset(platform: &str) -> String {
+    format!("duckdb-cli-{}.tar.gz", platform.replace('_', "-"))
+}
+
 /// Builds the extension through DuckDB's extension toolchain (`make
 /// release`) and returns the path to the loadable `.duckdb_extension`. The
 /// toolchain statically links DuckDB, links moraine's Rust core and the
@@ -361,6 +455,14 @@ pub(crate) fn optional_command_output(command: &mut Command) -> anyhow::Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A platform resolves to the asset a DuckDB release actually carries,
+    /// which spells it with hyphens.
+    #[test]
+    fn a_platform_names_the_published_cli_asset() {
+        assert_eq!(cli_asset("linux_arm64"), "duckdb-cli-linux-arm64.tar.gz");
+        assert_eq!(cli_asset("osx_amd64"), "duckdb-cli-osx-amd64.tar.gz");
+    }
 
     #[test]
     fn linux_compiler_prefers_debian_names() {

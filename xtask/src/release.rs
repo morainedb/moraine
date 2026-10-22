@@ -59,25 +59,23 @@ pub fn check_release_assets(arguments: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Loads one build and proves that its bundled DuckLake backfills row-ID
+/// Loads one published build into the stock CLI for the DuckDB it was
+/// built for and proves that its bundled DuckLake backfills row-ID
 /// statistics and prunes a three-file scan to one file.
 ///
-/// `version` names the DuckDB the build is for, so a bump that leaves a
-/// stale invocation behind fails here instead of smoke-testing the wrong
-/// artifact.
+/// `version` and `platform` name the build the artifact is: a loadable
+/// carries both in its footer and loads into nothing else, so a wrong pair
+/// fails on the load rather than smoke-testing the wrong artifact.
 pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
-    let [version, artifact] = arguments else {
-        bail!("usage: cargo xtask validate-release-artifact <duckdb-version> <artifact>");
+    let [version, platform, artifact] = arguments else {
+        bail!(
+            "usage: cargo xtask validate-release-artifact <duckdb-version> <platform> <artifact>, \
+             e.g. `… validate-release-artifact v2.0.0 linux_amd64 artifact/moraine.duckdb_extension`"
+        );
     };
-    ensure!(
-        version == duckdb::duckdb_pin(),
-        "this build is for DuckDB {}, not {version}: only the pinned version has a CLI \
-         that can load it",
-        duckdb::duckdb_pin()
-    );
     let artifact = fs::canonicalize(artifact)
         .with_context(|| format!("resolving the extension artifact {artifact}"))?;
-    let cli = duckdb::ensure_duckdb_cli()?;
+    let cli = duckdb::ensure_released_duckdb_cli(version, platform)?;
     let script_path = duckdb::workspace_root().join(RELEASE_SMOKE);
     let script = fs::read_to_string(&script_path)
         .with_context(|| format!("reading {}", script_path.display()))?;
@@ -95,7 +93,7 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
     ensure!(
         output.status.success(),
-        "the bundled DuckLake validation failed for DuckDB {version}"
+        "the bundled DuckLake validation failed for the {platform} build of DuckDB {version}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let row_id_stat_rows = stdout.matches("2147483540").count();
@@ -110,8 +108,8 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
          delete positions; its bundled DuckLake is missing part of the patch series"
     );
     println!(
-        "ok: the bundled DuckLake records and prunes by row IDs and takes existing delete \
-         positions under DuckDB {version}"
+        "ok: the {platform} build's bundled DuckLake records and prunes by row IDs and takes \
+         existing delete positions under a stock DuckDB {version}"
     );
     Ok(())
 }
@@ -156,18 +154,13 @@ fn directory_entries(directory: &str) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
-/// The release version an uploaded artifact's directory name carries.
+/// The release an uploaded artifact's directory name carries.
 ///
-/// The reusable build names each artifact `moraine-<token>-extension-<arch>`,
-/// where `<token>` is whatever it resolved `DUCKDB_VERSION` to: the release
-/// when it was given one, and the checkout's commit when it built the pinned
-/// submodule instead. Both have to land on the release the manifest names,
-/// since that is the version a loadable's footer carries and the one the
-/// asset is named for.
-fn asset_version(token: &str, pins: &[(String, String)]) -> Option<String> {
-    pins.iter()
-        .find(|(version, commit)| token == version || token == commit)
-        .map(|(version, _)| version.clone())
+/// The reusable build names each artifact `moraine-<token>-extension-<arch>`
+/// from the DuckDB version it was given, which is the version a loadable's
+/// footer carries and the one the asset is named for.
+fn asset_version(token: &str, versions: &[String]) -> Option<String> {
+    versions.iter().find(|version| *version == token).cloned()
 }
 
 /// Stages every uploaded artifact under the name a release asset takes.
@@ -185,17 +178,14 @@ pub fn stage_release_assets(arguments: &[String]) -> anyhow::Result<()> {
     fs::create_dir_all(destination)
         .with_context(|| format!("creating the staging directory {destination}"))?;
 
-    let pins = release_pins();
+    let versions = supported_duckdb_versions();
     let mut staged = 0;
     for entry in directory_entries(artifacts)? {
         let Some((token, architecture)) = parse_artifact_directory(&entry) else {
             continue;
         };
-        let version = asset_version(token, &pins).with_context(|| {
-            format!(
-                "artifact {entry} names DuckDB `{token}`, which is neither a supported \
-                 release nor the commit one of them pins"
-            )
+        let version = asset_version(token, &versions).with_context(|| {
+            format!("artifact {entry} names DuckDB `{token}`, which is not a supported release")
         })?;
         let from = Path::new(artifacts)
             .join(&entry)
@@ -220,28 +210,6 @@ fn parse_artifact_directory(entry: &str) -> Option<(&str, &str)> {
     let rest = entry.strip_prefix("moraine-")?;
     let (token, architecture) = rest.split_once("-extension-")?;
     (!token.is_empty() && !architecture.is_empty()).then_some((token, architecture))
-}
-
-/// Every supported release and the DuckDB commit it pins, where it names
-/// one. Only the primary entry carries commits.
-fn release_pins() -> Vec<(String, String)> {
-    let primary = crate::duckdb::primary_submodule_pins()
-        .into_iter()
-        .find(|(path, _)| path == "duckdb")
-        .map(|(_, commit)| commit)
-        .unwrap_or_default();
-    supported_duckdb_versions()
-        .into_iter()
-        .enumerate()
-        .map(|(index, version)| {
-            let commit = if index == 0 {
-                primary.clone()
-            } else {
-                String::new()
-            };
-            (version, commit)
-        })
-        .collect()
 }
 
 /// Every asset a release must carry, in the name the publish step gives it.
@@ -293,29 +261,24 @@ mod tests {
         assert!(ci.contains("  workflow_call:"));
         assert!(release.contains("    uses: ./.github/workflows/ci.yml"));
         let publish = release.split("  publish:\n").nth(1).unwrap();
-        assert!(publish.contains("    needs: [should-release, build-extension, ci]"));
+        assert!(publish.contains("    needs: [should-release, build-extension, validate, ci]"));
         assert!(!publish.contains("always()"));
     }
 
     use super::*;
 
-    /// An artifact built from the pinned submodule carries the commit, not
-    /// the release, and still has to land on the release's asset name.
+    /// A build of something nobody asked for must not be staged under a
+    /// supported release's name.
     #[test]
-    fn an_artifact_named_for_the_pinned_commit_resolves_to_its_release() {
-        let pins = vec![("v2.0.0".to_owned(), "d54cbbe3".to_owned())];
+    fn only_a_supported_release_names_an_asset() {
+        let versions = vec!["v2.0.0".to_owned()];
 
-        assert_eq!(asset_version("d54cbbe3", &pins).as_deref(), Some("v2.0.0"));
-        assert_eq!(asset_version("v2.0.0", &pins).as_deref(), Some("v2.0.0"));
-    }
-
-    /// A token naming neither is a build of something nobody asked for,
-    /// which must not be staged under a supported release's name.
-    #[test]
-    fn an_unrecognized_artifact_token_resolves_to_nothing() {
-        let pins = vec![("v2.0.0".to_owned(), "d54cbbe3".to_owned())];
-
-        assert_eq!(asset_version("v2.0.0-alpha49307", &pins), None);
+        assert_eq!(
+            asset_version("v2.0.0", &versions).as_deref(),
+            Some("v2.0.0")
+        );
+        assert_eq!(asset_version("v2.0.0-alpha49307", &versions), None);
+        assert_eq!(asset_version("d54cbbe3", &versions), None);
     }
 
     #[test]
@@ -367,6 +330,23 @@ mod tests {
         let missing = missing_assets(&present, &["v1.5.5".to_owned()]);
         assert_eq!(missing.len(), PUBLISHED_PLATFORMS.len() - 1);
         assert!(!missing.contains(&"moraine.v1.5.5.osx_arm64.duckdb_extension".to_owned()));
+    }
+
+    /// Validation covers exactly what a release publishes: a platform built
+    /// and never loaded ships unproven.
+    #[test]
+    fn every_published_platform_is_validated() {
+        let contents = fs::read_to_string(
+            crate::duckdb::workspace_root().join(crate::pins::VALIDATION_WORKFLOW),
+        )
+        .expect("reading the validation workflow");
+        for platform in PUBLISHED_PLATFORMS {
+            assert!(
+                contents.contains(&format!("platform: {platform}")),
+                "{} never validates {platform}",
+                crate::pins::VALIDATION_WORKFLOW
+            );
+        }
     }
 
     #[test]
