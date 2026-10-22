@@ -94,6 +94,12 @@ async fn decode_delete_file_positions_at(
     let position_index = projected.binary_search(&position).unwrap_or_default();
     let snapshot_index = snapshot.and_then(|column| projected.binary_search(&column).ok());
     let mask = ProjectionMask::roots(builder.parquet_schema(), projected);
+    let _decode_memory = super::reader::admit_decode(builder.metadata(), &mask, None)?;
+    let _position_memory = crate::MemoryReservation::reserve(
+        u64::try_from(builder.metadata().file_metadata().num_rows())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(32),
+    )?;
     let delete_file_stream = builder
         .with_projection(mask)
         .build()
@@ -160,6 +166,12 @@ async fn read_delete_file_positions(file: ParquetFile) -> Result<Vec<u64>> {
         .map_err(corrupt("delete-file read"))?;
     let position = delete_position(builder.schema().as_ref())?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), [position]);
+    let _decode_memory = super::reader::admit_decode(builder.metadata(), &mask, None)?;
+    let _position_memory = crate::MemoryReservation::reserve(
+        u64::try_from(builder.metadata().file_metadata().num_rows())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(32),
+    )?;
     let delete_file_stream = builder
         .with_projection(mask)
         .build()

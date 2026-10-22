@@ -137,3 +137,37 @@ fn table_cascades_keep_historical_mapping_and_file_statistics_counts() {
     view.remove_file_column_stats(1, 8, 8);
     assert_eq!(view.live_entity_count(), 1);
 }
+
+#[test]
+fn held_snapshot_delays_admission_for_a_new_generation() {
+    use std::sync::Arc;
+
+    use crate::{MemoryReservation, store::cache::retention::Budget};
+    let initial =
+        CatalogSnapshot::default().estimated_bytes() * 4 + size_of::<CatalogSnapshot>() as u64;
+    let budget = Budget::new(initial * 2 + 7);
+    let mut view = CatalogSnapshot {
+        memory: Some(Arc::new(
+            MemoryReservation::from_budget(initial, budget.clone()).unwrap(),
+        )),
+        ..Default::default()
+    };
+    let held = view.clone();
+    assert!(view.admit(8).is_err());
+    assert_eq!(budget.used(), initial);
+    drop(held);
+    view.admit(8).unwrap();
+    assert_eq!(budget.used(), initial + 8);
+    drop(view);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn a_new_snapshot_generation_discards_prior_scratch_allowances() {
+    let mut view = CatalogSnapshot::default();
+    view.admit(1_000_000).unwrap();
+    let expected = view.estimated_bytes() * 4 + size_of::<CatalogSnapshot>() as u64;
+    let mut next = view.clone();
+    next.admit(0).unwrap();
+    assert_eq!(next.memory.as_ref().unwrap().bytes(), expected);
+}

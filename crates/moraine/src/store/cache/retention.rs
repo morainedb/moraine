@@ -39,6 +39,10 @@ pub(crate) struct Charge {
 }
 
 impl Charge {
+    pub(crate) fn budget(&self) -> Arc<Budget> {
+        Arc::clone(&self.budget)
+    }
+
     pub(crate) fn new(budget: Arc<Budget>) -> Self {
         Self { budget, bytes: 0 }
     }

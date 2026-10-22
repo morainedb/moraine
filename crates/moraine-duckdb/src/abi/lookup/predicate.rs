@@ -49,7 +49,7 @@ pub unsafe extern "C" fn moraine_index_predicate_rows(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
         if out_covered.is_null() || out_certified.is_null() || predicates.is_null() {
             return Err(AbiError::invalid_argument(
                 "null predicate or coverage pointer",
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn moraine_index_predicate_rows(
             )
         }?;
         let Some(result) = result else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), moraine::MemoryReservation::reserve(0)?));
         };
         // SAFETY: output pointers checked above.
         unsafe {

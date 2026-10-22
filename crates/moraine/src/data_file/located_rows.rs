@@ -83,6 +83,8 @@ pub(crate) async fn scoped_read_row_stream(
         requested,
         row_id_position,
     )?;
+    let decode_memory =
+        crate::data_file::reader::admit_decode(builder.metadata(), &mask, scope.groups.as_deref())?;
     let builder = scope.narrow(
         builder
             .with_projection(mask)
@@ -94,6 +96,7 @@ pub(crate) async fn scoped_read_row_stream(
     let metrics = file.metrics.clone();
     let stream = stream
         .map(move |batch| {
+            let _decode_memory = &decode_memory;
             let batch = batch.map_err(corrupt("located read"))?;
             let batch = normalize_batch(batch, normalization.as_ref())?;
             let row_ids: ArrayRef = if let Some(position) = row_id_output {
@@ -125,7 +128,9 @@ pub(crate) async fn scoped_read_row_stream(
                 })
                 .collect::<Result<Vec<_>>>()?;
             arrays.push(row_ids);
-            unnamed_batch(arrays, batch.num_rows())
+            let batch = unnamed_batch(arrays, batch.num_rows())?;
+            crate::MemoryReservation::reserve(batch.get_array_memory_size() as u64)?
+                .into_record_batch(batch)
         })
         .boxed();
     Ok(TimedBatches { stream, metrics }.boxed())

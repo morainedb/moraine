@@ -15,6 +15,10 @@ struct Row(Rc<Cell<usize>>);
 unsafe impl DumpRow for Row {
     type Record = Input;
 
+    fn memory_bytes(_: &Self::Record) -> u64 {
+        64
+    }
+
     fn convert(record: Input) -> Result<Self, AbiError> {
         match record {
             Input::Row(counter) => Ok(Self(counter)),
@@ -55,7 +59,7 @@ fn conversion_panic_releases_every_completed_row() {
 fn successful_conversion_transfers_ownership_to_the_caller() {
     let releases = Rc::new(Cell::new(0));
     let records = vec![Input::Row(releases.clone()), Input::Row(releases.clone())];
-    let mut rows = convert_rows::<Row>(records).unwrap();
+    let (mut rows, _memory) = convert_rows::<Row>(records).unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(releases.get(), 0);
     for row in &mut rows {
@@ -63,7 +67,7 @@ fn successful_conversion_transfers_ownership_to_the_caller() {
         unsafe { row.release() };
     }
     assert_eq!(releases.get(), 2);
-    assert!(convert_rows::<Row>(Vec::new()).unwrap().is_empty());
+    assert!(convert_rows::<Row>(Vec::new()).unwrap().0.is_empty());
 }
 
 #[test]

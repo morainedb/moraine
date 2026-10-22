@@ -10,7 +10,14 @@ use std::{
 use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 
-use crate::{CacheIdentity, store::retry};
+use crate::{CacheIdentity, MemoryReservation, store::retry};
+
+fn memory_error(error: crate::Error) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "moraine working memory",
+        source: Box::new(error),
+    }
+}
 
 /// The widest fan-out any single read path asks for: index upkeep reads
 /// this many files at once. Admission must not sit below it.
@@ -158,14 +165,21 @@ impl DataStore {
         path: &Path,
         range: Range<u64>,
     ) -> object_store::Result<Bytes> {
-        ADMISSION
+        let bytes = range.end.checked_sub(range.start).ok_or_else(|| {
+            memory_error(crate::Error::Constraint(
+                "inverted data-file byte range".into(),
+            ))
+        })?;
+        let reservation = MemoryReservation::reserve(bytes).map_err(memory_error)?;
+        let bytes = ADMISSION
             .run(
                 self.background,
                 retry::retrying("a data-file read", path, || {
                     self.store.get_range(path, range.clone())
                 }),
             )
-            .await
+            .await?;
+        reservation.into_bytes(bytes).map_err(memory_error)
     }
 
     /// Reads at most `len` bytes from the start of `path`, returning what
@@ -177,7 +191,8 @@ impl DataStore {
             range: Some(object_store::GetRange::Bounded(0..len)),
             ..object_store::GetOptions::default()
         };
-        ADMISSION
+        let reservation = MemoryReservation::reserve(len).map_err(memory_error)?;
+        let bytes = ADMISSION
             .run(
                 self.background,
                 retry::retrying("a sidecar read", path, || async {
@@ -188,7 +203,8 @@ impl DataStore {
                         .await
                 }),
             )
-            .await
+            .await?;
+        reservation.into_bytes(bytes).map_err(memory_error)
     }
 
     /// Replaces whatever is at `path`. A sidecar's contents are a function
@@ -212,14 +228,44 @@ impl DataStore {
         path: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        ADMISSION
+        let requested = ranges
+            .iter()
+            .try_fold(0_u64, |total, range| {
+                range
+                    .end
+                    .checked_sub(range.start)
+                    .and_then(|bytes| total.checked_add(bytes))
+            })
+            .ok_or_else(|| {
+                memory_error(crate::Error::Constraint(
+                    "invalid data-file byte ranges".into(),
+                ))
+            })?;
+        let mut reservation = MemoryReservation::reserve(requested).map_err(memory_error)?;
+        let bytes = ADMISSION
             .run(
                 self.background,
                 retry::retrying("a data-file read", path, || {
                     self.store.get_ranges(path, ranges)
                 }),
             )
-            .await
+            .await?;
+        let actual = bytes
+            .iter()
+            .try_fold(0_u64, |total, bytes| total.checked_add(bytes.len() as u64))
+            .ok_or_else(|| {
+                memory_error(crate::Error::Constraint(
+                    "data-file response is too large".into(),
+                ))
+            })?;
+        reservation
+            .resize(actual.max(requested))
+            .map_err(memory_error)?;
+        let reservation = Arc::new(reservation);
+        Ok(bytes
+            .into_iter()
+            .map(|bytes| MemoryReservation::shared_bytes(Arc::clone(&reservation), bytes))
+            .collect())
     }
 }
 

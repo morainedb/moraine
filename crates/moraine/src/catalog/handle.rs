@@ -139,6 +139,7 @@ pub(crate) enum Store {
     Writer {
         db: Db,
         pacer: Arc<commit::FlushPacer>,
+        counters: Arc<crate::store::cache::CacheCounters>,
         /// The log the writer's commits are slots of, when they are.
         commit_log: Option<LogCommitter>,
     },
@@ -177,9 +178,14 @@ impl Store {
     /// transaction cannot begin.
     pub(crate) fn begin_commit_session(&self) -> Result<CommitSession> {
         match self {
-            Self::Writer { db, .. } => Ok(CommitSession::folder(
-                db.begin(IsolationLevel::Snapshot).map_err(Error::from)?,
-            )),
+            Self::Writer { db, counters, .. } => {
+                if counters.slatedb_unflushed_bytes() >= crate::memory::store_memory_limit()? {
+                    return Err(Error::Constraint("storage memory admission full; wait for the store to flush before retrying".into()));
+                }
+                Ok(CommitSession::folder(
+                    db.begin(IsolationLevel::Snapshot).map_err(Error::from)?,
+                ))
+            }
             Self::Committer { reader, .. } => Ok(CommitSession::committer(Arc::clone(reader))),
             Self::Reader(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
@@ -1711,6 +1717,7 @@ impl Catalog {
                 store: Arc::new(Store::Writer {
                     db,
                     pacer,
+                    counters: Arc::clone(&cache),
                     commit_log: commit_log.clone(),
                 }),
                 location: Arc::new(StoreLocation {

@@ -9,6 +9,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, info, warn};
 
 mod publication;
+mod retry_queue;
 mod rows_at;
 pub use publication::RowSummaryProgress;
 pub use rows_at::{ExcludedPositions, LocatedRowScan};

@@ -626,3 +626,124 @@ fn staging_memory_refusal_leaves_the_table_unchanged() {
         vec![vec!["0".to_owned()]]
     );
 }
+
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
+fn host_admission_refuses_attach_before_creating_a_store() {
+    let store = TempDir::new("host-admission");
+    let output = run_session_with_env(
+        &Attach::MoraineBare {
+            store_dir: store.path(),
+        },
+        "SELECT 1;",
+        &[("MORAINE_HOST_MEMORY_BYTES", "1")],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("host memory admission refused"), "{error}");
+    assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 0);
+}
+
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
+fn translation_memory_refusal_leaves_the_table_unchanged() {
+    let store = TempDir::new("translation-memory");
+    let data = TempDir::new("translation-memory-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.memory_rows (value VARCHAR);",
+    );
+    let output = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: store.path(),
+            data_path: data.path(),
+            options: "",
+            read_only: false,
+        },
+        "INSERT INTO lake.main.memory_rows VALUES (repeat('x', 65536));",
+        &[("MORAINE_COMMIT_MEMORY_BYTES", "4096")],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("commit memory"), "{error}");
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT count(*) FROM lake.main.memory_rows;"
+        )),
+        vec![vec!["0".to_owned()]]
+    );
+}
+
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
+fn exhausted_working_memory_refuses_an_existing_attach_cleanly() {
+    let store = TempDir::new("working-admission");
+    let data = TempDir::new("working-admission-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.rows (value BIGINT); INSERT INTO lake.main.rows VALUES (7);",
+    );
+    let output = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: store.path(),
+            data_path: data.path(),
+            options: "",
+            read_only: false,
+        },
+        "SELECT * FROM lake.main.rows;",
+        &[("MORAINE_WORKING_MEMORY_BYTES", "1")],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("working memory"), "{error}");
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT * FROM lake.main.rows;"
+        )),
+        vec![vec!["7".to_owned()]]
+    );
+}
+
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
+fn inline_scan_memory_refusal_does_not_return_a_partial_result() {
+    let store = TempDir::new("inline-memory");
+    let data = TempDir::new("inline-memory-data");
+    let attach = Attach::Moraine {
+        store_dir: store.path(),
+        data_path: data.path(),
+        options: ", DATA_INLINING_ROW_LIMIT 4096",
+        read_only: false,
+    };
+    let setup = run_session(
+        &attach,
+        "CREATE TABLE lake.main.rows AS SELECT i FROM range(2048) r(i);",
+    );
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let output = run_session_with_env(
+        &attach,
+        "SELECT sum(i * 2) FROM lake.main.rows;",
+        &[("MORAINE_WORKING_MEMORY_BYTES", "262144")],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("working memory"), "{error}");
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT sum(i * 2) FROM lake.main.rows;"
+        )),
+        vec![vec!["4192256".to_owned()]]
+    );
+}

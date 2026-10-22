@@ -60,6 +60,7 @@ fn dense_chunk_references(rows: &mut [InlineRow]) -> Vec<usize> {
 /// snapshot, so a flush that removes a chunk between windows fails the
 /// scan instead of serving a torn view.
 pub(crate) struct InlineScan {
+    _memory: crate::MemoryReservation,
     session: ReadSession,
     table: TableId,
     /// Every chunk the table holds, indexed by [`InlineRow::chunk`].
@@ -278,18 +279,25 @@ impl ReadOnlyCatalog {
                 store_inline::scan_inline_deletes(handle, table.get()),
             )?;
 
+            let count = chunks.iter().fold(0_u64, |total, chunk| {
+                total.saturating_add(chunk.row_count())
+            });
+            let memory = crate::MemoryReservation::reserve(
+                count.saturating_mul(4 * size_of::<InlineRow>() as u64),
+            )?;
             let rows = materialize_locator_rows(&chunks, &tombstones);
             let mut selected = kind.select(&rows, snapshot, start);
             if let Some(version) = schema_version {
                 selected.retain(|row| chunks[row.chunk].schema_version() == Some(version));
             }
 
-            Ok((chunks, selected, opened_head))
+            Ok((chunks, selected, opened_head, memory))
         })
         .await;
 
         match selection {
-            Ok((chunks, selected, opened_head)) => Ok(InlineScan {
+            Ok((chunks, selected, opened_head, memory)) => Ok(InlineScan {
+                _memory: memory,
                 session,
                 table,
                 chunks,

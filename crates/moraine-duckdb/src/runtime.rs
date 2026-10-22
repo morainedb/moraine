@@ -124,9 +124,16 @@ impl MoraineCatalogHandle {
     }
 
     /// Warms touched tables and publishes files registered by this commit.
-    pub(crate) fn spawn_commit_passes(&self, tables: Vec<TableId>, committed: SnapshotId) {
-        if !tables.is_empty() {
-            self.enqueue_pass(Pass::commit(tables, committed));
+    pub(crate) fn spawn_commit_passes(
+        &self,
+        files: Vec<(TableId, moraine::DataFileId)>,
+        committed: SnapshotId,
+    ) {
+        if !files.is_empty() {
+            match Pass::commit(files, committed) {
+                Ok(pass) => self.enqueue_pass(pass),
+                Err(error) => tracing::warn!(%error, "background publication admission refused"),
+            }
         }
     }
 
@@ -458,14 +465,14 @@ mod tests {
         // The current-thread runtime leaves every request pending until shutdown.
         for snapshot in 1..=100 {
             handle.spawn_commit_passes(
-                vec![moraine::TableId::new(1)],
+                vec![(moraine::TableId::new(1), moraine::DataFileId::new(1))],
                 moraine::SnapshotId::new(snapshot),
             );
         }
         let workers = handle.finish_warming();
         assert_eq!(handle.finish_warming(), 0);
         handle.spawn_commit_passes(
-            vec![moraine::TableId::new(2)],
+            vec![(moraine::TableId::new(2), moraine::DataFileId::new(2))],
             moraine::SnapshotId::new(101),
         );
         assert_eq!(handle.finish_warming(), 1);

@@ -34,8 +34,9 @@ foyer = { workspace = true }
 slatedb = { workspace = true }
 slatedb-common = { workspace = true }
 storekey = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

@@ -51,7 +51,7 @@ impl ScopedRows<'_> {
 
 /// The row groups and rows a scoped read narrows its reader to.
 pub(super) struct RowScope {
-    groups: Option<Vec<usize>>,
+    pub(super) groups: Option<Vec<usize>>,
     rows: Option<RowSelection>,
 }
 

@@ -1,6 +1,8 @@
 //! An immutable, materialized catalog view. Built once from a consistent
 //! store scan; every accessor is an in-memory lookup afterwards.
 
+use std::sync::Arc;
+
 use imbl::{HashMap, OrdMap, OrdSet};
 use prost::Message as _;
 
@@ -33,6 +35,7 @@ use crate::{
 /// nodes.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
+    pub(crate) memory: Option<Arc<crate::MemoryReservation>>,
     pub(crate) snapshot: SnapshotValue,
     /// The head record's batch count when this view was built, zero for a
     /// time-travel view.
@@ -175,6 +178,48 @@ fn nested_bytes<K1: Ord, K2: Ord, V: prost::Message>(map: &OrdMap<K1, OrdMap<K2,
 }
 
 impl CatalogSnapshot {
+    /// Admits a caller-owned copy of this view's metadata. Keep the returned
+    /// reservation until the copied results are released.
+    ///
+    /// # Errors
+    /// Returns an error when the process working allowance is exhausted.
+    pub fn reserve_copy(&self) -> Result<crate::MemoryReservation> {
+        crate::MemoryReservation::reserve(
+            self.estimated_bytes()
+                .saturating_mul(4)
+                .saturating_add(size_of::<Self>() as u64),
+        )
+    }
+
+    /// Admits growth; a shared generation keeps its own reservation.
+    pub(crate) fn admit(&mut self, additional: u64) -> Result<()> {
+        let current = if let Some(memory) = &self.memory
+            && Arc::strong_count(memory) == 1
+        {
+            memory.bytes()
+        } else {
+            // A new generation does not inherit scratch space or deleted records.
+            self.estimated_bytes()
+                .saturating_mul(4)
+                .saturating_add(size_of::<Self>() as u64)
+        };
+        let requested = current.saturating_add(additional);
+        match &mut self.memory {
+            Some(memory) => {
+                if let Some(unique) = Arc::get_mut(memory) {
+                    unique.resize(requested)
+                } else {
+                    *memory = Arc::new(memory.independent(requested)?);
+                    Ok(())
+                }
+            }
+            memory @ None => {
+                *memory = Some(Arc::new(crate::MemoryReservation::reserve(requested)?));
+                Ok(())
+            }
+        }
+    }
+
     /// Roughly what this view holds, in bytes: the encoded length of every
     /// entity it carries, name indexes excluded.
     pub(crate) fn estimated_bytes(&self) -> u64 {
@@ -207,12 +252,12 @@ impl CatalogSnapshot {
     /// not history); with `at: Some(s)` a record is included iff
     /// `begin_snapshot <= s` and it had not ended by `s` (`current` records
     /// never have; `history` records carry their end).
-    pub(crate) fn build_from<'a>(
+    pub(crate) fn try_build_from<'a>(
         snapshot: SnapshotValue,
         current: impl IntoIterator<Item = &'a EntityRecord>,
         history: impl IntoIterator<Item = &'a EntityRecord>,
         at: Option<u64>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut view = Self {
             snapshot,
             ..Self::default()
@@ -232,9 +277,20 @@ impl CatalogSnapshot {
             {
                 continue;
             }
+            view.admit(record.estimated_bytes().saturating_mul(4))?;
             view.put_record(record.clone());
         }
-        view
+        Ok(view)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_from<'a>(
+        snapshot: SnapshotValue,
+        current: impl IntoIterator<Item = &'a EntityRecord>,
+        history: impl IntoIterator<Item = &'a EntityRecord>,
+        at: Option<u64>,
+    ) -> Self {
+        Self::try_build_from(snapshot, current, history, at).unwrap()
     }
 
     /// The live records of `kind` for one table, in store key order. Only

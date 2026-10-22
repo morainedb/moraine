@@ -65,14 +65,18 @@ pub struct MoraineArrowBytes {
 }
 
 impl MoraineArrowBytes {
-    pub(crate) fn from_vec(mut v: Vec<u8>) -> Self {
+    pub(crate) fn from_vec(mut v: Vec<u8>) -> Result<Self, AbiError> {
+        let memory = moraine::MemoryReservation::reserve(v.capacity() as u64)?;
         let out = Self {
             data: v.as_mut_ptr(),
             len: v.len(),
             cap: v.capacity(),
         };
+        if v.capacity() != 0 {
+            crate::abi::memory::retain(out.data as usize, memory);
+        }
         std::mem::forget(v);
-        out
+        Ok(out)
     }
 
     fn empty() -> Self {
@@ -92,6 +96,7 @@ impl MoraineArrowBytes {
         if self.data.is_null() {
             return Vec::new();
         }
+        crate::abi::memory::release(self.data as usize);
         // SAFETY: caller contract preserves the original allocation fields.
         unsafe { Vec::from_raw_parts(self.data, self.len, self.cap) }
     }
@@ -150,11 +155,11 @@ unsafe fn write_bytes_result(
     attempt: impl FnOnce() -> Result<Vec<u8>, AbiError>,
 ) -> i32 {
     // SAFETY: `err` forwarded unchanged under this function's contract.
-    match unsafe { guard(err, attempt) } {
+    match unsafe { guard(err, || MoraineArrowBytes::from_vec(attempt()?)) } {
         Ok(buf) => {
             // SAFETY: `out` is a valid writable slot per this function's
             // contract.
-            unsafe { ptr::write(out, MoraineArrowBytes::from_vec(buf)) };
+            unsafe { ptr::write(out, buf) };
             codes::OK
         }
         Err(code) => {
@@ -180,6 +185,17 @@ pub unsafe extern "C" fn moraine_arrow_encode_schema(
     let attempt = || -> Result<Vec<u8>, AbiError> {
         // SAFETY: caller cedes ownership of the exported schema.
         let schema = unsafe { consume_schema(schema) }?;
+        let metadata_bytes = schema.metadata().iter().fold(0_u64, |bytes, (key, value)| {
+            bytes
+                .saturating_add(key.len() as u64)
+                .saturating_add(value.len() as u64)
+        });
+        let _memory = moraine::MemoryReservation::reserve(
+            (schema.fields().size() as u64)
+                .saturating_add(metadata_bytes)
+                .saturating_mul(4)
+                .saturating_add(4096),
+        )?;
         let mut buf = Vec::new();
         {
             let mut writer = StreamWriter::try_new(&mut buf, &schema)
@@ -224,6 +240,11 @@ pub unsafe extern "C" fn moraine_arrow_encode_chunk(
             .map_err(|e| encode_error(format!("array import: {e}")))?;
         drop(owned_schema);
         let batch = RecordBatch::from(StructArray::from(data));
+        let _memory = moraine::MemoryReservation::reserve(
+            (batch.get_array_memory_size() as u64)
+                .saturating_mul(3)
+                .saturating_add(65536),
+        )?;
 
         let generator = IpcDataGenerator::default();
         let mut tracker = DictionaryTracker::new(false);
@@ -254,6 +275,7 @@ pub unsafe extern "C" fn moraine_arrow_encode_chunk(
 /// version decoded once and reused across every chunk of a scan.
 pub struct MoraineArrowSchema {
     schema: SchemaRef,
+    _memory: moraine::MemoryReservation,
 }
 
 fn decode_inline_schema(schema_bytes: &[u8]) -> Result<SchemaRef, AbiError> {
@@ -284,9 +306,14 @@ pub unsafe extern "C" fn moraine_arrow_schema_decode(
         }
         // SAFETY: caller guarantees the schema slice is readable.
         let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) };
+        let memory =
+            moraine::MemoryReservation::reserve((schema_ipc_len as u64).saturating_mul(8))?;
         let schema = decode_inline_schema(schema_bytes)?;
 
-        Ok(Box::new(MoraineArrowSchema { schema }))
+        Ok(Box::new(MoraineArrowSchema {
+            schema,
+            _memory: memory,
+        }))
     };
     // SAFETY: `err` validity is this function's own safety contract.
     match unsafe { guard(err, attempt) } {
@@ -317,6 +344,7 @@ fn decode_inline_body(
     schema: SchemaRef,
     body: Bytes,
 ) -> Result<(FFI_ArrowArray, FFI_ArrowSchema), AbiError> {
+    let memory = moraine::MemoryReservation::reserve((body.len() as u64).saturating_mul(4))?;
     if body.len() < 4 {
         return Err(decode_error("inline chunk body truncated"));
     }
@@ -346,6 +374,7 @@ fn decode_inline_body(
     )
     .map_err(|e| decode_error(format!("read batch: {e}")))?;
     drop(body);
+    let batch = memory.into_record_batch(batch)?;
     to_ffi(&StructArray::from(batch).to_data())
         .map_err(|e| decode_error(format!("array export: {e}")))
 }
@@ -405,6 +434,7 @@ pub unsafe extern "C" fn moraine_arrow_decode_stream(
         }
         // SAFETY: caller guarantees `body_len` readable bytes at `body`.
         let bytes = unsafe { std::slice::from_raw_parts(body, body_len) };
+        let memory = moraine::MemoryReservation::reserve((body_len as u64).saturating_mul(4))?;
         let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
             .map_err(|e| decode_error(format!("reader: {e}")))?;
         let schema = reader.schema();
@@ -412,6 +442,7 @@ pub unsafe extern "C" fn moraine_arrow_decode_stream(
             Some(b) => b.map_err(|e| decode_error(format!("read batch: {e}")))?,
             None => RecordBatch::new_empty(schema),
         };
+        let batch = memory.into_record_batch(batch)?;
         to_ffi(&StructArray::from(batch).to_data())
             .map_err(|e| decode_error(format!("array export: {e}")))
     };
@@ -453,7 +484,7 @@ mod tests {
         bytes.extend_from_slice(b"payload");
         let pointer = bytes.as_ptr();
         let capacity = bytes.capacity();
-        let handed = MoraineArrowBytes::from_vec(bytes);
+        let handed = MoraineArrowBytes::from_vec(bytes).unwrap();
         // SAFETY: handed came from from_vec and has not been consumed.
         let returned = unsafe { handed.into_vec() };
         assert_eq!(returned.as_ptr(), pointer);
@@ -463,7 +494,7 @@ mod tests {
 
     #[test]
     fn encoded_buffer_moves_back_into_rust_without_copying() {
-        let encoded = MoraineArrowBytes::from_vec(vec![1, 2, 3, 4]);
+        let encoded = MoraineArrowBytes::from_vec(vec![1, 2, 3, 4]).unwrap();
         let data = encoded.data;
         // SAFETY: `encoded` was just minted above and is consumed once.
         let reclaimed = unsafe { encoded.into_vec() };

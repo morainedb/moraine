@@ -1,7 +1,7 @@
 //! Admission for authored rows, before translation allocates a write batch.
 
 use super::{Cell, RowOperation};
-use crate::{Error, Result};
+use crate::{Error, MemoryReservation, Result};
 
 const DEFAULT_LIMIT: usize = 256 * 1024 * 1024;
 
@@ -9,6 +9,7 @@ pub(super) struct StagingMemory {
     limit: usize,
     payload: usize,
     failure: Option<String>,
+    memory: Option<MemoryReservation>,
 }
 
 impl Default for StagingMemory {
@@ -38,6 +39,7 @@ impl StagingMemory {
             limit,
             payload: 0,
             failure: None,
+            memory: None,
         }
     }
 
@@ -64,12 +66,22 @@ impl StagingMemory {
                 "staging memory exceeds {} bytes; split the transaction or raise MORAINE_STAGING_MEMORY_BYTES",
                 self.limit
             ));
-        } else if ops.try_reserve_exact(capacity - ops.len()).is_err() {
-            self.failure = Some("staging memory allocation failed".into());
+        } else {
+            let admitted = match &mut self.memory {
+                Some(memory) => memory.resize(bytes as u64),
+                memory @ None => MemoryReservation::reserve(bytes as u64)
+                    .map(|reserved| *memory = Some(reserved)),
+            };
+            if let Err(error) = admitted {
+                self.failure = Some(error.to_string());
+            } else if ops.try_reserve_exact(capacity - ops.len()).is_err() {
+                self.failure = Some("staging memory allocation failed".into());
+            }
         }
         if self.failure.is_some() {
             *ops = Vec::new();
             self.payload = 0;
+            self.memory = None;
             return self.check();
         }
         ops.push(op);
@@ -96,4 +108,29 @@ fn payload_bytes(op: &RowOperation) -> usize {
         RowOperation::InlineInsert { arrow_body, .. } => arrow_body.len(),
         _ => 0,
     }
+}
+
+/// Authored input size used to admit translation before copying its rows.
+pub(super) fn authored_bytes(ops: &[RowOperation]) -> u64 {
+    ops.iter()
+        .fold(std::mem::size_of_val(ops) as u64, |bytes, op| {
+            bytes.saturating_add(payload_bytes(op) as u64)
+        })
+}
+
+/// Metadata copied into a translated catalog view; inline bodies are excluded.
+pub(super) fn metadata_bytes(ops: &[RowOperation]) -> u64 {
+    ops.iter()
+        .filter(|op| {
+            matches!(
+                op,
+                RowOperation::Insert { .. }
+                    | RowOperation::Delete { .. }
+                    | RowOperation::UpdateSetEnd { .. }
+                    | RowOperation::UpdateSetBegin { .. }
+            )
+        })
+        .fold(0_u64, |bytes, op| {
+            bytes.saturating_add((size_of::<RowOperation>() + payload_bytes(op)) as u64)
+        })
 }

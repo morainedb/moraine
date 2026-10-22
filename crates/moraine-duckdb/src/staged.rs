@@ -345,13 +345,11 @@ pub unsafe extern "C" fn moraine_tx_commit(
         }
         // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
         let catalog_ref = unsafe { &*catalog };
-        // Read before the commit consumes `tx`, spawned after it lands.
-        let warm_tables = tx.tables_with_staged_data_files();
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let report =
             unsafe { catalog_ref.block_on_commit(probe, probe_ctx, tx.commit_reporting()) }?;
-        catalog_ref.spawn_commit_passes(warm_tables, report.snapshot_id);
+        catalog_ref.spawn_commit_passes(report.registered_files, report.snapshot_id);
 
         // Repair runs only when this commit deferred entries, after the data
         // snapshot is durable; its failure, including cancellation, is not

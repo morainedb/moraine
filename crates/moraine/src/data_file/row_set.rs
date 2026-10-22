@@ -282,7 +282,7 @@ impl PositionedRowSet {
         }
 
         let mut ascending: Vec<u64> = row_ids.clone();
-        ascending.sort_unstable();
+        sort_checked(&mut ascending, &mut checkpoint)?;
         checkpoint()?;
         if ascending.windows(2).any(|pair| pair[0] == pair[1]) {
             drop(ascending);
@@ -336,7 +336,7 @@ impl PositionedRowSet {
             })
             .collect::<Result<Vec<_>>>()?;
         checkpoint()?;
-        ordered.sort_unstable();
+        sort_checked(&mut ordered, &mut checkpoint)?;
         checkpoint()?;
         let mut members = Vec::new();
         let mut offsets = Vec::new();
@@ -371,6 +371,45 @@ impl PositionedRowSet {
             order: RowOrder::Repeated { offsets, positions },
         })
     }
+}
+
+/// Sorts bounded runs, checking cancellation throughout the merge passes.
+pub(super) fn sort_checked<T: Copy + Ord>(
+    values: &mut Vec<T>,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    const RUN: usize = 4096;
+    for run in values.chunks_mut(RUN) {
+        checkpoint()?;
+        run.sort_unstable();
+    }
+    if values.len() <= RUN {
+        return Ok(());
+    }
+    let mut scratch = values.clone();
+    let mut width = RUN;
+    while width < values.len() {
+        for start in (0..values.len()).step_by(width.saturating_mul(2)) {
+            let middle = start.saturating_add(width).min(values.len());
+            let end = middle.saturating_add(width).min(values.len());
+            let (mut left, mut right) = (start, middle);
+            for (offset, output) in scratch[start..end].iter_mut().enumerate() {
+                if offset.is_multiple_of(RUN) {
+                    checkpoint()?;
+                }
+                if left < middle && (right == end || values[left] <= values[right]) {
+                    *output = values[left];
+                    left += 1;
+                } else {
+                    *output = values[right];
+                    right += 1;
+                }
+            }
+        }
+        std::mem::swap(values, &mut scratch);
+        width = width.saturating_mul(2);
+    }
+    Ok(())
 }
 
 impl RowOrder {

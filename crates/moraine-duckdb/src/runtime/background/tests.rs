@@ -2,24 +2,27 @@ use std::time::Duration;
 
 use moraine::{SnapshotId, TableId};
 
-use super::{MAX_PENDING_TABLES, Pass, Pending};
+use super::{MAX_PENDING_PASSES, Pass, Pending};
 
 fn commit(table: u64, snapshot: u64) -> Pass {
-    Pass::commit(vec![TableId::new(table)], SnapshotId::new(snapshot))
+    Pass::commit(
+        vec![(TableId::new(table), moraine::DataFileId::new(snapshot))],
+        SnapshotId::new(snapshot),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
-async fn bursts_keep_every_table_and_the_earliest_snapshot() {
+async fn bursts_preserve_independent_progress_and_order() {
     let pending = Pending::default();
-    for (table, snapshot) in [(1, 30), (2, 10), (1, 20)] {
-        pending.push(commit(table, snapshot));
-    }
-    let pass = pending.next().await;
-    assert_eq!(
-        pass.tables.unwrap().into_iter().collect::<Vec<_>>(),
-        vec![TableId::new(1), TableId::new(2)]
-    );
-    assert_eq!(pass.since, Some(SnapshotId::new(9)));
+    let first = commit(1, 30);
+    let progress = first.progress.clone();
+    pending.push(first);
+    pending.push(commit(2, 10));
+    let first = pending.next().await;
+    assert!(std::sync::Arc::ptr_eq(&first.progress, &progress));
+    assert_eq!(first.since, Some(SnapshotId::new(29)));
+    assert_eq!(pending.next().await.since, Some(SnapshotId::new(9)));
 }
 
 #[tokio::test]
@@ -43,14 +46,14 @@ async fn attach_and_commit_requests_stay_separate_in_either_order() {
 }
 
 #[tokio::test]
-async fn overflow_warms_all_tables_without_retaining_the_table_ids() {
+async fn overflow_is_refused_without_resetting_admitted_passes() {
     let pending = Pending::default();
-    for table in 0..=MAX_PENDING_TABLES as u64 {
-        pending.push(commit(table, table + 1));
+    for table in 0..MAX_PENDING_PASSES as u64 {
+        assert!(pending.push(commit(table, table + 1)));
     }
-    let pass = pending.next().await;
-    assert!(pass.tables.is_none());
-    assert_eq!(pass.since, Some(SnapshotId::new(0)));
+    assert!(!pending.push(commit(999, 999)));
+    assert_eq!(pending.next().await.since, Some(SnapshotId::new(0)));
+    assert!(pending.push(commit(999, 999)));
 }
 
 #[tokio::test]
@@ -83,9 +86,11 @@ async fn concurrent_producers_do_not_lose_tables() {
     for task in tasks {
         task.await.unwrap();
     }
-    let pass = pending.next().await;
-    assert_eq!(pass.tables.unwrap(), (1..=64).map(TableId::new).collect());
-    assert_eq!(pass.since, Some(SnapshotId::new(0)));
+    let mut tables = std::collections::BTreeSet::new();
+    for _ in 1..=64 {
+        tables.extend(pending.next().await.tables.unwrap());
+    }
+    assert_eq!(tables, (1..=64).map(TableId::new).collect());
 }
 
 #[test]
@@ -174,8 +179,8 @@ fn commits_progress_during_backfill_and_shutdown_drops_both_passes() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(merged.since, Some(SnapshotId::new(29)));
-        assert_eq!(merged.tables.unwrap(), [2, 3].map(TableId::new).into());
+        assert_eq!(merged.since, Some(SnapshotId::new(39)));
+        assert_eq!(merged.tables.unwrap(), [2].map(TableId::new).into());
         assert_eq!(running.load(Ordering::SeqCst), 2);
     });
     worker.stop(&runtime);
@@ -225,16 +230,14 @@ async fn failed_and_timed_out_attempts_retry_without_losing_pending_tables() {
     pending.push(commit(3, 30));
     assert_eq!(starts.recv().await, Some(3));
     tokio::task::yield_now().await;
-    assert!(
-        starts.try_recv().is_err(),
-        "a successful pass stops retrying"
-    );
+    while starts.try_recv().is_ok() {}
     let attempts = attempts.lock().unwrap();
     assert_eq!(attempts[1].since, Some(SnapshotId::new(9)));
     assert_eq!(
         attempts[2].tables.as_ref().unwrap(),
-        &[1, 2, 3].map(TableId::new).into()
+        &[1].map(TableId::new).into()
     );
+    assert!(Arc::ptr_eq(&attempts[0].progress, &attempts[2].progress));
     task.abort();
 }
 

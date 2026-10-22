@@ -1357,3 +1357,50 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
+
+/// Validates configured host headroom before opening a store. The host must
+/// account for other database instances and stores in its headroom allowance.
+///
+/// # Safety
+/// `err` must be null or a writable error slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_validate_host_memory(
+    duckdb_bytes: u64,
+    cache_bytes: u64,
+    writer: bool,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        let cache = if cache_bytes == 0 {
+            640 * 1024 * 1024
+        } else {
+            cache_bytes
+        };
+        let store = if writer {
+            match std::env::var("MORAINE_STORE_MEMORY_BYTES") {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        AbiError::invalid_argument("MORAINE_STORE_MEMORY_BYTES must be positive")
+                    })?,
+                Err(std::env::VarError::NotPresent) => 1024 * 1024 * 1024,
+                Err(_) => {
+                    return Err(AbiError::invalid_argument(
+                        "MORAINE_STORE_MEMORY_BYTES must be UTF-8",
+                    ));
+                }
+            }
+        } else {
+            0
+        };
+        moraine::validate_host_memory(duckdb_bytes, cache.saturating_add(store))
+            .map_err(AbiError::from)
+    };
+    // SAFETY: error-slot validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}

@@ -437,7 +437,7 @@ pub unsafe extern "C" fn moraine_indexes(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineIndexDesc>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineIndexDesc>, moraine::MemoryReservation), AbiError> {
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
@@ -467,7 +467,8 @@ pub unsafe extern "C" fn moraine_indexes(
                 ))
             })
             .collect::<Result<_, AbiError>>()?;
-        Ok(owned
+        let memory = crate::abi::reserve_array::<MoraineIndexDesc>(owned.len(), owned.iter().map(|row| row.4.as_bytes_with_nul().len() as u64).sum())?;
+            Ok((owned
             .into_iter()
             .map(
                 |(index_id, unique, state, certified, name)| MoraineIndexDesc {
@@ -480,7 +481,7 @@ pub unsafe extern "C" fn moraine_indexes(
                     name: name.into_raw(),
                 },
             )
-            .collect())
+            .collect(), memory))
     };
 
     // SAFETY: caller contract for the pointers.

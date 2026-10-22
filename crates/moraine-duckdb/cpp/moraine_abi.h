@@ -1642,6 +1642,16 @@ int32_t moraine_catalog_encrypted(struct MoraineCatalogHandle *handle,
 // [`moraine_attach_with_wal_store`] and not yet passed to `moraine_detach`.
 void moraine_detach(struct MoraineCatalogHandle *handle);
 
+// Validates configured host headroom before opening a store. The host must
+// account for other database instances and stores in its headroom allowance.
+//
+// # Safety
+// `err` must be null or a writable error slot.
+int32_t moraine_validate_host_memory(uint64_t duckdb_bytes,
+                                     uint64_t cache_bytes,
+                                     bool writer,
+                                     struct MoraineError *err);
+
 // Arms a stall for the cancellable call entering on this thread.
 // The shim consumes its session-owned arm before making this handoff.
 void moraine_fault_stall_next_read(uint64_t milliseconds);

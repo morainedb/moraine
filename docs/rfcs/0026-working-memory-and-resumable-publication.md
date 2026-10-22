@@ -2,118 +2,133 @@
 
 - **Date:** 2026-10-22
 
-## Resource boundaries
+## Contract
 
-`CACHE_MEMORY` bounds estimated cache retention. It cannot bound all memory in a
-DuckDB process. Catalog snapshots and caller-owned query results must remain
-valid while readers hold them; staged transactions retain authored rows until
-commit or rollback. DuckDB operators, Parquet decoding, allocator overhead, and
-transport buffers have separate lifetimes.
+The extension remains in-process. Admission rejects oversized work with an
+actionable error, and cancellation is cooperative. Results are never truncated;
+refused staging or translation poisons the transaction so an accepted prefix
+cannot commit. Indexes, Enterprise integration, migrations, WAL relocation, and
+checkpoints remain available.
 
-Preserve indexes, Enterprise's commit-log integration, migrations, WAL relocation,
-and checkpoints. Memory admission may refuse oversized work with an actionable
-error; it must never truncate results or commit a partially accepted transaction.
+`CACHE_MEMORY` limits estimated cache retention. `MORAINE_WORKING_MEMORY_BYTES`
+adds a separate process-wide allowance for admitted live working allocations,
+defaulting to 1 GiB. Positive byte counts are required. Owners reserve before
+known allocations and retain their reservation through use. Estimates include
+conservative space for copies and container overhead; they are not allocator or
+RSS measurements. A refusal releases temporary owners normally.
 
-## Snapshots and query copies
+`MemoryReservation` supports reservation, resizing, and ownership transfer to
+`Bytes` and Arrow batches. Clones, slices, nested Arrow buffers, null masks, and
+Arrow C exports retain the allowance until the final buffer owner releases it.
+`working_memory_usage()` returns reserved bytes and capacity. These APIs are
+additive and leave existing owned-result APIs intact.
 
-One catalog handle serializes cold head-view materialization. Waiters recheck the
-held projection after admission and share the resulting immutable snapshot. Hot
-reads keep their existing path. Time-travel materialization streams current and
-history records into the requested view, retaining only visible records instead
-of complete intermediate history vectors.
+## Snapshots and results
 
-Revision memos reserve result storage before making a cache-only copy. A denied
-reservation leaves the caller's result usable and skips the copy. Active reader
-ownership and allocated cache containers remain charged as described in
-[RFC 0009](0009-reader-consistency-and-caching.md).
+Cold head-view materialization is serialized per catalog. Snapshot generations
+reserve their estimated metadata storage; held readers retain their generation's
+reservation while a new generation is admitted independently. Time travel streams
+visible records into its view. Store scan buffers and retained record-set keys
+hold reservations through decoding and projection ownership.
 
-These changes reduce duplicate allocations. They do not cap the final catalog
-view or memory returned through existing owned `Vec` APIs. Bounding those
-lifetimes requires a shared query allocator or tracked result handles; introducing
-those cannot silently invalidate existing callers' data.
+`CatalogSnapshot::reserve_copy()` lets a caller admit metadata copies before
+materializing them. Snapshot C exports use it. Catalog dump conversion reserves
+row headers and string bytes. Index, inline, checkpoint, and maintenance arrays
+also retain their allowances, and the paired C free function releases that
+reservation. Exported IPC bytes retain admission through their paired free or
+transfer into staging. Inline cursors admit their materialized row selection before constructing it.
+Parquet row batches retain reservations through Arrow
+buffer ownership, including slices held after the scan ends.
 
-## Staged rows
+Legacy Rust methods returning ordinary `Vec` values preserve their signatures.
+External callers own allocations made from those results and must retain a
+reservation themselves when they need that storage included in admission. An
+in-process library cannot account for arbitrary caller closures or copies.
 
-`MORAINE_STAGING_MEMORY_BYTES` is a positive integer byte count, defaulting to
-268,435,456 (256 MiB) per staged transaction. It accounts for the operation vector's
-allocated capacity, cell vectors and strings, Arrow schema bytes, and retained
-Arrow body lengths. Shared bodies are conservatively charged per operation;
-slices may retain a larger allocation owned by their caller.
+## Staging, translation, and storage
 
-`StagedTransaction::try_stage` checks admission before retaining a row. A refusal
-releases all authored rows and poisons the transaction: later stages and commit
-fail. The existing infallible `stage` entry point retains that failure for commit;
-the DuckDB ABI uses `try_stage` to report it immediately. Configuration and memory
-errors avoid DuckLake's conflict-retry vocabulary. Rollback remains valid.
+`MORAINE_STAGING_MEMORY_BYTES` defaults to 256 MiB per staged transaction. It
+accounts for operation-vector capacity, cells, strings, schemas, and retained
+Arrow bodies. Staging also consumes the shared working allowance. Refusal drops
+authored rows and poisons the transaction; rollback remains valid.
 
-This is an authored-row allowance, not a bound on commit translation, index
-maintenance, caller-owned input buffers, or SlateDB's write buffers. Large work
-can raise the explicit allowance or use smaller transactions.
+`MORAINE_COMMIT_MEMORY_BYTES` defaults to 256 MiB per commit session. Translation
+scratch and the recorded write ledger consume that allowance and the shared
+working allowance. Admission precedes each store write and ledger copy. A refused
+write poisons commit even if a caller ignores the immediate error. Submission
+transfers the recorded ledger rather than cloning it. Reservations follow
+coalesced members and commit submission through acceptance.
 
-## Summary builds
+`MORAINE_STORE_MEMORY_BYTES` configures SlateDB's per-writer logical unflushed
+threshold, defaulting to its existing 1 GiB. The SST freeze threshold is at most
+half this setting. Starting a transaction at an already full recorded threshold
+is refused; SlateDB also applies its own write backpressure. The gauge is
+asynchronous and concurrent admitted batches can cross the threshold. It is not
+an exact allocator cap; host headroom must include those batches, compaction,
+transport, and allocator overhead.
 
-`MORAINE_SUMMARY_MEMORY_BYTES` is an integer byte count of at least 64, defaulting
-to 268,435,456 (256 MiB) per file. Builders admit at most `bytes / 64` physical rows,
-using a conservative allowance for row IDs, sort buffers, membership, positions,
-and encoding. Footer row counts are checked before reading the row-ID column;
-actual decoded batches cannot exceed the admitted count. Oversized files are left
-unpublished rather than retried as transient failures. Foreground position
-resolution falls back to a batched row-ID scan, retaining only requested
-positions and checking missing rows exactly; indexed SELECT/UPDATE/DELETE remain
-available above the summary-build limit. This is an admission estimate, not allocator-level accounting. Parquet footers, compressed pages,
-transport buffers, and allocator overhead still require headroom.
+## Parquet and summary work
 
-At most four construction or encoding tasks run process-wide; background row-ID
-construction can hold at most two of those slots. Completed summaries waiting for
-encoding or upload have separate lifetimes. CPU-heavy sorting and encoding run
-on blocking workers.
-Build permits follow the CPU task even when its awaiting future is cancelled, so
-a timeout cannot admit replacement buffers while abandoned CPU work still runs.
-Construction checks cancellation between phases and periodically while building
-positions. A synchronous sort or library codec call cannot be forcibly preempted;
-its work is bounded by the admitted file size.
+Object-store range and prefix requests reserve their requested byte counts before
+fetching. Returned bytes retain the reservation. Disk-cache byte records admit
+incremental vector growth. Parquet readers retain footer/metadata allowances and
+reserve four times the largest selected row group's projected uncompressed size
+before page decoding. Input ranges and retained output batches are charged
+separately. These estimates can refuse a very large row group even for a narrow
+selection; rewrite with smaller row groups or raise the working allowance.
 
-Sparse high-word row IDs can choose sorted storage before constructing a Roaring
-representation whose headers already outweigh the raw IDs. Repeated-row builds
-release the first sorted copy before building their positional representation.
-Sidecar continuation reads refuse lengths exceeding half the configured allowance;
-a prefix that already covers the summary is decoded without copying it.
+`MORAINE_SUMMARY_MEMORY_BYTES` defaults to 256 MiB per file and must be at least
+64. Builders admit at most `bytes / 64` physical rows and reserve that estimate
+against the shared working allowance before collecting row IDs. Oversized summary
+builds leave the file unpublished. Foreground indexed reads and mutations can
+still resolve requested positions by streaming row IDs.
+
+At most four summary construction/encoding tasks run process-wide; background
+construction occupies at most two. Blocking tasks retain their permits and
+reservations after cancellation of their waiter. Sorts process runs and merges
+with checkpoints every 4,096 entries. Encoding checks cancellation between small
+writes, and packed positions use an 8 KiB scratch buffer. Library codec calls and
+individual native operations complete before cancellation can be observed; there
+is no forced interruption or hard cancellation deadline.
 
 ## Publication and warming
 
-`RowSummaryProgress::new(tables, since)` records a selected table set and exclusive
-snapshot cutoff. `advance(catalog, data_store, data_prefix)` processes at most four
-files and returns whether the pass is complete. Callers must retain the same
-catalog and data location for the progress object's lifetime. A caller can drop it
-at any time; already published sidecars remain durable progress.
+`RowSummaryProgress::new(tables, since)` traverses an attach/backfill selection.
+`RowSummaryProgress::for_files(files)` publishes exact registered file IDs without
+catalog traversal. Each `advance` processes at most four files. Failed IDs retain
+1,024 resident entries and spill the rest to an anonymous temporary file. Retry
+rounds consume those IDs, never a suffix of successful files. Temporary-file
+errors are reported without advancing the affected frontier. A cancelled step
+can repeat its in-flight window. Spools disappear when progress is dropped.
 
-Files run concurrently but progress advances in key order. A cancelled step can
-repeat at most its in-flight window. Failed file IDs are remembered separately,
-up to 1,024 IDs, and retried without walking successful files again. If that set
-fills, the earliest omitted failure preserves a scan frontier. This bounds retry
-bookkeeping without losing failed work; overflow can repeat a suffix traversal.
-A retry round refreshes the snapshot, allowing dropped files to disappear. Normal
-steps hold one shared snapshot until their round finishes or progress is dropped.
+`CommitReport::registered_files` contains final rebased table/file IDs from the
+committed writes. The extension queues independent commit passes using those
+IDs. New commits never reset a running pass's cursor or completed warms. Failed
+passes rotate behind queued work; attach backfill has separate worker slots.
+Each pending lane admits at most 128 passes. Queue or memory refusal logs a
+warning and skips optional background work; it does not turn an already durable
+commit into a failure. Files remain readable and explicit publication/backfill
+can publish skipped summaries. Successful table warms are removed from each
+pass's deque. New commits can warm that table again for their newer data.
 
-The attach worker retains publication and per-table warming progress across
-attempt timeouts and retry backoff. Successful table warms are removed from the
-pending deque. New commit requests widen the table/cutoff selection and reset
-progress, because that work belongs to a newer catalog state. Warming has eight
-process-wide range slots, limiting its SlateDB pressure across attachments; this
-is not priority scheduling inside SlateDB.
+## Host configuration
 
-## Host memory
+DuckDB retains its configured `memory_limit` and temporary-storage settings.
+Setting `MORAINE_HOST_MEMORY_BYTES` enables a pre-attach check of DuckDB's current
+managed limit, Moraine's working allowance, the requested cache allowance, one
+writer's storage allowance, and native headroom. Headroom defaults to one quarter
+of the host envelope; `MORAINE_HOST_HEADROOM_BYTES` overrides it. Attach fails
+before opening the store if these allowances overlap. The core
+`validate_host_memory(duckdb_bytes, other_bytes)` also supports embedders supplying
+their aggregate cache/store allowance.
 
-Use DuckDB's `memory_limit` and temporary-storage settings for its managed operator
-and external-file buffers. Size that allowance together with Moraine's caches,
-active staging, summary builders, snapshots, query results, and storage buffers.
-Neither DuckDB's setting nor these Moraine allowances is a whole-process RSS cap.
-A container or service memory limit supplies the final ceiling and can terminate
-the process when reached. Staged rollbacks flush DuckDB's allocator, matching the existing large/failed
-commit path; on glibc the host also trims the system heap. Allocator trimming can
-return unused pages; it cannot reclaim live allocations and is not an admission
-mechanism.
+The embedder must include other database instances and stores in its aggregate
+allowance or headroom and revalidate after raising DuckDB's limit. Set these
+environment variables before starting the process. This check does not sample
+RSS, intercept every native allocation, or protect against understated Parquet
+metadata. A process/container ceiling remains the final failure boundary; leave
+headroom rather than sizing the engine and Moraine independently to that ceiling.
 
-Validation must cover cancellation, failed-file recovery, early staging refusal
-and rollback, concurrent snapshot loads, time travel, row-position invariants,
-Enterprise compatibility, and ordinary/indexed SQL comparisons.
+Validation covers ownership after eviction/drop, Arrow slices, atomic refusal,
+cooperative cancellation, retry spill/order, preserved publication progress,
+native SQL admission failures, and Enterprise compatibility.

@@ -11,6 +11,8 @@ use crate::error::AbiError;
 pub(crate) unsafe trait DumpRow: Sized {
     type Record;
 
+    fn memory_bytes(record: &Self::Record) -> u64;
+
     fn convert(record: Self::Record) -> Result<Self, AbiError>;
 
     /// Releases this row's resources.
@@ -21,12 +23,18 @@ pub(crate) unsafe trait DumpRow: Sized {
     unsafe fn release(&mut self);
 }
 
-pub(crate) fn convert_rows<Row: DumpRow>(records: Vec<Row::Record>) -> Result<Vec<Row>, AbiError> {
+pub(crate) fn convert_rows<Row: DumpRow>(
+    records: Vec<Row::Record>,
+) -> Result<(Vec<Row>, moraine::MemoryReservation), AbiError> {
+    let bytes = records.iter().fold(0_u64, |bytes, record| {
+        bytes.saturating_add(Row::memory_bytes(record))
+    });
+    let memory = moraine::MemoryReservation::reserve(bytes)?;
     let mut pending = PendingRows(Vec::with_capacity(records.len()));
     for record in records {
         pending.0.push(Row::convert(record)?);
     }
-    Ok(std::mem::take(&mut pending.0))
+    Ok((std::mem::take(&mut pending.0), memory))
 }
 
 /// Owns converted rows until the complete batch can be handed to the caller.
@@ -55,6 +63,14 @@ macro_rules! dump_row {
         // release frees exactly those strings and cannot unwind.
         unsafe impl $crate::dumps::conversion::DumpRow for $row {
             type Record = $record;
+
+            fn memory_bytes(record: &Self::Record) -> u64 {
+                let bytes = std::mem::size_of::<Self>() as u64;
+                $(let bytes = bytes.saturating_add(record.$string.len() as u64).saturating_add(1);)*
+                $(let bytes = bytes.saturating_add(record.$optional_string.as_ref().map_or(0, |value| value.len() as u64 + 1));)*
+                let _ = record;
+                bytes.saturating_add(64)
+            }
 
             fn convert(record: Self::Record) -> Result<Self, $crate::error::AbiError> {
                 $(let $string = $crate::abi::to_c_string(record.$string)?;)*

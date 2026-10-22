@@ -6,11 +6,10 @@ use futures::{StreamExt, stream};
 
 use super::{
     CatalogSnapshot, DataStore, Error, ReadOnlyCatalog, Result, SnapshotId, TableId, data_file,
-    data_file_info,
+    data_file_info, retry_queue::RetryQueue,
 };
 
-type Position = (u64, u64);
-const MAX_RETRY_FILES: usize = 1024;
+pub(super) type Position = (u64, u64);
 
 /// Progress through one selected snapshot's row-summary publication.
 /// Successful steps survive cancellation of a later step. Drop this value to
@@ -20,11 +19,11 @@ pub struct RowSummaryProgress {
     tables: Option<BTreeSet<TableId>>,
     since: Option<SnapshotId>,
     after: Option<Position>,
-    failed: BTreeSet<Position>,
+    failed: RetryQueue,
+    retries: RetryQueue,
     retrying: bool,
-    retry_cursor: Option<Position>,
-    overflow_after: Option<Bound<Position>>,
     complete: bool,
+    files: Option<std::collections::VecDeque<Position>>,
 }
 
 impl RowSummaryProgress {
@@ -37,25 +36,37 @@ impl RowSummaryProgress {
             tables: tables.map(|tables| tables.into_iter().collect()),
             since,
             after: None,
-            failed: BTreeSet::new(),
+            failed: RetryQueue::default(),
+            retries: RetryQueue::default(),
             retrying: false,
-            retry_cursor: None,
-            overflow_after: None,
             complete: false,
+            files: None,
         }
     }
 
-    async fn select(&mut self, snapshot: &CatalogSnapshot) -> Vec<Position> {
+    /// Publishes only the supplied files, without traversing the catalog.
+    #[must_use]
+    pub fn for_files(files: Vec<(TableId, crate::DataFileId)>) -> Self {
+        let mut progress = Self::new(None, None);
+        progress.files = Some(
+            files
+                .into_iter()
+                .map(|(table, file)| (table.get(), file.get()))
+                .collect(),
+        );
+        progress
+    }
+
+    async fn select(&mut self, snapshot: &CatalogSnapshot) -> Result<Vec<Position>> {
         if self.retrying {
-            return self
-                .failed
-                .range((
-                    self.retry_cursor.map_or(Bound::Unbounded, Bound::Excluded),
-                    Bound::Unbounded,
-                ))
+            return self.retries.peek(data_file::PUBLISH_CONCURRENCY).await;
+        }
+        if let Some(files) = &self.files {
+            return Ok(files
+                .iter()
                 .take(data_file::PUBLISH_CONCURRENCY)
                 .copied()
-                .collect();
+                .collect());
         }
         let lower = self
             .after
@@ -91,37 +102,29 @@ impl RowSummaryProgress {
                 }
                 selected.push((table, file));
                 if selected.len() == data_file::PUBLISH_CONCURRENCY {
-                    return selected;
+                    return Ok(selected);
                 }
             }
         }
-        selected
+        Ok(selected)
     }
 
     fn finish_round(&mut self) -> Result<bool> {
         self.snapshot = None;
-        if !self.failed.is_empty() && (!self.retrying || self.overflow_after.is_none()) {
-            self.retrying = true;
-            self.retry_cursor = None;
-        } else if let Some(after) = self.overflow_after.take() {
-            self.retrying = false;
-            self.after = match after {
-                Bound::Excluded(position) | Bound::Included(position) => Some(position),
-                Bound::Unbounded => None,
-            };
-        } else {
+        if self.failed.is_empty() {
             self.complete = true;
             return Ok(true);
         }
+        self.retrying = true;
+        self.retries = std::mem::take(&mut self.failed);
         Err(Error::Constraint(
             "row summary publication has files to retry".into(),
         ))
     }
 
     /// Publishes at most four files, returning `true` when the pass is
-    /// complete. Retries remember up to 1,024 failed file IDs; further
-    /// failures retain a scan frontier instead, bounding progress memory
-    /// without losing work.
+    /// complete. Failed file IDs spill to temporary storage after 1,024
+    /// resident entries, so retries never rescan successful files.
     ///
     /// # Errors
     ///
@@ -143,7 +146,7 @@ impl RowSummaryProgress {
             self.snapshot = Some(Arc::clone(&snapshot));
             snapshot
         };
-        let selected = self.select(&snapshot).await;
+        let selected = self.select(&snapshot).await?;
         if selected.is_empty() {
             return self.finish_round();
         }
@@ -179,18 +182,13 @@ impl RowSummaryProgress {
         let mut failure = None;
         while let Some((position, result)) = results.next().await {
             if let Err(error) = result {
-                if self.retrying || self.failed.len() < MAX_RETRY_FILES {
-                    self.failed.insert(position);
-                } else {
-                    self.overflow_after
-                        .get_or_insert(self.after.map_or(Bound::Unbounded, Bound::Excluded));
-                }
+                self.failed.push(position).await?;
                 failure.get_or_insert(error);
-            } else {
-                self.failed.remove(&position);
             }
             if self.retrying {
-                self.retry_cursor = Some(position);
+                self.retries.acknowledge(1);
+            } else if let Some(files) = &mut self.files {
+                files.pop_front();
             } else {
                 self.after = Some(position);
             }
@@ -206,15 +204,25 @@ impl RowSummaryProgress {
 mod tests {
     use super::*;
 
-    #[test]
-    fn overflow_retries_progress_despite_a_persistent_known_failure() {
-        let mut progress = RowSummaryProgress::new(None, None);
-        progress.failed.insert((1, 1));
-        progress.retrying = true;
-        progress.overflow_after = Some(Bound::Excluded((1, 1024)));
-        assert!(progress.finish_round().is_err());
-        assert!(!progress.retrying);
-        assert_eq!(progress.after, Some((1, 1024)));
-        assert!(progress.failed.contains(&(1, 1)));
+    #[tokio::test]
+    async fn retry_queue_spills_without_losing_or_revisiting_files() {
+        let mut queue = RetryQueue::default();
+        for file in 0..2053 {
+            queue.push((1, file)).await.unwrap();
+        }
+        assert!(queue.resident_len() <= 1024);
+        for start in (0..2053).step_by(4) {
+            let expected: Vec<_> = (start..(start + 4).min(2053))
+                .map(|file| (1, file))
+                .collect();
+            assert_eq!(queue.peek(4).await.unwrap(), expected);
+            assert_eq!(
+                queue.peek(4).await.unwrap(),
+                expected,
+                "an interrupted step does not advance"
+            );
+            queue.acknowledge(expected.len());
+        }
+        assert!(queue.is_empty());
     }
 }

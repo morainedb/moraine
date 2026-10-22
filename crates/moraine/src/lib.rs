@@ -259,13 +259,26 @@
 //!
 //! # Working memory
 //!
-//! Staged DuckDB transactions admit 256 MiB of authored rows by default;
+//! `MORAINE_WORKING_MEMORY_BYTES` limits admitted live allocations process-wide
+//! (default 1 GiB). Reservations follow snapshots, retained byte/Arrow buffers,
+//! staging, and commit translation. [`MemoryReservation`] and
+//! [`CatalogSnapshot::reserve_copy`] let embedders include their own copies.
+//! `MORAINE_COMMIT_MEMORY_BYTES` limits a commit session (default 256 MiB);
+//! refusal poisons commit rather than accepting a prefix. Store write buffers
+//! use `MORAINE_STORE_MEMORY_BYTES` (default 1 GiB per writer).
+//!
+//! Set `MORAINE_HOST_MEMORY_BYTES` to check the combined allowances before a
+//! DuckDB attach. Native headroom defaults to one quarter of that envelope,
+//! overridable with `MORAINE_HOST_HEADROOM_BYTES`. Embedders must account for
+//! other stores/engines and recheck after raising DuckDB's memory limit.
+//! These are admission estimates, not an RSS cap. Cancellation is cooperative.
+//!
 //! `MORAINE_STAGING_MEMORY_BYTES` sets a positive byte allowance per
-//! transaction. `MORAINE_SUMMARY_MEMORY_BYTES` sets the per-file summary-build
-//! allowance (default 256 MiB, at least 64 bytes). Builders admit one physical
-//! row per 64 bytes of allowance. These limits supplement cache retention; they
-//! do not bound snapshots, caller-owned results, DuckDB operators, or process
-//! RSS.
+//! transaction (default 256 MiB). `MORAINE_SUMMARY_MEMORY_BYTES` sets the
+//! per-file summary-build allowance (default 256 MiB, at least 64 bytes).
+//! Builders admit one physical row per 64 bytes of allowance. These limits
+//! supplement cache retention; they do not measure arbitrary caller
+//! allocations, DuckDB operators, or process RSS.
 //!
 //! # Layering
 //!
@@ -286,8 +299,10 @@ mod error;
 mod fault;
 #[doc(hidden)]
 pub mod ffi_support;
+mod memory;
 mod store;
 mod telemetry;
+pub use memory::{MemoryReservation, validate_host_memory, working_memory_usage};
 mod transaction;
 
 pub use catalog::{

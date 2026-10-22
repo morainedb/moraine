@@ -218,28 +218,43 @@ pub unsafe extern "C" fn moraine_maintenance_status_rows(
     out_len: *mut usize,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce =
-        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineMaintenanceStatusRow>, AbiError> {
-            let passes = handle_ref.block_on(handle_ref.catalog.reads().maintenance_status())?;
-            let owned = passes
-                .into_iter()
-                .flat_map(|pass| {
-                    let started_at_micros = pass.started_at.as_micros();
-                    let trigger = pass.trigger;
-                    let work_pending = pass.work_pending;
-                    pass.steps.into_iter().map(move |step| {
-                        Ok((
-                            started_at_micros,
-                            to_c_string(trigger.as_str())?,
-                            to_c_string(step.step)?,
-                            to_c_string(step.status)?,
-                            to_c_string(step.detail)?,
-                            work_pending,
-                        ))
-                    })
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<
+        (Vec<MoraineMaintenanceStatusRow>, moraine::MemoryReservation),
+        AbiError,
+    > {
+        let passes = handle_ref.block_on(handle_ref.catalog.reads().maintenance_status())?;
+        let owned = passes
+            .into_iter()
+            .flat_map(|pass| {
+                let started_at_micros = pass.started_at.as_micros();
+                let trigger = pass.trigger;
+                let work_pending = pass.work_pending;
+                pass.steps.into_iter().map(move |step| {
+                    Ok((
+                        started_at_micros,
+                        to_c_string(trigger.as_str())?,
+                        to_c_string(step.step)?,
+                        to_c_string(step.status)?,
+                        to_c_string(step.detail)?,
+                        work_pending,
+                    ))
                 })
-                .collect::<Result<Vec<_>, AbiError>>()?;
-            Ok(owned
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        let memory = crate::abi::reserve_array::<MoraineMaintenanceStatusRow>(
+            owned.len(),
+            owned
+                .iter()
+                .map(|row| {
+                    (row.1.as_bytes_with_nul().len()
+                        + row.2.as_bytes_with_nul().len()
+                        + row.3.as_bytes_with_nul().len()
+                        + row.4.as_bytes_with_nul().len()) as u64
+                })
+                .sum(),
+        )?;
+        Ok((
+            owned
                 .into_iter()
                 .map(
                     |(started_at_micros, trigger, step, status, detail, work_pending)| {
@@ -253,8 +268,10 @@ pub unsafe extern "C" fn moraine_maintenance_status_rows(
                         }
                     },
                 )
-                .collect())
-        };
+                .collect(),
+            memory,
+        ))
+    };
 
     // SAFETY: caller contract for the pointers.
     unsafe { handle_list(handle, out_items, out_len, err, produce) }
@@ -523,50 +540,60 @@ pub unsafe extern "C" fn moraine_store_census(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce =
-        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceCensus>, AbiError> {
-            let mut request = moraine::CensusRequest::default();
-            request.count_live_entries = count_live_entries;
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<
+        (Vec<MoraineSubspaceCensus>, moraine::MemoryReservation),
+        AbiError,
+    > {
+        let mut request = moraine::CensusRequest::default();
+        request.count_live_entries = count_live_entries;
 
-            // SAFETY: caller contract for `probe`/`probe_ctx`.
-            let census = unsafe {
-                handle_ref.block_on_cancellable(
-                    probe,
-                    probe_ctx,
-                    handle_ref.catalog.reads().store_census(request),
-                )
-            }?;
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let census = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.reads().store_census(request),
+            )
+        }?;
 
-            if !out_manifest_id.is_null() {
-                // SAFETY: caller contract — non-null means writable.
-                unsafe { *out_manifest_id = census.manifest_id };
+        if !out_manifest_id.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_manifest_id = census.manifest_id };
+        }
+        if !out_objects.is_null() {
+            let objects = census.objects.unwrap_or_default();
+            // SAFETY: caller contract — non-null means writable.
+            unsafe {
+                *out_objects = MoraineStoreObjects {
+                    listed: census.objects.is_some(),
+                    total_objects: objects.total_objects,
+                    total_bytes: objects.total_bytes,
+                    wal_objects: objects.wal_objects,
+                    wal_bytes: objects.wal_bytes,
+                    manifest_objects: objects.manifest_objects,
+                    manifest_bytes: objects.manifest_bytes,
+                    sst_objects: objects.sst_objects,
+                    sst_bytes: objects.sst_bytes,
+                    other_objects: objects.other_objects,
+                    other_bytes: objects.other_bytes,
+                };
             }
-            if !out_objects.is_null() {
-                let objects = census.objects.unwrap_or_default();
-                // SAFETY: caller contract — non-null means writable.
-                unsafe {
-                    *out_objects = MoraineStoreObjects {
-                        listed: census.objects.is_some(),
-                        total_objects: objects.total_objects,
-                        total_bytes: objects.total_bytes,
-                        wal_objects: objects.wal_objects,
-                        wal_bytes: objects.wal_bytes,
-                        manifest_objects: objects.manifest_objects,
-                        manifest_bytes: objects.manifest_bytes,
-                        sst_objects: objects.sst_objects,
-                        sst_bytes: objects.sst_bytes,
-                        other_objects: objects.other_objects,
-                        other_bytes: objects.other_bytes,
-                    };
-                }
-            }
+        }
 
-            let owned: Vec<(CString, &moraine::SubspaceCensus)> = census
-                .subspaces
+        let owned: Vec<(CString, &moraine::SubspaceCensus)> = census
+            .subspaces
+            .iter()
+            .map(|subspace| Ok((to_c_string(subspace.subspace.to_string())?, subspace)))
+            .collect::<Result<_, AbiError>>()?;
+        let memory = crate::abi::reserve_array::<MoraineSubspaceCensus>(
+            owned.len(),
+            owned
                 .iter()
-                .map(|subspace| Ok((to_c_string(subspace.subspace.to_string())?, subspace)))
-                .collect::<Result<_, AbiError>>()?;
-            Ok(owned
+                .map(|row| row.0.as_bytes_with_nul().len() as u64)
+                .sum(),
+        )?;
+        Ok((
+            owned
                 .into_iter()
                 .map(|(name, subspace)| {
                     let live = subspace.live.unwrap_or_default();
@@ -586,8 +613,10 @@ pub unsafe extern "C" fn moraine_store_census(
                         scheduled_files: live.scheduled_files,
                     }
                 })
-                .collect())
-        };
+                .collect(),
+            memory,
+        ))
+    };
 
     // SAFETY: caller contract for the pointers.
     unsafe { handle_list(handle, out_items, out_len, err, produce) }
@@ -652,7 +681,7 @@ pub unsafe extern "C" fn moraine_compact_store(
     err: *mut MoraineError,
 ) -> i32 {
     let produce =
-        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceMerge>, AbiError> {
+        |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineSubspaceMerge>, moraine::MemoryReservation), AbiError> {
             let mut request = moraine::CompactStoreRequest::default();
             if !subspace.is_null() {
                 // SAFETY: caller contract for the string pointer.
@@ -694,7 +723,8 @@ pub unsafe extern "C" fn moraine_compact_store(
                     ))
                 })
                 .collect::<Result<_, AbiError>>()?;
-            Ok(owned
+            let memory = crate::abi::reserve_array::<MoraineSubspaceMerge>(owned.len(), owned.iter().map(|row| (row.0.as_bytes_with_nul().len() + row.1.as_bytes_with_nul().len() + row.2.as_bytes_with_nul().len()) as u64).sum())?;
+            Ok((owned
                 .into_iter()
                 .map(|(subspace, outcome, detail, merge)| MoraineSubspaceMerge {
                     subspace: subspace.into_raw(),
@@ -704,7 +734,7 @@ pub unsafe extern "C" fn moraine_compact_store(
                     has_bytes_after: merge.bytes_after.is_some(),
                     bytes_after: merge.bytes_after.unwrap_or(0),
                 })
-                .collect())
+                .collect(), memory))
         };
 
     // SAFETY: caller contract for the pointers.

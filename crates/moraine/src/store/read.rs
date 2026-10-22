@@ -531,7 +531,7 @@ pub(crate) fn decode_history_record(key: Key, bytes: &[u8]) -> Result<EntityReco
 pub(crate) async fn visit_entity_records(
     handle: ReadHandle<'_>,
     historical: bool,
-    mut visit: impl FnMut(EntityRecord),
+    mut visit: impl FnMut(EntityRecord) -> Result<()>,
 ) -> Result<()> {
     let subspace = if historical {
         Subspace::History
@@ -549,7 +549,7 @@ pub(crate) async fn visit_entity_records(
         } else {
             decode_current_record(key, &entry.value)?
         };
-        visit(record);
+        visit(record)?;
         count += 1;
         if count.is_multiple_of(1024) {
             tokio::task::yield_now().await;
@@ -588,7 +588,13 @@ pub(crate) async fn scan_current_records(handle: ReadHandle<'_>) -> Result<Recor
         handle,
         Subspace::Current,
         current_entity_kind_prefix,
-        |encoded, key, bytes| Ok((encoded, Arc::new(decode_current_record(key, &bytes)?))),
+        |encoded, key, bytes| {
+            let memory = crate::MemoryReservation::reserve(
+                (bytes.len() as u64).saturating_mul(4).saturating_add(512),
+            )?;
+            let encoded = memory.into_bytes(encoded)?;
+            Ok((encoded, Arc::new(decode_current_record(key, &bytes)?)))
+        },
     )
     .await?;
 
@@ -601,7 +607,13 @@ pub(crate) async fn scan_history_records(handle: ReadHandle<'_>) -> Result<Recor
         handle,
         Subspace::History,
         history_entity_kind_prefix,
-        |encoded, key, bytes| Ok((encoded, Arc::new(decode_history_record(key, &bytes)?))),
+        |encoded, key, bytes| {
+            let memory = crate::MemoryReservation::reserve(
+                (bytes.len() as u64).saturating_mul(4).saturating_add(512),
+            )?;
+            let encoded = memory.into_bytes(encoded)?;
+            Ok((encoded, Arc::new(decode_history_record(key, &bytes)?)))
+        },
     )
     .await?;
 

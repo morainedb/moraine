@@ -8,7 +8,7 @@ use std::{
     ptr,
 };
 
-use super::{MoraineRowId, borrow_str, free_array, guard, resolve_table, write_array};
+use super::{MoraineRowId, borrow_str, free_array, guard, resolve_table, write_reserved_array};
 use crate::{
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
@@ -58,7 +58,7 @@ impl From<moraine::LocatedDeletion> for MoraineLocatedFile {
 /// Hands a `Vec<T>` to C as an owned (pointer, length) pair, without
 /// writing through an out-parameter — for an array embedded in a struct
 /// field rather than a top-level ABI output. Reclaimed the same way
-/// [`write_array`]'s output is, via [`free_array`].
+/// [`write_reserved_array`]'s output is, via [`free_array`].
 fn into_c_array<T>(items: Vec<T>) -> (*mut T, usize) {
     let boxed = items.into_boxed_slice();
     let len = boxed.len();
@@ -87,70 +87,91 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<moraine::LocatedDeletion>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_files.is_null() || out_files_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        if pairs_len > 0 && pairs.is_null() {
-            return Err(AbiError::invalid_argument("`pairs` is null"));
-        }
-
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: caller contract for the string pointers.
-        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
-        // SAFETY: caller contract.
-        let table = unsafe { borrow_str(table_name, "table_name") }?;
-        // SAFETY: caller contract — `pairs` points to `pairs_len` valid pairs.
-        let raw_pairs = unsafe {
-            if pairs_len == 0 {
-                &[]
-            } else {
-                std::slice::from_raw_parts(pairs, pairs_len)
+    let attempt =
+        || -> Result<(Vec<moraine::LocatedDeletion>, moraine::MemoryReservation), AbiError> {
+            if handle.is_null() {
+                return Err(AbiError::invalid_argument("`handle` is null"));
             }
+            if out_files.is_null() || out_files_len.is_null() {
+                return Err(AbiError::invalid_argument("output pointer is null"));
+            }
+            if pairs_len > 0 && pairs.is_null() {
+                return Err(AbiError::invalid_argument("`pairs` is null"));
+            }
+
+            // SAFETY: caller contract for `handle`.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: caller contract for the string pointers.
+            let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+            // SAFETY: caller contract.
+            let table = unsafe { borrow_str(table_name, "table_name") }?;
+            // SAFETY: caller contract — `pairs` points to `pairs_len` valid pairs.
+            let raw_pairs = unsafe {
+                if pairs_len == 0 {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(pairs, pairs_len)
+                }
+            };
+            if raw_pairs.iter().any(|pair| !pair.has_data_file_id) {
+                return Err(AbiError::invalid_argument(
+                    "positions require committed files",
+                ));
+            }
+            let mut memory = crate::abi::reserve_array::<MoraineLocatedFile>(
+                pairs_len,
+                (pairs_len as u64).saturating_mul(32),
+            )?;
+            let pairs: Vec<_> = raw_pairs
+                .iter()
+                .map(|pair| (pair.value, moraine::DataFileId::new(pair.data_file_id)))
+                .collect();
+
+            let reads = handle_ref.catalog.reads();
+            // SAFETY: caller contract for `probe` and `probe_ctx`.
+            let view =
+                unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, reads.snapshot()) }?;
+            let table_id = resolve_table(&view, schema, table)?;
+
+            let data_store = handle_ref.data_store.as_ref().ok_or_else(|| {
+                AbiError::invalid_argument("position resolution requires a data store")
+            })?;
+            let locate = reads.locate_row_positions_at(
+                &view,
+                data_store,
+                &handle_ref.data_prefix,
+                table_id,
+                &pairs,
+            );
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            let files = unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, locate) }?;
+            let bytes = files.iter().fold(0_u64, |total, file| {
+                total
+                    .saturating_add(
+                        (file.positions.len() as u64)
+                            .saturating_add(
+                                file.existing_positions
+                                    .as_ref()
+                                    .map_or(0, |positions| positions.len() as u64),
+                            )
+                            .saturating_mul(8),
+                    )
+                    .saturating_add(size_of::<MoraineLocatedFile>() as u64)
+            });
+            memory.resize(memory.bytes().max(bytes))?;
+            Ok((files, memory))
         };
-        if raw_pairs.iter().any(|pair| !pair.has_data_file_id) {
-            return Err(AbiError::invalid_argument(
-                "positions require committed files",
-            ));
-        }
-        let pairs: Vec<_> = raw_pairs
-            .iter()
-            .map(|pair| (pair.value, moraine::DataFileId::new(pair.data_file_id)))
-            .collect();
-
-        let reads = handle_ref.catalog.reads();
-        // SAFETY: caller contract for `probe` and `probe_ctx`.
-        let view = unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, reads.snapshot()) }?;
-        let table_id = resolve_table(&view, schema, table)?;
-
-        let data_store = handle_ref.data_store.as_ref().ok_or_else(|| {
-            AbiError::invalid_argument("position resolution requires a data store")
-        })?;
-        let locate = reads.locate_row_positions_at(
-            &view,
-            data_store,
-            &handle_ref.data_prefix,
-            table_id,
-            &pairs,
-        );
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, locate) }
-    };
 
     // SAFETY: `err` validity is this function's own safety contract.
     match unsafe { guard(err, attempt) } {
-        Ok(files) => {
+        Ok((files, memory)) => {
             // Every fallible step above already succeeded; only raw
             // pointers are minted from here on, so nothing below can leak.
             let files: Vec<MoraineLocatedFile> =
                 files.into_iter().map(MoraineLocatedFile::from).collect();
             // SAFETY: caller contract for the output pointers.
             unsafe {
-                write_array(files, out_files, out_files_len);
+                write_reserved_array(files, memory, out_files, out_files_len);
             }
             codes::OK
         }

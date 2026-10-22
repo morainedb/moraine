@@ -322,7 +322,15 @@ impl<'a> StoreBuilder<'a> {
     /// Opens (or creates) the store as a read-write [`Db`], with the
     /// per-store counters its reads tally into.
     pub(crate) async fn open_writer(&self) -> Result<(Db, Arc<cache::CacheCounters>)> {
-        let settings = self.settings();
+        let mut settings = self.settings();
+        let limit = crate::memory::store_memory_limit()?;
+        settings.max_unflushed_bytes = usize::try_from(limit).map_err(|_| {
+            Error::Configuration("MORAINE_STORE_MEMORY_BYTES exceeds platform capacity".into())
+        })?;
+        settings.l0_sst_size_bytes = settings
+            .l0_sst_size_bytes
+            .min(settings.max_unflushed_bytes / 2)
+            .max(1);
         let counters = cache::store_counters();
         let mut builder = Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)

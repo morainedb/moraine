@@ -1659,7 +1659,8 @@ membership entries when they cannot enter memory.
 
 Cold head-view loads share one materialization per handle. Time-travel views stream
 history records instead of retaining an intermediate history vector. Cache-only
-query copies reserve result bytes before allocation. These avoid duplicate work;
-owned result vectors and held snapshots remain caller working memory. Staging and
-summary-build admission, publication progress, and host sizing are specified in
+query copies reserve result bytes before allocation. Live snapshots, bridge-owned
+results, byte/Arrow buffers, staging, and translation use separate working-memory
+admission. Legacy caller-owned vectors require caller reservations. These controls,
+publication progress, and host sizing are specified in
 [RFC 0026](0026-working-memory-and-resumable-publication.md).

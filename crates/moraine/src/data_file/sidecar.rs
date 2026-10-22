@@ -9,7 +9,7 @@ use tracing::debug;
 
 use super::{
     DataStore,
-    auxiliary_cache::{decode_membership, decode_summary, encode_summary_halves},
+    auxiliary_cache::{decode_membership, decode_summary, encode_summary_halves_checked},
     row_set::{FileRowSet, PositionedRowSet},
 };
 use crate::error::{Error, Result};
@@ -57,8 +57,17 @@ pub(super) fn path_for(data_file: &Path) -> Result<Path> {
 }
 
 /// The bytes describing `rows`, for the file `identity` names.
+#[cfg(test)]
 pub(super) fn encode(identity: SidecarIdentity<'_>, rows: &PositionedRowSet) -> Result<Vec<u8>> {
-    let (set, order) = encode_summary_halves(rows)
+    encode_checked(identity, rows, &mut || Ok(()))
+}
+
+pub(super) fn encode_checked(
+    identity: SidecarIdentity<'_>,
+    rows: &PositionedRowSet,
+    check: &mut impl FnMut() -> std::io::Result<()>,
+) -> Result<Vec<u8>> {
+    let (set, order) = encode_summary_halves_checked(rows, check)
         .map_err(|error| Error::Corruption(format!("row summary will not encode: {error}")))?;
     let path = identity.file_path.as_bytes();
     let path_len = u32::try_from(path.len())

@@ -40,15 +40,15 @@ pub use statistics::*;
 pub use tags::*;
 
 use crate::{
-    abi::{free_array, guard, write_array},
+    abi::{free_array, guard, write_reserved_array},
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
 /// The shared shell of every dump entry point: null checks, the
 /// cancellable bridge into the core `fetch`, conversion to C rows, and
-/// `write_array`, all under [`guard`](crate::abi). Each `moraine_dump_*`
-/// signature stays written out for cbindgen.
+/// `write_reserved_array`, all under [`guard`](crate::abi). Each
+/// `moraine_dump_*` signature stays written out for cbindgen.
 ///
 /// Cancellable via `probe`/`probe_ctx` (polled immediately, then ~100 ms;
 /// a null `probe` disables polling): a cancellation returns
@@ -71,7 +71,7 @@ pub(crate) unsafe fn dump_rows<Row: DumpRow>(
     err: *mut MoraineError,
     fetch: impl AsyncFnOnce(&moraine::ReadOnlyCatalog) -> Result<Vec<Row::Record>, moraine::Error>,
 ) -> i32 {
-    let attempt = || -> Result<Vec<Row>, AbiError> {
+    let attempt = || -> Result<(Vec<Row>, moraine::MemoryReservation), AbiError> {
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -89,9 +89,9 @@ pub(crate) unsafe fn dump_rows<Row: DumpRow>(
 
     // SAFETY: `err` validity is the caller's contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, memory)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe { write_reserved_array(items, memory, out_items, out_len) };
             codes::OK
         }
         Err(code) => code,

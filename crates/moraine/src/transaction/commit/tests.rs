@@ -4886,6 +4886,7 @@ async fn catalog_with_a_reclaimed_snapshot() -> (
         None,
     ));
     let store = Store::Writer {
+        counters: crate::store::cache::store_counters(),
         db: db.clone(),
         pacer,
         commit_log: None,

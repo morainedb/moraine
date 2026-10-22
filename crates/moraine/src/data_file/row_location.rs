@@ -492,22 +492,40 @@ async fn publish_summary(
         let owned_file = file.clone();
         let table = identity.table_id;
         let data_file = identity.data_file_id;
+        let memory = crate::MemoryReservation::reserve(
+            rows.estimated_bytes()
+                .saturating_mul(4)
+                .saturating_add(4096),
+        )?;
         let rows = Arc::clone(rows);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel = CancelOnDrop(Arc::clone(&cancelled));
         let bytes = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            sidecar::encode(identity_of(&owned_file, table, data_file), &rows)
+            let bytes = sidecar::encode_checked(
+                identity_of(&owned_file, table, data_file),
+                &rows,
+                &mut || {
+                    if cancelled.load(Ordering::Relaxed) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "summary encoding cancelled",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            memory.into_bytes(bytes.into())
         })
         .await
         .map_err(|error| crate::Error::Interrupted(format!("summary encoding: {error}")))??;
-        file.store
-            .write(&path, bytes.into())
-            .await
-            .map_err(|error| {
-                crate::Error::from(
-                    slatedb::Error::unavailable("publishing row summary".to_owned())
-                        .with_source(Box::new(error)),
-                )
-            })
+        file.store.write(&path, bytes).await.map_err(|error| {
+            crate::Error::from(
+                slatedb::Error::unavailable("publishing row summary".to_owned())
+                    .with_source(Box::new(error)),
+            )
+        })
     }
     .await;
     metrics::sidecar_published(result.is_ok());
@@ -581,6 +599,7 @@ pub(super) async fn read_row_ids_limited(
             .filter(|&rows| rows <= maximum_rows)
             .ok_or_else(too_large)
     })?;
+    let memory = crate::MemoryReservation::reserve((rows as u64).saturating_mul(64))?;
     let mut row_ids = Vec::new();
     row_ids.try_reserve_exact(rows).map_err(|_| too_large())?;
     let mut batches = scoped_read_entry_batches(
@@ -602,7 +621,7 @@ pub(super) async fn read_row_ids_limited(
     // Permits move with CPU work: cancelling its waiter cannot admit another
     // build while the blocking task still owns its buffers.
     tokio::task::spawn_blocking(move || {
-        let (_permit, _background) = (permit, background);
+        let (_permit, _background, _memory) = (permit, background, memory);
         PositionedRowSet::from_file_order_checked(row_ids, || {
             if cancelled.load(Ordering::Relaxed) {
                 Err(crate::Error::Interrupted("summary build cancelled".into()))

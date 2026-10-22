@@ -16,7 +16,7 @@ use tokio::{
 };
 use tracing::warn;
 
-const MAX_PENDING_TABLES: usize = 1024;
+const MAX_PENDING_PASSES: usize = 128;
 
 // Separate pools reserve progress for commits while backfills are saturated.
 static COMMIT_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
@@ -53,6 +53,8 @@ pub(super) struct Pass {
     /// snapshot.
     since: Option<SnapshotId>,
     progress: Arc<tokio::sync::Mutex<Progress>>,
+    files: Option<Arc<Vec<(TableId, moraine::DataFileId)>>>,
+    _memory: Option<Arc<moraine::MemoryReservation>>,
 }
 
 impl Pass {
@@ -61,29 +63,23 @@ impl Pass {
             tables: (!preload).then(BTreeSet::new),
             since: None,
             progress: Arc::default(),
+            files: None,
+            _memory: None,
         }
     }
 
-    pub(super) fn commit(tables: Vec<TableId>, committed: SnapshotId) -> Self {
-        Self {
-            tables: (tables.len() <= MAX_PENDING_TABLES).then(|| tables.into_iter().collect()),
+    pub(super) fn commit(
+        files: Vec<(TableId, moraine::DataFileId)>,
+        committed: SnapshotId,
+    ) -> moraine::Result<Self> {
+        let memory = moraine::MemoryReservation::reserve((files.len() as u64).saturating_mul(128))?;
+        Ok(Self {
+            tables: Some(files.iter().map(|(table, _)| *table).collect()),
             since: Some(SnapshotId::new(committed.get().saturating_sub(1))),
             progress: Arc::default(),
-        }
-    }
-
-    fn merge(&mut self, next: Self) {
-        self.progress = Arc::default();
-        self.since = self.since.min(next.since);
-        match (&mut self.tables, next.tables) {
-            (Some(tables), Some(next)) => {
-                tables.extend(next);
-                if tables.len() > MAX_PENDING_TABLES {
-                    self.tables = None;
-                }
-            }
-            _ => self.tables = None,
-        }
+            files: Some(Arc::new(files)),
+            _memory: Some(Arc::new(memory)),
+        })
     }
 
     async fn run(self, catalog: &ReadOnlyCatalog, store: Option<&DataStore>, prefix: &str) -> bool {
@@ -122,6 +118,9 @@ impl Pass {
             return warmed;
         };
         let publication = progress.publishing.get_or_insert_with(|| {
+            if let Some(files) = self.files {
+                return RowSummaryProgress::for_files((*files).clone());
+            }
             let tables = self
                 .since
                 .and(self.tables)
@@ -143,21 +142,22 @@ impl Pass {
 
 #[derive(Default)]
 struct Pending {
-    pass: Mutex<Option<Pass>>,
+    passes: Mutex<VecDeque<Pass>>,
     ready: Notify,
 }
 
 impl Pending {
-    fn push(&self, next: Pass) {
+    fn push(&self, next: Pass) -> bool {
         let mut pending = self
-            .pass
+            .passes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &mut *pending {
-            Some(pass) => pass.merge(next),
-            None => *pending = Some(next),
+        if pending.len() >= MAX_PENDING_PASSES {
+            return false;
         }
+        pending.push_back(next);
         self.ready.notify_one();
+        true
     }
 
     async fn run_with<F: Future<Output = bool>>(
@@ -185,13 +185,14 @@ impl Pending {
                 );
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2).min(policy.retry_maximum);
-                if let Some(next) = self
-                    .pass
+                // Rotate existing work without admitting another queue entry.
+                let mut pending = self
+                    .passes
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    pass.merge(next);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(next) = pending.pop_front() {
+                    pending.push_back(pass);
+                    pass = next;
                 }
             }
         }
@@ -199,15 +200,15 @@ impl Pending {
 
     async fn next(&self) -> Pass {
         loop {
-            self.ready.notified().await;
             if let Some(pass) = self
-                .pass
+                .passes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
+                .pop_front()
             {
                 return pass;
             }
+            self.ready.notified().await;
         }
     }
 }
@@ -221,9 +222,13 @@ struct Schedule {
 impl Schedule {
     fn push(&self, pass: Pass) {
         if pass.since.is_some() {
-            self.commits.push(pass);
-        } else {
-            self.backfill.push(pass);
+            if !self.commits.push(pass) {
+                warn!(
+                    "background admission full; files remain readable and can be published by explicit backfill"
+                );
+            }
+        } else if !self.backfill.push(pass) {
+            warn!("background admission full; backfill was not queued");
         }
     }
 

@@ -266,3 +266,29 @@ async fn a_sweep_reclaims_summaries_whose_file_is_gone() {
         "a summary whose file is gone must be reclaimed"
     );
 }
+
+#[test]
+fn encoding_stops_when_its_caller_cancels() {
+    use super::{row_set::PositionedRowSet, sidecar};
+    let rows = PositionedRowSet::from_file_order((0..20_000).rev().collect()).unwrap();
+    let identity = sidecar::SidecarIdentity {
+        table_id: 1,
+        data_file_id: 2,
+        file_path: "a.parquet",
+        file_size: 3,
+    };
+    let mut checks = 0;
+    let result = sidecar::encode_checked(identity, &rows, &mut || {
+        checks += 1;
+        if checks >= 3 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_err());
+    assert_eq!(checks, 3);
+}

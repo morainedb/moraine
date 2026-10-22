@@ -318,6 +318,8 @@ pub(crate) async fn scoped_read_index_entry_batches(
     )?);
     let (scope, ordinals) = scoped_selection(rows, builder.metadata(), &file.path)?;
     let ordinals = Arc::new(ordinals);
+    let decode_memory =
+        crate::data_file::reader::admit_decode(builder.metadata(), &mask, scope.groups.as_deref())?;
     let builder = scope.narrow(
         builder
             .with_projection(mask)
@@ -329,6 +331,7 @@ pub(crate) async fn scoped_read_index_entry_batches(
     let metrics = Arc::clone(&file.metrics);
     Ok(arrow_reader
         .map(move |batch| {
+            let _decode_memory = &decode_memory;
             let batch = batch.map_err(corrupt("scoped read"))?;
             let batch = normalize_batch(batch, normalization.as_ref())?;
             file.metrics.arrow_batch();
@@ -391,6 +394,8 @@ pub(crate) async fn scoped_read_entry_batches(
         indexed_positions,
         row_id_position,
     )?;
+    let decode_memory =
+        crate::data_file::reader::admit_decode(builder.metadata(), &mask, scope.groups.as_deref())?;
     let builder = scope.narrow(
         builder
             .with_projection(mask)
@@ -400,6 +405,7 @@ pub(crate) async fn scoped_read_entry_batches(
 
     let mut emitted = 0usize;
     let selection_stream = arrow_reader.map(move |batch| {
+        let _decode_memory = &decode_memory;
         let batch = batch.map_err(corrupt("scoped read"))?;
         let batch = normalize_batch(batch, normalization.as_ref())?;
         let batch_start = emitted;

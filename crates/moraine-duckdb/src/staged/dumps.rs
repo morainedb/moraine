@@ -6,7 +6,7 @@ use super::MoraineTxHandle;
 #[cfg(doc)]
 use super::moraine_tx_begin;
 use crate::{
-    abi::{guard, write_array},
+    abi::{guard, write_reserved_array},
     dumps::{
         MoraineColumnMappingRow, MoraineColumnRow, MoraineColumnTagRow, MoraineDataFileRow,
         MoraineDeleteFileRow, MoraineFileColumnStatsRow, MoraineFilePartitionValueRow,
@@ -47,9 +47,9 @@ macro_rules! tx_dump_body {
 
         // SAFETY: `err` validity is this function's own safety contract.
         match unsafe { guard($err, attempt) } {
-            Ok(items) => {
+            Ok((items, memory)) => {
                 // SAFETY: checked non-null above; caller contract.
-                unsafe { write_array(items, $out_items, $out_len) };
+                unsafe { write_reserved_array(items, memory, $out_items, $out_len) };
                 codes::OK
             }
             Err(code) => code,

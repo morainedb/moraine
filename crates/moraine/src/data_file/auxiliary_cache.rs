@@ -334,6 +334,13 @@ fn encode_positioned_row_set(
 pub(super) fn encode_summary_halves(
     positioned: &PositionedRowSet,
 ) -> foyer::Result<(Vec<u8>, Vec<u8>)> {
+    encode_summary_halves_checked(positioned, &mut || Ok(()))
+}
+
+pub(super) fn encode_summary_halves_checked(
+    positioned: &PositionedRowSet,
+    check: &mut impl FnMut() -> std::io::Result<()>,
+) -> foyer::Result<(Vec<u8>, Vec<u8>)> {
     // Unreachable by construction: `PositionedRowSet::from_file_order` never
     // pairs a permutation with a range. A bare range tag carries no
     // permutation, so writing one here would silently answer positions by
@@ -371,24 +378,60 @@ pub(super) fn encode_summary_halves(
         ],
     };
     let mut set = Vec::new();
-    encode_row_set(&positioned.rows, shapes, &mut set)?;
+    encode_row_set(
+        &positioned.rows,
+        shapes,
+        &mut CheckedWriter {
+            output: &mut set,
+            check,
+            remaining: 0,
+        },
+    )?;
 
     let mut order = Vec::new();
+    let mut writer = CheckedWriter {
+        output: &mut order,
+        check,
+        remaining: 0,
+    };
     if let RowOrder::Permuted(permutation) = &positioned.order {
         // A permutation covers every physical row exactly once, so its
         // own length is the universe its positions fall in.
-        write_packed_positions(permutation, usize_as_u64(permutation.len()), &mut order)?;
+        write_packed_positions(permutation, usize_as_u64(permutation.len()), &mut writer)?;
     }
     if let RowOrder::Repeated { offsets, positions } = &positioned.order {
         let physical = usize_as_u64(positions.len());
-        order
+        writer
             .write_all(&physical.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
-        write_packed_positions(offsets, physical.saturating_add(1), &mut order)?;
-        write_packed_positions(positions, physical, &mut order)?;
+        write_packed_positions(offsets, physical.saturating_add(1), &mut writer)?;
+        write_packed_positions(positions, physical, &mut writer)?;
     }
 
     Ok((set, order))
+}
+
+struct CheckedWriter<'a, F> {
+    output: &'a mut Vec<u8>,
+    check: &'a mut F,
+    remaining: usize,
+}
+
+impl<F: FnMut() -> std::io::Result<()>> Write for CheckedWriter<'_, F> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes.len().min(8192);
+        if count >= self.remaining {
+            // write_all retries Interrupted; cancellation must escape that loop.
+            (self.check)().map_err(std::io::Error::other)?;
+            self.remaining = 8192;
+        }
+        self.output.extend_from_slice(&bytes[..count]);
+        self.remaining -= count;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Bits enough to hold every value below `universe`; none when the only
@@ -413,32 +456,21 @@ fn write_packed_positions(
         .write_all(&usize_as_u64(positions.len()).to_le_bytes())
         .map_err(io)?;
 
-    if let Some(out_of_range) = positions
-        .iter()
-        .find(|position| u64::from(**position) >= universe)
-    {
-        return Err(foyer::Error::new(
-            foyer::ErrorKind::Parse,
-            format!("position {out_of_range} is outside a universe of {universe}"),
-        ));
-    }
-
     let width = position_width(universe);
-    if width == 0 {
-        return Ok(());
-    }
-
-    let mut packed = Vec::with_capacity(
-        usize::try_from(
-            usize_as_u64(positions.len())
-                .saturating_mul(u64::from(width))
-                .div_ceil(8),
-        )
-        .unwrap_or(0),
-    );
+    let mut packed = Vec::with_capacity(8192);
     let mut accumulator = 0_u64;
     let mut bits = 0_u32;
     for position in positions {
+        if u64::from(*position) >= universe {
+            return Err(foyer::Error::new(
+                foyer::ErrorKind::Parse,
+                format!("position {position} is outside a universe of {universe}"),
+            ));
+        }
+        if packed.len() >= 8188 {
+            writer.write_all(&packed).map_err(io)?;
+            packed.clear();
+        }
         accumulator |= u64::from(*position) << bits;
         bits += width;
         while bits >= 8 {
@@ -791,11 +823,10 @@ impl foyer::Code for Weighed {
                 } else {
                     PageIndexPolicy::Skip
                 };
-                let mut buffer = Vec::new();
-                reader.read_to_end(&mut buffer).map_err(io)?;
+                let buffer = crate::memory::read_bytes(reader).map_err(io)?;
                 let metadata = ParquetMetaDataReader::new()
                     .with_page_index_policy(policy)
-                    .parse_and_finish(&Bytes::from(buffer))
+                    .parse_and_finish(&buffer)
                     .map_err(parse_failed)?;
                 AuxiliaryValue::Metadata {
                     metadata: Arc::new(metadata),
@@ -840,9 +871,8 @@ impl foyer::Code for Weighed {
                 reader,
             )?)),
             tag::BLOCK => {
-                let mut buffer = Vec::new();
-                reader.read_to_end(&mut buffer).map_err(io)?;
-                AuxiliaryValue::Block(Bytes::from(buffer))
+                let buffer = crate::memory::read_bytes(reader).map_err(io)?;
+                AuxiliaryValue::Block(buffer)
             }
             other => {
                 return Err(foyer::Error::new(

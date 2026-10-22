@@ -20,6 +20,7 @@
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -970,6 +971,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// the machine on top of DuckDB's. The ABI clamps it; read once here,
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
+	if (moraine_validate_host_memory(duckdb::BufferManager::GetBufferManager(context).GetMaxMemory(),
+	                                 cache_memory_bytes, !read_only, &err) != 0) {
+		ThrowMoraineError(err);
+	}
 	auto code = moraine_attach_with_commit_log(
 	    info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms, flush_on_commit,
 	    reader_poll_interval_ms, cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
