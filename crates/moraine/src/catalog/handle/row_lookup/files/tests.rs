@@ -819,3 +819,16 @@ async fn selection_defers_only_files_whose_bounds_exclude_every_requested_id() {
 
     warm.catalog.close().await.unwrap();
 }
+
+#[test]
+fn directory_weights_include_decoded_file_fields_and_spare_strings() {
+    let mut file = super::DataFileValue {
+        path: String::with_capacity(1024),
+        ..Default::default()
+    };
+    file.path.push('x');
+    assert!(
+        super::retained_file_bytes(&file)
+            >= (size_of::<super::DataFileValue>() + file.path.capacity()) as u64
+    );
+}

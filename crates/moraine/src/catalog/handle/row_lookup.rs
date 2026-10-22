@@ -23,7 +23,9 @@ pub(super) mod inline;
 
 use directories::{Directories, Directory};
 
-#[derive(Default)]
+use crate::store::cache::retention::Shared;
+
+#[cfg_attr(test, derive(Default))]
 pub(super) struct RowLookupCache {
     files: RwLock<Directories<FileDirectory>>,
     inline: RwLock<Directories<InlineDirectory>>,
@@ -39,6 +41,17 @@ pub(super) struct RowLookupCache {
 }
 
 impl RowLookupCache {
+    pub(super) fn shared() -> Self {
+        Self {
+            files: RwLock::new(Directories::shared()),
+            inline: RwLock::new(Directories::shared()),
+            summarized_files: AtomicU64::new(0),
+            inline_directory_builds: AtomicU64::new(0),
+            inline_tombstone_scans: AtomicU64::new(0),
+            summary_probes: AtomicU64::new(0),
+        }
+    }
+
     fn note_summarized(&self, files: usize) {
         self.summarized_files
             .fetch_add(u64::try_from(files).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -104,7 +117,7 @@ impl Directory for InlineDirectory {
     }
 }
 
-fn lookup<T: Directory>(cache: &RwLock<Directories<T>>, table: TableId) -> Option<Arc<T>> {
+fn lookup<T: Directory>(cache: &RwLock<Directories<T>>, table: TableId) -> Option<Shared<T>> {
     cache
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -113,7 +126,7 @@ fn lookup<T: Directory>(cache: &RwLock<Directories<T>>, table: TableId) -> Optio
 
 /// Active readers keep their directory even when it exceeds the retention
 /// limit.
-fn install<T: Directory>(cache: &RwLock<Directories<T>>, table: TableId, directory: Arc<T>) {
+fn install<T: Directory>(cache: &RwLock<Directories<T>>, table: TableId, directory: Shared<T>) {
     cache
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -144,7 +157,7 @@ struct FileDirectory {
     /// summarizes it then, so nothing is placed against a file whose
     /// bounds are unknown.
     deferred: OrdMap<u64, (u64, u64)>,
-    /// Encoded size of `files`, carried across refreshes.
+    /// Estimated decoded size of `files`, carried across refreshes.
     file_bytes: u64,
     bytes: u64,
 }

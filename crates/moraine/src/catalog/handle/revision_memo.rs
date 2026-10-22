@@ -9,14 +9,18 @@ use std::{
 use hashbrown::HashTable;
 use lru_slab::LruSlab;
 
-use crate::TableId;
+use crate::{
+    TableId,
+    store::cache::retention::{Budget, Charge, Shared},
+};
 
 struct Entry<K, V> {
     hash: u64,
     revision: u64,
     table: TableId,
     key: K,
-    value: Arc<V>,
+    value: Shared<V>,
+    _key_charge: Charge,
     bytes: usize,
 }
 
@@ -24,6 +28,7 @@ struct Entries<K, V> {
     index: HashTable<u32>,
     values: LruSlab<Entry<K, V>>,
     bytes: usize,
+    storage: Charge,
 }
 
 impl<K, V> Entries<K, V> {
@@ -58,19 +63,31 @@ pub(super) struct RevisionMemo<K, V> {
     hasher: RandomState,
     capacity: usize,
     max_entries: usize,
+    budget: Arc<Budget>,
 }
 
 impl<K: Eq + Hash, V> RevisionMemo<K, V> {
+    #[cfg(test)]
     pub(super) fn new(capacity: usize, max_entries: usize) -> Self {
+        Self::with_budget(capacity, max_entries, Budget::new(u64::MAX))
+    }
+
+    pub(super) fn shared(capacity: usize, max_entries: usize) -> Self {
+        Self::with_budget(capacity, max_entries, crate::store::cache::lookup_budget())
+    }
+
+    pub(super) fn with_budget(capacity: usize, max_entries: usize, budget: Arc<Budget>) -> Self {
         Self {
             entries: Mutex::new(Entries {
                 index: HashTable::new(),
                 values: LruSlab::new(),
                 bytes: 0,
+                storage: Charge::new(Arc::clone(&budget)),
             }),
             hasher: RandomState::new(),
             capacity,
             max_entries: max_entries.min(usize::try_from(u32::MAX - 1).unwrap_or(usize::MAX)),
+            budget,
         }
     }
 
@@ -88,22 +105,15 @@ impl<K: Eq + Hash, V> RevisionMemo<K, V> {
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let spare_slots =
-            (entries.values.capacity() - entries.values.len()) as usize * Self::slot_bytes();
-        let spare_index = entries
-            .index
-            .allocation_size()
-            .saturating_sub(entries.index.len() * (size_of::<u32>() + 1));
-        u64::try_from(
-            entries
-                .bytes
-                .saturating_add(spare_slots)
-                .saturating_add(spare_index),
-        )
-        .unwrap_or(u64::MAX)
+        let payload = entries
+            .bytes
+            .saturating_sub(entries.index.len() * Self::entry_bytes());
+        u64::try_from(payload)
+            .unwrap_or(u64::MAX)
+            .saturating_add(entries.storage.bytes())
     }
 
-    pub(super) fn get(&self, revision: u64, table: TableId, key: &K) -> Option<Arc<V>> {
+    pub(super) fn get(&self, revision: u64, table: TableId, key: &K) -> Option<Shared<V>> {
         self.get_matching(revision, table, key, |candidate| candidate == key)
     }
 
@@ -114,30 +124,49 @@ impl<K: Eq + Hash, V> RevisionMemo<K, V> {
         table: TableId,
         key: &Q,
         matches: impl Fn(&K) -> bool,
-    ) -> Option<Arc<V>> {
+    ) -> Option<Shared<V>> {
         let hash = self.hasher.hash_one((revision, table, key));
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = entries.find(hash, revision, table, matches)?;
-        Some(Arc::clone(&entries.values.get_mut(slot).value))
+        Some(entries.values.get_mut(slot).value.clone())
     }
 
     /// Whether `bytes`, plus the entry header, fits the retention limits.
     pub(super) fn can_hold(&self, bytes: usize) -> bool {
         self.max_entries != 0
-            && bytes
-                .checked_add(Self::entry_bytes())
-                .is_some_and(|total| total <= self.capacity)
+            && bytes.checked_add(Self::entry_bytes()).is_some_and(|total| {
+                total <= self.capacity
+                    && u64::try_from(total).unwrap_or(u64::MAX) <= self.budget.capacity()
+            })
     }
 
-    /// `bytes` is what the entry costs to retain, beyond its header.
-    pub(super) fn put(&self, revision: u64, table: TableId, key: K, value: Arc<V>, bytes: usize) {
-        if !self.can_hold(bytes) {
+    /// Weights describe dynamic allocations; value and container headers are
+    /// added here.
+    pub(super) fn put(
+        &self,
+        revision: u64,
+        table: TableId,
+        key: K,
+        value: Shared<V>,
+        key_bytes: usize,
+        value_bytes: usize,
+    ) {
+        let Some(value_bytes) = value_bytes
+            .checked_add(size_of::<V>())
+            .and_then(|bytes| bytes.checked_add(Shared::<V>::overhead()))
+        else {
+            return;
+        };
+        let Some(payload) = key_bytes.checked_add(value_bytes) else {
+            return;
+        };
+        if !self.can_hold(payload) {
             return;
         }
-        let bytes = Self::entry_bytes() + bytes;
+        let bytes = Self::entry_bytes() + payload;
         let hash = self.hasher.hash_one((revision, table, &key));
         let mut entries = self
             .entries
@@ -146,9 +175,18 @@ impl<K: Eq + Hash, V> RevisionMemo<K, V> {
         if let Some(slot) = entries.find(hash, revision, table, |candidate| candidate == &key) {
             entries.remove(slot);
         }
-        while entries.bytes > self.capacity - bytes || entries.index.len() >= self.max_entries {
-            let Some(oldest) = entries.values.lru() else {
+        let mut key_charge = Charge::new(Arc::clone(&self.budget));
+        loop {
+            let fits =
+                entries.bytes <= self.capacity - bytes && entries.index.len() < self.max_entries;
+            if fits
+                && value.try_charge(&self.budget, value_bytes as u64)
+                && key_charge.resize(key_bytes as u64)
+            {
                 break;
+            }
+            let Some(oldest) = entries.values.lru() else {
+                return;
             };
             entries.remove(oldest);
         }
@@ -159,10 +197,23 @@ impl<K: Eq + Hash, V> RevisionMemo<K, V> {
             table,
             key,
             value,
+            _key_charge: key_charge,
             bytes,
         });
         index.insert_unique(hash, slot, |&slot| values.peek(slot).hash);
         entries.bytes += bytes;
+        let storage_bytes = (entries.values.capacity() as usize)
+            .saturating_mul(Self::slot_bytes())
+            .saturating_add(entries.index.allocation_size());
+        if !entries
+            .storage
+            .resize(u64::try_from(storage_bytes).unwrap_or(u64::MAX))
+        {
+            entries.index = HashTable::new();
+            entries.values = LruSlab::new();
+            entries.bytes = 0;
+            entries.storage.resize(0);
+        }
     }
 }
 

@@ -433,6 +433,19 @@ fn ducklake_attach_reports_attributed_memory() {
          FROM moraine_memory_tally('lake');",
     ));
     assert_eq!(rows.last(), Some(&vec!["true".to_string(); 7]));
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        dir.path(),
+        data_dir.path(),
+        ", META_CACHE_MEMORY 16777216",
+        "INSERT INTO lake.main.t VALUES (1), (2); \
+         CREATE INDEX by_id ON lake.main.t(id); \
+         SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_id', 1); \
+         SELECT lookup_capacity_bytes = 2097152, lookup_occupancy_bytes > 0, \
+                lookup_occupancy_bytes <= lookup_capacity_bytes, \
+                block_capacity_bytes + auxiliary_metadata_capacity_bytes + lookup_capacity_bytes = 16777216 \
+         FROM moraine_cache_status();",
+    ));
+    assert_eq!(rows.last(), Some(&vec!["true".to_string(); 4]));
 }
 
 /// An attach naming no `META_CACHE_PRELOAD` preloads at the `'l0'` level:

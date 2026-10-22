@@ -10,8 +10,7 @@ and selective indexed reads remain supported. Removing the index data path or
 forcing indexed queries through ordinary full scans does not satisfy this design.
 
 Feature and compatibility removals require the owner's selection before
-implementation. The candidates below authorize no removal by themselves. No
-feature has been removed for this budget.
+implementation. No removal is approved. No feature has been removed for this budget.
 
 ## Measurement
 
@@ -26,8 +25,8 @@ with the Rust syntax tree, test-support files, and the fault-injection test log.
 | --- | ---: |
 | Baseline, consistently classified | 58,590 |
 | Maximum after a 25% reduction | 43,942 |
-| Current tree, including the background-reliability work | 57,841 |
-| Further net reduction required | 13,899 |
+| Current tree, including reliability and cache-budget fixes | 58,168 |
+| Further net reduction required | 14,226 |
 
 Earlier notes quoted a 59,212-line baseline. This audit freezes a specific commit
 and corrects classification, including 598 lines of fault-injection test-log
@@ -55,7 +54,7 @@ is approved, and there is no currently demonstrated path to the 25% target.
 
 The remaining reduction must come from shared implementations or separately
 reviewed removals that preserve Enterprise. No measured replacement design yet
-demonstrates the required 13,899-line saving; it must not be presented as a
+demonstrates the required 14,226-line saving; it must not be presented as a
 guaranteed result.
 
 The next consolidation targets are:
@@ -64,8 +63,6 @@ The next consolidation targets are:
   preserving ownership, nullability, column order, and both catalog versions.
 - Share mechanical operation dispatch between staged and committed metadata
   handling. Keep transaction conflict checks and index maintenance explicit.
-- Consolidate cache admission and accounting while preserving indexed query
-  behavior. Cache removal is not a substitute for implementing its memory budget.
 
 Count every handwritten declaration and generator needed by a replacement.
 Moving code, compressing formatting, generating identical repetition, or deleting

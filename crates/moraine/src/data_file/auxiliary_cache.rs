@@ -1267,6 +1267,7 @@ impl AuxiliaryCache {
                 Error::Corruption(format!("row summary: {cause}"))
             })?;
 
+        self.discard_redundant_membership(store, key);
         summary_of(&entry.value).ok_or_else(|| {
             Error::Corruption("a footer was cached under a row summary key".to_owned())
         })
@@ -1310,6 +1311,7 @@ impl AuxiliaryCache {
                 Error::Corruption(format!("row membership: {cause}"))
             })?;
 
+        self.discard_redundant_membership(store, key);
         membership_of(&entry.value).ok_or_else(|| {
             Error::Corruption("a footer was cached under a row membership key".to_owned())
         })
@@ -1396,6 +1398,21 @@ impl AuxiliaryCache {
         self.summaries.entered(&weighed);
         self.tier
             .insert(Self::file_summary_key(store, key), weighed);
+        self.discard_redundant_membership(store, key);
+    }
+
+    fn discard_redundant_membership(&self, store: &DataStore, key: &FileSummaryKey<'_>) {
+        let full = Self::file_summary_key(store, key);
+        let membership = Self::membership_key(store, key);
+        match &self.tier {
+            Tier::Memory(cache) if cache.contains(&full) => {
+                cache.remove(&membership);
+            }
+            Tier::Hybrid(cache) if cache.memory().contains(&full) => {
+                cache.remove(&membership);
+            }
+            _ => {}
+        }
     }
 
     /// The file's bytes over `range`, from the cache when that exact range

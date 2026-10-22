@@ -676,8 +676,8 @@ with, not consolidated), the byte tier (consolidated), and the data tier
 
 The SlateDB caches and the scoped reader's parsed-Parquet cache share a
 **budget and process lifetime, not an entry store**. `CACHE_MEMORY` is split
-once, at the first attach: the auxiliary metadata allowance comes off the
-top, and the remainder is the block budget shared elastically by stores.
+once, at the first attach: auxiliary metadata and lookup retention take their
+allowances, and the remainder is the block budget shared elastically by stores.
 An empty attach reserves no block memory and does not shrink another store.
 Read fills, disk promotions, and admitted flush or compaction output grow
 the requesting store's allowance under pressure. Growth first uses unassigned
@@ -711,14 +711,15 @@ which is a bound, but not one an operator can set.
 `ReadOnlyCatalog::projection_bytes` reports it, because a cache invisible to
 sizing is what this RFC's goals rule out.
 
-Lookup-directory limits are separate from `CACHE_MEMORY`: at most 64 MiB of
-accounted file entries and 64 MiB of inline entries per catalog. Charges include
+Lookup directories keep local ceilings of 64 MiB of accounted file entries and
+64 MiB of inline entries per catalog, within the shared lookup allowance described
+below. Charges include
 retained summaries, file metadata, deferred ranges, path strings, and entry
 headers. They are estimates, not allocator measurements; shared allocations
 are charged conservatively. Oversized replacements remove the older cached
 directory, serve the current query, and may be rebuilt on later lookups.
-Eviction releases the cache's ownership, while active readers keep their Arcs
-until their queries finish. It does not impose a bound on transient scan/build
+Eviction releases the cache's ownership, while active readers retain the value
+and its budget reservation until their queries finish. It does not impose a bound on transient scan/build
 memory or total process memory.
 
 Index probes use the same revision-keyed memo as other scoped results. Hits
@@ -728,8 +729,8 @@ them. A hash index points into an LRU slab, so lookup and recency updates do
 not scan or shift all retained entries. Full revision/table/key equality checks
 resolve hash collisions. Entry charges include the slab node and occupied hash
 bucket; diagnostics also count spare slab capacity and hash-table allocation
-slack. The existing count and byte ceilings still govern admission. These are
-retention limits, not a process memory budget.
+slack. The local count and byte ceilings and the process lookup allowance govern
+admission. They bound cache retention, not total process memory.
 
 Their storage engines remain separate because their entries have different
 identity, value, and tiering contracts:
@@ -1147,8 +1148,9 @@ and counts as one scan in the handle's tallies.
 The attach options keep their surface (RFC 0006) and change machinery:
 
 - `CACHE_DIR` / `CACHE_SIZE` — the block slot's disk device and cap.
-- `CACHE_MEMORY` (new) — one memory budget across both kinds, which share
-  one cache and are separated by eviction priority; an attach whose store
+- `CACHE_MEMORY` — one memory budget across lookup retention, auxiliary metadata,
+  and the block cache. Within the block share, SST metadata and data blocks
+  are separated by eviction priority; an attach whose store
   outgrows the protected share says so. Unset:
   what SlateDB gave a single store, now for the whole process. Never
   inert — the memory tiers exist without a `CACHE_DIR`.
@@ -1326,10 +1328,8 @@ keyed by object-store identity, path, and file size, adds the page index to a
 resident footer on demand rather than parsing the footer again under a second
 policy, and holds only metadata. A file whose row ids are its recorded dense
 range is remembered as a summary once its footer has proved that, so a repeat
-location of it needs neither. Its allowance is one sixteenth of
-`CACHE_MEMORY`'s metadata share, capped at 8 MiB, with the remainder of that
-share continuing to hold SlateDB metadata — one Moraine memory budget, not a
-third invisible one. Projected data-column ranges are retained under the same
+location of it needs neither. Its default allowance is one eightieth of
+`CACHE_MEMORY` (8 MiB at the default budget), deducted from the shared budget. Projected data-column ranges are retained under the same
 allowance, keyed by the exact range a read asked for and admitted at low
 priority so they leave before any footer or summary. A read declared
 **single-touch** — an index build or a backfill, which touches each column
@@ -1615,3 +1615,42 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   snapshot is a second durable encoding to version and migrate (RFC 0015).
   Deploy-cold attach must first be measured as a material problem; that result
   would justify a new format design rather than an open-ended cache task.
+
+## Lookup retention within the process budget
+
+File/inline lookup directories and revision-scoped probe, positioning, location,
+and deletion-ledger results share a process-wide lookup allowance. It takes one
+eighth of `CACHE_MEMORY`, deducted from the SlateDB block allowance; auxiliary
+metadata keeps its configured share. The first attach fixes all three shares.
+Default sizing is 80 MiB for lookup retention, 8 MiB for auxiliary metadata, and
+552 MiB for SlateDB blocks and metadata.
+
+Each cache keeps its existing local byte and entry ceilings. A global reservation
+also covers retained values, dynamic keys, reference-count bookkeeping, and
+allocated cache containers, including unused capacity. A failed reservation
+bypasses retention; it cannot fail a query. Container growth that cannot be
+charged is discarded. This bounds persistent estimated cache allocation, not the
+transient peak while constructing a value or growing a container.
+
+An admitted directory or memo result carries its reservation through reader
+clones. Eviction and catalog closure release only the allocations they actually
+stop retaining; an active reader releases the value charge when its last clone
+drops. Cached keys and containers are charged separately from values. Pressure
+may evict the admitting cache's older entries; one catalog does not lock and
+scan another catalog's caches to obtain a grant.
+
+`CacheStatus` adds process-wide lookup capacity and occupancy. The SQL
+`moraine_cache_status()` result appends matching columns. Existing C status
+structs retain their layout; a separate status function supplies the new fields.
+
+This is an estimated retention budget, not an RSS limit. Uncached or oversized
+query results, copies returned by public Vec APIs, snapshots, staging, per-file
+build buffers, DuckDB allocations, and allocator overhead remain working memory.
+Inner shared buffers can outlive a directory independently of its outer reader
+handle. These allocations must not be described as covered by cache eviction.
+
+A resident full row summary replaces a separately cached membership-only entry.
+Membership fills recheck after completion so a full summary built during the fill
+does not leave a redundant retained representation. Active readers keep their
+existing membership allocation; oversized full summaries do not displace useful
+membership entries when they cannot enter memory.

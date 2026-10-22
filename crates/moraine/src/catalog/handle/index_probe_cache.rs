@@ -1,9 +1,12 @@
 //! Bounded probe results shared by read scopes at the same store revision.
 
-use std::{ops::Bound, sync::Arc};
+use std::ops::Bound;
 
 use super::revision_memo::RevisionMemo;
-use crate::{IndexId, TableId, store::index_encoding::CanonicalKey};
+use crate::{
+    IndexId, TableId,
+    store::{cache::retention::Shared, index_encoding::CanonicalKey},
+};
 
 const CAPACITY: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -36,6 +39,7 @@ impl Probe {
 
 pub(super) struct IndexProbeCache(RevisionMemo<(IndexId, Probe), Vec<u64>>);
 
+#[cfg(test)]
 impl Default for IndexProbeCache {
     fn default() -> Self {
         Self(RevisionMemo::new(CAPACITY, MAX_ENTRIES))
@@ -43,6 +47,10 @@ impl Default for IndexProbeCache {
 }
 
 impl IndexProbeCache {
+    pub(super) fn shared() -> Self {
+        Self(RevisionMemo::shared(CAPACITY, MAX_ENTRIES))
+    }
+
     pub(super) fn estimated_bytes(&self) -> u64 {
         self.0.estimated_bytes()
     }
@@ -76,8 +84,8 @@ impl IndexProbeCache {
         probe: Probe,
         rows: &[u64],
     ) {
-        let bytes = probe
-            .bytes()
+        let probe_bytes = probe.bytes();
+        let bytes = probe_bytes
             .saturating_add(size_of::<Vec<u64>>())
             .saturating_add(size_of_val(rows));
         if !self.0.can_hold(bytes) {
@@ -87,8 +95,9 @@ impl IndexProbeCache {
             revision,
             table,
             (index, probe),
-            Arc::new(rows.to_vec()),
-            bytes,
+            Shared::new(rows.to_vec()),
+            probe_bytes,
+            size_of_val(rows),
         );
         tracing::debug!(
             table_id = table.get(),

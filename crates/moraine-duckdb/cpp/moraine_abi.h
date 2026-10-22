@@ -1949,6 +1949,14 @@ int32_t moraine_maintenance_status_rows(struct MoraineCatalogHandle *handle,
 // status call, not yet freed.
 void moraine_maintenance_status_free(struct MoraineMaintenanceStatusRow *items, size_t len);
 
+// Returns the process-wide lookup-cache allowance and estimated occupancy.
+//
+// # Safety
+//
+// Both output pointers must be valid and writable for the duration of the
+// call.
+int32_t moraine_lookup_cache_status(uint64_t *capacity, uint64_t *occupancy);
+
 // Measures the store, one row per subspace, and writes the manifest
 // version measured to `*out_manifest_id` and the store-wide object totals
 // to `*out_objects`.

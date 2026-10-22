@@ -2874,3 +2874,27 @@ fn a_move_from_the_wrong_log_store_is_refused() {
         "the refusal must name the recorded store, got: {message}"
     );
 }
+
+#[test]
+fn lookup_cache_status_rejects_null_outputs_without_writing() {
+    let mut untouched = 17;
+    // SAFETY: the non-null output is writable; null outputs are rejected.
+    unsafe {
+        assert_eq!(
+            moraine_lookup_cache_status(ptr::null_mut(), &raw mut untouched),
+            crate::error::codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            moraine_lookup_cache_status(&raw mut untouched, ptr::null_mut()),
+            crate::error::codes::INVALID_ARGUMENT
+        );
+    }
+    assert_eq!(untouched, 17);
+    let (mut capacity, mut occupancy) = (0, 0);
+    assert_eq!(
+        // SAFETY: both output pointers name writable local values.
+        unsafe { moraine_lookup_cache_status(&raw mut capacity, &raw mut occupancy) },
+        crate::error::codes::OK
+    );
+    assert!(occupancy <= capacity);
+}

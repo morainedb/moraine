@@ -2,12 +2,13 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::Instant,
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, info, warn};
+
+use crate::store::cache::retention::Shared;
 
 mod rows_at;
 
@@ -388,10 +389,15 @@ impl ReadOnlyCatalog {
         );
 
         if let Some(revision) = revision {
-            let bytes =
-                size_of_val(row_ids.as_slice()).saturating_add(size_of_val(located.as_slice()));
-            self.located_rows
-                .put(revision, table, row_ids, Arc::new(located.clone()), bytes);
+            let key_bytes = row_ids.capacity().saturating_mul(size_of::<u64>());
+            self.located_rows.put(
+                revision,
+                table,
+                row_ids,
+                Shared::new(located.clone()),
+                key_bytes,
+                size_of_val(located.as_slice()),
+            );
         }
 
         Ok(located)
@@ -545,12 +551,28 @@ impl ReadOnlyCatalog {
         }
 
         if let Some(revision) = revision {
-            let bytes = located
+            let value_bytes = located
                 .iter()
                 .map(|file| size_of_val(file.positions.as_slice()))
-                .fold(0usize, usize::saturating_add);
-            self.positioned_files
-                .put(revision, scope.table, key, Arc::new(located.clone()), bytes);
+                .fold(size_of_val(located.as_slice()), usize::saturating_add);
+            let key_bytes = key
+                .2
+                .iter()
+                .map(|(_, rows)| rows.capacity().saturating_mul(size_of::<u64>()))
+                .fold(
+                    key.2
+                        .capacity()
+                        .saturating_mul(size_of::<(DataFileId, Vec<u64>)>()),
+                    usize::saturating_add,
+                );
+            self.positioned_files.put(
+                revision,
+                scope.table,
+                key,
+                Shared::new(located.clone()),
+                key_bytes,
+                value_bytes,
+            );
         }
 
         Ok((located, summaries_built))

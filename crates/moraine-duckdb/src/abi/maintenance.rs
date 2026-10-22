@@ -384,6 +384,32 @@ pub struct MoraineObjectStoreTally {
     pub data_bytes: u64,
 }
 
+/// Returns the process-wide lookup-cache allowance and estimated occupancy.
+///
+/// # Safety
+///
+/// Both output pointers must be valid and writable for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_lookup_cache_status(
+    capacity: *mut u64,
+    occupancy: *mut u64,
+) -> i32 {
+    let attempt = || {
+        if capacity.is_null() || occupancy.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        let status = moraine::cache_status();
+        // SAFETY: pointers are non-null; validity is the caller's contract.
+        unsafe {
+            *capacity = status.lookup_capacity_bytes;
+            *occupancy = status.lookup_occupancy_bytes;
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
 /// Process-wide counts of what published row summaries have done.
 #[repr(C)]
 #[derive(Default)]

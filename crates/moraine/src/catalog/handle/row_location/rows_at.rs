@@ -13,6 +13,8 @@ use futures::{StreamExt, stream};
 pub use scan::LocatedRowScan;
 use tracing::debug;
 
+use crate::store::cache::retention::{Shared, hash_bytes};
+
 /// File positions a caller treats as deleted on top of the snapshot's own
 /// delete files, such as a transaction's uncommitted deletions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,7 +176,7 @@ impl ReadOnlyCatalog {
         &self,
         table: TableId,
         visible_at: u64,
-    ) -> Result<Arc<HashMap<u64, HashSet<u64>>>> {
+    ) -> Result<Shared<HashMap<u64, HashSet<u64>>>> {
         // Every scan a statement opens — the coverage estimate, then the
         // read — asks for the same ledger at the same revision and snapshot.
         let revision = self.pinned_revision();
@@ -203,13 +205,23 @@ impl ReadOnlyCatalog {
             "inlined file deletions scanned"
         );
 
-        let by_file = Arc::new(by_file);
+        let by_file = Shared::new(by_file);
         if let Some(revision) = revision {
-            let bytes = entries
-                .saturating_mul(size_of::<u64>().saturating_mul(2))
-                .saturating_add(by_file.len().saturating_mul(size_of::<HashSet<u64>>()));
-            self.inlined_file_deletes
-                .put(revision, table, visible_at, Arc::clone(&by_file), bytes);
+            let bytes = by_file
+                .values()
+                .map(|positions| hash_bytes::<u64>(positions.capacity()))
+                .fold(
+                    hash_bytes::<(u64, HashSet<u64>)>(by_file.capacity()),
+                    u64::saturating_add,
+                );
+            self.inlined_file_deletes.put(
+                revision,
+                table,
+                visible_at,
+                by_file.clone(),
+                0,
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+            );
         }
         Ok(by_file)
     }

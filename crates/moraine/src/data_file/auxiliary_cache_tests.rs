@@ -940,3 +940,53 @@ async fn summaries_served_from_memory_never_rewrite_the_disk_tier() {
 
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+#[tokio::test]
+async fn full_summaries_replace_redundant_membership_entries() {
+    for fetched in [false, true] {
+        let cache = AuxiliaryCache::new(1 << 20);
+        let store = DataStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("promoted.parquet");
+        let positioned = fragmented(4096);
+        let reader = cache
+            .fetch_membership(&store, &key(&path), || {
+                let rows = Arc::clone(&positioned.rows);
+                async { Ok(rows) }
+            })
+            .await
+            .unwrap();
+        if fetched {
+            cache
+                .fetch_summary(&store, &key(&path), || async { Ok(positioned) })
+                .await
+                .unwrap();
+        } else {
+            cache.insert_summary(&store, &key(&path), &positioned);
+        }
+        let held = cache.row_summaries();
+        assert_eq!(held.range + held.roaring + held.sorted, 1);
+        assert!(reader.contains(8190));
+    }
+}
+
+#[tokio::test]
+async fn membership_fill_does_not_keep_a_duplicate_of_a_full_summary_it_built() {
+    let cache = Arc::new(AuxiliaryCache::new(1 << 20));
+    let store = DataStore::new(Arc::new(InMemory::new()));
+    let path = Path::from("promoted-during-fill.parquet");
+    let filling = Arc::clone(&cache);
+    let fill_store = store.clone();
+    let fill_path = path.clone();
+    let positioned = fragmented(4096);
+    let expected = Arc::clone(&positioned.rows);
+    let rows = cache
+        .fetch_membership(&store, &key(&path), move || async move {
+            filling.insert_summary(&fill_store, &key(&fill_path), &positioned);
+            Ok(Arc::clone(&positioned.rows))
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&rows, &expected));
+    let held = cache.row_summaries();
+    assert_eq!(held.range + held.roaring + held.sorted, 1);
+}
