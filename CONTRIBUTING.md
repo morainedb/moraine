@@ -55,6 +55,20 @@ cargo xtask tidy-cpp
 cargo xtask e2e
 ```
 
+## One-off extension releases
+
+Run the **Extension** workflow on `main` with a fresh release tag:
+
+```bash
+gh workflow run extension.yml --repo morainedb/moraine --ref main \
+  -f tag=ext-v0.7.0-build.2
+```
+
+Tags use `ext-v<version>` or `ext-v<version>-build.<number>`. After every
+platform builds and passes validation, the workflow publishes unsigned
+binaries to that GitHub release and pins the community descriptor to the
+built commit. This does not bump the crate version or publish to crates.io.
+
 ## Conventions
 
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, …) — release-plz derives
