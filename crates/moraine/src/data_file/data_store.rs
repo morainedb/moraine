@@ -135,6 +135,10 @@ impl DataStore {
         }
     }
 
+    pub(super) fn is_background(&self) -> bool {
+        self.background
+    }
+
     /// The store itself, as it was handed over. A read taken from it
     /// directly carries none of the retries this type wraps its own
     /// data-file reads in.

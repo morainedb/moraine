@@ -257,6 +257,16 @@
 //! host's — and forwards them to `duckdb_logs`; see that crate's `logging`
 //! module.
 //!
+//! # Working memory
+//!
+//! Staged DuckDB transactions admit 256 MiB of authored rows by default;
+//! `MORAINE_STAGING_MEMORY_BYTES` sets a positive byte allowance per
+//! transaction. `MORAINE_SUMMARY_MEMORY_BYTES` sets the per-file summary-build
+//! allowance (default 256 MiB, at least 64 bytes). Builders admit one physical
+//! row per 64 bytes of allowance. These limits supplement cache retention; they
+//! do not bound snapshots, caller-owned results, DuckDB operators, or process
+//! RSS.
+//!
 //! # Layering
 //!
 //! - `catalog` — the DuckLake domain model. Never touches SlateDB directly.
@@ -292,11 +302,11 @@ pub use catalog::{
     MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
     MaintenanceStatusPass, MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome,
     MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId, PartitionSpec,
-    ReadOnlyCatalog, RecentRow, RowSummaryPublish, SUPERSEDED_CATALOG_VERSION, ScheduledDeletion,
-    SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus,
-    StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, serves_catalog_version,
-    store_paths_overlap,
+    ReadOnlyCatalog, RecentRow, RowSummaryProgress, RowSummaryPublish, SUPERSEDED_CATALOG_VERSION,
+    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
+    SortSpec, StoreCensus, StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge,
+    SubspaceName, TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
+    serves_catalog_version, store_paths_overlap,
 };
 pub use commit_log::{
     CommitLogProvider, SlotAdoption, SlotCommit, SlotCommitter, SlotEnvelope, SlotOffer, SlotWrite,

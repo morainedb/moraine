@@ -25,8 +25,8 @@ with the Rust syntax tree, test-support files, and the fault-injection test log.
 | --- | ---: |
 | Baseline, consistently classified | 58,590 |
 | Maximum after a 25% reduction | 43,942 |
-| Current tree, including reliability and cache-budget fixes | 58,168 |
-| Further net reduction required | 14,226 |
+| Current tree, including working-memory and publication fixes | 58,777 |
+| Further net reduction required | 14,835 |
 
 Earlier notes quoted a 59,212-line baseline. This audit freezes a specific commit
 and corrects classification, including 598 lines of fault-injection test-log
@@ -54,7 +54,7 @@ is approved, and there is no currently demonstrated path to the 25% target.
 
 The remaining reduction must come from shared implementations or separately
 reviewed removals that preserve Enterprise. No measured replacement design yet
-demonstrates the required 14,226-line saving; it must not be presented as a
+demonstrates the required 14,835-line saving; it must not be presented as a
 guaranteed result.
 
 The next consolidation targets are:

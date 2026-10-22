@@ -88,6 +88,13 @@ struct Value<T> {
 pub(crate) struct Shared<T>(Arc<Value<T>>);
 
 impl<T> Shared<T> {
+    pub(crate) fn charged(value: T, charge: Charge) -> Self {
+        Self(Arc::new(Value {
+            value,
+            charge: OnceLock::from(charge),
+        }))
+    }
+
     pub(crate) fn new(value: T) -> Self {
         Self(Arc::new(Value {
             value,

@@ -732,3 +732,34 @@ async fn a_provider_can_declare_external_compaction() {
     catalog.close().await.unwrap();
     assert!(compactions_objects(&object_store, "undeclared").await > 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_cold_snapshots_share_one_materialization() {
+    let catalog = open().await;
+    catalog
+        .commit(|tx| {
+            for id in 0..1000 {
+                tx.create_schema(&format!("schema_{id}"))?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    catalog.forget_head_view();
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let catalog = catalog.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            catalog.snapshot().await.unwrap()
+        }));
+    }
+    let snapshots = futures::future::join_all(tasks).await;
+    let first = snapshots[0].as_ref().unwrap();
+    for snapshot in &snapshots[1..] {
+        assert!(Arc::ptr_eq(first, snapshot.as_ref().unwrap()));
+    }
+    catalog.close().await.unwrap();
+}

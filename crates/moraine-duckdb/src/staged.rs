@@ -268,7 +268,7 @@ pub unsafe extern "C" fn moraine_tx_stage(
         };
         // SAFETY: caller contract for `tx`.
         let tx_ref = unsafe { &*tx };
-        tx_ref.lock()?.stage(op);
+        tx_ref.lock()?.try_stage(op)?;
         Ok(())
     };
 

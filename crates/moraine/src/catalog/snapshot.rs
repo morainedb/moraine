@@ -207,16 +207,6 @@ impl CatalogSnapshot {
     /// not history); with `at: Some(s)` a record is included iff
     /// `begin_snapshot <= s` and it had not ended by `s` (`current` records
     /// never have; `history` records carry their end).
-    pub(crate) fn build(
-        snapshot: SnapshotValue,
-        current: &[EntityRecord],
-        history: &[EntityRecord],
-        at: Option<u64>,
-    ) -> Self {
-        Self::build_from(snapshot, current, history, at)
-    }
-
-    /// As [`build`](Self::build), over any record iterators.
     pub(crate) fn build_from<'a>(
         snapshot: SnapshotValue,
         current: impl IntoIterator<Item = &'a EntityRecord>,
@@ -1705,7 +1695,7 @@ mod tests {
             EntityRecord::Column(column_rec(1, 0, "id", 0, 2)),
             EntityRecord::Column(column_rec(1, 1, "amount", 1, 2)),
         ];
-        let view = CatalogSnapshot::build(snap(2), &current, &[], None);
+        let view = CatalogSnapshot::build_from(snap(2), &current, &[], None);
 
         let s = view.schema_by_name("main").unwrap();
         assert_eq!(s.id, SchemaId::new(0));
@@ -1729,12 +1719,12 @@ mod tests {
         ];
         let history = vec![EntityRecord::Schema(schema_rec(0, "original", 1, Some(3)))];
 
-        let at2 = CatalogSnapshot::build(snap(2), &current.clone(), &history.clone(), Some(2));
+        let at2 = CatalogSnapshot::build_from(snap(2), &current.clone(), &history.clone(), Some(2));
         assert!(at2.schema_by_name("original").is_some());
         assert!(at2.schema_by_name("renamed").is_none());
         assert!(at2.table_by_id(TableId::new(1)).is_none());
 
-        let at4 = CatalogSnapshot::build(snap(4), &current, &history, Some(4));
+        let at4 = CatalogSnapshot::build_from(snap(4), &current, &history, Some(4));
         assert!(at4.schema_by_name("renamed").is_some());
         assert!(at4.table_by_id(TableId::new(1)).is_some());
     }
@@ -1748,7 +1738,7 @@ mod tests {
             end_snapshot: Some(3),
             ..column_rec(1, 5, "gone", 0, 1)
         })];
-        let view = CatalogSnapshot::build(snap(3), &[], &history, None);
+        let view = CatalogSnapshot::build_from(snap(3), &[], &history, None);
         assert!(view.columns_of(TableId::new(1)).is_empty());
     }
 
@@ -1759,7 +1749,7 @@ mod tests {
         let mut value = snap(7);
         value.snapshot_time_micros = -1_000;
 
-        let mut view = CatalogSnapshot::build(value, &[], &[], None);
+        let mut view = CatalogSnapshot::build_from(value, &[], &[], None);
         view.put_gc_file(GcFileValue {
             data_file_id: 9,
             path: "f9.parquet".into(),
@@ -1776,7 +1766,7 @@ mod tests {
 
     #[test]
     fn mutation_helpers_keep_indexes_coherent() {
-        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
+        let mut view = CatalogSnapshot::build_from(snap(1), &[], &[], None);
         view.put_schema(schema_rec(0, "main", 2, None));
         view.put_table(table_rec(1, 0, "orders", 2));
         view.put_column(column_rec(1, 0, "id", 0, 2));
@@ -1805,7 +1795,7 @@ mod tests {
         let history = vec![EntityRecord::File(file_rec(1, 9, 50, 1, Some(5)))];
 
         // Head view: only the live file; stats present.
-        let head = CatalogSnapshot::build(snap(6), &current.clone(), &[], None);
+        let head = CatalogSnapshot::build_from(snap(6), &current.clone(), &[], None);
         let files = head.data_files_of(TableId::new(1));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, DataFileId::new(10));
@@ -1813,7 +1803,7 @@ mod tests {
 
         // Time travel to snapshot 3: the ended file was live, the new one
         // not yet; stats are unversioned and served as-is.
-        let past = CatalogSnapshot::build(snap(3), &current, &history, Some(3));
+        let past = CatalogSnapshot::build_from(snap(3), &current, &history, Some(3));
         let files = past.data_files_of(TableId::new(1));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, DataFileId::new(9));
@@ -1822,7 +1812,7 @@ mod tests {
 
     #[test]
     fn stats_accessors_and_helpers() {
-        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
+        let mut view = CatalogSnapshot::build_from(snap(1), &[], &[], None);
         assert!(view.table_stats(TableId::new(1)).is_none());
         assert!(
             view.column_stats(TableId::new(1), ColumnId::new(1))
@@ -1908,13 +1898,13 @@ mod tests {
     fn views_are_versioned_and_indexed() {
         let current = vec![EntityRecord::View(view_rec(3, 0, "v2", 4, None))];
         let history = vec![EntityRecord::View(view_rec(3, 0, "v1", 1, Some(4)))];
-        let head = CatalogSnapshot::build(snap(5), &current.clone(), &[], None);
+        let head = CatalogSnapshot::build_from(snap(5), &current.clone(), &[], None);
         assert_eq!(
             head.view_by_name(SchemaId::new(0), "v2").unwrap().id,
             ViewId::new(3)
         );
         assert!(head.view_by_name(SchemaId::new(0), "v1").is_none());
-        let past = CatalogSnapshot::build(snap(2), &current, &history, Some(2));
+        let past = CatalogSnapshot::build_from(snap(2), &current, &history, Some(2));
         assert_eq!(past.view_by_id(ViewId::new(3)).unwrap().name, "v1");
     }
 
@@ -1934,7 +1924,7 @@ mod tests {
         };
         // Unversioned: included regardless of the time-travel target.
         let past =
-            CatalogSnapshot::build(snap(12), &[EntityRecord::Mapping(mapping)], &[], Some(1));
+            CatalogSnapshot::build_from(snap(12), &[EntityRecord::Mapping(mapping)], &[], Some(1));
         let mappings = past.mappings_of(TableId::new(4));
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].id, MappingId::new(21));
@@ -1947,14 +1937,14 @@ mod tests {
     fn macros_are_versioned_and_indexed() {
         let current = vec![EntityRecord::Macro(macro_rec(1, 5, "add", 10, None))];
         let history = vec![EntityRecord::Macro(macro_rec(2, 5, "old", 1, Some(10)))];
-        let head = CatalogSnapshot::build(snap(12), &current.clone(), &[], None);
+        let head = CatalogSnapshot::build_from(snap(12), &current.clone(), &[], None);
         assert_eq!(
             head.macro_by_name(SchemaId::new(5), "add").unwrap().id,
             MacroId::new(1)
         );
         assert!(head.macro_by_name(SchemaId::new(5), "old").is_none());
         assert_eq!(head.macros_in(SchemaId::new(5)).len(), 1);
-        let past = CatalogSnapshot::build(snap(2), &current, &history, Some(2));
+        let past = CatalogSnapshot::build_from(snap(2), &current, &history, Some(2));
         assert_eq!(past.macro_by_id(MacroId::new(2)).unwrap().name, "old");
         assert_eq!(
             past.macro_by_id(MacroId::new(2)).unwrap().implementations[0].macro_type,
@@ -2016,7 +2006,7 @@ mod tests {
             Some(4),
         ))];
 
-        let head = CatalogSnapshot::build(snap(5), &current.clone(), &[], None);
+        let head = CatalogSnapshot::build_from(snap(5), &current.clone(), &[], None);
         let infos = head.indexes_of(TableId::new(1));
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, IndexId::new(7));
@@ -2032,13 +2022,13 @@ mod tests {
 
         // Time travel to snapshot 2: the ended index was live, the new one
         // not yet.
-        let past = CatalogSnapshot::build(snap(2), &current, &history, Some(2));
+        let past = CatalogSnapshot::build_from(snap(2), &current, &history, Some(2));
         assert_eq!(past.indexes_of(TableId::new(1))[0].id, IndexId::new(8));
     }
 
     #[test]
     fn dropping_a_table_clears_its_indexes() {
-        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
+        let mut view = CatalogSnapshot::build_from(snap(1), &[], &[], None);
         view.put_table(table_rec(1, 0, "t", 1));
         view.put_index(index_rec(7, 1, "by_id", vec![0], true, 1, None));
         assert!(view.index_by_name(TableId::new(1), "by_id").is_some());
@@ -2065,7 +2055,7 @@ mod tests {
             deferred_maintenance: Some(true),
             ..index_rec(9, 1, "m", vec![0], false, 1, None)
         };
-        let view = CatalogSnapshot::build(
+        let view = CatalogSnapshot::build_from(
             snap(1),
             &[
                 EntityRecord::Index(building),
@@ -2089,7 +2079,7 @@ mod tests {
 
     #[test]
     fn option_resolution_cascades() {
-        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
+        let mut view = CatalogSnapshot::build_from(snap(1), &[], &[], None);
         view.put_schema(schema_rec(0, "s", 1, None));
         view.put_table(table_rec(1, 0, "t", 1));
         let mk = |pairs: &[(&str, &str)]| OptionScopeValue {

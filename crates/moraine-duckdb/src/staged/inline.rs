@@ -28,7 +28,7 @@ unsafe fn stage_operation(
         }
         // SAFETY: caller guarantees a live transaction.
         let tx_ref = unsafe { &*tx };
-        tx_ref.lock()?.stage(operation());
+        tx_ref.lock()?.try_stage(operation())?;
         Ok(())
     };
 

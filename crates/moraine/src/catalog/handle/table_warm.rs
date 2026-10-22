@@ -14,7 +14,9 @@ use crate::{
 };
 
 /// Ranges one table warm keeps in flight, sized for a remote object store.
-const WARM_RANGE_CONCURRENCY: usize = 32;
+const WARM_RANGE_CONCURRENCY: usize = 8;
+static WARM_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(WARM_RANGE_CONCURRENCY));
 
 /// The prefixes a lookup on `table` probes: each of its indexes' entries and
 /// its inlined data.
@@ -34,6 +36,10 @@ fn probe_prefixes(view: &CatalogSnapshot, table: TableId) -> Vec<Vec<u8>> {
 /// Reads the first entry under `prefix` in seek shape, admitting the SST
 /// metadata and first block a probe there would fetch.
 async fn warm_prefix(handle: ReadHandle<'_>, prefix: Vec<u8>) -> Result<()> {
+    let _permit = WARM_SLOTS
+        .acquire()
+        .await
+        .map_err(|error| crate::Error::Interrupted(format!("warming admission: {error}")))?;
     let mut iterator = handle.scan_prefix(prefix, .., ScanShape::Seek).await?;
     iterator.next().await?;
     Ok(())

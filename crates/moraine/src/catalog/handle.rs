@@ -33,7 +33,9 @@ pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
-pub use row_location::{ExcludedPositions, LocatedDeletion, LocatedRowScan, RowSummaryPublish};
+pub use row_location::{
+    ExcludedPositions, LocatedDeletion, LocatedRowScan, RowSummaryProgress, RowSummaryPublish,
+};
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -908,6 +910,7 @@ pub struct ReadOnlyCatalog {
     >,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    materializing: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
@@ -1367,6 +1370,7 @@ impl ReadOnlyCatalog {
         if let Some(pinned) = &self.pinned {
             return Ok(pinned.snapshot.clone());
         }
+        let _materializing = self.materializing.lock().await;
         let view = self.load_head_view(handle).await?;
         install_head_view_at(&self.projections, epoch, Arc::clone(&view));
         Ok(view)
@@ -1737,6 +1741,7 @@ impl Catalog {
                     commit_log,
                 )),
                 projections,
+                materializing: Arc::default(),
                 refresh_on_read: false,
                 asked: None,
             },
@@ -2376,6 +2381,7 @@ impl Catalog {
                 None,
             )),
             projections,
+            materializing: Arc::default(),
             refresh_on_read,
             asked,
         })

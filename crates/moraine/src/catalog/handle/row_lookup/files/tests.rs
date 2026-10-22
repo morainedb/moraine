@@ -556,7 +556,7 @@ fn missing_file(ordinal: u64) -> DataFile {
 /// Registers a file that cannot be summarized against a warm table,
 /// returning its id and the summary count once its read has failed once.
 async fn warm_table_with_unreadable_file() -> (WarmTable, DataFileId, u64) {
-    let warm = warm_table().await;
+    let warm = Box::pin(warm_table()).await;
     let table = warm.table;
     let added = Cell::new(None);
     warm.catalog

@@ -26,7 +26,7 @@ pub use handle::{
     IndexComparison, IndexPredicate, IndexPredicateRows, IndexReadIdentity, IndexReadScope,
     IndexVerification, LocatedDeletion, LocatedRowScan, MaintenanceReport, MaintenanceRequest,
     MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog,
-    RowSummaryPublish,
+    RowSummaryProgress, RowSummaryPublish,
 };
 pub(crate) use handle::{InlineScan, Store};
 pub use snapshot::CatalogSnapshot;

@@ -176,3 +176,20 @@ fn positions_of_absent_row_is_none() {
 
     assert_eq!(rows.positions_of(&[999]), vec![None]);
 }
+
+#[test]
+fn cancelled_summary_construction_stops_before_positioning() {
+    let mut checkpoints = 0;
+    let result = super::row_set::PositionedRowSet::from_file_order_checked(
+        (0..100_000).rev().collect(),
+        || {
+            checkpoints += 1;
+            if checkpoints >= 2 {
+                Err(crate::Error::Interrupted("cancelled summary".into()))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(result, Err(crate::Error::Interrupted(_))));
+}

@@ -143,6 +143,50 @@ impl<K: Eq + Hash, V> RevisionMemo<K, V> {
             })
     }
 
+    /// Reserves result storage before making a cache-only copy.
+    pub(super) fn put_cloned<Q>(
+        &self,
+        revision: u64,
+        table: TableId,
+        key: K,
+        value: &Q,
+        key_bytes: usize,
+        value_bytes: usize,
+    ) where
+        Q: ToOwned<Owned = V> + ?Sized,
+    {
+        let Some(weight) = value_bytes
+            .checked_add(size_of::<V>())
+            .and_then(|bytes| bytes.checked_add(Shared::<V>::overhead()))
+        else {
+            return;
+        };
+        if !self.can_hold(weight.saturating_add(key_bytes)) {
+            return;
+        }
+        let mut charge = Charge::new(Arc::clone(&self.budget));
+        {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !charge.resize(weight as u64) {
+                let Some(oldest) = entries.values.lru() else {
+                    return;
+                };
+                entries.remove(oldest);
+            }
+        }
+        self.put(
+            revision,
+            table,
+            key,
+            Shared::charged(value.to_owned(), charge),
+            key_bytes,
+            value_bytes,
+        );
+    }
+
     /// Weights describe dynamic allocations; value and container headers are
     /// added here.
     pub(super) fn put(

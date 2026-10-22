@@ -8,10 +8,9 @@ use std::{
 use futures::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, info, warn};
 
-use crate::store::cache::retention::Shared;
-
+mod publication;
 mod rows_at;
-
+pub use publication::RowSummaryProgress;
 pub use rows_at::{ExcludedPositions, LocatedRowScan};
 
 use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY};
@@ -390,11 +389,11 @@ impl ReadOnlyCatalog {
 
         if let Some(revision) = revision {
             let key_bytes = row_ids.capacity().saturating_mul(size_of::<u64>());
-            self.located_rows.put(
+            self.located_rows.put_cloned(
                 revision,
                 table,
                 row_ids,
-                Shared::new(located.clone()),
+                &located,
                 key_bytes,
                 size_of_val(located.as_slice()),
             );
@@ -541,8 +540,13 @@ impl ReadOnlyCatalog {
             .count();
         let mut located = Vec::with_capacity(file_ids.len());
         for file_id in file_ids {
-            let rows = by_file.get(&file_id).cloned().unwrap_or_default();
-            let positions = positioned_rows(&summaries, file_id, &rows, missing)?;
+            let rows = by_file.get(&file_id).map_or(&[][..], Vec::as_slice);
+            let positions = if summaries.get(&file_id).is_some_and(Result::is_err) {
+                self.stream_requested_positions(scope, file_id, rows, missing)
+                    .await?
+            } else {
+                positioned_rows(&summaries, file_id, rows, missing)?
+            };
 
             located.push(PositionedFile {
                 data_file_id: file_id,
@@ -565,17 +569,62 @@ impl ReadOnlyCatalog {
                         .saturating_mul(size_of::<(DataFileId, Vec<u64>)>()),
                     usize::saturating_add,
                 );
-            self.positioned_files.put(
+            self.positioned_files.put_cloned(
                 revision,
                 scope.table,
                 key,
-                Shared::new(located.clone()),
+                &located,
                 key_bytes,
                 value_bytes,
             );
         }
 
         Ok((located, summaries_built))
+    }
+
+    async fn stream_requested_positions(
+        &self,
+        scope: &LocationScope<'_>,
+        file_id: DataFileId,
+        rows: &[u64],
+        missing: MissingRows,
+    ) -> Result<Vec<u64>> {
+        let row_error = |row_id, reason| Error::RowPosition {
+            row_id,
+            data_file_id: Some(file_id),
+            reason,
+        };
+        let first = rows.first().copied().unwrap_or_default();
+        let file = scope
+            .snapshot
+            .data_files
+            .get(&scope.table.get())
+            .and_then(|files| files.get(&file_id.get()))
+            .map(data_file_info)
+            .ok_or_else(|| row_error(first, "file metadata is absent".into()))?;
+        let path = resolve_data_path(
+            scope.data_prefix,
+            scope.table_prefix,
+            &file.path,
+            file.path_is_relative,
+        )?;
+        let file_source = data_file::ParquetFile::new(
+            scope.store.clone(),
+            path,
+            file.file_size_bytes,
+            file.footer_size,
+        )
+        .with_metrics(self.data_read_metrics());
+        let (positions, absent) =
+            data_file::requested_positions(file_source, file.row_id_start, rows)
+                .await
+                .map_err(|error| row_error(first, format!("file could not be read: {error}")))?;
+        if let Some(row) = absent
+            && matches!(missing, MissingRows::Reject)
+        {
+            return Err(row_error(row, "row is not held by this file".into()));
+        }
+        Ok(positions)
     }
 
     /// The delete file currently registered against each positioned file,
@@ -785,6 +834,30 @@ impl ReadOnlyCatalog {
         Ok(total)
     }
 
+    async fn publish_file(
+        &self,
+        store: &DataStore,
+        data_prefix: &str,
+        table_prefix: &str,
+        table: TableId,
+        file: DataFileInfo,
+    ) -> Result<bool> {
+        let path = resolve_data_path(data_prefix, table_prefix, &file.path, file.path_is_relative)?;
+        data_file::publish_if_missing(
+            data_file::ParquetFile::new(
+                store.clone(),
+                path,
+                file.file_size_bytes,
+                file.footer_size,
+            )
+            .with_metrics(self.data_read_metrics()),
+            table.get(),
+            file.id.get(),
+            file.row_id_start,
+        )
+        .await
+    }
+
     /// Publishes missing summaries without filling the reader's summary caches.
     async fn publish_table(
         &self,
@@ -811,35 +884,14 @@ impl ReadOnlyCatalog {
         let mut published = RowSummaryPublish::default();
 
         let mut outcomes = stream::iter(files.map(|file| {
-            let resolved = resolve_data_path(
-                data_prefix,
-                &table_prefix,
-                &file.path,
-                file.path_is_relative,
-            );
-            let store = data_store.clone();
-            let metrics = self.data_read_metrics();
-
+            let table_prefix = &table_prefix;
             async move {
-                let written = match resolved {
-                    Ok(path) => {
-                        data_file::publish_if_missing(
-                            data_file::ParquetFile::new(
-                                store,
-                                path,
-                                file.file_size_bytes,
-                                file.footer_size,
-                            )
-                            .with_metrics(metrics),
-                            table.get(),
-                            file.id.get(),
-                            file.row_id_start,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                };
-                (file.id, written)
+                let id = file.id;
+                (
+                    id,
+                    self.publish_file(data_store, data_prefix, table_prefix, table, file)
+                        .await,
+                )
             }
         }))
         .buffer_unordered(data_file::PUBLISH_CONCURRENCY);

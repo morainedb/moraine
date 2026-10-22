@@ -155,18 +155,20 @@ sidecars are durable progress: later attempts and attaches check their headers
 instead of rebuilding them; no extra catalog checkpoint is required.
 
 The process admits four commit passes and four backfills, with separate pools
-so backfill saturation cannot consume commit slots. At most four summary builders
-hold decoded row IDs and encoded sidecars across all catalogs. A pass fans out to
-at most four tables and four files per table. Overlapping builds of the same
-immutable file share a lock and recheck its sidecar before rebuilding. Publishing
-reads and writes use at most half the shared data-I/O admission, leaving the
-remaining permits for foreground reads. This is reserved capacity, not preemption
-of an I/O request already running.
+so backfill saturation cannot consume commit slots. Summary construction admits four builders process-wide, with at most two
+background builds. Each file has a configurable admission allowance; CPU-heavy
+work runs off the async runtime and retains its permits through cancellation.
+Publication processes four files per step and retains its snapshot and progress
+between steps. Failed-file bookkeeping holds at most 1,024 IDs, falling back to a
+scan frontier on overflow. Warming retains completed-table progress and admits
+eight ranges across the process. The exact limits, cancellation boundaries, and
+public progress API are specified in
+[RFC 0026](0026-working-memory-and-resumable-publication.md).
 
-Warming generates prefixes one table at a time and attempts every range, returning
-the first failure to the retry worker. Catalog snapshots and per-file working
-buffers still scale with catalog/file size; the concurrency limits bound how many
-are active, not their individual size.
+Publishing reads and writes use at most half the shared data-I/O admission,
+leaving the remaining permits for foreground reads. This reserves capacity; it
+does not preempt an I/O request already running. Snapshot and caller-owned
+working memory remain separate from cache retention.
 
 The core exposes `ReadOnlyCatalog::publish_selected_row_summaries_since(data_store,
 data_prefix, tables, since)` for this path. The cutoff is exclusive and an empty
@@ -243,10 +245,10 @@ deployment can tell "none published yet" from "published and refused".
 A full summary and membership readers share the same immutable membership
 allocation. Membership-only reads still avoid loading positions. Independently
 decoded cache entries can retain separate copies, and cache weights remain
-conservative when entries share an allocation. File lookup directories can
-retain summaries after shared-cache eviction, under their separate 64 MiB
-accounted-entry limit per catalog. Active readers may retain evicted directories
-until their queries finish; neither budget is a process-wide memory limit.
+conservative when entries share an allocation. File lookup directories retain summaries under local limits and the process lookup
+allowance within `CACHE_MEMORY`. Admitted outer directory handles keep that charge
+after eviction until their readers finish. Independently retained inner buffers
+and query working memory still need headroom.
 
 A resident summary never consults a sidecar, so this adds nothing to a hit. It
 changes the cost of a **miss**, and of an eviction, from 5.21 MB to 1.25 MB for

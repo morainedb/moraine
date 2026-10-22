@@ -311,7 +311,7 @@ fn renaming_one_column_stages_no_write_for_any_sibling() {
         deleted_data_file_ids: Vec::new(),
         deletes_untargeted_files: false,
     };
-    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, &[], &[], None), 1);
+    let mut setup = Transaction::new(CatalogSnapshot::build_from(snap0, &[], &[], None), 1);
     let schema = setup.create_schema("s").unwrap();
     let table = setup
         .create_table(
@@ -379,7 +379,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
         deleted_data_file_ids: Vec::new(),
         deletes_untargeted_files: false,
     };
-    let empty = CatalogSnapshot::build(snap0, &[], &[], None);
+    let empty = CatalogSnapshot::build_from(snap0, &[], &[], None);
     let mut setup = Transaction::new(empty, 1);
     let schema = setup.create_schema("s").unwrap();
     let table = setup

@@ -3,10 +3,7 @@
 use std::ops::Bound;
 
 use super::revision_memo::RevisionMemo;
-use crate::{
-    IndexId, TableId,
-    store::{cache::retention::Shared, index_encoding::CanonicalKey},
-};
+use crate::{IndexId, TableId, store::index_encoding::CanonicalKey};
 
 const CAPACITY: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -91,11 +88,11 @@ impl IndexProbeCache {
         if !self.0.can_hold(bytes) {
             return;
         }
-        self.0.put(
+        self.0.put_cloned(
             revision,
             table,
             (index, probe),
-            Shared::new(rows.to_vec()),
+            rows,
             probe_bytes,
             size_of_val(rows),
         );

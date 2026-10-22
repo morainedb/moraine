@@ -1654,3 +1654,12 @@ Membership fills recheck after completion so a full summary built during the fil
 does not leave a redundant retained representation. Active readers keep their
 existing membership allocation; oversized full summaries do not displace useful
 membership entries when they cannot enter memory.
+
+### Working allocations
+
+Cold head-view loads share one materialization per handle. Time-travel views stream
+history records instead of retaining an intermediate history vector. Cache-only
+query copies reserve result bytes before allocation. These avoid duplicate work;
+owned result vectors and held snapshots remain caller working memory. Staging and
+summary-build admission, publication progress, and host sizing are specified in
+[RFC 0026](0026-working-memory-and-resumable-publication.md).

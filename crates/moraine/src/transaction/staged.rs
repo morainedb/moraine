@@ -60,6 +60,7 @@ mod apply;
 mod decode;
 mod index_upkeep;
 pub(crate) mod inline;
+mod memory;
 mod overlay;
 mod rebase;
 use rebase::Rebase;
@@ -429,6 +430,7 @@ pub struct StagedTransaction {
     diagnostic_id: u64,
     db_tx: Arc<CommitSession>,
     ops: Vec<RowOperation>,
+    staging: memory::StagingMemory,
     /// The committed records at this transaction's read point, read once
     /// per requested kind and shared by later reads of that kind.
     committed: CommittedRecordCache,
@@ -482,6 +484,7 @@ impl StagedTransaction {
             diagnostic_id: next_diagnostic_id(),
             db_tx: Arc::new(db_tx),
             ops: Vec::new(),
+            staging: memory::StagingMemory::default(),
             committed: tokio::sync::Mutex::new(HashMap::new()),
             head_view: tokio::sync::OnceCell::new(),
             committed_snapshots: tokio::sync::OnceCell::new(),
@@ -558,9 +561,21 @@ impl StagedTransaction {
     }
 
     /// Accumulates one row mutation. Nothing touches the store until
-    /// [`commit`](Self::commit).
+    /// [`commit`](Self::commit). A memory refusal is retained for commit; use
+    /// [`try_stage`](Self::try_stage) to receive it immediately.
     pub fn stage(&mut self, op: RowOperation) {
-        self.ops.push(op);
+        let _ = self.try_stage(op);
+    }
+
+    /// Stages a row within the transaction's memory allowance. A refusal
+    /// releases its authored rows and makes the transaction uncommittable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a constraint error on exhausted staging memory or an earlier
+    /// refusal.
+    pub fn try_stage(&mut self, op: RowOperation) -> Result<()> {
+        self.staging.push(&mut self.ops, op)
     }
 
     /// The tables this transaction registers new data files against,
@@ -1346,11 +1361,16 @@ impl StagedTransaction {
     /// As [`commit`](Self::commit).
     #[allow(clippy::too_many_lines)]
     pub async fn commit_reporting(self) -> Result<CommitReport> {
+        if let Err(error) = self.staging.check() {
+            commit::rollback(self.db_tx);
+            return Err(error);
+        }
         let started = Instant::now();
         let Self {
             diagnostic_id,
             db_tx,
             ops,
+            staging: _,
             committed: _,
             head_view,
             committed_snapshots: _,

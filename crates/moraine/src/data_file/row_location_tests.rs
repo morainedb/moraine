@@ -437,3 +437,39 @@ async fn concurrent_publishing_shares_one_file_build() {
         1
     );
 }
+
+#[tokio::test]
+async fn summary_row_limit_refuses_a_file_before_reading_its_column() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("summary-limit.parquet");
+    let batch = batch_with_embedded_row_ids(&[10, 20, 30]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+    let file = ParquetFile::new(DataStore::new(store.clone()), path, file_size, 0);
+    let error = super::row_location::read_row_ids_limited(file.clone(), None, 2)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("summary memory"));
+    let rows = super::row_location::read_row_ids_limited(file, None, 3)
+        .await
+        .unwrap();
+    assert_eq!(rows.positions_of(&[10, 30]), vec![Some(0), Some(2)]);
+}
+
+#[tokio::test]
+async fn requested_positions_stream_without_a_whole_file_summary() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("streamed-positions.parquet");
+    let batch = batch_with_embedded_row_ids(&[30, 10, 30, 20]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+    let file = ParquetFile::new(DataStore::new(store), path, file_size, 0);
+    assert!(
+        super::row_location::read_row_ids_limited(file.clone(), None, 2)
+            .await
+            .is_err()
+    );
+    let (positions, missing) = super::row_location::requested_positions(file, None, &[30, 99, 20])
+        .await
+        .unwrap();
+    assert_eq!(positions, vec![0, 2, 3]);
+    assert_eq!(missing, Some(99));
+}

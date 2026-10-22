@@ -862,18 +862,21 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         Some(_) => {
             read::consistent(tx, || async move {
                 let ((), head) = futures::try_join!(refuse_mid_migration(tx), read_head_value(tx))?;
-                let ((target, snapshot), current, history) = futures::try_join!(
-                    resolve_below(tx, at, head.snapshot_id),
-                    read::scan_current_entities(tx),
-                    read::scan_history_entities(tx),
-                )?;
-
-                Ok(CatalogSnapshot::build(
+                let (target, snapshot) = resolve_below(tx, at, head.snapshot_id).await?;
+                let mut view = CatalogSnapshot {
                     snapshot,
-                    &current,
-                    &history,
-                    Some(target),
-                ))
+                    ..CatalogSnapshot::default()
+                };
+                let mut visit = |record: read::EntityRecord| {
+                    if record.lifecycle().is_none_or(|(begin, end)| {
+                        begin <= target && end.is_none_or(|end| end > target)
+                    }) {
+                        view.put_record(record);
+                    }
+                };
+                read::visit_entity_records(tx, false, &mut visit).await?;
+                read::visit_entity_records(tx, true, &mut visit).await?;
+                Ok(view)
             })
             .await
         }

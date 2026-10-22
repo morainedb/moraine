@@ -78,3 +78,31 @@ async fn staged_body_owner_is_released_on_every_transaction_outcome() {
         catalog.close().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn staging_memory_failure_releases_rows_and_prevents_commit() {
+    let catalog = open().await;
+    let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap());
+    tx.staging = super::super::memory::StagingMemory::with_limit(1024);
+    tx.try_stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 1),
+    })
+    .unwrap();
+    let error = tx
+        .try_stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: vec![0; 2048],
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("staging memory"));
+    assert!(tx.ops.is_empty());
+    assert!(
+        tx.try_stage(RowOperation::InlineDrop { table_id: 1 })
+            .is_err()
+    );
+    assert!(tx.commit().await.is_err());
+    assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 0);
+    catalog.close().await.unwrap();
+}

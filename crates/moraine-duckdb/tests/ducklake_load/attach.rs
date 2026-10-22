@@ -592,3 +592,37 @@ fn ducklake_encrypted_writes_encrypted_files_and_reads_back() {
         catalog.close().await.expect("close catalog");
     });
 }
+
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
+fn staging_memory_refusal_leaves_the_table_unchanged() {
+    let store = TempDir::new("staging-memory");
+    let data = TempDir::new("staging-memory-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.memory_rows (value VARCHAR);",
+    );
+    let attach = Attach::Moraine {
+        store_dir: store.path(),
+        data_path: data.path(),
+        options: "",
+        read_only: false,
+    };
+    let output = run_session_with_env(
+        &attach,
+        "INSERT INTO lake.main.memory_rows VALUES (repeat('x', 65536));",
+        &[("MORAINE_STAGING_MEMORY_BYTES", "4096")],
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("staging memory"), "{error}");
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT count(*) FROM lake.main.memory_rows;"
+        )),
+        vec![vec!["0".to_owned()]]
+    );
+}

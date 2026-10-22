@@ -171,3 +171,27 @@ fn multiple_memos_share_a_budget_and_charge_evicted_readers() {
     drop(second);
     assert_eq!(budget.used(), 0);
 }
+
+#[test]
+fn denied_retention_does_not_copy_query_results() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted(Arc<AtomicUsize>);
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Self(self.0.clone())
+        }
+    }
+    let copies = Arc::new(AtomicUsize::new(0));
+    let value = Counted(copies.clone());
+    let budget = Budget::new(4096);
+    let mut other = crate::store::cache::retention::Charge::new(budget.clone());
+    assert!(other.resize(4096));
+    let memo = RevisionMemo::with_budget(4096, 16, budget);
+    memo.put_cloned(1, TableId::new(1), 1, &value, 0, 0);
+    assert_eq!(copies.load(Ordering::Relaxed), 0);
+    drop(other);
+    memo.put_cloned(1, TableId::new(1), 1, &value, 0, 0);
+    assert_eq!(copies.load(Ordering::Relaxed), 1);
+    assert!(memo.get(1, TableId::new(1), &1).is_some());
+}

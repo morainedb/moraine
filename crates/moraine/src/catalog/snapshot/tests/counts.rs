@@ -124,7 +124,7 @@ proptest! {
 #[test]
 fn table_cascades_keep_historical_mapping_and_file_statistics_counts() {
     let records: Vec<_> = (0..9).map(|kind| record(kind, 1, 8)).collect();
-    let mut view = CatalogSnapshot::build(snap(1), &records, &[], None);
+    let mut view = CatalogSnapshot::build_from(snap(1), &records, &[], None);
     assert_eq!(view.live_entity_count(), 9);
     for row in records {
         view.put_record(row);

@@ -2,13 +2,13 @@
 //! independently.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     future::Future,
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
-use moraine::{DataStore, ReadOnlyCatalog, SnapshotId, TableId};
+use moraine::{DataStore, ReadOnlyCatalog, RowSummaryProgress, SnapshotId, TableId};
 use tokio::{
     runtime::Runtime,
     sync::{Notify, Semaphore},
@@ -39,6 +39,12 @@ impl Default for Policy {
     }
 }
 
+#[derive(Default)]
+struct Progress {
+    warming: Option<VecDeque<TableId>>,
+    publishing: Option<RowSummaryProgress>,
+}
+
 #[derive(Clone)]
 pub(super) struct Pass {
     /// `None` warms every table; an empty set skips warming.
@@ -46,6 +52,7 @@ pub(super) struct Pass {
     /// `None` publishes every file; otherwise only files newer than this
     /// snapshot.
     since: Option<SnapshotId>,
+    progress: Arc<tokio::sync::Mutex<Progress>>,
 }
 
 impl Pass {
@@ -53,6 +60,7 @@ impl Pass {
         Self {
             tables: (!preload).then(BTreeSet::new),
             since: None,
+            progress: Arc::default(),
         }
     }
 
@@ -60,10 +68,12 @@ impl Pass {
         Self {
             tables: (tables.len() <= MAX_PENDING_TABLES).then(|| tables.into_iter().collect()),
             since: Some(SnapshotId::new(committed.get().saturating_sub(1))),
+            progress: Arc::default(),
         }
     }
 
     fn merge(&mut self, next: Self) {
+        self.progress = Arc::default();
         self.since = self.since.min(next.since);
         match (&mut self.tables, next.tables) {
             (Some(tables), Some(next)) => {
@@ -77,42 +87,55 @@ impl Pass {
     }
 
     async fn run(self, catalog: &ReadOnlyCatalog, store: Option<&DataStore>, prefix: &str) -> bool {
-        let tables = self
-            .tables
-            .map(|tables| tables.into_iter().collect::<Vec<_>>());
-        let warmed = match &tables {
-            None => warm_all_tables(catalog).await,
-            Some(tables) if !tables.is_empty() => catalog.warm_tables(tables).await,
-            Some(_) => Ok(()),
-        };
-        if let Err(error) = &warmed {
-            warn!(%error, "table warming will retry");
+        let mut progress = self.progress.lock().await;
+        if progress.warming.is_none() {
+            let tables = match &self.tables {
+                Some(tables) => tables.iter().copied().collect(),
+                None => match catalog.snapshot().await {
+                    Ok(snapshot) => snapshot
+                        .schemas()
+                        .into_iter()
+                        .flat_map(|schema| snapshot.tables_in(schema.id))
+                        .map(|table| table.id)
+                        .collect(),
+                    Err(error) => {
+                        warn!(%error, "table warming will retry");
+                        return false;
+                    }
+                },
+            };
+            progress.warming = Some(tables);
+        }
+        let mut warmed = true;
+        if let Some(tables) = &mut progress.warming {
+            while let Some(&table) = tables.front() {
+                if let Err(error) = catalog.warm_tables(&[table]).await {
+                    warn!(%error, "table warming will retry");
+                    warmed = false;
+                    break;
+                }
+                tables.pop_front();
+                tokio::task::yield_now().await;
+            }
         }
         let Some(store) = store else {
-            return warmed.is_ok();
+            return warmed;
         };
-        let published = match (self.since, tables) {
-            (Some(since), Some(tables)) => {
-                catalog
-                    .publish_selected_row_summaries_since(store.clone(), prefix, tables, since)
-                    .await
-            }
-            (Some(since), None) => {
-                catalog
-                    .publish_row_summaries_since(store.clone(), prefix, since)
-                    .await
-            }
-            (None, _) => {
-                catalog
-                    .publish_all_row_summaries(store.clone(), prefix)
-                    .await
-            }
-        };
-        match published {
-            Ok(outcome) => warmed.is_ok() && outcome.files_failed == 0,
-            Err(error) => {
-                warn!(%error, "row summary publishing will retry");
-                false
+        let publication = progress.publishing.get_or_insert_with(|| {
+            let tables = self
+                .since
+                .and(self.tables)
+                .map(|tables| tables.into_iter().collect());
+            RowSummaryProgress::new(tables, self.since)
+        });
+        loop {
+            match publication.advance(catalog, store, prefix).await {
+                Ok(true) => return warmed,
+                Ok(false) => tokio::task::yield_now().await,
+                Err(error) => {
+                    warn!(%error, "row summary publishing will retry");
+                    return false;
+                }
             }
         }
     }
@@ -249,19 +272,6 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.task.abort();
     }
-}
-
-/// Warms every table in the current snapshot.
-async fn warm_all_tables(catalog: &ReadOnlyCatalog) -> moraine::Result<()> {
-    let snapshot = catalog.snapshot().await?;
-    let tables = snapshot
-        .schemas()
-        .into_iter()
-        .flat_map(|schema| snapshot.tables_in(schema.id))
-        .map(|table| table.id)
-        .collect::<Vec<_>>();
-
-    catalog.warm_tables(&tables).await
 }
 
 #[cfg(test)]

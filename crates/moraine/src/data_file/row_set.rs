@@ -66,6 +66,15 @@ impl FileRowSet {
         }
 
         let raw_bytes = usize_as_u64(row_ids.len()).saturating_mul(size_of::<u64>() as u64);
+        let high_words = row_ids
+            .windows(2)
+            .filter(|pair| pair[0] >> 32 != pair[1] >> 32)
+            .count()
+            .saturating_add(usize::from(!row_ids.is_empty()));
+        if high_words.saturating_mul(size_of::<(u32, roaring::RoaringBitmap)>()) as u64 >= raw_bytes
+        {
+            return Ok(Self::Sorted(row_ids));
+        }
         let mut roaring = RoaringTreemap::from_sorted_iter(row_ids.iter().copied())
             .map_err(|_| Error::Constraint("file row ids must be strictly ascending".to_owned()))?;
         // Run compression is what makes a dense set cheap: unoptimized, a
@@ -255,7 +264,16 @@ impl PositionedRowSet {
     }
 
     /// Constructs from row IDs in file order, retaining repeated versions.
+    #[cfg(test)]
     pub(super) fn from_file_order(row_ids: Vec<u64>) -> Result<Self> {
+        Self::from_file_order_checked(row_ids, || Ok(()))
+    }
+
+    pub(super) fn from_file_order_checked(
+        row_ids: Vec<u64>,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        checkpoint()?;
         if is_strictly_ascending(&row_ids) {
             return Ok(Self {
                 rows: FileRowSet::from_sorted(row_ids)?.into(),
@@ -265,12 +283,17 @@ impl PositionedRowSet {
 
         let mut ascending: Vec<u64> = row_ids.clone();
         ascending.sort_unstable();
+        checkpoint()?;
         if ascending.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Self::repeated(row_ids);
+            drop(ascending);
+            return Self::repeated(row_ids, checkpoint);
         }
 
         let mut permutation = vec![0_u32; ascending.len()];
         for (position, row_id) in row_ids.iter().enumerate() {
+            if position % 16384 == 0 {
+                checkpoint()?;
+            }
             let rank = ascending
                 .binary_search(row_id)
                 .map_err(|_| Error::Corruption("row id vanished while sorting".to_owned()))?;
@@ -279,6 +302,8 @@ impl PositionedRowSet {
             })?;
         }
 
+        drop(row_ids);
+        checkpoint()?;
         let rows = FileRowSet::from_sorted(ascending)?;
         // A permutation never pairs with Range: demote a contiguous
         // permuted set to Roaring so position resolution still consults
@@ -298,7 +323,7 @@ impl PositionedRowSet {
         })
     }
 
-    fn repeated(row_ids: Vec<u64>) -> Result<Self> {
+    fn repeated(row_ids: Vec<u64>, mut checkpoint: impl FnMut() -> Result<()>) -> Result<Self> {
         let mut ordered = row_ids
             .into_iter()
             .enumerate()
@@ -310,11 +335,16 @@ impl PositionedRowSet {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        checkpoint()?;
         ordered.sort_unstable();
+        checkpoint()?;
         let mut members = Vec::new();
         let mut offsets = Vec::new();
         let mut positions = Vec::with_capacity(ordered.len());
         for (row_id, position) in ordered {
+            if positions.len() % 16384 == 0 {
+                checkpoint()?;
+            }
             if members.last() != Some(&row_id) {
                 offsets.push(u32::try_from(positions.len()).map_err(|_| {
                     Error::Constraint("file position exceeds the u32 domain".to_owned())
