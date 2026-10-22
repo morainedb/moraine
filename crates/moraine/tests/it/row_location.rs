@@ -7,7 +7,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use moraine::{Catalog, DataFile, DataFileId, DataStore, DeleteFile, Error, InlineChunk, TableId};
-use object_store::{ObjectStore, memory::InMemory};
+use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 
 use crate::fixtures::{col, datafile, open_memory, row_id_field, write_parquet as write};
 
@@ -363,6 +363,71 @@ async fn warming_counts_a_file_it_cannot_read_rather_than_failing() {
     assert_eq!(warmth.files_considered, 1);
     assert_eq!(warmth.summaries_built, 0);
     assert_eq!(warmth.files_failed, 1);
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn publishing_selected_tables_respects_the_snapshot_cutoff() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
+    let table = table_with(&catalog, vec![datafile(3)]).await;
+    let since = catalog.commit(|_| Ok(())).await.unwrap();
+    let (file_size_bytes, footer_size) = write(
+        &data,
+        "main/orders/data-2.parquet",
+        &batch_with_row_ids(&[40, 50], &[21, 22]),
+    )
+    .await;
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    file_size_bytes,
+                    footer_size,
+                    ..datafile(2)
+                },
+                &[],
+            )?;
+            let main = tx.schema_by_name("main").unwrap().id;
+            let other = tx.create_table(main, "other", &[col("a")])?;
+            tx.register_data_file(other, datafile(9), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let published = catalog
+        .publish_selected_row_summaries_since(store.clone(), "", vec![table], since)
+        .await
+        .unwrap();
+    assert_eq!(published.files_considered, 1);
+    assert_eq!(published.summaries_built, 1);
+    assert_eq!(
+        published.files_failed, 0,
+        "old and unselected missing files were not read"
+    );
+    let empty = catalog
+        .publish_selected_row_summaries_since(store.clone(), "", vec![], since)
+        .await
+        .unwrap();
+    assert_eq!(empty.files_considered, 0);
+    let repeated = catalog
+        .publish_selected_row_summaries_since(store.clone(), "", vec![table], since)
+        .await
+        .unwrap();
+    assert_eq!(repeated.files_considered, 1);
+    assert_eq!(repeated.summaries_built, 0);
+    let all = catalog
+        .publish_row_summaries_since(store, "", since)
+        .await
+        .unwrap();
+    assert_eq!(all.files_considered, 2);
+    assert_eq!(
+        all.files_failed, 1,
+        "the all-table pass still visits the other table"
+    );
     catalog.close().await.unwrap();
 }
 
@@ -962,4 +1027,81 @@ mod locate_row_positions {
         assert_eq!(existing, &vec![0]);
         catalog.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn publication_resumes_after_completed_files() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
+    let mut files = Vec::new();
+    for id in 1..=8 {
+        let (file_size_bytes, footer_size) = write(
+            &data,
+            &format!("main/orders/data-{id}.parquet"),
+            &batch_with_row_ids(&[10], &[id * 10]),
+        )
+        .await;
+        files.push(DataFile {
+            file_size_bytes,
+            footer_size,
+            record_count: 1,
+            ..datafile(u64::try_from(id).unwrap())
+        });
+    }
+    table_with(&catalog, files).await;
+    let mut progress = moraine::RowSummaryProgress::new(None, None);
+    assert!(!progress.advance(&catalog, &store, "").await.unwrap());
+    // A completed prefix must not be touched on the next step.
+    for id in 1..=4 {
+        for suffix in [".parquet", ".parquet.rowsum"] {
+            data.delete(&object_store::path::Path::from(format!(
+                "main/orders/data-{id}{suffix}"
+            )))
+            .await
+            .unwrap();
+        }
+    }
+    assert!(!progress.advance(&catalog, &store, "").await.unwrap());
+    assert!(progress.advance(&catalog, &store, "").await.unwrap());
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn publication_retries_failed_files_without_revisiting_successes() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
+    let batch = batch_with_row_ids(&[10], &[10]);
+    let mut files = Vec::new();
+    for id in 1..=8 {
+        let (file_size_bytes, footer_size) =
+            write(&data, &format!("main/orders/data-{id}.parquet"), &batch).await;
+        files.push(DataFile {
+            file_size_bytes,
+            footer_size,
+            record_count: 1,
+            ..datafile(id)
+        });
+    }
+    table_with(&catalog, files).await;
+    let missing = object_store::path::Path::from("main/orders/data-1.parquet");
+    data.delete(&missing).await.unwrap();
+    let mut progress = moraine::RowSummaryProgress::new(None, None);
+    assert!(progress.advance(&catalog, &store, "").await.is_err());
+    assert!(!progress.advance(&catalog, &store, "").await.unwrap());
+    assert!(progress.advance(&catalog, &store, "").await.is_err());
+    for id in 2..=8 {
+        for suffix in [".parquet", ".parquet.rowsum"] {
+            data.delete(&object_store::path::Path::from(format!(
+                "main/orders/data-{id}{suffix}"
+            )))
+            .await
+            .unwrap();
+        }
+    }
+    write(&data, missing.as_ref(), &batch).await;
+    assert!(!progress.advance(&catalog, &store, "").await.unwrap());
+    assert!(progress.advance(&catalog, &store, "").await.unwrap());
+    catalog.close().await.unwrap();
 }

@@ -1,6 +1,6 @@
 //! Adaptive exact membership for one immutable data file's row ids.
 
-use std::mem::size_of;
+use std::{mem::size_of, sync::Arc};
 
 use roaring::RoaringTreemap;
 
@@ -66,6 +66,15 @@ impl FileRowSet {
         }
 
         let raw_bytes = usize_as_u64(row_ids.len()).saturating_mul(size_of::<u64>() as u64);
+        let high_words = row_ids
+            .windows(2)
+            .filter(|pair| pair[0] >> 32 != pair[1] >> 32)
+            .count()
+            .saturating_add(usize::from(!row_ids.is_empty()));
+        if high_words.saturating_mul(size_of::<(u32, roaring::RoaringBitmap)>()) as u64 >= raw_bytes
+        {
+            return Ok(Self::Sorted(row_ids));
+        }
         let mut roaring = RoaringTreemap::from_sorted_iter(row_ids.iter().copied())
             .map_err(|_| Error::Constraint("file row ids must be strictly ascending".to_owned()))?;
         // Run compression is what makes a dense set cheap: unoptimized, a
@@ -182,7 +191,7 @@ pub(super) enum RowOrder {
 /// A membership set plus how to read file positions off it.
 #[derive(Debug, Clone)]
 pub(super) struct PositionedRowSet {
-    pub(super) rows: FileRowSet,
+    pub(super) rows: Arc<FileRowSet>,
     pub(super) order: RowOrder,
 }
 
@@ -247,7 +256,7 @@ impl PositionedRowSet {
             return None;
         }
 
-        match &self.rows {
+        match &*self.rows {
             FileRowSet::Range { start, .. } => Some(row_id - start),
             FileRowSet::Roaring(rows) => rows.rank(row_id).checked_sub(1),
             FileRowSet::Sorted(rows) => rows.binary_search(&row_id).ok().map(usize_as_u64),
@@ -255,22 +264,36 @@ impl PositionedRowSet {
     }
 
     /// Constructs from row IDs in file order, retaining repeated versions.
+    #[cfg(test)]
     pub(super) fn from_file_order(row_ids: Vec<u64>) -> Result<Self> {
+        Self::from_file_order_checked(row_ids, || Ok(()))
+    }
+
+    pub(super) fn from_file_order_checked(
+        row_ids: Vec<u64>,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        checkpoint()?;
         if is_strictly_ascending(&row_ids) {
             return Ok(Self {
-                rows: FileRowSet::from_sorted(row_ids)?,
+                rows: FileRowSet::from_sorted(row_ids)?.into(),
                 order: RowOrder::Ascending,
             });
         }
 
         let mut ascending: Vec<u64> = row_ids.clone();
-        ascending.sort_unstable();
+        sort_checked(&mut ascending, &mut checkpoint)?;
+        checkpoint()?;
         if ascending.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Self::repeated(row_ids);
+            drop(ascending);
+            return Self::repeated(row_ids, checkpoint);
         }
 
         let mut permutation = vec![0_u32; ascending.len()];
         for (position, row_id) in row_ids.iter().enumerate() {
+            if position % 16384 == 0 {
+                checkpoint()?;
+            }
             let rank = ascending
                 .binary_search(row_id)
                 .map_err(|_| Error::Corruption("row id vanished while sorting".to_owned()))?;
@@ -279,6 +302,8 @@ impl PositionedRowSet {
             })?;
         }
 
+        drop(row_ids);
+        checkpoint()?;
         let rows = FileRowSet::from_sorted(ascending)?;
         // A permutation never pairs with Range: demote a contiguous
         // permuted set to Roaring so position resolution still consults
@@ -293,12 +318,12 @@ impl PositionedRowSet {
         };
 
         Ok(Self {
-            rows,
+            rows: rows.into(),
             order: RowOrder::Permuted(permutation),
         })
     }
 
-    fn repeated(row_ids: Vec<u64>) -> Result<Self> {
+    fn repeated(row_ids: Vec<u64>, mut checkpoint: impl FnMut() -> Result<()>) -> Result<Self> {
         let mut ordered = row_ids
             .into_iter()
             .enumerate()
@@ -310,11 +335,16 @@ impl PositionedRowSet {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        ordered.sort_unstable();
+        checkpoint()?;
+        sort_checked(&mut ordered, &mut checkpoint)?;
+        checkpoint()?;
         let mut members = Vec::new();
         let mut offsets = Vec::new();
         let mut positions = Vec::with_capacity(ordered.len());
         for (row_id, position) in ordered {
+            if positions.len() % 16384 == 0 {
+                checkpoint()?;
+            }
             if members.last() != Some(&row_id) {
                 offsets.push(u32::try_from(positions.len()).map_err(|_| {
                     Error::Constraint("file position exceeds the u32 domain".to_owned())
@@ -337,10 +367,49 @@ impl PositionedRowSet {
             rows => rows,
         };
         Ok(Self {
-            rows,
+            rows: rows.into(),
             order: RowOrder::Repeated { offsets, positions },
         })
     }
+}
+
+/// Sorts bounded runs, checking cancellation throughout the merge passes.
+pub(super) fn sort_checked<T: Copy + Ord>(
+    values: &mut Vec<T>,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+) -> Result<()> {
+    const RUN: usize = 4096;
+    for run in values.chunks_mut(RUN) {
+        checkpoint()?;
+        run.sort_unstable();
+    }
+    if values.len() <= RUN {
+        return Ok(());
+    }
+    let mut scratch = values.clone();
+    let mut width = RUN;
+    while width < values.len() {
+        for start in (0..values.len()).step_by(width.saturating_mul(2)) {
+            let middle = start.saturating_add(width).min(values.len());
+            let end = middle.saturating_add(width).min(values.len());
+            let (mut left, mut right) = (start, middle);
+            for (offset, output) in scratch[start..end].iter_mut().enumerate() {
+                if offset.is_multiple_of(RUN) {
+                    checkpoint()?;
+                }
+                if left < middle && (right == end || values[left] <= values[right]) {
+                    *output = values[left];
+                    left += 1;
+                } else {
+                    *output = values[right];
+                    right += 1;
+                }
+            }
+        }
+        std::mem::swap(values, &mut scratch);
+        width = width.saturating_mul(2);
+    }
+    Ok(())
 }
 
 impl RowOrder {

@@ -19,6 +19,7 @@ use crate::data_file::{ParquetFile, auxiliary_cache};
 pub(super) struct ObjectStoreReader {
     pub(super) file: ParquetFile,
     pub(super) page_index: PageIndexPolicy,
+    memory: Option<Arc<crate::MemoryReservation>>,
 }
 
 impl ObjectStoreReader {
@@ -26,6 +27,7 @@ impl ObjectStoreReader {
         Self {
             file: file.clone(),
             page_index,
+            memory: None,
         }
     }
 }
@@ -59,6 +61,43 @@ impl AsyncFileReader for ObjectStoreReader {
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
         let prefetch = footer_prefetch_size(self.file.footer_size, self.file.file_size);
-        async move { auxiliary_cache::shared().metadata(self, prefetch).await }.boxed()
+        async move {
+            let mut memory =
+                crate::MemoryReservation::reserve(self.file.footer_size.saturating_mul(8))
+                    .map_err(|error| parquet::errors::ParquetError::General(error.to_string()))?;
+            let metadata = auxiliary_cache::shared().metadata(self, prefetch).await?;
+            memory
+                .resize(memory.bytes().max(metadata.memory_size() as u64))
+                .map_err(|error| parquet::errors::ParquetError::General(error.to_string()))?;
+            self.memory = Some(Arc::new(memory));
+            Ok(metadata)
+        }
+        .boxed()
     }
+}
+
+/// Reserves the largest projected row group before page decoding. Compressed
+/// input ranges have separate reservations; output batches retain their own.
+pub(super) fn admit_decode(
+    metadata: &ParquetMetaData,
+    projection: &parquet::arrow::ProjectionMask,
+    groups: Option<&[usize]>,
+) -> crate::Result<crate::MemoryReservation> {
+    let mut largest = 0_u64;
+    for (index, group) in metadata.row_groups().iter().enumerate() {
+        if groups.is_some_and(|groups| !groups.contains(&index)) {
+            continue;
+        }
+        let mut bytes = 0_u64;
+        for (column, chunk) in group.columns().iter().enumerate() {
+            if projection.leaf_included(column) {
+                let size = u64::try_from(chunk.uncompressed_size())
+                    .map_err(|_| crate::Error::Corruption("negative Parquet column size".into()))?;
+                bytes = bytes.saturating_add(size);
+            }
+        }
+        // Decoded values, validity/offset buffers, and normalization scratch.
+        largest = largest.max(bytes.saturating_mul(4));
+    }
+    crate::MemoryReservation::reserve(largest)
 }

@@ -331,7 +331,9 @@ duckdb::unique_ptr<duckdb::FunctionData> CacheStatusBind(duckdb::ClientContext &
 	         "block_disk_capacity_bytes",
 	         "auxiliary_metadata_capacity_bytes",
 	         "auxiliary_metadata_occupancy_bytes",
-	         "auxiliary_metadata_evictions"};
+	         "auxiliary_metadata_evictions",
+	         "lookup_capacity_bytes",
+	         "lookup_occupancy_bytes"};
 	return_types.assign(names.size(), LogicalType::UBIGINT);
 	return nullptr;
 }
@@ -359,6 +361,12 @@ void CacheStatusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 	output.SetValue(7, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_capacity_bytes));
 	output.SetValue(8, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_occupancy_bytes));
 	output.SetValue(9, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_evictions));
+	uint64_t lookup_capacity = 0, lookup_occupancy = 0;
+	if (moraine_lookup_cache_status(&lookup_capacity, &lookup_occupancy) != MORAINE_OK) {
+		throw duckdb::InternalException("moraine_lookup_cache_status: could not read lookup sizing");
+	}
+	output.SetValue(10, 0, duckdb::Value::UBIGINT(lookup_capacity));
+	output.SetValue(11, 0, duckdb::Value::UBIGINT(lookup_occupancy));
 	output.SetChildCardinality(1);
 }
 

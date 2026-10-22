@@ -2,10 +2,9 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_u64};
+use super::{conversion::dump_row, dump_rows, free_rows};
 use crate::{
-    abi::{free_c_string, to_c_string},
-    error::{AbiError, MoraineError},
+    error::MoraineError,
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -28,35 +27,13 @@ pub struct MoraineTagRow {
     pub value: *mut c_char,
 }
 
-/// Converts core `ducklake_tag` records into the C row shape. Shared by the
-/// committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn tag_rows(
-    rows: Vec<moraine::ffi_support::TagRow>,
-) -> Result<Vec<MoraineTagRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let key = to_c_string(std::mem::take(&mut row.key))?;
-            let value = to_c_string(std::mem::take(&mut row.value))?;
-            Ok((row, key, value))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(row, key, value)| {
-            let (has_end, end) = opt_u64(row.end_snapshot);
-            MoraineTagRow {
-                object_id: row.object_id,
-                begin_snapshot: row.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                key: key.into_raw(),
-                value: value.into_raw(),
-            }
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::TagRow => MoraineTagRow {
+        values { object_id, begin_snapshot }
+        optional { end_snapshot => has_end_snapshot }
+        strings { key, value }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_tag` row into `*out_items`/`*out_len`.
@@ -87,7 +64,6 @@ pub unsafe extern "C" fn moraine_dump_tags(
             probe_ctx,
             err,
             moraine::ffi_support::dump_tags,
-            tag_rows,
         )
     }
 }
@@ -102,10 +78,7 @@ pub unsafe extern "C" fn moraine_dump_tags(
 pub unsafe extern "C" fn moraine_dump_tags_free(items: *mut MoraineTagRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |t| {
-            free_c_string(t.key);
-            free_c_string(t.value);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -131,36 +104,13 @@ pub struct MoraineColumnTagRow {
     pub value: *mut c_char,
 }
 
-/// Converts core `ducklake_column_tag` records into the C row shape. Shared by
-/// the committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn column_tag_rows(
-    rows: Vec<moraine::ffi_support::ColumnTagRow>,
-) -> Result<Vec<MoraineColumnTagRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let key = to_c_string(std::mem::take(&mut row.key))?;
-            let value = to_c_string(std::mem::take(&mut row.value))?;
-            Ok((row, key, value))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(row, key, value)| {
-            let (has_end, end) = opt_u64(row.end_snapshot);
-            MoraineColumnTagRow {
-                table_id: row.table_id,
-                column_id: row.column_id,
-                begin_snapshot: row.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                key: key.into_raw(),
-                value: value.into_raw(),
-            }
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::ColumnTagRow => MoraineColumnTagRow {
+        values { table_id, column_id, begin_snapshot }
+        optional { end_snapshot => has_end_snapshot }
+        strings { key, value }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_column_tag` row into `*out_items`/`*out_len`.
@@ -191,7 +141,6 @@ pub unsafe extern "C" fn moraine_dump_column_tags(
             probe_ctx,
             err,
             moraine::ffi_support::dump_column_tags,
-            column_tag_rows,
         )
     }
 }
@@ -209,10 +158,7 @@ pub unsafe extern "C" fn moraine_dump_column_tags_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |t| {
-            free_c_string(t.key);
-            free_c_string(t.value);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -238,35 +184,13 @@ pub struct MoraineViewColumnTagRow {
     pub value: *mut c_char,
 }
 
-/// Converts core `ducklake_view_column_tag` records into the C row shape.
-pub(crate) fn view_column_tag_rows(
-    rows: Vec<moraine::ffi_support::ViewColumnTagRow>,
-) -> Result<Vec<MoraineViewColumnTagRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let column_name = to_c_string(std::mem::take(&mut row.column_name))?;
-            let key = to_c_string(std::mem::take(&mut row.key))?;
-            let value = to_c_string(std::mem::take(&mut row.value))?;
-            Ok((row, column_name, key, value))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(row, column_name, key, value)| {
-            let (has_end, end) = opt_u64(row.end_snapshot);
-            MoraineViewColumnTagRow {
-                view_id: row.view_id,
-                column_name: column_name.into_raw(),
-                begin_snapshot: row.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                key: key.into_raw(),
-                value: value.into_raw(),
-            }
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::ViewColumnTagRow => MoraineViewColumnTagRow {
+        values { view_id, begin_snapshot }
+        optional { end_snapshot => has_end_snapshot }
+        strings { column_name, key, value }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_view_column_tag` row into
@@ -298,7 +222,6 @@ pub unsafe extern "C" fn moraine_dump_view_column_tags(
             probe_ctx,
             err,
             moraine::ffi_support::dump_view_column_tags,
-            view_column_tag_rows,
         )
     }
 }
@@ -316,11 +239,7 @@ pub unsafe extern "C" fn moraine_dump_view_column_tags_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |t| {
-            free_c_string(t.column_name);
-            free_c_string(t.key);
-            free_c_string(t.value);
-        });
+        free_rows(items, len);
     }
 }
 

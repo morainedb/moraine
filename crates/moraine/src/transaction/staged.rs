@@ -43,7 +43,7 @@ use crate::{
         StagedBytes,
         handle::ReadHandle,
         inline as store_inline,
-        key::{EntityKey, InlineKey, InlineOperation, Key},
+        key::{CurrentKey, EntityKey, InlineKey, InlineOperation, Key},
         proto, read, value,
     },
     transaction::{
@@ -60,6 +60,7 @@ mod apply;
 mod decode;
 mod index_upkeep;
 pub(crate) mod inline;
+mod memory;
 mod overlay;
 mod rebase;
 use rebase::Rebase;
@@ -429,6 +430,7 @@ pub struct StagedTransaction {
     diagnostic_id: u64,
     db_tx: Arc<CommitSession>,
     ops: Vec<RowOperation>,
+    staging: memory::StagingMemory,
     /// The committed records at this transaction's read point, read once
     /// per requested kind and shared by later reads of that kind.
     committed: CommittedRecordCache,
@@ -482,6 +484,7 @@ impl StagedTransaction {
             diagnostic_id: next_diagnostic_id(),
             db_tx: Arc::new(db_tx),
             ops: Vec::new(),
+            staging: memory::StagingMemory::default(),
             committed: tokio::sync::Mutex::new(HashMap::new()),
             head_view: tokio::sync::OnceCell::new(),
             committed_snapshots: tokio::sync::OnceCell::new(),
@@ -558,9 +561,21 @@ impl StagedTransaction {
     }
 
     /// Accumulates one row mutation. Nothing touches the store until
-    /// [`commit`](Self::commit).
+    /// [`commit`](Self::commit). A memory refusal is retained for commit; use
+    /// [`try_stage`](Self::try_stage) to receive it immediately.
     pub fn stage(&mut self, op: RowOperation) {
-        self.ops.push(op);
+        let _ = self.try_stage(op);
+    }
+
+    /// Stages a row within the transaction's memory allowance. A refusal
+    /// releases its authored rows and makes the transaction uncommittable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a constraint error on exhausted staging memory or an earlier
+    /// refusal.
+    pub fn try_stage(&mut self, op: RowOperation) -> Result<()> {
+        self.staging.push(&mut self.ops, op)
     }
 
     /// The tables this transaction registers new data files against,
@@ -1346,11 +1361,16 @@ impl StagedTransaction {
     /// As [`commit`](Self::commit).
     #[allow(clippy::too_many_lines)]
     pub async fn commit_reporting(self) -> Result<CommitReport> {
+        if let Err(error) = self.staging.check() {
+            commit::rollback(self.db_tx);
+            return Err(error);
+        }
         let started = Instant::now();
         let Self {
             diagnostic_id,
             db_tx,
             ops,
+            staging,
             committed: _,
             head_view,
             committed_snapshots: _,
@@ -1447,6 +1467,7 @@ impl StagedTransaction {
             commit::rollback(db_tx);
             let authored = read_view.unwrap_or(base);
             let member = StagedMember {
+                _staging: staging,
                 ours,
                 base_head: proto::HeadValue {
                     snapshot_id: authored.snapshot.snapshot_id,
@@ -1480,6 +1501,7 @@ impl StagedTransaction {
             );
             return Ok(CommitReport {
                 snapshot_id,
+                registered_files: report.registered_files,
                 deferred_indexes: report.deferred_indexes,
                 index_entries: report.index_entries,
                 staged_bytes: report.staged_bytes.0,
@@ -1540,6 +1562,7 @@ impl StagedTransaction {
                 || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
                 |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
             );
+            let registered_files = registered_files(&writes)?;
             let phase_started = Instant::now();
             let landed = reporting_phase(
                 "commit-batch",
@@ -1578,6 +1601,7 @@ impl StagedTransaction {
                     );
                     return Ok(CommitReport {
                         snapshot_id: SnapshotId::new(result_id),
+                        registered_files,
                         deferred_indexes,
                         index_entries,
                         staged_bytes: staged_bytes.0,
@@ -1666,6 +1690,7 @@ async fn stage_rows(
     mints_snapshot: bool,
     phases: &mut CommitPhases,
 ) -> Result<RowsStaged> {
+    db_tx.reserve_translation(memory::authored_bytes(ops).saturating_mul(4))?;
     let ops = rebase.inline_ops(ops);
     let store = context.data_store.as_ref();
     let read_metrics = Arc::new(data_file::ScopedReadMetrics::reporting_to(Arc::clone(
@@ -1772,6 +1797,7 @@ async fn stage_rows(
 /// A staged commit riding the batch: its rows and the head it authored
 /// them against, re-staged against each premise it is offered.
 struct StagedMember {
+    _staging: memory::StagingMemory,
     ops: Vec<RowOperation>,
     base: Arc<CatalogSnapshot>,
     base_head: proto::HeadValue,
@@ -1782,6 +1808,7 @@ struct StagedMember {
 }
 
 struct MemberReport {
+    registered_files: Vec<(TableId, crate::DataFileId)>,
     deferred_indexes: Vec<IndexId>,
     index_entries: u64,
     staged_bytes: StagedBytes,
@@ -1860,6 +1887,7 @@ impl commit::StageOnto for StagedMember {
             stage_ms = crate::telemetry::milliseconds(phases.stage),
             "staged commit staged onto its batch"
         );
+        let registered_files = registered_files(&staged.writes)?;
         batch.admit_member(
             staged.result_id,
             self.ours.clone(),
@@ -1870,6 +1898,7 @@ impl commit::StageOnto for StagedMember {
             .report
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(MemberReport {
+            registered_files,
             deferred_indexes: staged.deferred_indexes,
             index_entries,
             staged_bytes: staged.staged_bytes,
@@ -1882,12 +1911,31 @@ impl commit::StageOnto for StagedMember {
     }
 }
 
+fn registered_files(writes: &[commit::StagedWrite]) -> Result<Vec<(TableId, crate::DataFileId)>> {
+    let mut files = BTreeSet::new();
+    let prefix = crate::store::key::current_entity_kind_prefix(crate::store::key::EntityKind::File);
+    for (key, value) in writes {
+        if value.is_some()
+            && key.starts_with(&prefix)
+            && let Key::Current(CurrentKey::Entity(EntityKey::File {
+                table_id,
+                data_file_id,
+            })) = Key::decode(key)?
+        {
+            files.insert((TableId::new(table_id), crate::DataFileId::new(data_file_id)));
+        }
+    }
+    Ok(files.into_iter().collect())
+}
+
 /// What a landed commit produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CommitReport {
     /// The snapshot the commit's rows are visible at.
     pub snapshot_id: SnapshotId,
+    /// Data files registered by this commit, using their final rebased IDs.
+    pub registered_files: Vec<(TableId, crate::DataFileId)>,
     /// Deferred-maintenance indexes this commit left `Maintaining`.
     pub deferred_indexes: Vec<IndexId>,
     /// Equality-index entries derived by this commit.
@@ -2204,6 +2252,7 @@ fn translate(
     // shared `current` key); begin-rebases apply last, targeting rows this
     // commit inserted. Inline ops are translated by `translate_inline`.
     let mut state = base.clone();
+    state.admit(memory::metadata_bytes(ops).saturating_mul(4))?;
     let mut children = collect_child_rows(ops, rebase)?;
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
@@ -2351,6 +2400,7 @@ fn translate_maintenance(
     let rebase = Rebase::identity(base);
 
     let mut state = base.clone();
+    state.admit(memory::metadata_bytes(ops).saturating_mul(4))?;
     let mut children = ChildRows::default();
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;

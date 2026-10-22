@@ -23,7 +23,7 @@ fn groups_with_offset_index(metadata: &ParquetMetaData) -> usize {
 
 fn summary(row_ids: Vec<u64>) -> Arc<PositionedRowSet> {
     Arc::new(PositionedRowSet {
-        rows: FileRowSet::from_sorted(row_ids).unwrap(),
+        rows: FileRowSet::from_sorted(row_ids).unwrap().into(),
         order: RowOrder::Ascending,
     })
 }
@@ -41,6 +41,32 @@ fn key(path: &Path) -> FileSummaryKey<'_> {
         path,
         file_size: 100,
     }
+}
+
+#[tokio::test]
+async fn membership_hits_share_storage_and_survive_eviction() {
+    let cache = AuxiliaryCache::new(1 << 20);
+    let store = DataStore::new(Arc::new(InMemory::new()));
+    let path = Path::from("shared-membership.parquet");
+    let positioned = fragmented(4096);
+    cache.insert_summary(&store, &key(&path), &positioned);
+    let first = cache
+        .fetch_membership(&store, &key(&path), || async {
+            panic!("resident summary must answer membership")
+        })
+        .await
+        .unwrap();
+    let second = cache
+        .fetch_membership(&store, &key(&path), || async {
+            panic!("resident summary must answer membership")
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&positioned.rows, &first));
+    drop(positioned);
+    cache.resize(0);
+    assert!(first.contains(8190));
+    assert!(Arc::ptr_eq(&first, &second));
 }
 
 /// Two stores holding the same path keep separate entries.
@@ -557,7 +583,7 @@ fn positions_pack_to_the_width_the_row_count_needs() {
     use super::auxiliary_cache::{AuxiliaryValue, Weighed};
 
     let summary = PositionedRowSet {
-        rows: FileRowSet::Sorted(vec![10, 20, 30, 40, 50]),
+        rows: FileRowSet::Sorted(vec![10, 20, 30, 40, 50]).into(),
         order: RowOrder::Permuted(vec![4, 0, 3, 1, 2]),
     };
     let mut encoded = Vec::new();
@@ -580,11 +606,11 @@ fn positions_beyond_the_row_count_are_refused() {
     use super::auxiliary_cache::{AuxiliaryValue, Weighed};
 
     let permuted = PositionedRowSet {
-        rows: FileRowSet::Sorted(vec![10, 20]),
+        rows: FileRowSet::Sorted(vec![10, 20]).into(),
         order: RowOrder::Permuted(vec![0, 9]),
     };
     let repeated = PositionedRowSet {
-        rows: FileRowSet::Sorted(vec![10, 30]),
+        rows: FileRowSet::Sorted(vec![10, 30]).into(),
         order: RowOrder::Repeated {
             offsets: vec![0, 1, 3],
             positions: vec![0, 1, 5],
@@ -663,7 +689,7 @@ fn repeated_summary_disk_form_rejects_invalid_positions() {
         (vec![10, 10], vec![0, 1, 3], vec![0, 1, 2]),
     ] {
         let summary = PositionedRowSet {
-            rows: FileRowSet::Sorted(members),
+            rows: FileRowSet::Sorted(members).into(),
             order: RowOrder::Repeated { offsets, positions },
         };
         let mut encoded = Vec::new();
@@ -913,4 +939,54 @@ async fn summaries_served_from_memory_never_rewrite_the_disk_tier() {
     );
 
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn full_summaries_replace_redundant_membership_entries() {
+    for fetched in [false, true] {
+        let cache = AuxiliaryCache::new(1 << 20);
+        let store = DataStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("promoted.parquet");
+        let positioned = fragmented(4096);
+        let reader = cache
+            .fetch_membership(&store, &key(&path), || {
+                let rows = Arc::clone(&positioned.rows);
+                async { Ok(rows) }
+            })
+            .await
+            .unwrap();
+        if fetched {
+            cache
+                .fetch_summary(&store, &key(&path), || async { Ok(positioned) })
+                .await
+                .unwrap();
+        } else {
+            cache.insert_summary(&store, &key(&path), &positioned);
+        }
+        let held = cache.row_summaries();
+        assert_eq!(held.range + held.roaring + held.sorted, 1);
+        assert!(reader.contains(8190));
+    }
+}
+
+#[tokio::test]
+async fn membership_fill_does_not_keep_a_duplicate_of_a_full_summary_it_built() {
+    let cache = Arc::new(AuxiliaryCache::new(1 << 20));
+    let store = DataStore::new(Arc::new(InMemory::new()));
+    let path = Path::from("promoted-during-fill.parquet");
+    let filling = Arc::clone(&cache);
+    let fill_store = store.clone();
+    let fill_path = path.clone();
+    let positioned = fragmented(4096);
+    let expected = Arc::clone(&positioned.rows);
+    let rows = cache
+        .fetch_membership(&store, &key(&path), move || async move {
+            filling.insert_summary(&fill_store, &key(&fill_path), &positioned);
+            Ok(Arc::clone(&positioned.rows))
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&rows, &expected));
+    let held = cache.row_summaries();
+    assert_eq!(held.range + held.roaring + held.sorted, 1);
 }

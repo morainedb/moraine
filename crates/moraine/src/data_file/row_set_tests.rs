@@ -176,3 +176,47 @@ fn positions_of_absent_row_is_none() {
 
     assert_eq!(rows.positions_of(&[999]), vec![None]);
 }
+
+#[test]
+fn cancelled_summary_construction_stops_before_positioning() {
+    let mut checkpoints = 0;
+    let result = super::row_set::PositionedRowSet::from_file_order_checked(
+        (0..100_000).rev().collect(),
+        || {
+            checkpoints += 1;
+            if checkpoints >= 2 {
+                Err(crate::Error::Interrupted("cancelled summary".into()))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(result, Err(crate::Error::Interrupted(_))));
+}
+
+#[test]
+fn sorting_can_stop_between_chunks_before_visiting_the_tail() {
+    let mut values: Vec<_> = (0_u64..32768).rev().collect();
+    let tail = values[16384..].to_vec();
+    let mut checkpoints = 0;
+    let result = super::row_set::sort_checked(&mut values, &mut || {
+        checkpoints += 1;
+        if checkpoints == 2 {
+            Err(crate::Error::Interrupted("cancel sort".into()))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_err());
+    assert_eq!(&values[16384..], tail);
+}
+
+proptest::proptest! {
+    #[test]
+    fn chunked_sort_matches_the_standard_sort(mut values in proptest::collection::vec(proptest::prelude::any::<u64>(), 0..20000)) {
+        let mut expected = values.clone();
+        expected.sort_unstable();
+        super::row_set::sort_checked(&mut values, &mut || Ok(())).unwrap();
+        proptest::prop_assert_eq!(values, expected);
+    }
+}

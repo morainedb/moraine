@@ -10,7 +10,14 @@ use std::{
 use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 
-use crate::{CacheIdentity, store::retry};
+use crate::{CacheIdentity, MemoryReservation, store::retry};
+
+fn memory_error(error: crate::Error) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "moraine working memory",
+        source: Box::new(error),
+    }
+}
 
 /// The widest fan-out any single read path asks for: index upkeep reads
 /// this many files at once. Admission must not sit below it.
@@ -60,25 +67,42 @@ fn descriptor_limit() -> Option<u64> {
     }
 }
 
-static ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
-    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(in_flight_reads())));
+static ADMISSION: LazyLock<Admission> = LazyLock::new(|| Admission::new(in_flight_reads()));
 
-/// Runs one store read under admission. A retry inside `work` is the same
-/// logical read and keeps its permit; the wait is named because a caller
-/// held by a saturated store is otherwise silent.
-async fn admitted<T>(
-    work: impl Future<Output = object_store::Result<T>>,
-) -> object_store::Result<T> {
-    let _permit = crate::telemetry::reporting_phase(
-        "data-read-admission",
-        Arc::clone(&ADMISSION).acquire_owned(),
-    )
-    .await
-    .map_err(|error| object_store::Error::Generic {
-        store: "moraine data store",
-        source: Box::new(error),
-    })?;
-    work.await
+struct Admission {
+    all: tokio::sync::Semaphore,
+    background: tokio::sync::Semaphore,
+}
+
+impl Admission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            all: tokio::sync::Semaphore::new(capacity),
+            background: tokio::sync::Semaphore::new((capacity / 2).max(1)),
+        }
+    }
+
+    async fn run<T>(
+        &self,
+        background: bool,
+        work: impl Future<Output = object_store::Result<T>>,
+    ) -> object_store::Result<T> {
+        let failure = |error| object_store::Error::Generic {
+            store: "moraine data store",
+            source: Box::new(error),
+        };
+        // Wait outside shared admission so queued background reads leave foreground
+        // slots free.
+        let _background = if background {
+            Some(self.background.acquire().await.map_err(failure)?)
+        } else {
+            None
+        };
+        let _permit = crate::telemetry::reporting_phase("data-read-admission", self.all.acquire())
+            .await
+            .map_err(failure)?;
+        work.await
+    }
 }
 
 /// An object store holding data files, named once for the caches that key
@@ -87,6 +111,7 @@ async fn admitted<T>(
 pub struct DataStore {
     store: Arc<dyn ObjectStore>,
     pub(super) identity: CacheIdentity,
+    background: bool,
 }
 
 impl DataStore {
@@ -101,7 +126,24 @@ impl DataStore {
     /// restarts when the identity names a stable object namespace.
     #[must_use]
     pub fn with_cache_identity(store: Arc<dyn ObjectStore>, identity: CacheIdentity) -> Self {
-        Self { store, identity }
+        Self {
+            store,
+            identity,
+            background: false,
+        }
+    }
+
+    /// Shares caches while reserving half of process I/O admission for
+    /// foreground reads.
+    pub(crate) fn background(&self) -> Self {
+        Self {
+            background: true,
+            ..self.clone()
+        }
+    }
+
+    pub(super) fn is_background(&self) -> bool {
+        self.background
     }
 
     /// The store itself, as it was handed over. A read taken from it
@@ -123,10 +165,21 @@ impl DataStore {
         path: &Path,
         range: Range<u64>,
     ) -> object_store::Result<Bytes> {
-        admitted(retry::retrying("a data-file read", path, || {
-            self.store.get_range(path, range.clone())
-        }))
-        .await
+        let bytes = range.end.checked_sub(range.start).ok_or_else(|| {
+            memory_error(crate::Error::Constraint(
+                "inverted data-file byte range".into(),
+            ))
+        })?;
+        let reservation = MemoryReservation::reserve(bytes).map_err(memory_error)?;
+        let bytes = ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a data-file read", path, || {
+                    self.store.get_range(path, range.clone())
+                }),
+            )
+            .await?;
+        reservation.into_bytes(bytes).map_err(memory_error)
     }
 
     /// Reads at most `len` bytes from the start of `path`, returning what
@@ -138,24 +191,34 @@ impl DataStore {
             range: Some(object_store::GetRange::Bounded(0..len)),
             ..object_store::GetOptions::default()
         };
-        admitted(retry::retrying("a sidecar read", path, || async {
-            self.store
-                .get_opts(path, options.clone())
-                .await?
-                .bytes()
-                .await
-        }))
-        .await
+        let reservation = MemoryReservation::reserve(len).map_err(memory_error)?;
+        let bytes = ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a sidecar read", path, || async {
+                    self.store
+                        .get_opts(path, options.clone())
+                        .await?
+                        .bytes()
+                        .await
+                }),
+            )
+            .await?;
+        reservation.into_bytes(bytes).map_err(memory_error)
     }
 
     /// Replaces whatever is at `path`. A sidecar's contents are a function
     /// of the file it describes, so a racing writer writes the same bytes.
     pub(crate) async fn write(&self, path: &Path, bytes: Bytes) -> object_store::Result<()> {
-        retry::retrying("a sidecar write", path, || {
-            self.store.put(path, bytes.clone().into())
-        })
-        .await
-        .map(|_| ())
+        ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a sidecar write", path, || {
+                    self.store.put(path, bytes.clone().into())
+                }),
+            )
+            .await
+            .map(|_| ())
     }
 
     /// [`Self::read_range`] over several ranges in one request, so the
@@ -165,10 +228,44 @@ impl DataStore {
         path: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        admitted(retry::retrying("a data-file read", path, || {
-            self.store.get_ranges(path, ranges)
-        }))
-        .await
+        let requested = ranges
+            .iter()
+            .try_fold(0_u64, |total, range| {
+                range
+                    .end
+                    .checked_sub(range.start)
+                    .and_then(|bytes| total.checked_add(bytes))
+            })
+            .ok_or_else(|| {
+                memory_error(crate::Error::Constraint(
+                    "invalid data-file byte ranges".into(),
+                ))
+            })?;
+        let mut reservation = MemoryReservation::reserve(requested).map_err(memory_error)?;
+        let bytes = ADMISSION
+            .run(
+                self.background,
+                retry::retrying("a data-file read", path, || {
+                    self.store.get_ranges(path, ranges)
+                }),
+            )
+            .await?;
+        let actual = bytes
+            .iter()
+            .try_fold(0_u64, |total, bytes| total.checked_add(bytes.len() as u64))
+            .ok_or_else(|| {
+                memory_error(crate::Error::Constraint(
+                    "data-file response is too large".into(),
+                ))
+            })?;
+        reservation
+            .resize(actual.max(requested))
+            .map_err(memory_error)?;
+        let reservation = Arc::new(reservation);
+        Ok(bytes
+            .into_iter()
+            .map(|bytes| MemoryReservation::shared_bytes(Arc::clone(&reservation), bytes))
+            .collect())
     }
 }
 
@@ -177,3 +274,6 @@ impl std::fmt::Debug for DataStore {
         write!(f, "DataStore({})", self.store)
     }
 }
+
+#[cfg(test)]
+mod tests;

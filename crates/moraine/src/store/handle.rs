@@ -224,7 +224,7 @@ impl ReadHandle<'_> {
         let mut iterator = self.scan_prefix(prefix, range, shape).await?;
         let mut entries = Vec::new();
         while let Some(entry) = iterator.next().await? {
-            entries.push(entry);
+            entries.push(admit_entry(entry)?);
         }
         Ok(entries)
     }
@@ -258,7 +258,7 @@ impl ReadHandle<'_> {
                     .1
                     .saturating_add(entry.key.len() + entry.value.len());
                 let last = suffix_of(&entry.key);
-                entries.push(entry);
+                entries.push(admit_entry(entry)?);
 
                 let Some(split) = split.filter(|_| streamed.1 > threshold) else {
                     continue;
@@ -365,6 +365,19 @@ impl ReadSession {
             tx.rollback();
         }
     }
+}
+
+/// Retains admission for scan buffers through decoding and cache installation.
+fn admit_entry(mut entry: KeyValue) -> Result<KeyValue, slatedb::Error> {
+    let bytes = (entry.key.len() as u64)
+        .saturating_add(entry.value.len() as u64)
+        .saturating_add(64);
+    let memory = crate::MemoryReservation::reserve(bytes)
+        .map_err(|error| slatedb::Error::invalid(error.to_string()))?;
+    entry.value = memory
+        .into_bytes(entry.value)
+        .map_err(|error| slatedb::Error::invalid(error.to_string()))?;
+    Ok(entry)
 }
 
 #[cfg(test)]

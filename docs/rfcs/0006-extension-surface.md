@@ -340,12 +340,15 @@ disk tier to bound. It threads through the shim (`moraine_attach_with_wal_store`
 the memory side — `META_CACHE_MEMORY` through the DuckLake attach,
 `CACHE_MEMORY` standalone — and the one cache option that is never inert,
 because the memory tiers exist with or without a disk device. It is one
-budget across both kinds, which share one cache and are separated by
-eviction priority rather than by capacity; `moraine_store_census` reports a
+budget across SlateDB blocks/metadata, auxiliary parsed metadata, and lookup
+retention. Lookup caches receive one eighth; auxiliary metadata keeps its
+configured share; the rest holds SlateDB blocks and metadata, separated by
+eviction priority; `moraine_store_census` reports a
 store's index and filter bytes, and the attach warns when the budget cannot
 hold them. Unset, the budget is what SlateDB would give a *single*
 store by default — now for the whole process, so a multi-store host is
-strictly smaller than before, and a single-store host is unchanged. This
+bounded by one configured allowance. Lookup retention no longer adds independent
+per-catalog budgets. This
 is the number to weigh against DuckDB's `memory_limit` when sizing a
 host: DuckDB's budget covers its own buffers and the data-file cache, and
 this cache is the process-wide memory consumer beside it. A handle's
@@ -454,6 +457,9 @@ the same fact.
 reports capacity, current occupancy, and cumulative evictions for SlateDB
 metadata, SlateDB data-block memory, and parsed Parquet metadata. It also
 reports the configured data-block disk capacity, NULL without a disk tier.
+`lookup_capacity_bytes` and `lookup_occupancy_bytes` report the shared directory
+and revision-result allowance and its estimated usage, including admitted values
+still held by readers after eviction.
 Disk occupancy is omitted because Foyer does not expose a reliable live
 value through the cache interface; configured capacity is not mislabeled as
 usage. `moraine_store_census` adds `filter_bytes`, `index_bytes`, and
@@ -767,7 +773,7 @@ regardless of the language it is written in.
   the *clone* in `dump_entities`, not the marshalling), and that fix is
   strictly cheaper and strictly prior. Against that, the row structs are
   the schema contract: each is checked field-for-field against
-  `metadata_tables.cpp`'s spec table by the compiler and against
+  `metadata_table_specs.cpp`'s spec table by the compiler and against
   DuckLake's own DDL by review, where an Arrow schema assembled at runtime
   would move both to a runtime failure. Inline chunk bodies are the case
   that genuinely is columnar and where DuckDB owns both export and import,
@@ -778,6 +784,20 @@ regardless of the language it is written in.
   (SlateDB requires tokio, RFC 0001). The C-ABI layer owns the tokio runtime
   and `block_on`s core futures, so the C++ shim only ever calls synchronous C
   functions. This is the "FFI boundary" of RFC 0001's async rule.
+
+### Metadata row conversion
+
+Metadata row structs and exported functions remain explicit Rust declarations
+so cbindgen can generate the C header without expanding macros. Each row has
+one field mapping for scalar values, nullable scalars, owned strings, and
+nullable strings. That mapping defines both record conversion and cleanup.
+
+Conversion validates all strings in a row before transferring their pointers.
+A batch owner releases completed rows if a later conversion fails or unwinds;
+only a successful batch transfers ownership to the caller. This avoids an
+intermediate buffer of records and converted strings. The C row structs have
+no Rust destructor: only the conversion owner and the matching exported free
+function release their pointers.
 
 ### C ABI error mapping (v0)
 

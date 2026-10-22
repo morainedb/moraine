@@ -143,7 +143,7 @@ fn a_repeated_summary_keeps_every_physical_position() {
 #[test]
 fn a_dense_summary_publishes_its_range() {
     let rows = PositionedRowSet {
-        rows: FileRowSet::range(100, 3).unwrap(),
+        rows: FileRowSet::range(100, 3).unwrap().into(),
         order: RowOrder::Ascending,
     };
     let bytes = sidecar::encode(identity(), &rows).unwrap();
@@ -163,7 +163,7 @@ fn malformed_summary_membership_is_rejected() {
         let bytes = sidecar::encode(
             identity(),
             &PositionedRowSet {
-                rows,
+                rows: rows.into(),
                 order: RowOrder::Ascending,
             },
         )
@@ -186,7 +186,7 @@ fn malformed_summary_permutations_are_rejected() {
         let mut bytes = sidecar::encode(
             identity(),
             &PositionedRowSet {
-                rows: FileRowSet::Sorted(vec![10, 30, 70]),
+                rows: FileRowSet::Sorted(vec![10, 30, 70]).into(),
                 order: RowOrder::Permuted(vec![0, 1, 2]),
             },
         )
@@ -265,4 +265,30 @@ async fn a_sweep_reclaims_summaries_whose_file_is_gone() {
             .is_err(),
         "a summary whose file is gone must be reclaimed"
     );
+}
+
+#[test]
+fn encoding_stops_when_its_caller_cancels() {
+    use super::{row_set::PositionedRowSet, sidecar};
+    let rows = PositionedRowSet::from_file_order((0..20_000).rev().collect()).unwrap();
+    let identity = sidecar::SidecarIdentity {
+        table_id: 1,
+        data_file_id: 2,
+        file_path: "a.parquet",
+        file_size: 3,
+    };
+    let mut checks = 0;
+    let result = sidecar::encode_checked(identity, &rows, &mut || {
+        checks += 1;
+        if checks >= 3 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_err());
+    assert_eq!(checks, 3);
 }

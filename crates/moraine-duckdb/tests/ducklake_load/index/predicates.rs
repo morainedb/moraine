@@ -212,3 +212,21 @@ fn certified_composite_equalities_delete_without_a_scan() {
         vec![vec!["0", "0", "0"]]
     );
 }
+
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn indexed_predicate_optimizer_skips_other_catalog_backends() {
+    let metadata = TempDir::new("predicate-reference-meta");
+    let data = TempDir::new("predicate-reference-data");
+    let rows = csv_rows(&run_reference_ducklake_sql(
+        metadata.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t AS SELECT i AS id, md5(i::VARCHAR) AS payload FROM range(524288) t(i); \
+         UPDATE lake.main.t SET payload = 'changed' WHERE id = 500000; \
+         DELETE FROM lake.main.t WHERE id = 500001; \
+         SELECT (SELECT count(*) FROM lake.main.t WHERE id = 500000), \
+                (SELECT payload FROM lake.main.t WHERE id = 500000), \
+                (SELECT count(*) FROM lake.main.t WHERE id = 500001);",
+    ));
+    assert_eq!(rows, vec![vec!["1", "changed", "0"]]);
+}

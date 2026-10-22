@@ -33,7 +33,9 @@ pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
-pub use row_location::{ExcludedPositions, LocatedDeletion, LocatedRowScan, RowSummaryPublish};
+pub use row_location::{
+    ExcludedPositions, LocatedDeletion, LocatedRowScan, RowSummaryProgress, RowSummaryPublish,
+};
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -67,9 +69,6 @@ use crate::{
         session::CommitSession,
     },
 };
-
-/// Tables warmed concurrently, sized for a remote object store.
-pub(crate) const WARM_TABLE_CONCURRENCY: usize = 32;
 
 /// Files whose row-id summaries are read concurrently, sized for a remote
 /// object store.
@@ -140,6 +139,7 @@ pub(crate) enum Store {
     Writer {
         db: Db,
         pacer: Arc<commit::FlushPacer>,
+        counters: Arc<crate::store::cache::CacheCounters>,
         /// The log the writer's commits are slots of, when they are.
         commit_log: Option<LogCommitter>,
     },
@@ -178,9 +178,14 @@ impl Store {
     /// transaction cannot begin.
     pub(crate) fn begin_commit_session(&self) -> Result<CommitSession> {
         match self {
-            Self::Writer { db, .. } => Ok(CommitSession::folder(
-                db.begin(IsolationLevel::Snapshot).map_err(Error::from)?,
-            )),
+            Self::Writer { db, counters, .. } => {
+                if counters.slatedb_unflushed_bytes() >= crate::memory::store_memory_limit()? {
+                    return Err(Error::Constraint("storage memory admission full; wait for the store to flush before retrying".into()));
+                }
+                Ok(CommitSession::folder(
+                    db.begin(IsolationLevel::Snapshot).map_err(Error::from)?,
+                ))
+            }
             Self::Committer { reader, .. } => Ok(CommitSession::committer(Arc::clone(reader))),
             Self::Reader(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
@@ -337,20 +342,15 @@ pub struct CatalogOptions {
     /// default) leaves a cap of 16 GiB in force, and without a
     /// [`cache_dir`](Self::cache_dir) there is no device to bound.
     pub cache_size: Option<u64>,
-    /// How much memory the process-wide caches may hold — SST metadata,
-    /// parsed Parquet metadata used by equality-index upkeep, and data
-    /// blocks, which tier to the device when one is configured.
-    /// Process-wide, like [`cache_size`](Self::cache_size).
-    /// `None` (the default) takes what SlateDB gives a single store, now
-    /// for the whole process. Never inert: the memory slots exist with or
-    /// without a `cache_dir`. This bounds cache residents, not process RSS;
-    /// SlateDB write buffers, catalog projections, commit staging, DuckDB,
-    /// and allocator retention are additional when sizing a host.
+    /// Process-wide allowance for SlateDB blocks/metadata, parsed Parquet
+    /// metadata, and lookup retention; the first attach fixes it (default 640
+    /// MiB). This is not an RSS limit: uncached query results, snapshots,
+    /// write buffers, staging, DuckDB, and allocator overhead require
+    /// additional memory.
     pub cache_memory: Option<u64>,
     /// Percent of each cache budget the auxiliary slot takes, for parsed
     /// Parquet metadata and file row summaries. Process-wide and settled by
-    /// the first attach; unset keeps the derived share, which caps memory at
-    /// 64 MiB and takes an eightieth of the configured device.
+    /// the first attach; unset takes one eightieth of each configured budget.
     pub cache_auxiliary_percent: Option<u32>,
     /// What to warm into the cache while the catalog opens, so the first
     /// query pays no first touch. Warming is reading, so it is bounded by
@@ -916,6 +916,7 @@ pub struct ReadOnlyCatalog {
     >,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    materializing: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
@@ -1375,6 +1376,7 @@ impl ReadOnlyCatalog {
         if let Some(pinned) = &self.pinned {
             return Ok(pinned.snapshot.clone());
         }
+        let _materializing = self.materializing.lock().await;
         let view = self.load_head_view(handle).await?;
         install_head_view_at(&self.projections, epoch, Arc::clone(&view));
         Ok(view)
@@ -1715,6 +1717,7 @@ impl Catalog {
                 store: Arc::new(Store::Writer {
                     db,
                     pacer,
+                    counters: Arc::clone(&cache),
                     commit_log: commit_log.clone(),
                 }),
                 location: Arc::new(StoreLocation {
@@ -1725,17 +1728,17 @@ impl Catalog {
                 reads: Arc::new(ReadTally::default()),
                 cache,
                 data_reads: Arc::default(),
-                row_lookups: Arc::default(),
-                index_probes: Arc::default(),
-                located_rows: Arc::new(revision_memo::RevisionMemo::new(
+                row_lookups: Arc::new(row_lookup::RowLookupCache::shared()),
+                index_probes: Arc::new(index_probe_cache::IndexProbeCache::shared()),
+                located_rows: Arc::new(revision_memo::RevisionMemo::shared(
                     LOCATED_MEMO_BYTES,
                     MEMO_ENTRIES,
                 )),
-                positioned_files: Arc::new(revision_memo::RevisionMemo::new(
+                positioned_files: Arc::new(revision_memo::RevisionMemo::shared(
                     POSITIONED_MEMO_BYTES,
                     MEMO_ENTRIES,
                 )),
-                inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::new(
+                inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::shared(
                     LEDGER_MEMO_BYTES,
                     MEMO_ENTRIES,
                 )),
@@ -1745,6 +1748,7 @@ impl Catalog {
                     commit_log,
                 )),
                 projections,
+                materializing: Arc::default(),
                 refresh_on_read: false,
                 asked: None,
             },
@@ -2364,17 +2368,17 @@ impl Catalog {
             reads: Arc::new(ReadTally::default()),
             cache,
             data_reads: Arc::default(),
-            row_lookups: Arc::default(),
-            index_probes: Arc::default(),
-            located_rows: Arc::new(revision_memo::RevisionMemo::new(
+            row_lookups: Arc::new(row_lookup::RowLookupCache::shared()),
+            index_probes: Arc::new(index_probe_cache::IndexProbeCache::shared()),
+            located_rows: Arc::new(revision_memo::RevisionMemo::shared(
                 LOCATED_MEMO_BYTES,
                 MEMO_ENTRIES,
             )),
-            positioned_files: Arc::new(revision_memo::RevisionMemo::new(
+            positioned_files: Arc::new(revision_memo::RevisionMemo::shared(
                 POSITIONED_MEMO_BYTES,
                 MEMO_ENTRIES,
             )),
-            inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::new(
+            inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::shared(
                 LEDGER_MEMO_BYTES,
                 MEMO_ENTRIES,
             )),
@@ -2384,6 +2388,7 @@ impl Catalog {
                 None,
             )),
             projections,
+            materializing: Arc::default(),
             refresh_on_read,
             asked,
         })

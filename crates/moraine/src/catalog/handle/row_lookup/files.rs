@@ -10,7 +10,6 @@ use std::{
 };
 
 use imbl::{OrdMap, ordmap::DiffItem};
-use prost::Message as _;
 use tracing::{debug, warn};
 
 use super::{FileDirectory, Intervals};
@@ -21,7 +20,10 @@ use crate::{
     },
     data_file::{DataStore, FileSummary},
     error::Result,
-    store::proto::{DataFileValue, FileColumnStatsValue},
+    store::{
+        cache::retention::Shared,
+        proto::{DataFileValue, FileColumnStatsValue},
+    },
 };
 
 type Placements = HashMap<u64, Vec<DataFileId>>;
@@ -146,6 +148,14 @@ fn row_id_bounds(
 
 impl FileDirectory {
     fn estimated_bytes(&self) -> u64 {
+        let metadata_bytes = size_of::<Self>()
+            .saturating_add(self.data_prefix.capacity())
+            .saturating_add(self.table_prefix.capacity())
+            .saturating_add(
+                self.deferred
+                    .len()
+                    .saturating_mul(size_of::<(u64, (u64, u64))>()),
+            );
         let summary_bytes = self.summaries.values().fold(0_u64, |bytes, summary| {
             bytes
                 .saturating_add(summary.estimated_bytes())
@@ -160,6 +170,7 @@ impl FileDirectory {
                 u64::try_from(self.failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX),
             )
             .saturating_add(self.file_bytes)
+            .saturating_add(u64::try_from(metadata_bytes).unwrap_or(u64::MAX))
     }
 
     fn retained_summary(
@@ -350,7 +361,9 @@ impl FileDirectory {
             match change {
                 DiffItem::Add(id, value) => {
                     changes.selected.insert(*id, data_file_info(value));
-                    changes.file_bytes = changes.file_bytes.saturating_add(encoded_bytes(value));
+                    changes.file_bytes = changes
+                        .file_bytes
+                        .saturating_add(retained_file_bytes(value));
                 }
                 DiffItem::Update {
                     old: (id, before),
@@ -360,12 +373,14 @@ impl FileDirectory {
                     changes.selected.insert(*id, data_file_info(after));
                     changes.file_bytes = changes
                         .file_bytes
-                        .saturating_sub(encoded_bytes(before))
-                        .saturating_add(encoded_bytes(after));
+                        .saturating_sub(retained_file_bytes(before))
+                        .saturating_add(retained_file_bytes(after));
                 }
                 DiffItem::Remove(id, value) => {
                     changes.removed.insert(*id);
-                    changes.file_bytes = changes.file_bytes.saturating_sub(encoded_bytes(value));
+                    changes.file_bytes = changes
+                        .file_bytes
+                        .saturating_sub(retained_file_bytes(value));
                 }
             }
         }
@@ -387,8 +402,29 @@ impl FileDirectory {
     }
 }
 
-fn encoded_bytes(value: &DataFileValue) -> u64 {
-    u64::try_from(value.encoded_len()).unwrap_or(u64::MAX)
+fn retained_file_bytes(value: &DataFileValue) -> u64 {
+    let strings = value
+        .path
+        .capacity()
+        .saturating_add(value.file_format.capacity())
+        .saturating_add(value.encryption_key.as_ref().map_or(0, String::capacity));
+    let partitions = value
+        .partition_values
+        .iter()
+        .map(|partition| partition.partition_value.capacity())
+        .fold(
+            value
+                .partition_values
+                .capacity()
+                .saturating_mul(size_of::<crate::store::proto::FilePartitionValue>()),
+            usize::saturating_add,
+        );
+    u64::try_from(
+        size_of::<DataFileValue>()
+            .saturating_add(strings)
+            .saturating_add(partitions),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 impl ReadOnlyCatalog {
@@ -441,12 +477,13 @@ impl ReadOnlyCatalog {
             // id means the answer is not yet in hand.
             Some(directory) if directory.describes(files) && directory.covers(row_ids) => directory,
             held => {
-                let previous = held.unwrap_or_else(|| Arc::new(FileDirectory::empty(&scope)));
-                let directory = Arc::new(
+                let previous = held.unwrap_or_else(|| Shared::new(FileDirectory::empty(&scope)));
+                let directory = Shared::new(
                     self.refresh_directory(&scope, &previous, files, row_ids)
                         .await,
                 );
-                super::install(&self.row_lookups.files, table, Arc::clone(&directory));
+                drop(previous);
+                super::install(&self.row_lookups.files, table, directory.clone());
                 directory
             }
         };

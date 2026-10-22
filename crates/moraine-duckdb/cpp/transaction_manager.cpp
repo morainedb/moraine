@@ -305,6 +305,7 @@ void MoraineTransactionManager::RollbackTransaction(duckdb::Transaction &transac
 	}
 	if (staged != nullptr) {
 		moraine_tx_rollback(staged);
+		duckdb::Allocator::FlushAll();
 	}
 }
 

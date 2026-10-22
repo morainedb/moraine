@@ -2573,7 +2573,7 @@ mod tests {
             deleted_data_file_ids: Vec::new(),
             deletes_untargeted_files: false,
         };
-        Transaction::new(CatalogSnapshot::build(snapshot, &[], &[], None), 5)
+        Transaction::new(CatalogSnapshot::build_from(snapshot, &[], &[], None), 5)
     }
 
     /// A nested column: `name` of DuckLake's `struct` marker, holding
@@ -3130,7 +3130,7 @@ mod tests {
         });
         let mut current = vec![EntityRecord::Table(table)];
         current.extend(columns);
-        let state = CatalogSnapshot::build(snapshot, &current, &[], None);
+        let state = CatalogSnapshot::build_from(snapshot, &current, &[], None);
         let mut transaction = Transaction::new(state, 5);
         let c = transaction.add_column(TableId::new(1), &col("c")).unwrap();
         assert_eq!(c, ColumnId::new(3));
@@ -3509,7 +3509,7 @@ mod tests {
             parent_schema_id: None,
         };
         let mut transaction = Transaction::new(
-            CatalogSnapshot::build(
+            CatalogSnapshot::build_from(
                 snapshot,
                 &[crate::store::read::EntityRecord::Schema(main)],
                 &[],

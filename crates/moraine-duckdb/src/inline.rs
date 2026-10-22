@@ -21,8 +21,7 @@ use bytes::Bytes;
 use moraine::ffi_support::inline::{InlineBodies, InlineScanCursor, InlineScanKind};
 
 use crate::{
-    abi::{free_array, guard, write_array},
-    dumps::opt_u64,
+    abi::{free_array, guard, write_reserved_array},
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
@@ -291,7 +290,7 @@ pub unsafe extern "C" fn moraine_inline_scan_next(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<(Vec<MoraineInlineRow>, Vec<MoraineInlineChunk>), AbiError> {
+    let attempt = || -> Result<(Vec<MoraineInlineRow>, Vec<MoraineInlineChunk>, moraine::MemoryReservation, moraine::MemoryReservation), AbiError> {
         if cursor.is_null() {
             return Err(AbiError::invalid_argument("`cursor` is null"));
         }
@@ -314,11 +313,13 @@ pub unsafe extern "C" fn moraine_inline_scan_next(
             catalog_ref.block_on_cancellable(probe, probe_ctx, open_scan.next_window(max_rows))
         }?;
 
+        let rows_memory = crate::abi::reserve_array::<MoraineInlineRow>(record.rows.len(), 0)?;
+        let chunks_memory = crate::abi::reserve_array::<MoraineInlineChunk>(record.chunk_bodies.len(), 0)?;
+        let bodies = record.chunk_bodies.into_iter().map(|body| moraine::MemoryReservation::reserve(body.len() as u64)?.into_bytes(body)).collect::<moraine::Result<Vec<_>>>()?;
         let rows = record
             .rows
             .into_iter()
             .map(|row| {
-                let (has_end_snapshot, end_snapshot) = opt_u64(row.end_snapshot);
                 let chunk_index = usize::try_from(row.chunk_index).map_err(|_| {
                     AbiError::invalid_argument("inline scan chunk index exceeds usize")
                 })?;
@@ -326,29 +327,28 @@ pub unsafe extern "C" fn moraine_inline_scan_next(
                     row_id: row.row_id,
                     schema_version: row.schema_version,
                     begin_snapshot: row.begin_snapshot,
-                    has_end_snapshot,
-                    end_snapshot,
+                    has_end_snapshot: row.end_snapshot.is_some(),
+                    end_snapshot: row.end_snapshot.unwrap_or_default(),
                     chunk_index,
                     offset_in_chunk: row.offset_in_chunk,
                 })
             })
             .collect::<Result<Vec<_>, AbiError>>()?;
-        let chunks = record
-            .chunk_bodies
+        let chunks = bodies
             .into_iter()
             .map(MoraineInlineChunk::from_bytes)
             .collect();
 
-        Ok((rows, chunks))
+        Ok((rows, chunks, rows_memory, chunks_memory))
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
     match unsafe { guard(err, attempt) } {
-        Ok((items, chunks)) => {
+        Ok((items, chunks, rows_memory, chunks_memory)) => {
             // SAFETY: checked non-null above; caller contract.
             unsafe {
-                write_array(items, out_items, out_len);
-                write_array(chunks, out_chunks, out_chunks_len);
+                write_reserved_array(items, rows_memory, out_items, out_len);
+                write_reserved_array(chunks, chunks_memory, out_chunks, out_chunks_len);
             }
             codes::OK
         }
@@ -433,43 +433,59 @@ pub unsafe extern "C" fn moraine_inline_schemas(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineInlineSchemaRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let schemas = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::inline::inline_schemas(handle_ref.catalog.reads(), table_id),
-            )
-        }?;
-        Ok(schemas
-            .into_iter()
-            .map(|(schema_version, bytes)| {
-                let (arrow_schema, arrow_schema_len, owner) = share_bytes(bytes);
-                MoraineInlineSchemaRow {
-                    schema_version,
-                    arrow_schema,
-                    arrow_schema_len,
-                    owner,
-                }
-            })
-            .collect())
-    };
+    let attempt =
+        || -> Result<(Vec<MoraineInlineSchemaRow>, moraine::MemoryReservation), AbiError> {
+            if handle.is_null() {
+                return Err(AbiError::invalid_argument("`handle` is null"));
+            }
+            if out_items.is_null() || out_len.is_null() {
+                return Err(AbiError::invalid_argument("output pointer is null"));
+            }
+            // SAFETY: caller contract for `handle`.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe`/`probe_ctx` validity is this function's own
+            // safety contract.
+            let schemas = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    moraine::ffi_support::inline::inline_schemas(
+                        handle_ref.catalog.reads(),
+                        table_id,
+                    ),
+                )
+            }?;
+            let schemas = schemas
+                .into_iter()
+                .map(|(version, bytes)| {
+                    moraine::MemoryReservation::reserve(bytes.len() as u64)?
+                        .into_bytes(bytes)
+                        .map(|bytes| (version, bytes))
+                })
+                .collect::<moraine::Result<Vec<_>>>()?;
+            let memory = crate::abi::reserve_array::<MoraineInlineSchemaRow>(schemas.len(), 0)?;
+            Ok((
+                schemas
+                    .into_iter()
+                    .map(|(schema_version, bytes)| {
+                        let (arrow_schema, arrow_schema_len, owner) = share_bytes(bytes);
+                        MoraineInlineSchemaRow {
+                            schema_version,
+                            arrow_schema,
+                            arrow_schema_len,
+                            owner,
+                        }
+                    })
+                    .collect(),
+                memory,
+            ))
+        };
 
     // SAFETY: `err` validity is this function's own safety contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, memory)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe { write_reserved_array(items, memory, out_items, out_len) };
             codes::OK
         }
         Err(code) => code,
@@ -628,38 +644,45 @@ pub unsafe extern "C" fn moraine_inline_registered_tables(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineInlineTableRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let tables = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::inline::inline_registered_tables(handle_ref.catalog.reads()),
-            )
-        }?;
-        Ok(tables
-            .into_iter()
-            .map(|(table_id, schema_version)| MoraineInlineTableRow {
-                table_id,
-                schema_version,
-            })
-            .collect())
-    };
+    let attempt =
+        || -> Result<(Vec<MoraineInlineTableRow>, moraine::MemoryReservation), AbiError> {
+            if handle.is_null() {
+                return Err(AbiError::invalid_argument("`handle` is null"));
+            }
+            if out_items.is_null() || out_len.is_null() {
+                return Err(AbiError::invalid_argument("output pointer is null"));
+            }
+            // SAFETY: caller contract for `handle`.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe`/`probe_ctx` validity is this function's own
+            // safety contract.
+            let tables = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    moraine::ffi_support::inline::inline_registered_tables(
+                        handle_ref.catalog.reads(),
+                    ),
+                )
+            }?;
+            let memory = crate::abi::reserve_array::<MoraineInlineTableRow>(tables.len(), 0)?;
+            Ok((
+                tables
+                    .into_iter()
+                    .map(|(table_id, schema_version)| MoraineInlineTableRow {
+                        table_id,
+                        schema_version,
+                    })
+                    .collect(),
+                memory,
+            ))
+        };
 
     // SAFETY: `err` validity is this function's own safety contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, memory)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe { write_reserved_array(items, memory, out_items, out_len) };
             codes::OK
         }
         Err(code) => code,
@@ -766,44 +789,50 @@ pub unsafe extern "C" fn moraine_inline_file_deletes(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineInlineFileDeleteRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let file_deletes = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::inline::inline_file_deletes(
-                    handle_ref.catalog.reads(),
-                    table_id,
-                ),
-            )
-        }?;
-        Ok(file_deletes
-            .into_iter()
-            .map(
-                |(file_id, row_id, begin_snapshot)| MoraineInlineFileDeleteRow {
-                    file_id,
-                    row_id,
-                    begin_snapshot,
-                },
-            )
-            .collect())
-    };
+    let attempt =
+        || -> Result<(Vec<MoraineInlineFileDeleteRow>, moraine::MemoryReservation), AbiError> {
+            if handle.is_null() {
+                return Err(AbiError::invalid_argument("`handle` is null"));
+            }
+            if out_items.is_null() || out_len.is_null() {
+                return Err(AbiError::invalid_argument("output pointer is null"));
+            }
+            // SAFETY: caller contract for `handle`.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe`/`probe_ctx` validity is this function's own
+            // safety contract.
+            let file_deletes = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    moraine::ffi_support::inline::inline_file_deletes(
+                        handle_ref.catalog.reads(),
+                        table_id,
+                    ),
+                )
+            }?;
+            let memory =
+                crate::abi::reserve_array::<MoraineInlineFileDeleteRow>(file_deletes.len(), 0)?;
+            Ok((
+                file_deletes
+                    .into_iter()
+                    .map(
+                        |(file_id, row_id, begin_snapshot)| MoraineInlineFileDeleteRow {
+                            file_id,
+                            row_id,
+                            begin_snapshot,
+                        },
+                    )
+                    .collect(),
+                memory,
+            ))
+        };
 
     // SAFETY: `err` validity is this function's own safety contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, memory)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe { write_reserved_array(items, memory, out_items, out_len) };
             codes::OK
         }
         Err(code) => code,
@@ -967,7 +996,7 @@ mod tests {
                 tx,
                 1,
                 0,
-                MoraineArrowBytes::from_vec(b"schema".to_vec()),
+                MoraineArrowBytes::from_vec(b"schema".to_vec()).unwrap(),
                 &raw mut err,
             )
         };
@@ -1102,7 +1131,7 @@ mod tests {
                 tx,
                 1,
                 0,
-                MoraineArrowBytes::from_vec(b"schema".to_vec()),
+                MoraineArrowBytes::from_vec(b"schema".to_vec()).unwrap(),
                 &raw mut err,
             )
         };
@@ -1117,7 +1146,7 @@ mod tests {
                     1,
                     chunk * 2,
                     2,
-                    MoraineArrowBytes::from_vec(format!("chunk-{chunk}").into_bytes()),
+                    MoraineArrowBytes::from_vec(format!("chunk-{chunk}").into_bytes()).unwrap(),
                     &raw mut err,
                 )
             };
@@ -1153,7 +1182,7 @@ mod tests {
         assert_eq!(len, 0, "an exhausted scan serves an empty window");
         assert_eq!(chunks_len, 0);
         // SAFETY: matching allocator (empty, but still owned per the
-        // `write_array` contract), not yet freed.
+        // `write_reserved_array` contract), not yet freed.
         unsafe { moraine_inline_scan_free(rows, len, chunks, chunks_len) };
         // SAFETY: `cursor` is open.
         unsafe { moraine_inline_scan_close(cursor) };
@@ -1205,7 +1234,7 @@ mod tests {
                 tx,
                 1,
                 0,
-                MoraineArrowBytes::from_vec(schema_bytes.to_vec()),
+                MoraineArrowBytes::from_vec(schema_bytes.to_vec()).unwrap(),
                 &raw mut err,
             )
         };
@@ -1222,7 +1251,7 @@ mod tests {
                 1,
                 0,
                 2,
-                MoraineArrowBytes::from_vec(body.to_vec()),
+                MoraineArrowBytes::from_vec(body.to_vec()).unwrap(),
                 &raw mut err,
             )
         };
@@ -1350,7 +1379,7 @@ mod tests {
         let (rows3, len3, chunks3, chunks_len3) = unsafe { scan_all(handle, 1, 0, 3) };
         assert_eq!(len3, 0, "flushed chunk must be gone from the scan");
         // SAFETY: matching allocator (empty, but still owned per the
-        // `write_array` contract), not yet freed.
+        // `write_reserved_array` contract), not yet freed.
         unsafe { moraine_inline_scan_free(rows3, len3, chunks3, chunks_len3) };
 
         let mut table_rows2: *mut MoraineInlineTableRow = ptr::null_mut();

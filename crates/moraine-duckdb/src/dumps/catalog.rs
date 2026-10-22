@@ -3,10 +3,9 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_c_string, opt_into_raw, opt_u64};
+use super::{conversion::dump_row, dump_rows, free_rows};
 use crate::{
-    abi::{free_c_string, to_c_string},
-    error::{AbiError, MoraineError},
+    error::MoraineError,
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -35,41 +34,13 @@ pub struct MoraineSchemaRow {
     pub parent_schema_id: u64,
 }
 
-/// Converts core `ducklake_schema` records into the C row shape. Shared by the
-/// committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn schema_rows(
-    rows: Vec<moraine::ffi_support::SchemaRecord>,
-) -> Result<Vec<MoraineSchemaRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut v| {
-            let schema_uuid = to_c_string(std::mem::take(&mut v.schema_uuid))?;
-            let schema_name = to_c_string(std::mem::take(&mut v.schema_name))?;
-            let path = to_c_string(std::mem::take(&mut v.path))?;
-            Ok((v, schema_uuid, schema_name, path))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(v, schema_uuid, schema_name, path)| {
-            let (has_end, end) = opt_u64(v.end_snapshot);
-            let (has_parent_schema_id, parent_schema_id) = opt_u64(v.parent_schema_id);
-            MoraineSchemaRow {
-                schema_id: v.schema_id,
-                schema_uuid: schema_uuid.into_raw(),
-                begin_snapshot: v.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                schema_name: schema_name.into_raw(),
-                path: path.into_raw(),
-                path_is_relative: v.path_is_relative,
-                has_parent_schema_id,
-                parent_schema_id,
-            }
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::SchemaRecord => MoraineSchemaRow {
+        values { schema_id, begin_snapshot, path_is_relative }
+        optional { end_snapshot => has_end_snapshot, parent_schema_id => has_parent_schema_id }
+        strings { schema_uuid, schema_name, path }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_schema` row — current and history — into
@@ -101,7 +72,6 @@ pub unsafe extern "C" fn moraine_dump_schemas(
             probe_ctx,
             err,
             moraine::ffi_support::dump_schemas,
-            schema_rows,
         )
     }
 }
@@ -116,11 +86,7 @@ pub unsafe extern "C" fn moraine_dump_schemas(
 pub unsafe extern "C" fn moraine_dump_schemas_free(items: *mut MoraineSchemaRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.schema_uuid);
-            free_c_string(d.schema_name);
-            free_c_string(d.path);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -149,38 +115,13 @@ pub struct MoraineTableRow {
     pub path_is_relative: bool,
 }
 
-/// Converts core `ducklake_table` records into the C row shape. Shared by the
-/// committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn table_rows(
-    rows: Vec<moraine::ffi_support::TableRecord>,
-) -> Result<Vec<MoraineTableRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut v| {
-            let table_uuid = to_c_string(std::mem::take(&mut v.table_uuid))?;
-            let table_name = to_c_string(std::mem::take(&mut v.table_name))?;
-            let path = to_c_string(std::mem::take(&mut v.path))?;
-            Ok((v, table_uuid, table_name, path))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-    Ok(owned
-        .into_iter()
-        .map(|(v, table_uuid, table_name, path)| {
-            let (has_end, end) = opt_u64(v.end_snapshot);
-            MoraineTableRow {
-                table_id: v.table_id,
-                table_uuid: table_uuid.into_raw(),
-                begin_snapshot: v.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                schema_id: v.schema_id,
-                table_name: table_name.into_raw(),
-                path: path.into_raw(),
-                path_is_relative: v.path_is_relative,
-            }
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::TableRecord => MoraineTableRow {
+        values { table_id, begin_snapshot, schema_id, path_is_relative }
+        optional { end_snapshot => has_end_snapshot }
+        strings { table_uuid, table_name, path }
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_table` row — current and history — into
@@ -212,7 +153,6 @@ pub unsafe extern "C" fn moraine_dump_tables(
             probe_ctx,
             err,
             moraine::ffi_support::dump_tables,
-            table_rows,
         )
     }
 }
@@ -227,11 +167,7 @@ pub unsafe extern "C" fn moraine_dump_tables(
 pub unsafe extern "C" fn moraine_dump_tables_free(items: *mut MoraineTableRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.table_uuid);
-            free_c_string(d.table_name);
-            free_c_string(d.path);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -260,42 +196,13 @@ pub struct MoraineViewRow {
     pub column_aliases: *mut c_char,
 }
 
-/// Converts core `ducklake_view` records into the C row shape. Shared by the
-/// committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn view_rows(
-    rows: Vec<moraine::ffi_support::ViewRecord>,
-) -> Result<Vec<MoraineViewRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut v| {
-            let view_uuid = to_c_string(std::mem::take(&mut v.view_uuid))?;
-            let view_name = to_c_string(std::mem::take(&mut v.view_name))?;
-            let dialect = to_c_string(std::mem::take(&mut v.dialect))?;
-            let sql = to_c_string(std::mem::take(&mut v.sql))?;
-            let column_aliases = opt_c_string(v.column_aliases.as_deref())?;
-            Ok((v, view_uuid, view_name, dialect, sql, column_aliases))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(v, view_uuid, view_name, dialect, sql, column_aliases)| {
-            let (has_end, end) = opt_u64(v.end_snapshot);
-            MoraineViewRow {
-                view_id: v.view_id,
-                view_uuid: view_uuid.into_raw(),
-                begin_snapshot: v.begin_snapshot,
-                has_end_snapshot: has_end,
-                end_snapshot: end,
-                schema_id: v.schema_id,
-                view_name: view_name.into_raw(),
-                dialect: dialect.into_raw(),
-                sql: sql.into_raw(),
-                column_aliases: opt_into_raw(column_aliases),
-            }
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::ViewRecord => MoraineViewRow {
+        values { view_id, begin_snapshot, schema_id }
+        optional { end_snapshot => has_end_snapshot }
+        strings { view_uuid, view_name, dialect, sql }
+        optional_strings { column_aliases }
+    }
 }
 
 /// Dumps every `ducklake_view` row — current and history — into
@@ -327,7 +234,6 @@ pub unsafe extern "C" fn moraine_dump_views(
             probe_ctx,
             err,
             moraine::ffi_support::dump_views,
-            view_rows,
         )
     }
 }
@@ -342,13 +248,7 @@ pub unsafe extern "C" fn moraine_dump_views(
 pub unsafe extern "C" fn moraine_dump_views_free(items: *mut MoraineViewRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.view_uuid);
-            free_c_string(d.view_name);
-            free_c_string(d.dialect);
-            free_c_string(d.sql);
-            free_c_string(d.column_aliases);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -389,67 +289,18 @@ pub struct MoraineColumnRow {
     pub default_value_dialect: *mut c_char,
 }
 
-/// Converts core `ducklake_column` records into the C row shape. Shared by the
-/// committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn column_rows(
-    rows: Vec<moraine::ffi_support::ColumnRecord>,
-) -> Result<Vec<MoraineColumnRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut v| {
-            let column_name = to_c_string(std::mem::take(&mut v.column_name))?;
-            let column_type = to_c_string(std::mem::take(&mut v.column_type))?;
-            let initial_default = opt_c_string(v.initial_default.as_deref())?;
-            let default_value = opt_c_string(v.default_value.as_deref())?;
-            let default_value_type = opt_c_string(v.default_value_type.as_deref())?;
-            let default_value_dialect = opt_c_string(v.default_value_dialect.as_deref())?;
-            Ok((
-                v,
-                column_name,
-                column_type,
-                initial_default,
-                default_value,
-                default_value_type,
-                default_value_dialect,
-            ))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-    Ok(owned
-        .into_iter()
-        .map(
-            |(
-                v,
-                column_name,
-                column_type,
-                initial_default,
-                default_value,
-                default_value_type,
-                default_value_dialect,
-            )| {
-                let (has_end, end) = opt_u64(v.end_snapshot);
-                let (has_parent, parent) = opt_u64(v.parent_column);
-
-                MoraineColumnRow {
-                    column_id: v.column_id,
-                    begin_snapshot: v.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                    table_id: v.table_id,
-                    column_order: v.column_order,
-                    column_name: column_name.into_raw(),
-                    column_type: column_type.into_raw(),
-                    initial_default: opt_into_raw(initial_default),
-                    default_value: opt_into_raw(default_value),
-                    nulls_allowed: v.nulls_allowed,
-                    has_parent_column: has_parent,
-                    parent_column: parent,
-                    default_value_type: opt_into_raw(default_value_type),
-                    default_value_dialect: opt_into_raw(default_value_dialect),
-                }
-            },
-        )
-        .collect())
+dump_row! {
+    moraine::ffi_support::ColumnRecord => MoraineColumnRow {
+        values { column_id, begin_snapshot, table_id, column_order, nulls_allowed }
+        optional { end_snapshot => has_end_snapshot, parent_column => has_parent_column }
+        strings { column_name, column_type }
+        optional_strings {
+            initial_default,
+            default_value,
+            default_value_type,
+            default_value_dialect,
+        }
+    }
 }
 
 /// Dumps every `ducklake_column` row — current and history — into
@@ -481,7 +332,6 @@ pub unsafe extern "C" fn moraine_dump_columns(
             probe_ctx,
             err,
             moraine::ffi_support::dump_columns,
-            column_rows,
         )
     }
 }
@@ -496,14 +346,7 @@ pub unsafe extern "C" fn moraine_dump_columns(
 pub unsafe extern "C" fn moraine_dump_columns_free(items: *mut MoraineColumnRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.column_name);
-            free_c_string(d.column_type);
-            free_c_string(d.initial_default);
-            free_c_string(d.default_value);
-            free_c_string(d.default_value_type);
-            free_c_string(d.default_value_dialect);
-        });
+        free_rows(items, len);
     }
 }
 

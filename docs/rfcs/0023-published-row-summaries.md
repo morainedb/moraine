@@ -130,10 +130,54 @@ Two producers, which between them leave nothing behind:
    before summaries were published. It walks everything, but a file already
    published costs one header read — no summary is fetched to find out — so it
    is expensive exactly once per lake and negligible after.
-2. **A pass over what a commit added**, run once the commit returns and bounded
-   to the files registered after the snapshot that preceded it. Every commit
-   after the backfill publishes its own, so the two together cover the lake
-   without either one re-walking it.
+2. **A pass over what commits added**, queued after a commit returns and bounded
+   to files registered after the earliest preceding snapshot in the batch.
+
+Each attach owns one worker with separate backfill and commit queues. It polls
+both passes concurrently, rotating which is polled first, so a long backfill does
+not block newly committed files. Backfill keeps making progress and releasing
+shared I/O permits while commit work is pending. There is at most one active pass and
+one merged pending batch per queue; detach cancels and joins both before closing
+the catalog. Concurrent passes may inspect or publish the same immutable file.
+
+Commit requests deduplicate touched tables and retain the oldest snapshot
+boundary, even when commits enqueue out of order. They publish only files in
+that table set after the retained boundary. More than 1,024 pending table IDs
+promotes warming and publishing to all tables, bounding the queue without
+dropping work. Attach backfill publishes every table, including with preload
+disabled. Publishing is best effort with automatic retries while attached. Failed reads,
+encodings, writes, and partial passes retain their table set and earliest cutoff;
+new pending work merges into that batch. Retries back off from one second to one
+minute. Each admitted attempt has a five-minute deadline, after which its future
+is cancelled and its batch retried. The deadline excludes waiting for admission.
+Detach cancels attempts and backoff sleeps. Successfully written immutable
+sidecars are durable progress: later attempts and attaches check their headers
+instead of rebuilding them; no extra catalog checkpoint is required.
+
+The process admits four commit passes and four backfills, with separate pools
+so backfill saturation cannot consume commit slots. Summary construction admits four builders process-wide, with at most two
+background builds. Each file has a configurable admission allowance; CPU-heavy
+work runs off the async runtime and retains its permits through cancellation.
+Publication processes four files per step and retains its snapshot and progress
+between steps. Failed-file bookkeeping holds at most 1,024 IDs, falling back to a
+scan frontier on overflow. Warming retains completed-table progress and admits
+eight ranges across the process. The exact limits, cancellation boundaries, and
+public progress API are specified in
+[RFC 0026](0026-working-memory-and-resumable-publication.md).
+
+Publishing reads and writes use at most half the shared data-I/O admission,
+leaving the remaining permits for foreground reads. This reserves capacity; it
+does not preempt an I/O request already running. Snapshot and caller-owned
+working memory remain separate from cache retention.
+
+The core exposes `ReadOnlyCatalog::publish_selected_row_summaries_since(data_store,
+data_prefix, tables, since)` for this path. The cutoff is exclusive and an empty
+table list does no publishing. Existing whole-catalog and selected-table APIs
+remain available. A pass resolves one catalog snapshot and accumulates outcomes
+as files finish, without retaining a result per file or per table. File metadata
+is projected lazily from the snapshot, bounded by the publishing concurrency;
+the pass does not copy an entire table's file list. The snapshot itself remains
+resident for the pass.
 
 Neither can live inside the commit, and not for want of trying: the commit
 protocol holds no data store, by design, so it cannot read the file it just
@@ -197,6 +241,14 @@ count sidecar hit, miss, rejected-on-identity and publish outcome, so a
 deployment can tell "none published yet" from "published and refused".
 
 ### Memory
+
+A full summary and membership readers share the same immutable membership
+allocation. Membership-only reads still avoid loading positions. Independently
+decoded cache entries can retain separate copies, and cache weights remain
+conservative when entries share an allocation. File lookup directories retain summaries under local limits and the process lookup
+allowance within `CACHE_MEMORY`. Admitted outer directory handles keep that charge
+after eviction until their readers finish. Independently retained inner buffers
+and query working memory still need headroom.
 
 A resident summary never consults a sidecar, so this adds nothing to a hit. It
 changes the cost of a **miss**, and of an eviction, from 5.21 MB to 1.25 MB for

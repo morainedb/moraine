@@ -20,7 +20,10 @@ use std::{
 use anyhow::{Context, bail, ensure};
 
 use crate::{
-    bench::timing::{median, parse_run_times},
+    bench::{
+        support::TempDir,
+        timing::{median, parse_run_times},
+    },
     catalog_target::{CatalogTarget, sql_literal},
     duckdb, ducklake_patch,
 };
@@ -174,29 +177,6 @@ fn parse_sample(stdout: &str) -> anyhow::Result<Sample> {
         warm_get_ms: parse_field(&fields, 4, "warm_get_ms")?,
         errors: parse_field(&fields, 5, "errors")?,
     })
-}
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(files: usize) -> anyhow::Result<Self> {
-        let path = env::temp_dir().join(format!(
-            "moraine-reader-bench-{}-{files}",
-            std::process::id()
-        ));
-        if path.exists() {
-            fs::remove_dir_all(&path).with_context(|| format!("clearing {}", path.display()))?;
-        }
-        fs::create_dir_all(path.join("data"))
-            .with_context(|| format!("creating {}", path.display()))?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 struct Artifacts<'a> {
@@ -488,8 +468,11 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     );
 
     for files in options.files {
-        let temp = TempDir::new(files)?;
-        let data_path = temp.0.join("data");
+        let temp = TempDir::new(env::temp_dir().join(format!(
+            "moraine-reader-bench-{}-{files}",
+            std::process::id()
+        )))?;
+        let data_path = temp.data();
         let catalog_uri = target.catalog_uri(&format!("reader-{files}"))?;
         seed(
             &artifacts,

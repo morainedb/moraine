@@ -350,3 +350,43 @@ fn summary_scan_reads_uuid_columns() {
         "wrong rows: {result}"
     );
 }
+
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn indexed_operations_stream_positions_above_the_summary_limit() {
+    let store = TempDir::new("summary-limit-index");
+    let data = TempDir::new("summary-limit-index-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 1048576",
+        data.path().display()
+    );
+    let attach = Attach::Moraine {
+        store_dir: store.path(),
+        data_path: data.path(),
+        options: &options,
+        read_only: false,
+    };
+    let output = run_session_with_env(
+        &attach,
+        "CREATE TABLE lake.main.t AS SELECT i a, i * 2 b FROM range(524288) r(i);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
+         CALL ducklake_flush_inlined_data('lake');
+         SELECT 'before',sum(data.b) FROM lake.main.t data
+         JOIN moraine_index_lookup('lake','main','t','by_a',7) hits
+         ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+         UPDATE lake.main.t SET b=99 WHERE a=7;
+         SELECT 'updated',sum(b) FROM lake.main.t WHERE a=7;
+         DELETE FROM lake.main.t WHERE a=7;
+         SELECT 'deleted',count(*) FROM lake.main.t WHERE a=7;",
+        &[("MORAINE_SUMMARY_MEMORY_BYTES", "64")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for answer in ["before,14", "updated,99", "deleted,0"] {
+        assert!(stdout.lines().any(|line| line == answer), "{stdout}");
+    }
+}

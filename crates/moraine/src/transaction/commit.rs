@@ -862,18 +862,23 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         Some(_) => {
             read::consistent(tx, || async move {
                 let ((), head) = futures::try_join!(refuse_mid_migration(tx), read_head_value(tx))?;
-                let ((target, snapshot), current, history) = futures::try_join!(
-                    resolve_below(tx, at, head.snapshot_id),
-                    read::scan_current_entities(tx),
-                    read::scan_history_entities(tx),
-                )?;
-
-                Ok(CatalogSnapshot::build(
+                let (target, snapshot) = resolve_below(tx, at, head.snapshot_id).await?;
+                let mut view = CatalogSnapshot {
                     snapshot,
-                    &current,
-                    &history,
-                    Some(target),
-                ))
+                    ..CatalogSnapshot::default()
+                };
+                let mut visit = |record: read::EntityRecord| {
+                    if record.lifecycle().is_none_or(|(begin, end)| {
+                        begin <= target && end.is_none_or(|end| end > target)
+                    }) {
+                        view.admit(record.estimated_bytes().saturating_mul(4))?;
+                        view.put_record(record);
+                    }
+                    Ok(())
+                };
+                read::visit_entity_records(tx, false, &mut visit).await?;
+                read::visit_entity_records(tx, true, &mut visit).await?;
+                Ok(view)
             })
             .await
         }
@@ -898,12 +903,12 @@ pub(crate) async fn materialize_capturing(
             "scanned `current`"
         );
 
-        let mut view = CatalogSnapshot::build_from(
+        let mut view = CatalogSnapshot::try_build_from(
             snapshot,
             current.values().map(Arc::as_ref),
             std::iter::empty(),
             None,
-        );
+        )?;
         // A head view stands at the store state the head record names.
         view.batch_seq = head.batch_seq;
 
@@ -927,12 +932,12 @@ pub(crate) async fn materialize_from(
         }
         let (_, snapshot) = resolve_below(tx, None, head.snapshot_id).await?;
 
-        let mut view = CatalogSnapshot::build_from(
+        let mut view = CatalogSnapshot::try_build_from(
             snapshot,
             current.values().map(Arc::as_ref),
             std::iter::empty(),
             None,
-        );
+        )?;
         view.batch_seq = head.batch_seq;
 
         Ok(Some(view))
@@ -1347,7 +1352,9 @@ where
 {
     let head = base.snapshot.snapshot_id;
     let new_id = head + 1;
-    let mut tx = Transaction::new(base.clone(), new_id);
+    let mut state = base.clone();
+    state.admit(0)?;
+    let mut tx = Transaction::new(state, new_id);
     f(&mut tx)?;
     let TransactionParts {
         operations,
@@ -1357,6 +1364,10 @@ where
         next_catalog_id,
         next_file_id,
     } = tx.into_parts();
+    let growth = state
+        .estimated_bytes()
+        .saturating_sub(base.estimated_bytes());
+    state.admit(growth.saturating_mul(4))?;
 
     if operations.is_empty() {
         let mut writes = Vec::new();
@@ -1569,7 +1580,7 @@ pub(crate) async fn submit_batch(
     // The probes read the transaction from their own tasks, so it is
     // shared; every one is awaited before staging returns, leaving this
     // the last reference.
-    let Some(db_tx) = Arc::into_inner(db_tx) else {
+    let Some(mut db_tx) = Arc::into_inner(db_tx) else {
         return Err(Error::Interrupted(
             "a reader outlived the batch it read from; nothing was submitted".to_owned(),
         ));
@@ -1589,7 +1600,7 @@ pub(crate) async fn submit_batch(
     let folder = db_tx.is_folder();
     // Everything the session staged, index entries included: what the slot
     // carries, and what a holder reading through its reader folds itself.
-    let staged_writes = db_tx.staged();
+    let (staged_writes, _memory) = db_tx.take_staged()?;
     // Held through the local commit below, so the folder's idle poll cannot
     // fold the slot this batch wins before the batch itself lands locally.
     let _held = match log {

@@ -2,18 +2,19 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::Instant,
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, info, warn};
 
+mod publication;
+mod retry_queue;
 mod rows_at;
-
+pub use publication::RowSummaryProgress;
 pub use rows_at::{ExcludedPositions, LocatedRowScan};
 
-use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
+use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY};
 use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DataFileInfo, DeleteFileInfo, FileRowCandidate, SnapshotId,
@@ -199,12 +200,10 @@ fn positioned_rows(
 pub struct RowSummaryPublish {
     /// Current data files the pass looked at.
     pub files_considered: u64,
-    /// Files whose row-id column it read, cached and published. The rest
-    /// were already resident, answered from a summary published earlier,
-    /// or answer from their dense range.
+    /// Files whose row-id summaries were successfully written. Other files
+    /// already have a sidecar or derive their IDs from catalog metadata.
     pub summaries_built: u64,
-    /// Files it could not summarize. They stay correct but cold: a later
-    /// lookup leaves every requested row a candidate for them.
+    /// Files whose summary could not be read, encoded, or written.
     pub files_failed: u64,
 }
 
@@ -390,10 +389,15 @@ impl ReadOnlyCatalog {
         );
 
         if let Some(revision) = revision {
-            let bytes =
-                size_of_val(row_ids.as_slice()).saturating_add(size_of_val(located.as_slice()));
-            self.located_rows
-                .put(revision, table, row_ids, Arc::new(located.clone()), bytes);
+            let key_bytes = row_ids.capacity().saturating_mul(size_of::<u64>());
+            self.located_rows.put_cloned(
+                revision,
+                table,
+                row_ids,
+                &located,
+                key_bytes,
+                size_of_val(located.as_slice()),
+            );
         }
 
         Ok(located)
@@ -537,8 +541,13 @@ impl ReadOnlyCatalog {
             .count();
         let mut located = Vec::with_capacity(file_ids.len());
         for file_id in file_ids {
-            let rows = by_file.get(&file_id).cloned().unwrap_or_default();
-            let positions = positioned_rows(&summaries, file_id, &rows, missing)?;
+            let rows = by_file.get(&file_id).map_or(&[][..], Vec::as_slice);
+            let positions = if summaries.get(&file_id).is_some_and(Result::is_err) {
+                self.stream_requested_positions(scope, file_id, rows, missing)
+                    .await?
+            } else {
+                positioned_rows(&summaries, file_id, rows, missing)?
+            };
 
             located.push(PositionedFile {
                 data_file_id: file_id,
@@ -547,15 +556,76 @@ impl ReadOnlyCatalog {
         }
 
         if let Some(revision) = revision {
-            let bytes = located
+            let value_bytes = located
                 .iter()
                 .map(|file| size_of_val(file.positions.as_slice()))
-                .fold(0usize, usize::saturating_add);
-            self.positioned_files
-                .put(revision, scope.table, key, Arc::new(located.clone()), bytes);
+                .fold(size_of_val(located.as_slice()), usize::saturating_add);
+            let key_bytes = key
+                .2
+                .iter()
+                .map(|(_, rows)| rows.capacity().saturating_mul(size_of::<u64>()))
+                .fold(
+                    key.2
+                        .capacity()
+                        .saturating_mul(size_of::<(DataFileId, Vec<u64>)>()),
+                    usize::saturating_add,
+                );
+            self.positioned_files.put_cloned(
+                revision,
+                scope.table,
+                key,
+                &located,
+                key_bytes,
+                value_bytes,
+            );
         }
 
         Ok((located, summaries_built))
+    }
+
+    async fn stream_requested_positions(
+        &self,
+        scope: &LocationScope<'_>,
+        file_id: DataFileId,
+        rows: &[u64],
+        missing: MissingRows,
+    ) -> Result<Vec<u64>> {
+        let row_error = |row_id, reason| Error::RowPosition {
+            row_id,
+            data_file_id: Some(file_id),
+            reason,
+        };
+        let first = rows.first().copied().unwrap_or_default();
+        let file = scope
+            .snapshot
+            .data_files
+            .get(&scope.table.get())
+            .and_then(|files| files.get(&file_id.get()))
+            .map(data_file_info)
+            .ok_or_else(|| row_error(first, "file metadata is absent".into()))?;
+        let path = resolve_data_path(
+            scope.data_prefix,
+            scope.table_prefix,
+            &file.path,
+            file.path_is_relative,
+        )?;
+        let file_source = data_file::ParquetFile::new(
+            scope.store.clone(),
+            path,
+            file.file_size_bytes,
+            file.footer_size,
+        )
+        .with_metrics(self.data_read_metrics());
+        let (positions, absent) =
+            data_file::requested_positions(file_source, file.row_id_start, rows)
+                .await
+                .map_err(|error| row_error(first, format!("file could not be read: {error}")))?;
+        if let Some(row) = absent
+            && matches!(missing, MissingRows::Reject)
+        {
+            return Err(row_error(row, "row is not held by this file".into()));
+        }
+        Ok(positions)
     }
 
     /// The delete file currently registered against each positioned file,
@@ -629,7 +699,7 @@ impl ReadOnlyCatalog {
     ) -> Result<RowSummaryPublish> {
         let snapshot = self.snapshot().await?;
 
-        self.publish_table(&snapshot, &data_store, data_prefix, table)
+        self.publish_tables(&snapshot, &data_store, data_prefix, vec![table], None)
             .await
     }
 
@@ -654,23 +724,8 @@ impl ReadOnlyCatalog {
             .map(|table| table.id)
             .collect::<Vec<_>>();
 
-        let mut total = RowSummaryPublish::default();
-        for table in tables {
-            let table_total = self
-                .summarize_table_since(&snapshot, &data_store, data_prefix, table, since)
-                .await?;
-            total = RowSummaryPublish {
-                files_considered: total
-                    .files_considered
-                    .saturating_add(table_total.files_considered),
-                summaries_built: total
-                    .summaries_built
-                    .saturating_add(table_total.summaries_built),
-                files_failed: total.files_failed.saturating_add(table_total.files_failed),
-            };
-        }
-
-        Ok(total)
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, Some(since))
+            .await
     }
 
     /// Deletes published row summaries whose data file is no longer under
@@ -715,12 +770,11 @@ impl ReadOnlyCatalog {
             .map(|table| table.id)
             .collect::<Vec<_>>();
 
-        self.publish_selected_row_summaries(data_store, data_prefix, tables)
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, None)
             .await
     }
 
-    /// Builds and caches the summaries a lookup would otherwise build cold,
-    /// for the given tables.
+    /// Publishes summaries for the given tables without filling summary caches.
     ///
     /// # Errors
     ///
@@ -733,122 +787,118 @@ impl ReadOnlyCatalog {
         tables: Vec<TableId>,
     ) -> Result<RowSummaryPublish> {
         let snapshot = self.snapshot().await?;
-        let total = stream::iter(tables)
-            .map(|table| self.publish_table(&snapshot, &data_store, data_prefix, table))
-            .buffer_unordered(WARM_TABLE_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await?
-            .into_iter()
-            .fold(RowSummaryPublish::default(), |acc, table| {
-                RowSummaryPublish {
-                    files_considered: acc.files_considered.saturating_add(table.files_considered),
-                    summaries_built: acc.summaries_built.saturating_add(table.summaries_built),
-                    files_failed: acc.files_failed.saturating_add(table.files_failed),
-                }
-            });
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, None)
+            .await
+    }
 
+    /// Publishes files in `tables` registered strictly after `since`.
+    /// An empty table list publishes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the snapshot cannot be read. Per-file
+    /// failures are counted in [`RowSummaryPublish::files_failed`].
+    pub async fn publish_selected_row_summaries_since(
+        &self,
+        data_store: DataStore,
+        data_prefix: &str,
+        tables: Vec<TableId>,
+        since: SnapshotId,
+    ) -> Result<RowSummaryPublish> {
+        if tables.is_empty() {
+            return Ok(RowSummaryPublish::default());
+        }
+        let snapshot = self.snapshot().await?;
+        self.publish_tables(&snapshot, &data_store, data_prefix, tables, Some(since))
+            .await
+    }
+
+    async fn publish_tables(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: &DataStore,
+        data_prefix: &str,
+        tables: Vec<TableId>,
+        since: Option<SnapshotId>,
+    ) -> Result<RowSummaryPublish> {
+        let mut outcomes = stream::iter(tables)
+            .map(|table| self.publish_table(snapshot, data_store, data_prefix, table, since))
+            .buffer_unordered(data_file::PUBLISH_CONCURRENCY);
+        let mut total = RowSummaryPublish::default();
+        while let Some(table) = outcomes.try_next().await? {
+            total.files_considered = total
+                .files_considered
+                .saturating_add(table.files_considered);
+            total.summaries_built = total.summaries_built.saturating_add(table.summaries_built);
+            total.files_failed = total.files_failed.saturating_add(table.files_failed);
+        }
         Ok(total)
     }
 
-    /// One table's publishing pass against an already-resolved head view.
+    async fn publish_file(
+        &self,
+        store: &DataStore,
+        data_prefix: &str,
+        table_prefix: &str,
+        table: TableId,
+        file: DataFileInfo,
+    ) -> Result<bool> {
+        let path = resolve_data_path(data_prefix, table_prefix, &file.path, file.path_is_relative)?;
+        data_file::publish_if_missing(
+            data_file::ParquetFile::new(
+                store.clone(),
+                path,
+                file.file_size_bytes,
+                file.footer_size,
+            )
+            .with_metrics(self.data_read_metrics()),
+            table.get(),
+            file.id.get(),
+            file.row_id_start,
+        )
+        .await
+    }
+
+    /// Publishes missing summaries without filling the reader's summary caches.
     async fn publish_table(
         &self,
         snapshot: &CatalogSnapshot,
         data_store: &DataStore,
         data_prefix: &str,
         table: TableId,
+        since: Option<SnapshotId>,
     ) -> Result<RowSummaryPublish> {
-        let files = snapshot.data_files_of(table);
-        self.summarize_files(snapshot, data_store, data_prefix, table, files)
-            .await
-    }
-
-    /// One table's files registered after `since`, which is what a commit
-    /// just landed rather than everything the table holds.
-    async fn summarize_table_since(
-        &self,
-        snapshot: &CatalogSnapshot,
-        data_store: &DataStore,
-        data_prefix: &str,
-        table: TableId,
-        since: SnapshotId,
-    ) -> Result<RowSummaryPublish> {
-        let files = snapshot
-            .data_files
-            .get(&table.get())
-            .map(|files| {
-                files
-                    .values()
-                    .filter(|file| file.begin_snapshot > since.get())
-                    .map(data_file_info)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        self.summarize_files(snapshot, data_store, data_prefix, table, files)
-            .await
-    }
-
-    /// Publishes `files`' summaries, skipping those already published and
-    /// those whose ids the catalog already describes.
-    ///
-    /// Concurrency matches a lookup's, and nothing here enters the summary
-    /// caches: a pass over a lake must not evict the working set of the
-    /// process running it.
-    async fn summarize_files(
-        &self,
-        snapshot: &CatalogSnapshot,
-        data_store: &DataStore,
-        data_prefix: &str,
-        table: TableId,
-        files: Vec<DataFileInfo>,
-    ) -> Result<RowSummaryPublish> {
-        if files.is_empty() {
+        let Some(files) = snapshot.data_files.get(&table.get()) else {
+            return Ok(RowSummaryPublish::default());
+        };
+        let mut files = files.values();
+        let mut files = std::iter::from_fn(|| {
+            files
+                .find(|file| since.is_none_or(|since| file.begin_snapshot > since.get()))
+                .map(data_file_info)
+        })
+        .peekable();
+        if files.peek().is_none() {
             return Ok(RowSummaryPublish::default());
         }
         let table_prefix = snapshot.table_data_prefix(table)?;
-        let mut published = RowSummaryPublish {
-            files_considered: u64::try_from(files.len()).unwrap_or(u64::MAX),
-            ..RowSummaryPublish::default()
-        };
+        let mut published = RowSummaryPublish::default();
 
-        let outcomes = stream::iter(files.into_iter().map(|file| {
-            let resolved = resolve_data_path(
-                data_prefix,
-                &table_prefix,
-                &file.path,
-                file.path_is_relative,
-            );
-            let store = data_store.clone();
-            let metrics = self.data_read_metrics();
-
+        let mut outcomes = stream::iter(files.map(|file| {
+            let table_prefix = &table_prefix;
             async move {
-                let written = match resolved {
-                    Ok(path) => {
-                        data_file::publish_if_missing(
-                            data_file::ParquetFile::new(
-                                store,
-                                path,
-                                file.file_size_bytes,
-                                file.footer_size,
-                            )
-                            .with_metrics(metrics),
-                            table.get(),
-                            file.id.get(),
-                            file.row_id_start,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                };
-                (file.id, written)
+                let id = file.id;
+                (
+                    id,
+                    self.publish_file(data_store, data_prefix, table_prefix, table, file)
+                        .await,
+                )
             }
         }))
-        .buffer_unordered(SUMMARY_READ_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(data_file::PUBLISH_CONCURRENCY);
 
-        for (data_file_id, written) in outcomes {
+        while let Some((data_file_id, written)) = outcomes.next().await {
+            published.files_considered = published.files_considered.saturating_add(1);
             match written {
                 Ok(true) => {
                     published.summaries_built = published.summaries_built.saturating_add(1);

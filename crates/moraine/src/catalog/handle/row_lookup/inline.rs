@@ -1,10 +1,7 @@
 //! Requested inline IDs selected before chunk bodies or row objects are
 //! materialized.
 
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::{InlineDirectory, Intervals};
 use crate::{
@@ -14,6 +11,7 @@ use crate::{
     },
     error::Result,
     store::{
+        cache::retention::Shared,
         handle::{ReadHandle, ReadSession},
         inline::{self as store_inline, InlineChunkLocator, stream::InlineTombstones},
         key::InlineOperation,
@@ -31,7 +29,7 @@ impl ReadOnlyCatalog {
         handle: ReadHandle<'_>,
         table: TableId,
         head: HeadValue,
-    ) -> Result<(Arc<InlineDirectory>, Option<ScannedChunks>)> {
+    ) -> Result<(Shared<InlineDirectory>, Option<ScannedChunks>)> {
         let cached =
             super::lookup(&self.row_lookups.inline, table).filter(|held| held.head == head);
         if let Some(directory) = cached {
@@ -43,7 +41,7 @@ impl ReadOnlyCatalog {
         if let Some(locators) =
             projection::folded_inline_locators(&self.projections, table.get(), &head)
         {
-            let directory = Arc::new(InlineDirectory {
+            let directory = Shared::new(InlineDirectory {
                 head,
                 ranges: Intervals::new(
                     locators
@@ -51,7 +49,7 @@ impl ReadOnlyCatalog {
                         .map(|locator| (locator.row_id_start(), locator.row_id_end(), *locator)),
                 ),
             });
-            super::install(&self.row_lookups.inline, table, Arc::clone(&directory));
+            super::install(&self.row_lookups.inline, table, directory.clone());
             return Ok((directory, None));
         }
         self.row_lookups.note_inline_directory_built();
@@ -85,7 +83,7 @@ impl ReadOnlyCatalog {
                 .map(|locator| (locator.operation(), *locator))
                 .collect(),
         );
-        let directory = Arc::new(InlineDirectory {
+        let directory = Shared::new(InlineDirectory {
             head,
             ranges: Intervals::new(
                 locators
@@ -105,7 +103,7 @@ impl ReadOnlyCatalog {
         requested: &[u64],
         head: HeadValue,
         visible_at: Option<u64>,
-    ) -> Result<(InlineRowSource, Vec<InlineRow>, Arc<InlineDirectory>)> {
+    ) -> Result<(InlineRowSource, Vec<InlineRow>, Shared<InlineDirectory>)> {
         let (directory, scanned) = self.inline_lookup_directory(handle, table, head).await?;
         let visible_at = visible_at.unwrap_or(head.snapshot_id);
         let mut selected = Vec::new();

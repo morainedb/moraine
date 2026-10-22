@@ -334,12 +334,19 @@ fn encode_positioned_row_set(
 pub(super) fn encode_summary_halves(
     positioned: &PositionedRowSet,
 ) -> foyer::Result<(Vec<u8>, Vec<u8>)> {
+    encode_summary_halves_checked(positioned, &mut || Ok(()))
+}
+
+pub(super) fn encode_summary_halves_checked(
+    positioned: &PositionedRowSet,
+    check: &mut impl FnMut() -> std::io::Result<()>,
+) -> foyer::Result<(Vec<u8>, Vec<u8>)> {
     // Unreachable by construction: `PositionedRowSet::from_file_order` never
     // pairs a permutation with a range. A bare range tag carries no
     // permutation, so writing one here would silently answer positions by
     // arithmetic on decode.
     if matches!(
-        (&positioned.rows, &positioned.order),
+        (&*positioned.rows, &positioned.order),
         (
             FileRowSet::Range { .. },
             RowOrder::Permuted(_) | RowOrder::Repeated { .. }
@@ -371,24 +378,60 @@ pub(super) fn encode_summary_halves(
         ],
     };
     let mut set = Vec::new();
-    encode_row_set(&positioned.rows, shapes, &mut set)?;
+    encode_row_set(
+        &positioned.rows,
+        shapes,
+        &mut CheckedWriter {
+            output: &mut set,
+            check,
+            remaining: 0,
+        },
+    )?;
 
     let mut order = Vec::new();
+    let mut writer = CheckedWriter {
+        output: &mut order,
+        check,
+        remaining: 0,
+    };
     if let RowOrder::Permuted(permutation) = &positioned.order {
         // A permutation covers every physical row exactly once, so its
         // own length is the universe its positions fall in.
-        write_packed_positions(permutation, usize_as_u64(permutation.len()), &mut order)?;
+        write_packed_positions(permutation, usize_as_u64(permutation.len()), &mut writer)?;
     }
     if let RowOrder::Repeated { offsets, positions } = &positioned.order {
         let physical = usize_as_u64(positions.len());
-        order
+        writer
             .write_all(&physical.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
-        write_packed_positions(offsets, physical.saturating_add(1), &mut order)?;
-        write_packed_positions(positions, physical, &mut order)?;
+        write_packed_positions(offsets, physical.saturating_add(1), &mut writer)?;
+        write_packed_positions(positions, physical, &mut writer)?;
     }
 
     Ok((set, order))
+}
+
+struct CheckedWriter<'a, F> {
+    output: &'a mut Vec<u8>,
+    check: &'a mut F,
+    remaining: usize,
+}
+
+impl<F: FnMut() -> std::io::Result<()>> Write for CheckedWriter<'_, F> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes.len().min(8192);
+        if count >= self.remaining {
+            // write_all retries Interrupted; cancellation must escape that loop.
+            (self.check)().map_err(std::io::Error::other)?;
+            self.remaining = 8192;
+        }
+        self.output.extend_from_slice(&bytes[..count]);
+        self.remaining -= count;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Bits enough to hold every value below `universe`; none when the only
@@ -413,32 +456,21 @@ fn write_packed_positions(
         .write_all(&usize_as_u64(positions.len()).to_le_bytes())
         .map_err(io)?;
 
-    if let Some(out_of_range) = positions
-        .iter()
-        .find(|position| u64::from(**position) >= universe)
-    {
-        return Err(foyer::Error::new(
-            foyer::ErrorKind::Parse,
-            format!("position {out_of_range} is outside a universe of {universe}"),
-        ));
-    }
-
     let width = position_width(universe);
-    if width == 0 {
-        return Ok(());
-    }
-
-    let mut packed = Vec::with_capacity(
-        usize::try_from(
-            usize_as_u64(positions.len())
-                .saturating_mul(u64::from(width))
-                .div_ceil(8),
-        )
-        .unwrap_or(0),
-    );
+    let mut packed = Vec::with_capacity(8192);
     let mut accumulator = 0_u64;
     let mut bits = 0_u32;
     for position in positions {
+        if u64::from(*position) >= universe {
+            return Err(foyer::Error::new(
+                foyer::ErrorKind::Parse,
+                format!("position {position} is outside a universe of {universe}"),
+            ));
+        }
+        if packed.len() >= 8188 {
+            writer.write_all(&packed).map_err(io)?;
+            packed.clear();
+        }
         accumulator |= u64::from(*position) << bits;
         bits += width;
         while bits >= 8 {
@@ -582,15 +614,15 @@ pub(super) fn decode_membership(reader: &mut impl Read) -> foyer::Result<FileRow
 fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<PositionedRowSet> {
     let positioned = match tag {
         tag::RANGE_ASCENDING => Ok(PositionedRowSet {
-            rows: decode_row_set(RowSetShape::Range, reader)?,
+            rows: decode_row_set(RowSetShape::Range, reader)?.into(),
             order: RowOrder::Ascending,
         }),
         tag::ROARING_ASCENDING => Ok(PositionedRowSet {
-            rows: decode_row_set(RowSetShape::Roaring, reader)?,
+            rows: decode_row_set(RowSetShape::Roaring, reader)?.into(),
             order: RowOrder::Ascending,
         }),
         tag::SORTED_ASCENDING => Ok(PositionedRowSet {
-            rows: decode_row_set(RowSetShape::Sorted, reader)?,
+            rows: decode_row_set(RowSetShape::Sorted, reader)?.into(),
             order: RowOrder::Ascending,
         }),
         tag::ROARING_PERMUTED => {
@@ -602,7 +634,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let expected_len = usize::try_from(bitmap.len()).unwrap_or(usize::MAX);
             let permutation = read_permutation(expected_len, reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Roaring(bitmap),
+                rows: FileRowSet::Roaring(bitmap).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -610,7 +642,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let row_ids = read_sorted_body(reader)?;
             let permutation = read_permutation(row_ids.len(), reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Sorted(row_ids),
+                rows: FileRowSet::Sorted(row_ids).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -620,7 +652,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let permutation =
                 read_packed_positions(expected_len, usize_as_u64(expected_len), reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Roaring(bitmap),
+                rows: FileRowSet::Roaring(bitmap).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -629,7 +661,7 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             let permutation =
                 read_packed_positions(row_ids.len(), usize_as_u64(row_ids.len()), reader)?;
             Ok(PositionedRowSet {
-                rows: FileRowSet::Sorted(row_ids),
+                rows: FileRowSet::Sorted(row_ids).into(),
                 order: RowOrder::Permuted(permutation),
             })
         }
@@ -711,7 +743,7 @@ fn validated_repeated(
     }
     validate_positions(&positions)?;
     Ok(PositionedRowSet {
-        rows,
+        rows: rows.into(),
         order: RowOrder::Repeated { offsets, positions },
     })
 }
@@ -791,11 +823,10 @@ impl foyer::Code for Weighed {
                 } else {
                     PageIndexPolicy::Skip
                 };
-                let mut buffer = Vec::new();
-                reader.read_to_end(&mut buffer).map_err(io)?;
+                let buffer = crate::memory::read_bytes(reader).map_err(io)?;
                 let metadata = ParquetMetaDataReader::new()
                     .with_page_index_policy(policy)
-                    .parse_and_finish(&Bytes::from(buffer))
+                    .parse_and_finish(&buffer)
                     .map_err(parse_failed)?;
                 AuxiliaryValue::Metadata {
                     metadata: Arc::new(metadata),
@@ -840,9 +871,8 @@ impl foyer::Code for Weighed {
                 reader,
             )?)),
             tag::BLOCK => {
-                let mut buffer = Vec::new();
-                reader.read_to_end(&mut buffer).map_err(io)?;
-                AuxiliaryValue::Block(Bytes::from(buffer))
+                let buffer = crate::memory::read_bytes(reader).map_err(io)?;
+                AuxiliaryValue::Block(buffer)
             }
             other => {
                 return Err(foyer::Error::new(
@@ -1267,6 +1297,7 @@ impl AuxiliaryCache {
                 Error::Corruption(format!("row summary: {cause}"))
             })?;
 
+        self.discard_redundant_membership(store, key);
         summary_of(&entry.value).ok_or_else(|| {
             Error::Corruption("a footer was cached under a row summary key".to_owned())
         })
@@ -1287,7 +1318,7 @@ impl AuxiliaryCache {
         Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
     {
         if let Some(positioned) = self.summary(store, key).await {
-            return Ok(Arc::new(positioned.rows.clone()));
+            return Ok(Arc::clone(&positioned.rows));
         }
 
         let fill = fill();
@@ -1310,6 +1341,7 @@ impl AuxiliaryCache {
                 Error::Corruption(format!("row membership: {cause}"))
             })?;
 
+        self.discard_redundant_membership(store, key);
         membership_of(&entry.value).ok_or_else(|| {
             Error::Corruption("a footer was cached under a row membership key".to_owned())
         })
@@ -1396,6 +1428,21 @@ impl AuxiliaryCache {
         self.summaries.entered(&weighed);
         self.tier
             .insert(Self::file_summary_key(store, key), weighed);
+        self.discard_redundant_membership(store, key);
+    }
+
+    fn discard_redundant_membership(&self, store: &DataStore, key: &FileSummaryKey<'_>) {
+        let full = Self::file_summary_key(store, key);
+        let membership = Self::membership_key(store, key);
+        match &self.tier {
+            Tier::Memory(cache) if cache.contains(&full) => {
+                cache.remove(&membership);
+            }
+            Tier::Hybrid(cache) if cache.memory().contains(&full) => {
+                cache.remove(&membership);
+            }
+            _ => {}
+        }
     }
 
     /// The file's bytes over `range`, from the cache when that exact range
@@ -1658,7 +1705,7 @@ fn summary_of(value: &AuxiliaryValue) -> Option<Arc<PositionedRowSet>> {
 fn membership_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
     match value {
         AuxiliaryValue::Membership(rows) => Some(Arc::clone(rows)),
-        AuxiliaryValue::Summary(positioned) => Some(Arc::new(positioned.rows.clone())),
+        AuxiliaryValue::Summary(positioned) => Some(Arc::clone(&positioned.rows)),
         AuxiliaryValue::Metadata { .. }
         | AuxiliaryValue::Block(_)
         | AuxiliaryValue::DeletePositions(_) => None,

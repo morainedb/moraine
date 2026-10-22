@@ -19,6 +19,7 @@ use crate::{
 /// A write whose key or value cannot be decoded is refused; the caller
 /// must drop the cached view.
 pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> Result<()> {
+    view.admit(0)?;
     let mut new_head: Option<u64> = None;
     let mut minted: Option<SnapshotValue> = None;
 
@@ -26,11 +27,18 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
         let bytes = write.as_deref();
         match Key::decode(encoded_key)? {
             Key::Current(CurrentKey::Entity(entity)) => match bytes {
-                Some(bytes) => view.put_record(decode_entity(entity, bytes)?),
+                Some(bytes) => {
+                    let record = decode_entity(entity, bytes)?;
+                    view.admit(record.estimated_bytes().saturating_mul(4))?;
+                    view.put_record(record);
+                }
                 None => remove_entity(view, entity),
             },
             Key::Current(CurrentKey::GcFile { data_file_id }) => match bytes {
-                Some(bytes) => view.put_gc_file(value::decode_value(bytes)?),
+                Some(bytes) => {
+                    view.admit((bytes.len() as u64).saturating_mul(4).saturating_add(256))?;
+                    view.put_gc_file(value::decode_value(bytes)?);
+                }
                 None => view.remove_gc_file(data_file_id),
             },
             Key::Snapshot { .. } => {

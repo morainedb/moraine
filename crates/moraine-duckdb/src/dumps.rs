@@ -16,6 +16,7 @@
 //!   `false`.
 
 mod catalog;
+mod conversion;
 mod files;
 mod macros;
 mod mappings;
@@ -25,12 +26,10 @@ mod snapshots;
 mod statistics;
 mod tags;
 
-use std::{
-    ffi::{CString, c_char, c_void},
-    ptr,
-};
+use std::ffi::c_void;
 
 pub use catalog::*;
+pub(crate) use conversion::{DumpRow, convert_rows};
 pub use files::*;
 pub use macros::*;
 pub use mappings::*;
@@ -41,37 +40,15 @@ pub use statistics::*;
 pub use tags::*;
 
 use crate::{
-    abi::{free_array, guard, to_c_string, write_array},
+    abi::{free_array, guard, write_reserved_array},
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
-/// Splits an optional `u64` into the `(has, value)` pair the dump row
-/// structs carry.
-pub(crate) fn opt_u64(v: Option<u64>) -> (bool, u64) {
-    v.map_or((false, 0), |x| (true, x))
-}
-
-/// Splits an optional `bool` into the `(has, value)` pair the dump row
-/// structs carry.
-pub(crate) fn opt_bool(v: Option<bool>) -> (bool, bool) {
-    v.map_or((false, false), |x| (true, x))
-}
-
-/// Converts an optional string to an owned, possibly-null `CString`.
-pub(crate) fn opt_c_string(s: Option<&str>) -> Result<Option<CString>, AbiError> {
-    s.map(to_c_string).transpose()
-}
-
-/// The raw pointer for an optional owned `CString`: null for `None`.
-pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
-    s.map_or(ptr::null_mut(), CString::into_raw)
-}
-
 /// The shared shell of every dump entry point: null checks, the
-/// cancellable bridge into the core `fetch`, `convert` to C rows, and
-/// `write_array`, all under [`guard`](crate::abi). Each `moraine_dump_*`
-/// signature stays written out for cbindgen.
+/// cancellable bridge into the core `fetch`, conversion to C rows, and
+/// `write_reserved_array`, all under [`guard`](crate::abi). Each
+/// `moraine_dump_*` signature stays written out for cbindgen.
 ///
 /// Cancellable via `probe`/`probe_ctx` (polled immediately, then ~100 ms;
 /// a null `probe` disables polling): a cancellation returns
@@ -85,18 +62,16 @@ pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
 /// pointers. `probe`, if non-null, must be safe to call with `probe_ctx` from
 /// any thread. `err`, if non-null, must be a valid, writable [`MoraineError`].
 /// All for the duration of the call.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn dump_rows<Row, Rows>(
+pub(crate) unsafe fn dump_rows<Row: DumpRow>(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut Row,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
-    fetch: impl AsyncFnOnce(&moraine::ReadOnlyCatalog) -> Result<Rows, moraine::Error>,
-    convert: impl FnOnce(Rows) -> Result<Vec<Row>, AbiError>,
+    fetch: impl AsyncFnOnce(&moraine::ReadOnlyCatalog) -> Result<Vec<Row::Record>, moraine::Error>,
 ) -> i32 {
-    let attempt = || -> Result<Vec<Row>, AbiError> {
+    let attempt = || -> Result<(Vec<Row>, moraine::MemoryReservation), AbiError> {
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -109,33 +84,31 @@ pub(crate) unsafe fn dump_rows<Row, Rows>(
         let rows = unsafe {
             handle_ref.block_on_cancellable(probe, probe_ctx, fetch(handle_ref.catalog.reads()))
         }?;
-        convert(rows)
+        convert_rows(rows)
     };
 
     // SAFETY: `err` validity is the caller's contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, memory)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe { write_reserved_array(items, memory, out_items, out_len) };
             codes::OK
         }
         Err(code) => code,
     }
 }
 
-/// The shared shell of every dump `_free`: `release` each element's owned
-/// strings and reclaim the array, under `catch_unwind`. Null `items` is a
-/// no-op.
+/// Releases the rows and their array under `catch_unwind`. Null is a no-op.
 ///
 /// # Safety
 ///
 /// `items`/`len` must be exactly the pointer and length written by the
 /// matching dump call, not yet freed.
-pub(crate) unsafe fn free_rows<Row>(items: *mut Row, len: usize, release: impl FnMut(&mut Row)) {
+unsafe fn free_rows<Row: conversion::DumpRow>(items: *mut Row, len: usize) {
     let attempt = std::panic::AssertUnwindSafe(|| {
         // SAFETY: forwarded caller contract.
         unsafe {
-            free_array(items, len, release);
+            free_array(items, len, |row| row.release());
         }
     });
     let _ = std::panic::catch_unwind(attempt);
@@ -353,7 +326,10 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{CStr, c_void};
+    use std::{
+        ffi::{CStr, c_void},
+        ptr,
+    };
 
     use super::{
         test_support::{TempDir, attach_ok, seed},

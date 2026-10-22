@@ -13,7 +13,7 @@ use moraine::CatalogOptions;
 use crate::{
     abi::{
         MoraineS3Config, StoreKind, borrow_s3_creds, borrow_str, free_array, free_c_string, guard,
-        to_c_string, write_array,
+        to_c_string, write_reserved_array,
     },
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, new_runtime},
@@ -164,6 +164,13 @@ pub unsafe extern "C" fn moraine_checkpoints(
             .into_iter()
             .map(|checkpoint| Ok((to_c_string(checkpoint.id.as_str())?, checkpoint)))
             .collect::<Result<Vec<_>, AbiError>>()?;
+        let memory = crate::abi::reserve_array::<MoraineCheckpoint>(
+            owned.len(),
+            owned
+                .iter()
+                .map(|row| row.0.as_bytes_with_nul().len() as u64)
+                .sum(),
+        )?;
         let items = owned
             .into_iter()
             .map(|(id, checkpoint)| MoraineCheckpoint {
@@ -179,7 +186,7 @@ pub unsafe extern "C" fn moraine_checkpoints(
 
         // SAFETY: both out-parameters are non-null and writable per the
         // caller contract, checked above.
-        unsafe { write_array(items, out_items, out_len) };
+        unsafe { write_reserved_array(items, memory, out_items, out_len) };
         Ok(())
     };
 

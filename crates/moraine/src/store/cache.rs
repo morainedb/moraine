@@ -1,5 +1,5 @@
 //! The caches every store in the process shares: one budget across SlateDB
-//! metadata, SlateDB blocks, and auxiliary parsed metadata.
+//! metadata, SlateDB blocks, auxiliary metadata, and lookup retention.
 //!
 //! Metadata and blocks share one cache and are separated by eviction
 //! priority rather than by capacity. Blocks tier to disk when a cache
@@ -28,6 +28,15 @@ use tracing::{info, warn};
 use crate::data_file;
 
 mod allocation;
+pub(crate) mod retention;
+
+static LOOKUP_BUDGET: std::sync::OnceLock<Arc<retention::Budget>> = std::sync::OnceLock::new();
+
+pub(crate) fn lookup_budget() -> Arc<retention::Budget> {
+    Arc::clone(
+        LOOKUP_BUDGET.get_or_init(|| retention::Budget::new(CacheConfig::default().lookup_share())),
+    )
+}
 
 /// Memory the cache takes when no budget is configured: SlateDB's
 /// single-store default (512 MiB of blocks, 128 MiB of metadata).
@@ -65,15 +74,14 @@ pub(crate) fn disk_cache_block_size(capacity: u64) -> u64 {
 /// later stores share what it built, whatever they ask for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CacheConfig {
-    /// Memory budget across both slots.
+    /// Memory budget across block, auxiliary, and lookup retention.
     pub(crate) memory: Option<u64>,
     /// The block slot's disk device, when one is configured.
     pub(crate) dir: Option<PathBuf>,
     /// That device's byte cap.
     pub(crate) disk_size: Option<u64>,
     /// Percent of each budget the auxiliary slot takes, in both memory and
-    /// disk. Unset keeps the derived share, which caps memory at 64 MiB and
-    /// takes an eightieth of a device sized for one store.
+    /// disk. Unset takes one eightieth of each budget.
     pub(crate) auxiliary_percent: Option<u32>,
 }
 
@@ -83,19 +91,26 @@ pub(crate) struct CacheConfig {
 const MAX_AUXILIARY_PERCENT: u32 = 50;
 
 impl CacheConfig {
+    fn lookup_share(&self) -> u64 {
+        self.memory.unwrap_or(DEFAULT_CACHE_MEMORY).max(2) / 8
+    }
+
     /// Bytes for scoped Parquet metadata and for the one cache SlateDB
     /// metadata and data blocks share.
     fn slots(&self) -> (u64, u64) {
         let budget = self.memory.unwrap_or(DEFAULT_CACHE_MEMORY).max(2);
         let auxiliary_metadata = self.auxiliary_share(budget);
-        let shared = budget.saturating_sub(auxiliary_metadata).max(1);
+        let shared = budget
+            .saturating_sub(auxiliary_metadata)
+            .saturating_sub(self.lookup_share())
+            .max(1);
 
         (auxiliary_metadata, shared)
     }
 
     /// The auxiliary slot's bytes out of `budget`: the share asked for, or
     /// the standing one an eightieth wide. Both come out of the budget, so
-    /// the two slots always sum to it.
+    /// lookup retention and the two slots always sum to it.
     fn auxiliary_share(&self, budget: u64) -> u64 {
         match self.auxiliary_percent {
             Some(percent) => {
@@ -298,6 +313,12 @@ pub struct CacheStatus {
     pub auxiliary_metadata_occupancy_bytes: u64,
     /// Parsed Parquet metadata entries evicted since the cache was built.
     pub auxiliary_metadata_evictions: u64,
+    /// Memory reserved for process-wide lookup directories and revision
+    /// results.
+    pub lookup_capacity_bytes: u64,
+    /// Estimated retained lookup bytes, including containers and admitted
+    /// values still held by readers after eviction.
+    pub lookup_occupancy_bytes: u64,
     /// The row summaries resident within the auxiliary allowance, by shape.
     pub row_summaries: RowSummaryOccupancy,
 }
@@ -995,6 +1016,8 @@ pub fn cache_status() -> CacheStatus {
         auxiliary_metadata_capacity_bytes: auxiliary_capacity,
         auxiliary_metadata_occupancy_bytes: auxiliary_usage,
         auxiliary_metadata_evictions: AUXILIARY_METADATA_EVICTIONS.load(Ordering::Relaxed),
+        lookup_capacity_bytes: config.lookup_share(),
+        lookup_occupancy_bytes: lookup_budget().used(),
         row_summaries: data_file::row_summary_occupancy(),
     }
 }
@@ -1351,6 +1374,7 @@ async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc
 /// Applies the first attach's sizing to the process: the auxiliary
 /// allowance, and where the auxiliary cache keeps its disk tier.
 async fn settle(config: &CacheConfig) {
+    LOOKUP_BUDGET.get_or_init(|| retention::Budget::new(config.lookup_share()));
     let (auxiliary_metadata_bytes, shared_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
     let (auxiliary_disk, _) = config.disk_slots();
@@ -1688,7 +1712,7 @@ mod tests {
             ..CacheConfig::default()
         };
         let (auxiliary, shared) = config.slots();
-        assert_eq!(auxiliary + shared, 1_000);
+        assert_eq!(auxiliary + shared + config.lookup_share(), 1_000);
         assert!(auxiliary < shared);
     }
 
@@ -1697,14 +1721,17 @@ mod tests {
     #[test]
     fn an_unset_budget_matches_one_stores_defaults() {
         let (auxiliary, shared) = CacheConfig::default().slots();
-        assert_eq!(auxiliary + shared, DEFAULT_CACHE_MEMORY);
+        assert_eq!(
+            auxiliary + shared + CacheConfig::default().lookup_share(),
+            DEFAULT_CACHE_MEMORY
+        );
         assert_eq!(auxiliary, 8 * 1024 * 1024);
-        assert_eq!(shared, 632 * 1024 * 1024);
+        assert_eq!(shared, 552 * 1024 * 1024);
         assert!(metadata_ceiling(shared) > 4 * 120 * 1024 * 1024);
     }
 
-    /// The parsed-metadata allowance scales with the budget up to its
-    /// ceiling, and is deducted from the shared slot.
+    /// The parsed-metadata allowance scales with the budget and is deducted
+    /// from the shared slot.
     #[test]
     fn the_auxiliary_allowance_scales_with_the_budget() {
         let allowance = |memory: u64| {
@@ -1940,12 +1967,11 @@ mod tests {
         assert_eq!(metadata_shortfall(625_189_215, 625_189_215), None);
         assert_eq!(metadata_shortfall(625_189_215, 850_604_851), None);
 
-        // Priority lifts the default ceiling from 120 MiB to 568 MiB, which
-        // still leaves the store that prompted the check short.
+        // Metadata protection covers 90% of the block share after lookup retention.
         let (_, shared) = CacheConfig::default().slots();
         assert_eq!(
             metadata_shortfall(625_189_215, metadata_ceiling(shared)),
-            Some(28_759_187)
+            Some(104_256_659)
         );
     }
 
@@ -2030,7 +2056,7 @@ mod tests {
         let derived = config(None);
         let (auxiliary, shared) = derived.slots();
         assert_eq!(auxiliary, 8_000_000_000 / 80);
-        assert_eq!(auxiliary + shared, 8_000_000_000);
+        assert_eq!(auxiliary + shared + 1_000_000_000, 8_000_000_000);
         let (auxiliary_disk, store_disk) = derived.disk_slots();
         assert_eq!(auxiliary_disk, 20 * 1024 * 1024 * 1024 / 80);
         assert_eq!(auxiliary_disk + store_disk, 20 * 1024 * 1024 * 1024);
@@ -2039,7 +2065,7 @@ mod tests {
         let asked = config(Some(10));
         let (auxiliary, shared) = asked.slots();
         assert_eq!(auxiliary, 800_000_000);
-        assert_eq!(auxiliary + shared, 8_000_000_000);
+        assert_eq!(auxiliary + shared + 1_000_000_000, 8_000_000_000);
         let (auxiliary_disk, store_disk) = asked.disk_slots();
         assert_eq!(auxiliary_disk, 2 * 1024 * 1024 * 1024);
         assert_eq!(auxiliary_disk + store_disk, 20 * 1024 * 1024 * 1024);
@@ -2058,6 +2084,6 @@ mod tests {
             auxiliary,
             8_000_000_000 / 100 * u64::from(MAX_AUXILIARY_PERCENT)
         );
-        assert!(shared >= auxiliary);
+        assert!(shared + config(Some(90)).lookup_share() >= auxiliary);
     }
 }

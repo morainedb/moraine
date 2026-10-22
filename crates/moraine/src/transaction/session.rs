@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use slatedb::{DbReader, DbTransaction, WriteHandle};
 
 use crate::{
+    MemoryReservation,
     error::{Error, Result},
     store::handle::ReadHandle,
     transaction::commit::StagedWrite,
@@ -17,7 +18,24 @@ use crate::{
 pub(crate) struct CommitSession {
     inner: Inner,
     /// Every write staged, in order, for the slot the batch becomes.
-    staged: Mutex<Vec<StagedWrite>>,
+    staged: Mutex<Staged>,
+    memory_limit: u64,
+}
+
+#[derive(Default)]
+struct Staged {
+    writes: Vec<StagedWrite>,
+    memory: Option<MemoryReservation>,
+    failure: Option<String>,
+}
+
+impl Staged {
+    fn check(&self) -> Result<()> {
+        match &self.failure {
+            Some(error) => Err(Error::Constraint(error.clone())),
+            None => Ok(()),
+        }
+    }
 }
 
 enum Inner {
@@ -40,17 +58,29 @@ impl std::fmt::Debug for CommitSession {
 impl CommitSession {
     /// The folder's session over `tx`.
     pub(crate) fn folder(tx: DbTransaction) -> Self {
-        Self {
-            inner: Inner::Folder(tx),
-            staged: Mutex::new(Vec::new()),
-        }
+        Self::new(Inner::Folder(tx))
     }
 
     /// A committer's session over `reader`.
     pub(crate) fn committer(reader: Arc<DbReader>) -> Self {
+        Self::new(Inner::Committer(reader))
+    }
+
+    fn new(inner: Inner) -> Self {
+        let mut staged = Staged::default();
+        let memory_limit = match std::env::var("MORAINE_COMMIT_MEMORY_BYTES") {
+            Ok(value) => value.parse::<u64>().ok().filter(|value| *value > 0),
+            Err(std::env::VarError::NotPresent) => Some(256 * 1024 * 1024),
+            Err(_) => None,
+        };
+        if memory_limit.is_none() {
+            staged.failure =
+                Some("MORAINE_COMMIT_MEMORY_BYTES must be a positive byte count".into());
+        }
         Self {
-            inner: Inner::Committer(reader),
-            staged: Mutex::new(Vec::new()),
+            inner,
+            staged: Mutex::new(staged),
+            memory_limit: memory_limit.unwrap_or(0),
         }
     }
 
@@ -73,13 +103,7 @@ impl CommitSession {
     ///
     /// The store's error if the folder's transaction refuses the write.
     pub(crate) fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
-        let (key, value) = (key.as_ref(), value.as_ref());
-        if let Inner::Folder(tx) = &self.inner {
-            tx.put(key, value).map_err(Error::from)?;
-        }
-        self.record((key.to_vec(), Some(value.to_vec())));
-
-        Ok(())
+        self.record(key.as_ref(), Some(value.as_ref()))
     }
 
     /// Stages one delete.
@@ -88,28 +112,75 @@ impl CommitSession {
     ///
     /// The store's error if the folder's transaction refuses the write.
     pub(crate) fn delete(&self, key: impl AsRef<[u8]>) -> Result<()> {
-        let key = key.as_ref();
-        if let Inner::Folder(tx) = &self.inner {
-            tx.delete(key).map_err(Error::from)?;
+        self.record(key.as_ref(), None)
+    }
+
+    fn record(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
+        staged.check()?;
+        let result: Result<()> = (|| {
+            let added = (key.len() as u64)
+                .saturating_add(value.map_or(0, |value| value.len() as u64))
+                .saturating_add(128 + size_of::<StagedWrite>() as u64)
+                .saturating_mul(2);
+            self.admit(&mut staged, added)?;
+            if let Inner::Folder(tx) = &self.inner {
+                match value {
+                    Some(value) => tx.put(key, value),
+                    None => tx.delete(key),
+                }
+                .map_err(Error::from)?;
+            }
+            staged
+                .writes
+                .push((key.to_vec(), value.map(<[u8]>::to_vec)));
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            staged.failure = Some(error.to_string());
         }
-        self.record((key.to_vec(), None));
-
-        Ok(())
+        result
     }
 
-    fn record(&self, write: StagedWrite) {
-        self.staged
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(write);
+    fn admit(&self, staged: &mut Staged, added: u64) -> Result<()> {
+        staged.check()?;
+        let total = staged
+            .memory
+            .as_ref()
+            .map_or(0, MemoryReservation::bytes)
+            .saturating_add(added);
+        if total > self.memory_limit {
+            return Err(Error::Constraint(format!(
+                "commit memory exceeds {} bytes; split the transaction or raise MORAINE_COMMIT_MEMORY_BYTES",
+                self.memory_limit
+            )));
+        }
+        match &mut staged.memory {
+            Some(memory) => memory.resize(total),
+            memory @ None => {
+                MemoryReservation::reserve(total).map(|reserved| *memory = Some(reserved))
+            }
+        }
     }
 
-    /// Every write staged so far, in order.
-    pub(crate) fn staged(&self) -> Vec<StagedWrite> {
-        self.staged
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    /// Admits translation scratch space before constructing the store batch.
+    pub(crate) fn reserve_translation(&self, bytes: u64) -> Result<()> {
+        let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = self.admit(&mut staged, bytes);
+        if let Err(error) = &result {
+            staged.failure = Some(error.to_string());
+        }
+        result
+    }
+
+    /// Transfers the log batch without copying it, retaining its admission.
+    pub(crate) fn take_staged(&mut self) -> Result<(Vec<StagedWrite>, Option<MemoryReservation>)> {
+        let staged = self
+            .staged
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        staged.check()?;
+        Ok((std::mem::take(&mut staged.writes), staged.memory.take()))
     }
 
     /// Discards the session.
@@ -128,6 +199,14 @@ impl CommitSession {
     /// The store's error, kinds intact: a transaction conflict is a lost
     /// race to the caller.
     pub(crate) async fn commit(self) -> std::result::Result<Option<WriteHandle>, slatedb::Error> {
+        if let Err(error) = self
+            .staged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .check()
+        {
+            return Err(slatedb::Error::invalid(error.to_string()));
+        }
         match self.inner {
             Inner::Folder(tx) => tx.commit().await,
             Inner::Committer(_) => Ok(None),
@@ -153,12 +232,12 @@ mod tests {
         db.close().await.unwrap();
         let reader = Arc::new(DbReader::builder("", store).build().await.unwrap());
 
-        let session = CommitSession::committer(reader.clone());
+        let mut session = CommitSession::committer(reader.clone());
         assert!(!session.is_folder());
         session.put(b"k", b"v").unwrap();
         session.delete(b"gone").unwrap();
         assert_eq!(
-            session.staged(),
+            session.take_staged().unwrap().0,
             vec![
                 (b"k".to_vec(), Some(b"v".to_vec())),
                 (b"gone".to_vec(), None)
@@ -168,5 +247,22 @@ mod tests {
         assert!(session.commit().await.unwrap().is_none());
         assert!(reader.get(b"k").await.unwrap().is_none());
         reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_translation_prevents_committing_an_accepted_prefix() {
+        let store = Arc::new(InMemory::new());
+        let db = Db::builder("translation-budget", store)
+            .build()
+            .await
+            .unwrap();
+        let mut session =
+            CommitSession::folder(db.begin(slatedb::IsolationLevel::Snapshot).unwrap());
+        session.memory_limit = 1024;
+        session.put(b"first", b"small").unwrap();
+        assert!(session.put(b"large", vec![0; 4096]).is_err());
+        assert!(session.commit().await.is_err());
+        assert!(db.get(b"first").await.unwrap().is_none());
+        db.close().await.unwrap();
     }
 }

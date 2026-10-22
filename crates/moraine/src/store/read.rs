@@ -527,7 +527,39 @@ pub(crate) fn decode_history_record(key: Key, bytes: &[u8]) -> Result<EntityReco
     }
 }
 
+/// Visits decoded records without retaining an intermediate scan result.
+pub(crate) async fn visit_entity_records(
+    handle: ReadHandle<'_>,
+    historical: bool,
+    mut visit: impl FnMut(EntityRecord) -> Result<()>,
+) -> Result<()> {
+    let subspace = if historical {
+        Subspace::History
+    } else {
+        Subspace::Current
+    };
+    let mut iterator = handle
+        .scan_prefix(subspace_prefix(subspace), .., ScanShape::Streaming)
+        .await?;
+    let mut count = 0_usize;
+    while let Some(entry) = iterator.next().await? {
+        let key = Key::decode(&entry.key)?;
+        let record = if historical {
+            decode_history_record(key, &entry.value)?
+        } else {
+            decode_current_record(key, &entry.value)?
+        };
+        visit(record)?;
+        count += 1;
+        if count.is_multiple_of(1024) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
 /// Every live entity record.
+#[cfg(any(test, feature = "fault-injection"))]
 pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     scan_decode_subspace(
         handle,
@@ -539,6 +571,7 @@ pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<
 }
 
 /// Every ended entity-version record.
+#[cfg(test)]
 pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     scan_decode_subspace(
         handle,
@@ -555,7 +588,13 @@ pub(crate) async fn scan_current_records(handle: ReadHandle<'_>) -> Result<Recor
         handle,
         Subspace::Current,
         current_entity_kind_prefix,
-        |encoded, key, bytes| Ok((encoded, Arc::new(decode_current_record(key, &bytes)?))),
+        |encoded, key, bytes| {
+            let memory = crate::MemoryReservation::reserve(
+                (bytes.len() as u64).saturating_mul(4).saturating_add(512),
+            )?;
+            let encoded = memory.into_bytes(encoded)?;
+            Ok((encoded, Arc::new(decode_current_record(key, &bytes)?)))
+        },
     )
     .await?;
 
@@ -568,7 +607,13 @@ pub(crate) async fn scan_history_records(handle: ReadHandle<'_>) -> Result<Recor
         handle,
         Subspace::History,
         history_entity_kind_prefix,
-        |encoded, key, bytes| Ok((encoded, Arc::new(decode_history_record(key, &bytes)?))),
+        |encoded, key, bytes| {
+            let memory = crate::MemoryReservation::reserve(
+                (bytes.len() as u64).saturating_mul(4).saturating_add(512),
+            )?;
+            let encoded = memory.into_bytes(encoded)?;
+            Ok((encoded, Arc::new(decode_history_record(key, &bytes)?)))
+        },
     )
     .await?;
 

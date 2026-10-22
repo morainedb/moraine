@@ -583,7 +583,7 @@ Every column list is transcribed verbatim from
 pinned DuckLake source (`src/storage/ducklake_metadata_manager.cpp`).
 `not null` marks only columns DuckLake itself declares `NOT NULL`/`PRIMARY
 KEY`. `moraine-duckdb`'s C++ source is the single source of truth
-(`cpp/metadata_tables.cpp`'s `MetadataTableSpecsImpl`); this table is a
+(`cpp/metadata_table_specs.cpp`'s `MetadataTableSpecsImpl`); this table is a
 human-readable mirror of it.
 
 | Table | Fed from | Notes |
@@ -599,8 +599,8 @@ human-readable mirror of it.
 | `ducklake_table_stats` | `moraine_dump_table_stats` | unversioned |
 | `ducklake_table_column_stats` | `moraine_dump_table_column_stats` | unversioned |
 | `ducklake_file_column_stats` | `moraine_dump_file_column_stats` | unversioned |
-| `ducklake_metadata` | synthesized in C++, no ABI call | see below |
-| `ducklake_schema_versions` | `moraine_dump_schema_versions` (`ProvideSchemaVersions`) | one row per `(table_id, schema_version)` transition |
+| `ducklake_metadata` | store facts plus `moraine_dump_options` | staged reads overlay option changes |
+| `ducklake_schema_versions` | `moraine_dump_schema_versions` | one row per `(table_id, schema_version)` transition |
 | `ducklake_inlined_data_tables` | `moraine_inline_registered_tables` (`ProvideInlinedDataTables`) | every `(table_id, schema_version)` with a recorded `inline/schema`; see "Data inlining" below — writable only as a no-op (`kVoidInsertable`), since `CreateInlineDataTable` already stages the registration this table's own `INSERT` would double-register |
 | `ducklake_partition_info` | `moraine_dump_partition_info` | current + history rows; partition columns embed in the spec's record |
 | `ducklake_partition_column` | `moraine_dump_partition_columns` | flattened from the spec records' embedded columns |
@@ -610,18 +610,11 @@ human-readable mirror of it.
 | `ducklake_tag` | `moraine_dump_tags` | one row per embedded entry of the object's container record, ended entries included (each carries its own begin/end) |
 | `ducklake_column_tag` | `moraine_dump_column_tags` | flattened from each column's latest record — a column version transition carries entries forward, so only that record's set is emitted |
 | `ducklake_files_scheduled_for_deletion` | `moraine_dump_scheduled_deletions` | the physical-deletion schedule (`current/gcfile`, keyed by the scheduled file's id); written by expiry/compaction, drained by `ducklake_cleanup_old_files` |
-| `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_file_variant_stats`, `ducklake_column_mapping`, `ducklake_name_mapping` | always empty | store models none of these kinds — a missing table is a bind-time error even for a query that would return zero rows (see below) |
+| `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_file_variant_stats`, `ducklake_column_mapping`, `ducklake_name_mapping` | corresponding `moraine_dump_*` providers | empty when the store has no records of that kind |
 
-Every table DuckLake's own schema defines is served, either with real data
-or as an always-empty stand-in; none are left unbound. This is required:
-`DuckLakeMetadataManager::BuildCatalogForSnapshot`, the query DuckLake's own
-attach/snapshot-load always runs, joins and correlated-subqueries
-`ducklake_tag`, `ducklake_column_tag`, `ducklake_inlined_data_tables`,
-`ducklake_macro(_impl/_parameters)`, and `ducklake_partition_info`/`_column`
-unconditionally while resolving basic table/view/schema info — a *missing*
-table is a bind-time `Catalog Error` even though the query would otherwise
-return zero rows for it. So absent store-modeled data means an empty table
-(`ProvideEmpty` in `cpp/metadata_tables.cpp`), never an absent SQL table.
+Every table DuckLake queries is registered, even when its provider returns no
+rows. DuckLake's catalog queries join these tables unconditionally; a missing
+table would fail binding before its emptiness could matter.
 
 The exists-probe `SELECT NULL FROM ducklake_metadata LIMIT 1` references
 zero real columns; DuckDB's optimizer only takes that "virtual column" scan
@@ -643,7 +636,7 @@ DuckLake's `ducklake_column.column_type`, read back through its own
 *different*, lowercase vocabulary instead (`"int64"`, `"float64"`,
 `"timestamptz"`, ...); serving the stored string verbatim throws `Invalid
 Input Error: Failed to parse DuckLake type - unsupported type 'BIGINT'`. One
-translation point (`DuckLakeColumnType` in `cpp/metadata_tables.cpp`)
+translation point (`DuckLakeColumnType` in `cpp/metadata_table_specs.cpp`)
 reparses the stored SQL string through `MapColumnType`, then names the
 resulting `LogicalTypeId` DuckLake's way — never two independently
 maintained type tables. Every type `MapColumnType` supports maps exactly,

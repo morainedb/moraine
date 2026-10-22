@@ -10,6 +10,27 @@ use proptest::prelude::*;
 use super::{DenseRanges, FIRST_RETRY_SKIP};
 use crate::{Catalog, CatalogOptions, ColumnDef, DataFile, DataFileId, DataStore, TableId};
 
+#[test]
+fn retained_size_includes_deferred_files_and_paths() {
+    let store = DataStore::new(Arc::new(InMemory::new()));
+    let scope = super::DirectoryScope {
+        store: &store,
+        data_prefix: "",
+        table_prefix: "",
+        table: TableId::new(1),
+        stats: None,
+    };
+    let mut directory = super::FileDirectory::empty(&scope);
+    let empty = directory.estimated_bytes();
+    directory.deferred.insert(1, (0, 100));
+    directory.data_prefix = "prefix".repeat(100);
+    directory.table_prefix = "table".repeat(100);
+    let added = size_of::<(u64, (u64, u64))>()
+        + directory.data_prefix.capacity()
+        + directory.table_prefix.capacity();
+    assert!(directory.estimated_bytes() >= empty + added as u64);
+}
+
 /// Writes `rows` values with no row-id column to `path`, returning the
 /// file and footer sizes the catalog records.
 async fn write_dense_file(store: &InMemory, path: &str, rows: u64) -> (u64, u64) {
@@ -125,6 +146,19 @@ async fn warm_table() -> WarmTable {
     assert_eq!(warm.catalog.row_lookups.summarized_files(), 4);
 
     warm
+}
+
+#[tokio::test]
+async fn file_lookups_remain_correct_without_directory_retention() {
+    let warm = warm_table().await;
+    let expected = warm.locate(vec![4, 10, 50]).await;
+    let held = super::super::lookup(&warm.catalog.row_lookups.files, warm.table).unwrap();
+    *warm.catalog.row_lookups.files.write().unwrap() = super::super::Directories::new(0);
+
+    assert_eq!(warm.locate(vec![4, 10, 50]).await, expected);
+    assert!(super::super::lookup(&warm.catalog.row_lookups.files, warm.table).is_none());
+    assert_eq!(held.place(&[4]).0[&4], vec![warm.ids[1]]);
+    warm.catalog.close().await.unwrap();
 }
 
 /// Positioning reuses verified summaries only for the same immutable file and
@@ -522,7 +556,7 @@ fn missing_file(ordinal: u64) -> DataFile {
 /// Registers a file that cannot be summarized against a warm table,
 /// returning its id and the summary count once its read has failed once.
 async fn warm_table_with_unreadable_file() -> (WarmTable, DataFileId, u64) {
-    let warm = warm_table().await;
+    let warm = Box::pin(warm_table()).await;
     let table = warm.table;
     let added = Cell::new(None);
     warm.catalog
@@ -784,4 +818,17 @@ async fn selection_defers_only_files_whose_bounds_exclude_every_requested_id() {
     assert!(next.is_empty(), "a file read back is no longer deferred");
 
     warm.catalog.close().await.unwrap();
+}
+
+#[test]
+fn directory_weights_include_decoded_file_fields_and_spare_strings() {
+    let mut file = super::DataFileValue {
+        path: String::with_capacity(1024),
+        ..Default::default()
+    };
+    file.path.push('x');
+    assert!(
+        super::retained_file_bytes(&file)
+            >= (size_of::<super::DataFileValue>() + file.path.capacity()) as u64
+    );
 }

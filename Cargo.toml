@@ -20,6 +20,8 @@ dhat = "0.3"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 # Diff iterator misses updates past a shared leaf before 7.0.2; regression pinned in commit/diff.rs.
 imbl = "7.0.2"
+hashbrown = { version = "0.17.1", default-features = false }
+lru-slab = "0.1.2"
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.7.0" }
 # 0.22.6 is the floor slatedb pins, and it is what sets the workspace MSRV.
@@ -39,6 +41,7 @@ slatedb = "0.17.0"
 slatedb-common = "0.17.0"
 storekey = "0.11"
 stats_alloc = "0.1"
+tempfile = "3"
 thiserror = "2"
 tokio = "1"
 tracing = "0.1"

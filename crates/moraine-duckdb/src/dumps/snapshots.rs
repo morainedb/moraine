@@ -3,10 +3,9 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_c_string, opt_into_raw};
+use super::{conversion::dump_row, dump_rows, free_rows};
 use crate::{
-    abi::{free_c_string, to_c_string},
-    error::{AbiError, MoraineError},
+    error::MoraineError,
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -36,36 +35,13 @@ pub struct MoraineSnapshotRow {
     pub commit_extra_info: *mut c_char,
 }
 
-/// Converts snapshot records to C rows.
-pub(crate) fn snapshot_rows(
-    rows: Vec<moraine::ffi_support::SnapshotRecord>,
-) -> Result<Vec<MoraineSnapshotRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut v| {
-            let changes_made = to_c_string(std::mem::take(&mut v.changes_made))?;
-            let author = opt_c_string(v.author.as_deref())?;
-            let commit_message = opt_c_string(v.commit_message.as_deref())?;
-            let commit_extra_info = opt_c_string(v.commit_extra_info.as_deref())?;
-            Ok((v, changes_made, author, commit_message, commit_extra_info))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-    Ok(owned
-        .into_iter()
-        .map(
-            |(v, changes_made, author, commit_message, commit_extra_info)| MoraineSnapshotRow {
-                snapshot_id: v.snapshot_id,
-                snapshot_time_micros: v.snapshot_time_micros,
-                schema_version: v.schema_version,
-                next_catalog_id: v.next_catalog_id,
-                next_file_id: v.next_file_id,
-                changes_made: changes_made.into_raw(),
-                author: opt_into_raw(author),
-                commit_message: opt_into_raw(commit_message),
-                commit_extra_info: opt_into_raw(commit_extra_info),
-            },
-        )
-        .collect())
+dump_row! {
+    moraine::ffi_support::SnapshotRecord => MoraineSnapshotRow {
+        values { snapshot_id, snapshot_time_micros, schema_version, next_catalog_id, next_file_id }
+        optional {}
+        strings { changes_made }
+        optional_strings { author, commit_message, commit_extra_info }
+    }
 }
 
 /// Dumps every `ducklake_snapshot` row into `*out_items`/`*out_len`.
@@ -98,7 +74,6 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
             probe_ctx,
             err,
             moraine::ffi_support::dump_snapshots,
-            snapshot_rows,
         )
     }
 }
@@ -113,12 +88,7 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
 pub unsafe extern "C" fn moraine_dump_snapshots_free(items: *mut MoraineSnapshotRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |d| {
-            free_c_string(d.changes_made);
-            free_c_string(d.author);
-            free_c_string(d.commit_message);
-            free_c_string(d.commit_extra_info);
-        });
+        free_rows(items, len);
     }
 }
 
@@ -136,24 +106,13 @@ pub struct MoraineSchemaVersionRow {
     pub table_id: u64,
 }
 
-/// Converts core `ducklake_schema_versions` records into the C row shape.
-/// Shared by the committed dump and the transaction-aware one, so the two can
-/// never drift in what they report.
-// Infallible — this kind's row carries no strings — but it keeps the
-// fallible signature every converter shares, so `dump_rows` and the
-// transaction-aware dumps take them all the same way.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn schema_version_rows(
-    rows: Vec<moraine::ffi_support::SchemaVersionRow>,
-) -> Result<Vec<MoraineSchemaVersionRow>, AbiError> {
-    Ok(rows
-        .into_iter()
-        .map(|v| MoraineSchemaVersionRow {
-            begin_snapshot: v.begin_snapshot,
-            schema_version: v.schema_version,
-            table_id: v.table_id,
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::SchemaVersionRow => MoraineSchemaVersionRow {
+        values { begin_snapshot, schema_version, table_id }
+        optional {}
+        strings {}
+        optional_strings {}
+    }
 }
 
 /// Dumps every `ducklake_schema_versions` row into
@@ -185,7 +144,6 @@ pub unsafe extern "C" fn moraine_dump_schema_versions(
             probe_ctx,
             err,
             moraine::ffi_support::dump_schema_versions,
-            schema_version_rows,
         )
     }
 }
@@ -203,6 +161,6 @@ pub unsafe extern "C" fn moraine_dump_schema_versions_free(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |_row| {});
+        free_rows(items, len);
     }
 }

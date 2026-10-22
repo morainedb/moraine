@@ -237,6 +237,58 @@ fn staged_file_readers_preserve_row_group_counts() {
     );
 }
 
+/// Catalog shapes stay independent when both versions share a DuckDB instance.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
+fn mixed_catalog_versions_preserve_their_shapes_in_either_attach_order() {
+    let stable = TempDir::new("mixed-stable-store");
+    let extended = TempDir::new("mixed-extended-store");
+    let data = TempDir::new("mixed-version-data");
+    for store in [&stable, &extended] {
+        run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "CREATE TABLE lake.main.t(a BIGINT);",
+        );
+    }
+    raise(extended.path(), ", confirm => true");
+
+    for (first, second, first_extended) in [(&stable, &extended, false), (&extended, &stable, true)]
+    {
+        let sql = format!(
+            "ATTACH 'moraine:{}' AS other;
+             SELECT database_name, table_name, count(*) FROM duckdb_columns()
+             WHERE database_name IN ('m', 'other') AND table_name IN (
+                 'ducklake_schema', 'ducklake_data_file', 'ducklake_delete_file',
+                 'ducklake_file_column_stats', 'ducklake_table_column_stats',
+                 'ducklake_view_column_tag')
+             GROUP BY database_name, table_name ORDER BY database_name, table_name;",
+            second.path().display()
+        );
+        let mut expected = Vec::new();
+        for (alias, is_extended) in [("m", first_extended), ("other", !first_extended)] {
+            for (table, base, added) in [
+                ("ducklake_data_file", 16, 1),
+                ("ducklake_delete_file", 13, 1),
+                ("ducklake_file_column_stats", 10, 2),
+                ("ducklake_schema", 7, 1),
+                ("ducklake_table_column_stats", 7, 2),
+            ] {
+                let width = base + if is_extended { added } else { 0 };
+                expected.push(vec![alias.to_owned(), table.to_owned(), width.to_string()]);
+            }
+            if is_extended {
+                expected.push(vec![
+                    alias.to_owned(),
+                    EXTENDED_ONLY_TABLE.to_owned(),
+                    "6".to_owned(),
+                ]);
+            }
+        }
+        assert_eq!(csv_rows(&run_standalone_sql(first.path(), &sql)), expected);
+    }
+}
+
 /// A raise that would record refuses without an acknowledgement, and
 /// records nothing when it refuses. A dry run needs none: it is the
 /// pre-flight for the door.

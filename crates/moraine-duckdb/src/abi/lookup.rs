@@ -42,31 +42,43 @@ unsafe fn abi_located_row_ids(
     probe_ctx: *mut c_void,
     table_id: moraine::TableId,
     lookup: impl Future<Output = moraine::Result<Vec<u64>>>,
-) -> Result<Vec<MoraineRowId>, AbiError> {
+) -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
     let reads = handle_ref.catalog.reads();
     // SAFETY: caller contract for `probe`/`probe_ctx`.
-    let located = unsafe {
+    let (located, mut memory) = unsafe {
         handle_ref.block_on_cancellable(probe, probe_ctx, async {
             let row_ids = lookup.await?;
-            reads
+            let memory = moraine::MemoryReservation::reserve(
+                (row_ids.len() as u64).saturating_mul(2 * size_of::<MoraineRowId>() as u64),
+            )?;
+            let located = reads
                 .locate_row_ids(
                     handle_ref.data_store.clone(),
                     &handle_ref.data_prefix,
                     table_id,
                     row_ids,
                 )
-                .await
+                .await?;
+            Ok::<_, moraine::Error>((located, memory))
         })
     }?;
 
-    Ok(located
-        .into_iter()
-        .map(|candidate| MoraineRowId {
-            value: candidate.row_id,
-            data_file_id: candidate.data_file_id.map_or(0, moraine::DataFileId::get),
-            has_data_file_id: candidate.data_file_id.is_some(),
-        })
-        .collect())
+    memory.resize(
+        memory
+            .bytes()
+            .max((located.len() as u64).saturating_mul(2 * size_of::<MoraineRowId>() as u64)),
+    )?;
+    Ok((
+        located
+            .into_iter()
+            .map(|candidate| MoraineRowId {
+                value: candidate.row_id,
+                data_file_id: candidate.data_file_id.map_or(0, moraine::DataFileId::get),
+                has_data_file_id: candidate.data_file_id.is_some(),
+            })
+            .collect(),
+        memory,
+    ))
 }
 
 /// The table, index, and table columns an index entry point names.
@@ -261,7 +273,7 @@ pub unsafe extern "C" fn moraine_index_lookup(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
         if values_len == 0 {
             return Err(AbiError::invalid_argument("index lookup: no value given"));
         }
@@ -353,7 +365,7 @@ pub unsafe extern "C" fn moraine_index_in(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
         if keys.is_null() && keys_len != 0 {
             return Err(AbiError::invalid_argument(
                 "`keys` is null but its length is nonzero",
@@ -475,7 +487,7 @@ pub unsafe extern "C" fn moraine_index_range(
 ) -> i32 {
     use std::ops::Bound;
 
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
         let lower_empty = lower_values.is_null() || lower_len == 0;
         let upper_empty = upper_values.is_null() || upper_len == 0;
         if lower_empty && upper_empty {
@@ -585,7 +597,7 @@ pub unsafe extern "C" fn moraine_index_nulls(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
         if prefix_len == 0 {
             return Err(AbiError::invalid_argument(
                 "index nulls: the prefix names no predicate",

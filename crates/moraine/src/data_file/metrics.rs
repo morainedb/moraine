@@ -162,7 +162,22 @@ impl ScopedReadMetrics {
 }
 
 /// Runs Arrow-to-index encoding off the async executor under one shared bound.
-pub(crate) async fn run_bounded_index_encoding<T, F>(work: F) -> Result<T>
+pub(crate) async fn run_bounded_index_encoding<T, F>(
+    memory: Arc<crate::MemoryReservation>,
+    work: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    run_index_encoding(memory, work, Arc::clone(&INDEX_ENCODING_PERMITS)).await
+}
+
+async fn run_index_encoding<T, F>(
+    memory: Arc<crate::MemoryReservation>,
+    work: F,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -176,14 +191,14 @@ where
     let unit = tokio::spawn(async move {
         // Process-wide, so one catalog's encoding starves every other one's;
         // named here because a caller parked on it is otherwise silent.
-        let permit = crate::telemetry::reporting_phase(
-            "index-encoding-permit",
-            Arc::clone(&INDEX_ENCODING_PERMITS).acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            Error::Interrupted("index encoding limiter stopped before work began".to_owned())
-        })?;
+        let permit =
+            crate::telemetry::reporting_phase("index-encoding-permit", permits.acquire_owned())
+                .await
+                .map_err(|_| {
+                    Error::Interrupted(
+                        "index encoding limiter stopped before work began".to_owned(),
+                    )
+                })?;
         // The permit is held until this blocking work returns, and a blocking
         // task cannot be cancelled: work that never returns removes a permit
         // from the process for good. Reporting the hold names the holder,
@@ -192,14 +207,84 @@ where
             "index-encoding-hold",
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _memory = memory;
                 work()
             }),
         )
         .await
         .map_err(|error| Error::Interrupted(format!("index encoding worker stopped: {error}")))?
     });
+    let _cancel = AbortEncoding(unit.abort_handle());
     unit.await
         .map_err(|error| Error::Interrupted(format!("index encoding unit stopped: {error}")))?
+}
+
+struct AbortEncoding(tokio::task::AbortHandle);
+
+impl Drop for AbortEncoding {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_queued_encoding_never_runs() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permits = slots.acquire().await.unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let running = Arc::clone(&ran);
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let memory = Arc::new(crate::MemoryReservation::reserve(0).unwrap());
+        let mut work = Box::pin(run_index_encoding(
+            memory,
+            move || {
+                running.store(true, Ordering::Relaxed);
+                let _ = finished.send(());
+                Ok(())
+            },
+            Arc::clone(&slots),
+        ));
+        assert!(futures::poll!(work.as_mut()).is_pending());
+        tokio::task::yield_now().await;
+        drop(work);
+        drop(permits);
+        let _ = tokio::time::timeout(Duration::from_secs(5), completion)
+            .await
+            .unwrap();
+        assert!(!ran.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn cancelled_running_encoding_retains_its_admission() {
+        let memory = Arc::new(crate::MemoryReservation::reserve(8192).unwrap());
+        let held = Arc::downgrade(&memory);
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_bounded_index_encoding(memory, move || {
+            let _ = started.send(());
+            finish.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        }));
+        running.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let retained = held.upgrade().is_some();
+        release.send(()).unwrap();
+        assert!(retained);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while held.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
 
 /// Process-wide counts of what published row summaries have done, so a

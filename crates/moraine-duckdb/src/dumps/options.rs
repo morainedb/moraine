@@ -6,10 +6,9 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_c_string, opt_into_raw, opt_u64};
+use super::{conversion::dump_row, dump_rows, free_rows};
 use crate::{
-    abi::{free_c_string, to_c_string},
-    error::{AbiError, MoraineError},
+    error::MoraineError,
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -28,35 +27,13 @@ pub struct MoraineOptionRow {
     pub scope_id: u64,
 }
 
-/// Converts core `ducklake_metadata` records into the C row shape. Shared by
-/// the committed dump and the transaction-aware one, so the two can never
-/// drift in what they report.
-pub(crate) fn option_rows(
-    rows: Vec<moraine::ffi_support::OptionRow>,
-) -> Result<Vec<MoraineOptionRow>, AbiError> {
-    let owned = rows
-        .into_iter()
-        .map(|mut row| {
-            let key = to_c_string(std::mem::take(&mut row.key))?;
-            let value = to_c_string(std::mem::take(&mut row.value))?;
-            let scope = opt_c_string(row.scope.as_deref())?;
-            Ok((row, key, value, scope))
-        })
-        .collect::<Result<Vec<_>, AbiError>>()?;
-
-    Ok(owned
-        .into_iter()
-        .map(|(row, key, value, scope)| {
-            let (has_scope_id, scope_id) = opt_u64(row.scope_id);
-            MoraineOptionRow {
-                key: key.into_raw(),
-                value: value.into_raw(),
-                scope: opt_into_raw(scope),
-                has_scope_id,
-                scope_id,
-            }
-        })
-        .collect())
+dump_row! {
+    moraine::ffi_support::OptionRow => MoraineOptionRow {
+        values {}
+        optional { scope_id => has_scope_id }
+        strings { key, value }
+        optional_strings { scope }
+    }
 }
 
 /// Dumps every stored `ducklake_metadata` row into
@@ -88,7 +65,6 @@ pub unsafe extern "C" fn moraine_dump_options(
             probe_ctx,
             err,
             moraine::ffi_support::dump_options,
-            option_rows,
         )
     }
 }
@@ -103,10 +79,6 @@ pub unsafe extern "C" fn moraine_dump_options(
 pub unsafe extern "C" fn moraine_dump_options_free(items: *mut MoraineOptionRow, len: usize) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        free_rows(items, len, |row| {
-            free_c_string(row.key);
-            free_c_string(row.value);
-            free_c_string(row.scope);
-        });
+        free_rows(items, len);
     }
 }

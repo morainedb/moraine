@@ -498,6 +498,11 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 		return std::nullopt;
 	}
 	auto &table = info->table;
+	auto &lake = table.ParentCatalog().Cast<duckdb::DuckLakeCatalog>();
+	auto metadata = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(lake.MetadataDatabaseName()));
+	if (!metadata || metadata->GetCatalogType() != "moraine") {
+		return std::nullopt;
+	}
 	auto transaction = info->GetTransaction();
 	if (!transaction || table.IsTransactionLocal()) {
 		return std::nullopt;

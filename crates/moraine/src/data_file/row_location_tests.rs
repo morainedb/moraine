@@ -379,3 +379,97 @@ async fn publishing_skips_a_file_whose_ids_are_derivable() {
         "a dense file must not get a summary it does not need"
     );
 }
+
+/// A failed sidecar write is reported and a later pass can finish it.
+#[tokio::test]
+async fn publishing_reports_write_failures_and_recovers() {
+    let memory = Arc::new(InMemory::new());
+    let path = Path::from("retry.parquet");
+    let size = write_fixture(&memory, &path, &batch_with_embedded_row_ids(&[9, 2, 7])).await;
+    let root = std::env::temp_dir().join(format!("moraine-publish-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("retry.parquet.rowsum")).unwrap();
+    let local = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap());
+    local
+        .put(
+            &path,
+            memory
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let file = || ParquetFile::new(DataStore::new(local.clone()), path.clone(), size, 0);
+    let failed = publish_if_missing(file(), 1, 1, None).await;
+    std::fs::remove_dir(root.join("retry.parquet.rowsum")).unwrap();
+    let retried = publish_if_missing(file(), 1, 1, None).await;
+    let checkpoint = publish_if_missing(file(), 1, 1, None).await;
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        failed.is_err(),
+        "a failed write must not count as a published summary"
+    );
+    assert!(retried.unwrap());
+    assert!(
+        !checkpoint.unwrap(),
+        "a successful sidecar is durable retry progress"
+    );
+}
+
+/// Overlapping passes build one sidecar for an immutable file.
+#[tokio::test]
+async fn concurrent_publishing_shares_one_file_build() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("concurrent.parquet");
+    let size = write_fixture(&store, &path, &batch_with_embedded_row_ids(&[9, 2, 7])).await;
+    let store = DataStore::new(store);
+    let file = || ParquetFile::new(store.clone(), path.clone(), size, 0);
+    let (first, second) = tokio::join!(
+        publish_if_missing(file(), 1, 1, None),
+        publish_if_missing(file(), 1, 1, None),
+    );
+    assert_eq!(
+        usize::from(first.unwrap()) + usize::from(second.unwrap()),
+        1
+    );
+}
+
+#[tokio::test]
+async fn summary_row_limit_refuses_a_file_before_reading_its_column() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("summary-limit.parquet");
+    let batch = batch_with_embedded_row_ids(&[10, 20, 30]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+    let file = ParquetFile::new(DataStore::new(store.clone()), path, file_size, 0);
+    let error = super::row_location::read_row_ids_limited(file.clone(), None, 2)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("summary memory"));
+    let rows = super::row_location::read_row_ids_limited(file, None, 3)
+        .await
+        .unwrap();
+    assert_eq!(rows.positions_of(&[10, 30]), vec![Some(0), Some(2)]);
+}
+
+#[tokio::test]
+async fn requested_positions_stream_without_a_whole_file_summary() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("streamed-positions.parquet");
+    let batch = batch_with_embedded_row_ids(&[30, 10, 30, 20]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+    let file = ParquetFile::new(DataStore::new(store), path, file_size, 0);
+    assert!(
+        super::row_location::read_row_ids_limited(file.clone(), None, 2)
+            .await
+            .is_err()
+    );
+    let (positions, missing) = super::row_location::requested_positions(file, None, &[30, 99, 20])
+        .await
+        .unwrap();
+    assert_eq!(positions, vec![0, 2, 3]);
+    assert_eq!(missing, Some(99));
+}

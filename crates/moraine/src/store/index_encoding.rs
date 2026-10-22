@@ -257,7 +257,7 @@ pub struct OrderedColumn {
 /// The canonical encoding of an index's ordered column values: the
 /// storekey-framed concatenation of the per-column component encodings,
 /// held as one opaque byte string.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CanonicalKey(Bytes);
 
 // Coded as a storekey byte string rather than by the derive, which routes a

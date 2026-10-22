@@ -184,10 +184,19 @@ fn fold_record(half: &mut RecordHalf, write: &BatchWrite<'_>) {
             records.remove(write.encoded_key());
         }
         Ok(Some(DecodedValue::Record(record))) => {
-            records.insert(
-                Bytes::copy_from_slice(write.encoded_key()),
-                Arc::new(record),
-            );
+            let key = crate::MemoryReservation::reserve(
+                record
+                    .estimated_bytes()
+                    .saturating_mul(4)
+                    .saturating_add(512),
+            )
+            .and_then(|memory| memory.into_bytes(Bytes::copy_from_slice(write.encoded_key())));
+            match key {
+                Ok(key) => {
+                    records.insert(key, Arc::new(record));
+                }
+                Err(_) => *half = None,
+            }
         }
         _ => *half = None,
     }

@@ -1,11 +1,8 @@
 //! Snapshot-scoped directories for selective row lookups.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use imbl::OrdMap;
@@ -20,13 +17,15 @@ use crate::{
     },
 };
 
+mod directories;
 pub(super) mod files;
 pub(super) mod inline;
 
-/// Table directories kept per source kind.
-const DIRECTORY_CAPACITY: usize = 256;
+use directories::{Directories, Directory};
 
-#[derive(Default)]
+use crate::store::cache::retention::Shared;
+
+#[cfg_attr(test, derive(Default))]
 pub(super) struct RowLookupCache {
     files: RwLock<Directories<FileDirectory>>,
     inline: RwLock<Directories<InlineDirectory>>,
@@ -42,6 +41,17 @@ pub(super) struct RowLookupCache {
 }
 
 impl RowLookupCache {
+    pub(super) fn shared() -> Self {
+        Self {
+            files: RwLock::new(Directories::shared()),
+            inline: RwLock::new(Directories::shared()),
+            summarized_files: AtomicU64::new(0),
+            inline_directory_builds: AtomicU64::new(0),
+            inline_tombstone_scans: AtomicU64::new(0),
+            summary_probes: AtomicU64::new(0),
+        }
+    }
+
     fn note_summarized(&self, files: usize) {
         self.summarized_files
             .fetch_add(u64::try_from(files).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -90,89 +100,33 @@ impl RowLookupCache {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         files
-            .directories()
-            .map(|directory| directory.bytes)
-            .sum::<u64>()
-            .saturating_add(
-                inline
-                    .directories()
-                    .map(|directory| directory.ranges.estimated_bytes())
-                    .sum(),
-            )
+            .estimated_bytes()
+            .saturating_add(inline.estimated_bytes())
     }
 }
 
-/// At most `DIRECTORY_CAPACITY` table directories, each stamped with its
-/// last use so the least recently used one is evicted first.
-struct Directories<T> {
-    entries: HashMap<TableId, Held<T>>,
-    clock: AtomicU64,
-}
-
-struct Held<T> {
-    directory: Arc<T>,
-    used: AtomicU64,
-}
-
-impl<T> Default for Directories<T> {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            clock: AtomicU64::new(0),
-        }
+impl Directory for FileDirectory {
+    fn retained_bytes(&self) -> u64 {
+        self.bytes
     }
 }
 
-impl<T> Directories<T> {
-    /// The directory held for `table`, stamped as just used.
-    fn get(&self, table: TableId) -> Option<Arc<T>> {
-        let held = self.entries.get(&table)?;
-        held.used.store(
-            self.clock.fetch_add(1, Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-
-        Some(Arc::clone(&held.directory))
-    }
-
-    /// Holds `directory` for `table`, evicting the least recently used one
-    /// when at capacity.
-    fn insert(&mut self, table: TableId, directory: Arc<T>) {
-        if self.entries.len() >= DIRECTORY_CAPACITY
-            && !self.entries.contains_key(&table)
-            && let Some(evicted) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, held)| held.used.load(Ordering::Relaxed))
-                .map(|(table, _)| *table)
-        {
-            self.entries.remove(&evicted);
-        }
-
-        let used = AtomicU64::new(self.clock.fetch_add(1, Ordering::Relaxed));
-        self.entries.insert(table, Held { directory, used });
-    }
-
-    fn directories(&self) -> impl Iterator<Item = &T> {
-        self.entries.values().map(|held| held.directory.as_ref())
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
+impl Directory for InlineDirectory {
+    fn retained_bytes(&self) -> u64 {
+        (size_of::<Self>() as u64).saturating_add(self.ranges.estimated_bytes())
     }
 }
 
-/// The directory held for `table`, if any.
-fn lookup<T>(cache: &RwLock<Directories<T>>, table: TableId) -> Option<Arc<T>> {
+fn lookup<T: Directory>(cache: &RwLock<Directories<T>>, table: TableId) -> Option<Shared<T>> {
     cache
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(table)
 }
 
-/// Holds `directory` for `table`; active readers own their copies.
-fn install<T>(cache: &RwLock<Directories<T>>, table: TableId, directory: Arc<T>) {
+/// Active readers keep their directory even when it exceeds the retention
+/// limit.
+fn install<T: Directory>(cache: &RwLock<Directories<T>>, table: TableId, directory: Shared<T>) {
     cache
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -203,7 +157,7 @@ struct FileDirectory {
     /// summarizes it then, so nothing is placed against a file whose
     /// bounds are unknown.
     deferred: OrdMap<u64, (u64, u64)>,
-    /// Encoded size of `files`, carried across refreshes.
+    /// Estimated decoded size of `files`, carried across refreshes.
     file_bytes: u64,
     bytes: u64,
 }
@@ -290,40 +244,9 @@ impl<T> Intervals<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
-
     use proptest::prelude::*;
 
-    use super::{DIRECTORY_CAPACITY, Directories, Intervals, install, lookup};
-    use crate::catalog::TableId;
-
-    /// Past capacity, the directory unused for longest is the one evicted.
-    #[test]
-    fn eviction_drops_the_least_recently_used_directory() {
-        let cache = RwLock::new(Directories::default());
-        let table = |id: usize| TableId::new(u64::try_from(id).unwrap());
-        for id in 0..DIRECTORY_CAPACITY {
-            install(&cache, table(id), Arc::new(id));
-        }
-
-        assert!(lookup(&cache, table(0)).is_some());
-        install(
-            &cache,
-            table(DIRECTORY_CAPACITY),
-            Arc::new(DIRECTORY_CAPACITY),
-        );
-
-        assert_eq!(cache.read().unwrap().len(), DIRECTORY_CAPACITY);
-        assert!(
-            lookup(&cache, table(0)).is_some(),
-            "the directory just used was evicted"
-        );
-        assert!(
-            lookup(&cache, table(1)).is_none(),
-            "the directory unused for longest survived"
-        );
-        assert!(lookup(&cache, table(DIRECTORY_CAPACITY)).is_some());
-    }
+    use super::Intervals;
 
     #[test]
     fn interval_lookup_keeps_nested_ranges_and_domain_endpoints() {

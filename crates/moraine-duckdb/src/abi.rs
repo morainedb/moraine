@@ -23,6 +23,7 @@ mod fault;
 mod indexes;
 mod lookup;
 mod maintenance;
+pub(crate) mod memory;
 mod positions;
 mod read_scope;
 mod row_scan;
@@ -145,51 +146,57 @@ pub(crate) unsafe fn free_c_string(ptr: *mut c_char) {
     drop(unsafe { CString::from_raw(ptr) });
 }
 
-/// Hands a `Vec<T>` to C as a heap array: writes the (pointer, length)
-/// pair through `out_items`/`out_len`. Callers build `items` owned-first:
-/// every `CString` in the batch converts before any raw pointer is minted,
-/// so a partial failure leaks nothing.
+/// Transfers an admitted array to C; its paired free releases the allowance.
 ///
 /// # Safety
-///
-/// `out_items` and `out_len` must be valid, writable pointers for the
-/// duration of this call.
-pub(crate) unsafe fn write_array<T>(items: Vec<T>, out_items: *mut *mut T, out_len: *mut usize) {
-    let boxed = items.into_boxed_slice();
+/// The output pointers must be valid writable slots.
+pub(crate) unsafe fn write_reserved_array<T>(
+    items: Vec<T>,
+    memory: moraine::MemoryReservation,
+    out_items: *mut *mut T,
+    out_len: *mut usize,
+) {
+    let mut boxed = items.into_boxed_slice();
+    if !boxed.is_empty() {
+        memory::retain(boxed.as_mut_ptr() as usize, memory);
+    }
     let len = boxed.len();
-    let ptr = Box::into_raw(boxed).cast::<T>();
-    // SAFETY: caller contract above.
+    let pointer = Box::into_raw(boxed).cast::<T>();
+    // SAFETY: caller provides valid output slots.
     unsafe {
+        *out_items = pointer;
         *out_len = len;
-        *out_items = ptr;
     }
 }
 
-/// Reclaims an array written by [`write_array`], running `drop_elem` on
-/// every element first (to release any owned C strings inside) before
+/// Reclaims an array written by [`write_reserved_array`], running `drop_elem`
+/// on every element first (to release any owned C strings inside) before
 /// dropping the backing allocation.
 ///
 /// # Safety
 ///
 /// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`write_array`] call, not yet freed.
+/// matching [`write_reserved_array`] call, not yet freed.
 pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: impl FnMut(&mut T)) {
     if items.is_null() {
         return;
     }
+    // Remove the entry before the allocator can reuse this address.
+    let _memory = memory::take(items as usize);
     // SAFETY: caller contract above.
     let slice = unsafe { std::slice::from_raw_parts_mut(items, len) };
     for elem in &mut *slice {
         drop_elem(elem);
     }
     let raw_slice = ptr::slice_from_raw_parts_mut(items, len);
-    // SAFETY: reconstructs the exact `Box<[T]>` `write_array` produced.
+    // SAFETY: reconstructs the exact `Box<[T]>` `write_reserved_array` produced.
     drop(unsafe { Box::from_raw(raw_slice) });
 }
 
 /// The shared shell of a snapshot list export: null-check the outputs,
 /// borrow the snapshot, run `produce` under the panic/error guard, and write
-/// the array (see [`write_array`] for the owned-first rule on `produce`).
+/// the array (see [`write_reserved_array`] for the owned-first rule on
+/// `produce`).
 ///
 /// # Safety
 ///
@@ -202,7 +209,7 @@ unsafe fn snapshot_list<Row>(
     err: *mut MoraineError,
     produce: impl FnOnce(&moraine::CatalogSnapshot) -> Result<Vec<Row>, AbiError>,
 ) -> i32 {
-    let attempt = || -> Result<Vec<Row>, AbiError> {
+    let attempt = || -> Result<(Vec<Row>, moraine::MemoryReservation), AbiError> {
         if snapshot.is_null() {
             return Err(AbiError::invalid_argument("`snapshot` is null"));
         }
@@ -210,18 +217,32 @@ unsafe fn snapshot_list<Row>(
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         // SAFETY: caller contract for `snapshot`.
-        produce(unsafe { &(*snapshot).snapshot })
+        let snapshot = unsafe { &(*snapshot).snapshot };
+        let memory = snapshot.reserve_copy()?;
+        Ok((produce(snapshot)?, memory))
     };
 
     // SAFETY: `err` validity is the caller's contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, memory)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe { write_reserved_array(items, memory, out_items, out_len) };
             codes::OK
         }
         Err(code) => code,
     }
+}
+
+pub(crate) fn reserve_array<Row>(
+    length: usize,
+    payload: u64,
+) -> Result<moraine::MemoryReservation, AbiError> {
+    moraine::MemoryReservation::reserve(
+        (length as u64)
+            .saturating_mul(2 * size_of::<Row>() as u64)
+            .saturating_add(payload),
+    )
+    .map_err(AbiError::from)
 }
 
 /// The shared shell of a handle list export: null-check the handle and
@@ -237,9 +258,11 @@ unsafe fn handle_list<Row>(
     out_items: *mut *mut Row,
     out_len: *mut usize,
     err: *mut MoraineError,
-    produce: impl FnOnce(&MoraineCatalogHandle) -> Result<Vec<Row>, AbiError>,
+    produce: impl FnOnce(
+        &MoraineCatalogHandle,
+    ) -> Result<(Vec<Row>, moraine::MemoryReservation), AbiError>,
 ) -> i32 {
-    let attempt = || -> Result<Vec<Row>, AbiError> {
+    let attempt = || -> Result<(Vec<Row>, moraine::MemoryReservation), AbiError> {
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -252,9 +275,9 @@ unsafe fn handle_list<Row>(
 
     // SAFETY: `err` validity is the caller's contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, memory)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe { write_reserved_array(items, memory, out_items, out_len) };
             codes::OK
         }
         Err(code) => code,

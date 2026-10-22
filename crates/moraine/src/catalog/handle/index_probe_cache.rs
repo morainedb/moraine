@@ -1,13 +1,14 @@
 //! Bounded probe results shared by read scopes at the same store revision.
 
-use std::{collections::VecDeque, ops::Bound, sync::Mutex};
+use std::ops::Bound;
 
+use super::revision_memo::RevisionMemo;
 use crate::{IndexId, TableId, store::index_encoding::CanonicalKey};
 
 const CAPACITY: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum Probe {
     Many(Vec<CanonicalKey>),
     Range(Bound<CanonicalKey>, Bound<CanonicalKey>, bool),
@@ -33,32 +34,22 @@ impl Probe {
     }
 }
 
-struct Entry {
-    revision: u64,
-    table: TableId,
-    index: IndexId,
-    probe: Probe,
-    rows: Vec<u64>,
-    bytes: usize,
-}
+pub(super) struct IndexProbeCache(RevisionMemo<(IndexId, Probe), Vec<u64>>);
 
-#[derive(Default)]
-struct Entries {
-    values: VecDeque<Entry>,
-    bytes: usize,
+#[cfg(test)]
+impl Default for IndexProbeCache {
+    fn default() -> Self {
+        Self(RevisionMemo::new(CAPACITY, MAX_ENTRIES))
+    }
 }
-
-#[derive(Default)]
-pub(super) struct IndexProbeCache(Mutex<Entries>);
 
 impl IndexProbeCache {
+    pub(super) fn shared() -> Self {
+        Self(RevisionMemo::shared(CAPACITY, MAX_ENTRIES))
+    }
+
     pub(super) fn estimated_bytes(&self) -> u64 {
-        let entries = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let spare = (entries.values.capacity() - entries.values.len()) * size_of::<Entry>();
-        u64::try_from(entries.bytes + spare).unwrap_or(u64::MAX)
+        self.0.estimated_bytes()
     }
 
     pub(super) fn get(
@@ -68,26 +59,18 @@ impl IndexProbeCache {
         index: IndexId,
         probe: &Probe,
     ) -> Option<Vec<u64>> {
-        let mut entries = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let position = entries.values.iter().position(|entry| {
-            entry.revision == revision
-                && entry.table == table
-                && entry.index == index
-                && &entry.probe == probe
-        })?;
-        let entry = entries.values.remove(position)?;
-        let rows = entry.rows.clone();
-        entries.values.push_front(entry);
-        drop(entries);
+        let rows = self.0.get_matching(
+            revision,
+            table,
+            &(index, probe),
+            |(candidate_index, candidate)| *candidate_index == index && candidate == probe,
+        )?;
         tracing::debug!(
             table_id = table.get(),
             index_id = index.get(),
             "index probe reused"
         );
-        Some(rows)
+        Some(rows.as_ref().clone())
     }
 
     pub(super) fn put(
@@ -98,44 +81,25 @@ impl IndexProbeCache {
         probe: Probe,
         rows: &[u64],
     ) {
-        let bytes = size_of::<Entry>() + probe.bytes() + size_of_val(rows);
-        if bytes > CAPACITY {
+        let probe_bytes = probe.bytes();
+        let bytes = probe_bytes
+            .saturating_add(size_of::<Vec<u64>>())
+            .saturating_add(size_of_val(rows));
+        if !self.0.can_hold(bytes) {
             return;
         }
-        let mut entries = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(position) = entries.values.iter().position(|entry| {
-            entry.revision == revision
-                && entry.table == table
-                && entry.index == index
-                && entry.probe == probe
-        }) && let Some(previous) = entries.values.remove(position)
-        {
-            entries.bytes -= previous.bytes;
-        }
-        while entries.bytes + bytes > CAPACITY || entries.values.len() >= MAX_ENTRIES {
-            let Some(oldest) = entries.values.pop_back() else {
-                break;
-            };
-            entries.bytes -= oldest.bytes;
-        }
-        entries.values.push_front(Entry {
+        self.0.put_cloned(
             revision,
             table,
-            index,
-            probe,
-            rows: rows.to_vec(),
-            bytes,
-        });
-        entries.bytes += bytes;
-        let retained_bytes = entries.bytes;
-        drop(entries);
+            (index, probe),
+            rows,
+            probe_bytes,
+            size_of_val(rows),
+        );
         tracing::debug!(
             table_id = table.get(),
             index_id = index.get(),
-            retained_bytes,
+            retained_bytes = self.estimated_bytes(),
             "index probe cached"
         );
     }
@@ -173,6 +137,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn borrowed_probes_find_every_owned_mode() {
+        let cache = IndexProbeCache::default();
+        let key = CanonicalKey::empty();
+        let probes = [
+            Probe::Many(vec![key.clone()]),
+            Probe::Range(Bound::Included(key.clone()), Bound::Unbounded, false),
+            Probe::Range(Bound::Excluded(key.clone()), Bound::Unbounded, false),
+            Probe::Range(Bound::Included(key.clone()), Bound::Unbounded, true),
+            Probe::Nulls(key.clone(), false),
+            Probe::Nulls(key, true),
+            Probe::Limited(Box::new(Probe::Many(vec![])), 1),
+            Probe::Limited(Box::new(Probe::Many(vec![])), 2),
+        ];
+        for (position, probe) in probes.iter().enumerate() {
+            cache.put(
+                1,
+                TableId::new(1),
+                IndexId::new(1),
+                probe.clone(),
+                &[position as u64],
+            );
+        }
+        for (position, probe) in probes.iter().enumerate() {
+            assert_eq!(
+                cache.get(1, TableId::new(1), IndexId::new(1), probe),
+                Some(vec![position as u64])
+            );
+        }
+    }
+
+    #[test]
     fn identities_modes_and_eviction_do_not_alias() {
         let cache = IndexProbeCache::default();
         let table = TableId::new(1);
@@ -196,7 +191,7 @@ mod tests {
         cache.put(2, table, index, probe.clone(), &rows);
         cache.put(3, table, index, probe.clone(), &rows);
         assert_eq!(cache.get(1, table, index, &probe), None);
-        assert!(cache.0.lock().unwrap().bytes <= CAPACITY);
+        assert!(cache.estimated_bytes() <= CAPACITY as u64);
         assert_eq!(cache.get(3, table, index, &probe), Some(rows));
     }
 }
