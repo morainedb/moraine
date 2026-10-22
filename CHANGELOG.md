@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/morainedb/moraine/compare/v0.7.0...v0.8.0) - 2026-10-22
+
+### Added
+
+- [**breaking**] store the parent a nested schema records ([#347](https://github.com/morainedb/moraine/pull/347))
+- [**breaking**] bring the DuckDB 2.0.0 release into main ([#344](https://github.com/morainedb/moraine/pull/344))
+- store a VARIANT column and the statistics its files carry ([#342](https://github.com/morainedb/moraine/pull/342))
+- demote takes a lake off its commit log ([#336](https://github.com/morainedb/moraine/pull/336))
+- [**breaking**] fold on a cadence, refresh instead of polling, over the commit log ([#332](https://github.com/morainedb/moraine/pull/332))
+- [**breaking**] bring the DuckDB 2.0 line into main ([#327](https://github.com/morainedb/moraine/pull/327))
+- run the maintenance pass from any committer, with compaction left to another process ([#325](https://github.com/morainedb/moraine/pull/325))
+- a committer takes the store when the tail is long and keeps it ([#322](https://github.com/morainedb/moraine/pull/322))
+- commit through the commit log, as the folder or over a reader ([#320](https://github.com/morainedb/moraine/pull/320))
+- commit-log plug boundary ([#319](https://github.com/morainedb/moraine/pull/319))
+- write the write-ahead log to a store of its own ([#286](https://github.com/morainedb/moraine/pull/286))
+- reclaim published row summaries in the maintenance pass ([#280](https://github.com/morainedb/moraine/pull/280))
+- publish a file's row summary beside the file it describes ([#279](https://github.com/morainedb/moraine/pull/279))
+- let an attach size the auxiliary cache's share ([#276](https://github.com/morainedb/moraine/pull/276))
+- say which phase of an index lookup took the time ([#273](https://github.com/morainedb/moraine/pull/273))
+- report the data store's reads beside the catalog's own ([#272](https://github.com/morainedb/moraine/pull/272))
+- position a located change's rows when it runs, not when it binds ([#270](https://github.com/morainedb/moraine/pull/270))
+- report both halves of an index read's bind ([#262](https://github.com/morainedb/moraine/pull/262))
+- report what locating a deletion's positions spent ([#256](https://github.com/morainedb/moraine/pull/256))
+- a load hook for a build that wraps the extension's core ([#324](https://github.com/morainedb/moraine/pull/324))
+- build the extension for DuckDB v1.5.6 ([#282](https://github.com/morainedb/moraine/pull/282))
+- let a located update take per-row values ([#258](https://github.com/morainedb/moraine/pull/258))
+
+### Fixed
+
+- isolate commit-log sessions and writer fold cursors ([#350](https://github.com/morainedb/moraine/pull/350))
+- a cache grant survives a peer's reclaim until its insert lands ([#337](https://github.com/morainedb/moraine/pull/337))
+- a lake with no compactor stops folding, rather than stopping ([#335](https://github.com/morainedb/moraine/pull/335))
+- a holder fenced unseen closes quietly ([#323](https://github.com/morainedb/moraine/pull/323))
+- count the probe window's disk-tier reads where filters land ([#281](https://github.com/morainedb/moraine/pull/281))
+- stream a dead index's sweep and say how far it has got ([#268](https://github.com/morainedb/moraine/pull/268))
+- keep a staged build's in-flight plans polled while its window is full ([#267](https://github.com/morainedb/moraine/pull/267))
+- take the index-encoding permit on a task the caller cannot park ([#266](https://github.com/morainedb/moraine/pull/266))
+- keep row ids through flush and compaction, and unstall located updates ([#265](https://github.com/morainedb/moraine/pull/265))
+- give the slow-open advice once, and keep records out of parsed output ([#248](https://github.com/morainedb/moraine/pull/248))
+- let a flush exceed the per-commit ceiling ([#254](https://github.com/morainedb/moraine/pull/254))
+- reclaim the inlined data of tables the catalog no longer records ([#247](https://github.com/morainedb/moraine/pull/247))
+- report the pinned store revision as the catalog version ([#341](https://github.com/morainedb/moraine/pull/341))
+- make a DuckLake merge always write the row-id column ([#269](https://github.com/morainedb/moraine/pull/269))
+- let an empty selection update nothing ([#260](https://github.com/morainedb/moraine/pull/260))
+
+### Other
+
+- both inline inserts open before either of them commits ([#340](https://github.com/morainedb/moraine/pull/340))
+- hold the crates.io release while slatedb is patched ([#334](https://github.com/morainedb/moraine/pull/334))
+- the competing writes that squeeze the cache go one at a time ([#333](https://github.com/morainedb/moraine/pull/333))
+- fan out scoped reads and admit them against one bound ([#289](https://github.com/morainedb/moraine/pull/289))
+- *(deps)* Bump roaring from 0.11.3 to 0.11.5 ([#284](https://github.com/morainedb/moraine/pull/284))
+- drop the DuckLake backfill patch and locate hunks by context ([#283](https://github.com/morainedb/moraine/pull/283))
+- move to slatedb 0.17 ([#278](https://github.com/morainedb/moraine/pull/278))
+- keep a chunk's probes in flight against each other ([#277](https://github.com/morainedb/moraine/pull/277))
+- read only the files a locate's row ids can be in ([#275](https://github.com/morainedb/moraine/pull/275))
+- measure what a batched index lookup's probes actually cost ([#274](https://github.com/morainedb/moraine/pull/274))
+- confirm inlined rows with one tombstone scan, not one per row ([#271](https://github.com/morainedb/moraine/pull/271))
+- locate a probe's rows and read the deletion ledger once per revision ([#263](https://github.com/morainedb/moraine/pull/263))
+- *(deps)* bump arrow and parquet to 60.0.0 ([#261](https://github.com/morainedb/moraine/pull/261))
+- clear a table's inlined deletions in one operation ([#255](https://github.com/morainedb/moraine/pull/255))
+- enforce C and C++ formatting and static analysis ([#349](https://github.com/morainedb/moraine/pull/349))
+- let a summary scan read UUID columns ([#257](https://github.com/morainedb/moraine/pull/257))
+
 ## [0.7.0](https://github.com/morainedb/moraine/compare/v0.6.5...v0.7.0) - 2026-09-20
 
 ### Added
