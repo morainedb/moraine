@@ -2,17 +2,26 @@ name: Validate the extension
 # Prove every uploaded build in the engine its users run: load the artifact
 # into the stock CLI for the DuckDB it was built for, on a runner of that
 # platform, and exercise the bundled DuckLake's patch series. Called by the
-# two workflows that publish, each after its build.
+# two workflows that publish, each after its build, with the releases that
+# build covered.
 on:
   workflow_call:
+    inputs:
+      duckdb_versions:
+        description: JSON array of the DuckDB releases to prove a build for.
+        required: true
+        type: string
 
 jobs:
   validate:
-    name: Validate ${{ matrix.platform }}
+    name: Validate ${{ matrix.duckdb_version }} on ${{ matrix.target.platform }}
     strategy:
       fail-fast: false
+      # Every release the manifest supports, on every platform a release
+      # publishes: a build nothing loads is a build nobody proved.
       matrix:
-        include:
+        duckdb_version: ${{ fromJson(inputs.duckdb_versions) }}
+        target:
           - platform: linux_amd64
             runner: ubuntu-24.04
           - platform: linux_arm64
@@ -23,12 +32,12 @@ jobs:
           # it both run under Rosetta.
           - platform: osx_amd64
             runner: macos-15
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
-          name: moraine-v2.0.0-extension-${{ matrix.platform }}
+          name: moraine-${{ matrix.duckdb_version }}-extension-${{ matrix.target.platform }}
           path: artifact
       - uses: Swatinem/rust-cache@v2
       # Declared after rust-cache so this save fires before rust-cache's
@@ -36,7 +45,8 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: target/duckdb-cli
-          key: duckdb-cli-${{ matrix.platform }}-${{ hashFiles('.github/duckdb-versions') }}
+          key: duckdb-cli-${{ matrix.target.platform }}-${{ matrix.duckdb_version }}
       - run: >-
-          cargo run -q -p xtask -- validate-release-artifact v2.0.0
-          ${{ matrix.platform }} artifact/moraine.duckdb_extension
+          cargo run -q -p xtask -- validate-release-artifact
+          ${{ matrix.duckdb_version }} ${{ matrix.target.platform }}
+          artifact/moraine.duckdb_extension

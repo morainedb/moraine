@@ -6,10 +6,11 @@
 //! differs from the one in its metadata footer, so the pin is not a
 //! preference — it decides which engine can load the artifact at all. It
 //! is also named in several places that cannot be derived from one another
-//! (two git submodules, a Rust constant, two workflow files, a README
-//! table), and a bump that misses one produces an artifact that builds,
-//! passes CI, and then fails to load. This makes that a build failure
-//! instead.
+//! (two git submodules, a Rust constant, the debug build's input defaults,
+//! a README table), and a bump that misses one produces an artifact that
+//! builds, passes CI, and then fails to load. This makes that a build
+//! failure instead. The workflows that publish name no version at all:
+//! they build and prove whatever the manifest lists.
 //!
 //! The DuckLake commit rides along because it is not moraine's to pick:
 //! DuckDB hard-codes it, so a DuckDB bump moves it silently. Left
@@ -43,15 +44,18 @@ pub const DUCKLAKE_RELEASE_PINS: &str = "patches/ducklake/source-pins";
 /// release the series targets and the DuckLake revision it fetches.
 const DUCKLAKE_PATCH_TASK: &str = "xtask/src/ducklake_patch.rs";
 
-/// Every workflow naming a DuckDB version: the two that publish builds, the
-/// one that proves them, and the on-demand debug build whose default names
-/// the primary.
+/// Every workflow that touches a DuckDB version: the two that publish
+/// builds, the one that proves them, and the on-demand debug build.
 const WORKFLOWS: [&str; 4] = [
     ".github/workflows/extension.yml",
     ".github/workflows/release.yml",
     VALIDATION_WORKFLOW,
-    ".github/workflows/debug-build.yml",
+    DEBUG_BUILD_WORKFLOW,
 ];
+
+/// The one workflow naming a version outright: its on-demand inputs default
+/// to the primary pin. The others take every version from the manifest.
+const DEBUG_BUILD_WORKFLOW: &str = ".github/workflows/debug-build.yml";
 
 /// The workflows that build the extension, and so have to prove the build
 /// they produce before publishing it.
@@ -66,6 +70,21 @@ pub const VALIDATION_WORKFLOW: &str = ".github/workflows/validate-extension.yml"
 /// How much of a commit `duckdb_extensions()` reports as
 /// `extension_version`, and so how much the pins carry.
 const SHORT_COMMIT: usize = 8;
+
+/// Prints every supported release as a JSON array, for a workflow matrix:
+/// adding a line to `.github/duckdb-versions` is what makes CI build and
+/// prove another release.
+pub fn print_version_matrix() {
+    println!("{}", version_matrix(&supported_duckdb_versions()));
+}
+
+fn version_matrix(versions: &[String]) -> String {
+    let entries: Vec<String> = versions
+        .iter()
+        .map(|version| format!("\"{version}\""))
+        .collect();
+    format!("[{}]", entries.join(","))
+}
 
 /// Checks every pinned DuckDB version reference against the primary entry
 /// in `.github/duckdb-versions`, reporting all mismatches at once rather
@@ -106,13 +125,13 @@ pub fn check_pins() -> anyhow::Result<()> {
         }
     }
 
-    // Two levels of check, because the files differ in kind. In a workflow
-    // every DuckDB version is a pin, so an unlisted one is a mistake; in
-    // prose a version is often an example, so only the primary's presence
-    // is required.
+    // Workflows differ in kind. Any DuckDB version one writes down is a
+    // pin, so an unlisted one is a mistake; the publishing pair writes
+    // none, taking the whole list from the manifest, while the debug
+    // build's inputs default to the primary.
     for file in WORKFLOWS {
         let contents = read(file)?;
-        if !contents.contains(pin) {
+        if file == DEBUG_BUILD_WORKFLOW && !contents.contains(pin) {
             problems.push(format!("{file} never names the primary pin `{pin}`"));
         }
         for stale in stale_versions(&contents, &supported) {
@@ -123,10 +142,10 @@ pub fn check_pins() -> anyhow::Result<()> {
         problems.extend(tools_ref_problem(file, &contents));
         if BUILDING_WORKFLOWS.contains(&file) {
             problems.extend(smoke_problem(file, &contents));
-            problems.extend(build_version_problems(file, &contents, pin));
+            problems.extend(build_version_problems(file, &contents));
         }
     }
-    problems.extend(validation_problems(&read(VALIDATION_WORKFLOW)?, pin));
+    problems.extend(validation_problems(&read(VALIDATION_WORKFLOW)?));
 
     let readme = read(README)?;
     if !readme.contains(pin) {
@@ -192,11 +211,14 @@ pub fn check_pins() -> anyhow::Result<()> {
 /// DuckDB it names, which is what that job loads it into.
 fn smoke_problem(file: &str, contents: &str) -> Option<String> {
     let call = format!("uses: ./{VALIDATION_WORKFLOW}");
-    let gated = contents.contains(&call) && needs_job(contents, "validate");
+    let gated = contents.contains(&call)
+        && contents.contains("duckdb_versions: ${{ needs.versions.outputs.matrix }}")
+        && needs_job(contents, "validate");
     (!gated).then(|| {
         format!(
-            "{file} builds the extension without a `validate` job calling `{call}` that \
-             publishing waits on, so it would publish a build nothing loaded"
+            "{file} builds the extension without a `validate` job calling `{call}` over \
+             every built version that publishing waits on, so it would publish a build \
+             nothing loaded"
         )
     })
 }
@@ -215,17 +237,23 @@ fn needs_job(contents: &str, job: &str) -> bool {
         })
 }
 
-/// Distribution builds name the release DuckDB is checked out at, and leave
-/// `duckdb_tag` alone: the tooling calls it internal, and every version
-/// string a build stamps follows `duckdb_version`.
-fn build_version_problems(file: &str, contents: &str, pin: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    let setting = format!("duckdb_version: {pin}");
-    if !contents.contains(&setting) {
-        problems.push(format!(
-            "{file} must pass `{setting}` to the distribution build"
-        ));
-    }
+/// A distribution build takes the release DuckDB is checked out at from the
+/// manifest, one matrix leg per supported version, and leaves `duckdb_tag`
+/// alone: the tooling calls that input internal, and every version string a
+/// build stamps follows `duckdb_version`.
+fn build_version_problems(file: &str, contents: &str) -> Vec<String> {
+    let mut problems: Vec<String> = [
+        "cargo run -q -p xtask -- version-matrix",
+        "duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}",
+        "duckdb_version: ${{ matrix.duckdb_version }}",
+    ]
+    .into_iter()
+    .filter(|expected| !contents.contains(expected))
+    .map(|expected| {
+        format!("{file} must name `{expected}`, so a release the manifest adds is built")
+    })
+    .collect();
+
     if contents.contains("duckdb_tag:") {
         problems.push(format!(
             "{file} passes `duckdb_tag`, which stamps a tag onto the checkout instead of \
@@ -235,13 +263,13 @@ fn build_version_problems(file: &str, contents: &str, pin: &str) -> Vec<String> 
     problems
 }
 
-/// The smoke the validation workflow runs and the artifact name the
-/// distribution build gives it both carry the pin, so a bump that misses
-/// either reads as a missing build rather than a passing one.
-fn validation_problems(contents: &str, pin: &str) -> Vec<String> {
+/// The validation workflow loads one artifact per version it is handed, so
+/// a release the manifest adds is proven rather than merely built.
+fn validation_problems(contents: &str) -> Vec<String> {
     [
-        format!("validate-release-artifact {pin}"),
-        format!("name: moraine-{pin}-extension-"),
+        "duckdb_version: ${{ fromJson(inputs.duckdb_versions) }}",
+        "name: moraine-${{ matrix.duckdb_version }}-extension-",
+        "validate-release-artifact",
     ]
     .into_iter()
     .filter(|expected| !contents.contains(expected))
@@ -635,27 +663,30 @@ mod tests {
         }
     }
 
+    /// Every checked-in build takes the releases it builds from the manifest.
     #[test]
-    fn distribution_builds_name_the_release_they_check_out() {
+    fn distribution_builds_take_every_version_from_the_manifest() {
         for file in BUILDING_WORKFLOWS {
             let contents = read(file).expect("reading the workflow");
-            assert!(
-                build_version_problems(file, &contents, duckdb_pin()).is_empty(),
-                "{:?}",
-                build_version_problems(file, &contents, duckdb_pin())
-            );
+            let problems = build_version_problems(file, &contents);
+            assert!(problems.is_empty(), "{problems:?}");
         }
     }
 
-    /// The checked-in validation workflow loads the pin's artifacts.
+    /// The checked-in validation workflow loads one artifact per version.
     #[test]
-    fn the_validation_workflow_names_the_pin() {
+    fn the_validation_workflow_is_driven_by_the_manifest() {
         let contents = read(VALIDATION_WORKFLOW).expect("reading the workflow");
-        assert!(
-            validation_problems(&contents, duckdb_pin()).is_empty(),
-            "{:?}",
-            validation_problems(&contents, duckdb_pin())
-        );
+        let problems = validation_problems(&contents);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// The matrix a workflow reads is every supported release, as JSON.
+    #[test]
+    fn the_version_matrix_is_the_manifest_as_json() {
+        let matrix = version_matrix(&["v2.0.0".to_owned(), "v1.5.6".to_owned()]);
+
+        assert_eq!(matrix, "[\"v2.0.0\",\"v1.5.6\"]");
     }
 
     /// The patch task targets the release the manifest calls primary.
@@ -704,14 +735,15 @@ mod tests {
 
     #[test]
     fn a_build_that_publishes_without_validation_is_a_problem() {
-        let gated = format!(
-            "  validate:\n    needs: build\n    uses: ./{VALIDATION_WORKFLOW}\n  \
-             release:\n    needs: [build, validate]\n"
+        let call = format!(
+            "  validate:\n    needs: [versions, build]\n    uses: ./{VALIDATION_WORKFLOW}\n    \
+             with:\n      duckdb_versions: ${{{{ needs.versions.outputs.matrix }}}}\n"
         );
+        let gated = format!("{call}  release:\n    needs: [build, validate]\n");
         assert_eq!(smoke_problem("w.yml", &gated), None);
 
         // Calling the workflow without waiting on it publishes regardless.
-        let ungated = format!("  validate:\n    needs: build\n    uses: ./{VALIDATION_WORKFLOW}\n");
+        let ungated = call;
         let problem =
             smoke_problem("w.yml", &ungated).expect("a build nothing waits on is a problem");
         assert!(
@@ -734,14 +766,15 @@ mod tests {
         assert!(!needs_job("  validate:\n", "validate"));
     }
 
+    /// The failure this exists for: a validation workflow pinned to one
+    /// version keeps publishing the releases it never loads.
     #[test]
-    fn a_validation_workflow_for_another_version_is_a_problem() {
-        let workflow = "          name: moraine-v9.9.9-extension-${{ matrix.platform }}\n      \
-                        - run: cargo run -q -p xtask -- validate-release-artifact v9.9.9 \
-                        ${{ matrix.platform }} artifact/moraine.duckdb_extension\n";
-        assert!(validation_problems(workflow, "v9.9.9").is_empty());
+    fn a_validation_workflow_naming_one_version_is_a_problem() {
+        let problems = validation_problems(
+            "          name: moraine-v9.9.9-extension-${{ matrix.platform }}\n      \
+             - run: cargo run -q -p xtask -- validate-release-artifact v9.9.9\n",
+        );
 
-        let problems = validation_problems(workflow, "v9.9.10");
         assert_eq!(problems.len(), 2, "{problems:?}");
     }
 
