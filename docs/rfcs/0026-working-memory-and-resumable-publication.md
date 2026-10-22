@@ -91,6 +91,10 @@ writes, and packed positions use an 8 KiB scratch buffer. Library codec calls an
 individual native operations complete before cancellation can be observed; there
 is no forced interruption or hard cancellation deadline.
 
+Index encoding cancels queued workers when their caller is dropped. Running
+workers retain their input-memory allowance and CPU permit until the synchronous
+call returns, even if the scan or transaction has already been cancelled.
+
 ## Publication and warming
 
 `RowSummaryProgress::new(tables, since)` traverses an attach/backfill selection.

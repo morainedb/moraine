@@ -853,17 +853,28 @@ async fn inline_chunk_index_entries(
     if chunk.begin_snapshot > base.snapshot.snapshot_id {
         context.apply_pending_column_names(table_id, &mut columns);
     }
+    let body = chunk.body.into_bytes();
+    let memory = Arc::new(crate::MemoryReservation::reserve(
+        (body.len() as u64)
+            .saturating_mul(4)
+            .saturating_add(
+                held.map_or(0, |rows| rows.capacity() as u64)
+                    .saturating_mul(32),
+            )
+            .saturating_add(schema.fields().size() as u64)
+            .saturating_add(4096),
+    )?);
     let plan = InlineDecodePlan {
         columns,
         schema,
-        body: chunk.body.into_bytes(),
+        body,
         indexes,
         row_id_start: chunk.row_id_start,
         held: held.cloned(),
     };
 
     let metrics = Arc::clone(&context.metrics);
-    data_file::run_bounded_index_encoding(move || {
+    data_file::run_bounded_index_encoding(memory, move || {
         let started = Instant::now();
         metrics.inline_chunk();
         let result = plan.derive();

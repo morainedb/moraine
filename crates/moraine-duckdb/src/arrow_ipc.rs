@@ -87,18 +87,20 @@ impl MoraineArrowBytes {
         }
     }
 
-    /// Reclaims a buffer returned by an Arrow encoder without copying it.
+    /// Reclaims the buffer and its admission; keep both until ownership
+    /// transfers.
     ///
     /// # Safety
     ///
     /// `self` must have been minted by [`Self::from_vec`] and not consumed.
-    pub(crate) unsafe fn into_vec(self) -> Vec<u8> {
+    pub(crate) unsafe fn into_parts(self) -> (Vec<u8>, Option<moraine::MemoryReservation>) {
         if self.data.is_null() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
-        crate::abi::memory::release(self.data as usize);
+        let memory = crate::abi::memory::take(self.data as usize);
         // SAFETY: caller contract preserves the original allocation fields.
-        unsafe { Vec::from_raw_parts(self.data, self.len, self.cap) }
+        let bytes = unsafe { Vec::from_raw_parts(self.data, self.len, self.cap) };
+        (bytes, memory)
     }
 }
 
@@ -111,7 +113,8 @@ impl MoraineArrowBytes {
 pub unsafe extern "C" fn moraine_arrow_bytes_free(bytes: MoraineArrowBytes) {
     // SAFETY: caller guarantees the fields came from `from_vec` and are
     // freed once.
-    drop(unsafe { bytes.into_vec() });
+    let (buffer, _memory) = unsafe { bytes.into_parts() };
+    drop(buffer);
 }
 
 /// Runs `attempt` under [`guard`] and writes the produced C Data
@@ -486,7 +489,7 @@ mod tests {
         let capacity = bytes.capacity();
         let handed = MoraineArrowBytes::from_vec(bytes).unwrap();
         // SAFETY: handed came from from_vec and has not been consumed.
-        let returned = unsafe { handed.into_vec() };
+        let (returned, _memory) = unsafe { handed.into_parts() };
         assert_eq!(returned.as_ptr(), pointer);
         assert_eq!(returned.capacity(), capacity);
         assert_eq!(returned, b"payload");
@@ -497,10 +500,18 @@ mod tests {
         let encoded = MoraineArrowBytes::from_vec(vec![1, 2, 3, 4]).unwrap();
         let data = encoded.data;
         // SAFETY: `encoded` was just minted above and is consumed once.
-        let reclaimed = unsafe { encoded.into_vec() };
+        let (reclaimed, _memory) = unsafe { encoded.into_parts() };
 
         assert_eq!(reclaimed.as_ptr().cast_mut(), data);
         assert_eq!(reclaimed, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn reclaiming_bytes_transfers_their_memory_reservation() {
+        let encoded = MoraineArrowBytes::from_vec(Vec::with_capacity(8192)).unwrap();
+        // SAFETY: the buffer was just minted above and is consumed once.
+        let (bytes, memory) = unsafe { encoded.into_parts() };
+        assert_eq!(memory.unwrap().bytes(), bytes.capacity() as u64);
     }
 
     /// Encodes a struct array's schema-only stream and body-only chunk, as
@@ -538,7 +549,7 @@ mod tests {
         std::mem::forget(in_schema);
         assert_eq!(code, 0, "encode chunk failed");
         // SAFETY: the encoder minted this buffer and this call consumes it.
-        let body = unsafe { body_bytes.into_vec() };
+        let (body, _memory) = unsafe { body_bytes.into_parts() };
         (
             schema_bytes,
             MoraineInlineChunk::from_bytes(Bytes::from(body)),

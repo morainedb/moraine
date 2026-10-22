@@ -318,8 +318,11 @@ pub(crate) async fn scoped_read_index_entry_batches(
     )?);
     let (scope, ordinals) = scoped_selection(rows, builder.metadata(), &file.path)?;
     let ordinals = Arc::new(ordinals);
-    let decode_memory =
-        crate::data_file::reader::admit_decode(builder.metadata(), &mask, scope.groups.as_deref())?;
+    let decode_memory = Arc::new(crate::data_file::reader::admit_decode(
+        builder.metadata(),
+        &mask,
+        scope.groups.as_deref(),
+    )?);
     let builder = scope.narrow(
         builder
             .with_projection(mask)
@@ -331,13 +334,12 @@ pub(crate) async fn scoped_read_index_entry_batches(
     let metrics = Arc::clone(&file.metrics);
     Ok(arrow_reader
         .map(move |batch| {
-            let _decode_memory = &decode_memory;
             let batch = batch.map_err(corrupt("scoped read"))?;
             let batch = normalize_batch(batch, normalization.as_ref())?;
             file.metrics.arrow_batch();
             let batch_start = emitted;
             emitted = emitted.saturating_add(batch.num_rows());
-            Result::Ok((batch, batch_start))
+            Result::Ok((batch, batch_start, Arc::clone(&decode_memory)))
         })
         .map(move |prepared| {
             let projections = Arc::clone(&projections);
@@ -345,8 +347,8 @@ pub(crate) async fn scoped_read_index_entry_batches(
             let excluded_ordinals = excluded_ordinals.clone();
             let metrics = Arc::clone(&metrics);
             async move {
-                let (batch, batch_start) = prepared?;
-                run_bounded_index_encoding(move || {
+                let (batch, batch_start, memory) = prepared?;
+                run_bounded_index_encoding(memory, move || {
                     let started = Instant::now();
                     let result = record_batch_index_entries(
                         &batch,

@@ -25,15 +25,15 @@ with the Rust syntax tree, test-support files, and the fault-injection test log.
 | --- | ---: |
 | Baseline, consistently classified | 58,590 |
 | Maximum after a 25% reduction | 43,942 |
-| Current tree, including live-memory admission and publication fixes | 59,744 |
-| Further net reduction required | 15,802 |
+| Current tree, including live-memory admission and publication fixes | 59,809 |
+| Further net reduction required | 15,867 |
 
 Earlier notes quoted a 59,212-line baseline. This audit freezes a specific commit
 and corrects classification, including 598 lines of fault-injection test-log
 support previously placed in production. Reclassification is applied on both
 sides and is not credited as code removed. Census artifacts are in
 `.context/launch-census-baseline.json` and
-`.context/launch-census-admission-final.json` in this review workspace.
+`.context/launch-census-pr-reviewed.json` in this review workspace.
 
 ## Enterprise compatibility
 
@@ -55,7 +55,7 @@ is approved, and there is no currently demonstrated path to the 25% target.
 
 The remaining reduction must come from shared implementations or separately
 reviewed removals that preserve Enterprise. No measured replacement design yet
-demonstrates the required 15,802-line saving; it must not be presented as a
+demonstrates the required 15,867-line saving; it must not be presented as a
 guaranteed result.
 
 The next consolidation targets are:

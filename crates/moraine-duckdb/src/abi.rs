@@ -181,6 +181,8 @@ pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: imp
     if items.is_null() {
         return;
     }
+    // Remove the entry before the allocator can reuse this address.
+    let _memory = memory::take(items as usize);
     // SAFETY: caller contract above.
     let slice = unsafe { std::slice::from_raw_parts_mut(items, len) };
     for elem in &mut *slice {
@@ -189,7 +191,6 @@ pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: imp
     let raw_slice = ptr::slice_from_raw_parts_mut(items, len);
     // SAFETY: reconstructs the exact `Box<[T]>` `write_reserved_array` produced.
     drop(unsafe { Box::from_raw(raw_slice) });
-    memory::release(items as usize);
 }
 
 /// The shared shell of a snapshot list export: null-check the outputs,

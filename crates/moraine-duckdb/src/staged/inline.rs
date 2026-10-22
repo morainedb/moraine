@@ -60,7 +60,7 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema_owned(
 ) -> i32 {
     // Reclaim first so every return path consumes the caller's buffer.
     // SAFETY: caller contract guarantees the buffer came from the encoder.
-    let arrow_schema = unsafe { arrow_schema.into_vec() };
+    let (arrow_schema, _memory) = unsafe { arrow_schema.into_parts() };
     // SAFETY: `tx` and `err` follow this entry point's caller contract.
     unsafe {
         stage_operation(tx, err, || RowOperation::InlineSchema {
@@ -92,7 +92,7 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert_owned(
 ) -> i32 {
     // Reclaim first so every return path consumes the caller's buffer.
     // SAFETY: caller contract guarantees the buffer came from the encoder.
-    let arrow_body = unsafe { arrow_body.into_vec() };
+    let (arrow_body, _memory) = unsafe { arrow_body.into_parts() };
     // SAFETY: `tx` and `err` follow this entry point's caller contract.
     unsafe {
         stage_operation(tx, err, || RowOperation::InlineInsert {

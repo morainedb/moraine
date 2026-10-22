@@ -255,13 +255,16 @@ async fn index_encoding_workers_share_one_process_bound() {
         let active = Arc::clone(&active);
         let peak = Arc::clone(&peak);
         async move {
-            run_bounded_index_encoding(move || {
-                let held = active.fetch_add(1, Ordering::AcqRel) + 1;
-                peak.fetch_max(held, Ordering::AcqRel);
-                std::thread::sleep(Duration::from_millis(10));
-                active.fetch_sub(1, Ordering::AcqRel);
-                Ok(position)
-            })
+            run_bounded_index_encoding(
+                Arc::new(crate::MemoryReservation::reserve(0).unwrap()),
+                move || {
+                    let held = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(held, Ordering::AcqRel);
+                    std::thread::sleep(Duration::from_millis(10));
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    Ok(position)
+                },
+            )
             .await
         }
     });
@@ -2884,11 +2887,14 @@ async fn a_parked_stream_of_queued_encoders_does_not_starve_another() {
         .map(|_| {
             let holding = Arc::clone(&holding);
             let release = Arc::clone(&release);
-            tokio::spawn(run_bounded_index_encoding(move || {
-                holding.fetch_add(1, Ordering::SeqCst);
-                release.wait();
-                Ok(())
-            }))
+            tokio::spawn(run_bounded_index_encoding(
+                Arc::new(crate::MemoryReservation::reserve(0).unwrap()),
+                move || {
+                    holding.fetch_add(1, Ordering::SeqCst);
+                    release.wait();
+                    Ok(())
+                },
+            ))
         })
         .collect();
     while holding.load(Ordering::SeqCst) < permits {
@@ -2897,7 +2903,12 @@ async fn a_parked_stream_of_queued_encoders_does_not_starve_another() {
 
     // A stream of as many encoders, polled once so they queue, then parked.
     let mut parked = futures::stream::iter(0..permits)
-        .map(|_| run_bounded_index_encoding(|| Ok(())))
+        .map(|_| {
+            run_bounded_index_encoding(
+                Arc::new(crate::MemoryReservation::reserve(0).unwrap()),
+                || Ok(()),
+            )
+        })
         .buffered(permits);
     let mut first = Box::pin(parked.next());
     assert!(futures::poll!(first.as_mut()).is_pending());
@@ -2913,7 +2924,10 @@ async fn a_parked_stream_of_queued_encoders_does_not_starve_another() {
     // An encoder that arrives now must still get a permit.
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        run_bounded_index_encoding(|| Ok(())),
+        run_bounded_index_encoding(
+            Arc::new(crate::MemoryReservation::reserve(0).unwrap()),
+            || Ok(()),
+        ),
     )
     .await
     .expect("an encoder behind a parked stream must not wait forever")
