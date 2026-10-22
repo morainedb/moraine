@@ -32,7 +32,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: |
-          python3 -m venv target/clang-tools
+          python3 -m venv --clear target/clang-tools
           target/clang-tools/bin/python -m pip install "clang-format==$(cat .clang-tools-version)"
       - run: cargo xtask fmt-cpp --check
 
@@ -129,7 +129,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: |
-          python3 -m venv target/clang-tools
+          python3 -m venv --clear target/clang-tools
           target/clang-tools/bin/python -m pip install "clang-tidy==$(cat .clang-tools-version)"
       # The C++ half of the build. Caching ninja's build tree instead does
       # nothing: a checkout stamps every source with the current time, so
