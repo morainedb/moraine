@@ -8,6 +8,14 @@ ifneq ($(DUCKDB_TAG),)
 EXT_FLAGS += -DDUCKDB_EXPLICIT_VERSION=$(DUCKDB_TAG)
 endif
 
+# A published build compiles DuckDB from the pinned submodule. The
+# distribution tooling otherwise links a prebuilt DuckDB keyed by commit in
+# a staging bucket, which labels a release commit with the pre-release build
+# it was cut from: that archive, and any extension linking it, carries a
+# version string the pin does not.
+DUCKDB_PREBUILT_LIBRARY =
+DUCKDB_PREBUILT_EXTENSIONS =
+
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Use the release configuration without compiling DuckDB or the Rust core.

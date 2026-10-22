@@ -627,6 +627,35 @@ mod tests {
         }
     }
 
+    /// A published build compiles DuckDB rather than linking a prebuilt
+    /// one, whatever the distribution tooling exports.
+    #[test]
+    #[cfg(unix)]
+    fn the_build_links_no_prebuilt_duckdb() {
+        // The pins job runs this with submodules; Rust-only checkouts omit them.
+        if !workspace_root()
+            .join("extension-ci-tools/makefiles/duckdb_extension.Makefile")
+            .is_file()
+        {
+            return;
+        }
+        let output = Command::new("make")
+            .args(["--dry-run", "release"])
+            .env("DUCKDB_PREBUILT_LIBRARY", "/prebuilt/libduckdb_static.a")
+            .env("DUCKDB_PREBUILT_EXTENSIONS", "json;parquet")
+            .env("DUCKDB_TAG", duckdb_pin())
+            .current_dir(workspace_root())
+            .output()
+            .expect("running make");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let command = String::from_utf8(output.stdout).expect("make command text");
+        assert!(!command.contains("PREBUILT"), "{command}");
+    }
+
     #[test]
     #[cfg(unix)]
     fn the_build_tag_overrides_the_ci_checkout_version() {
