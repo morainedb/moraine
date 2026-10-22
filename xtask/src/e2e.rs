@@ -1,5 +1,5 @@
-//! The `e2e` task: downloads/caches the pinned DuckDB CLI, builds and
-//! packages the extension, and runs
+//! The `e2e` task: builds and packages the extension beside the pinned
+//! DuckDB CLI, and runs
 //! `crates/moraine-duckdb/tests/duckdb_load.rs`,
 //! `crates/moraine-duckdb/tests/ducklake_load.rs`, and the `test/sql`
 //! sqllogictest files un-ignored against the real binaries and repository

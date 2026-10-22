@@ -377,14 +377,16 @@ builds it that way and drives it through a real DuckDB CLI.
 per line, newest first, the first line carrying the commit each submodule
 must sit on. `xtask` reads it (`include_str!`) and `cargo xtask check-pins`
 fails if any other place naming a version disagrees — the two submodules,
-all three workflow files, the table below, the DuckLake source pin every
+all four workflow files, the table below, the DuckLake source pin every
 supported release is built from, and the patch task's own target. It also
-fails when a workflow builds the extension without running the release
-smoke against what it built.
+fails when a workflow builds the extension without waiting on the job that
+loads what it built.
 
-The single entry is DuckDB's 2.0 LTS release. The CLI the suites run is
-the one the build produces beside the extension, stamped with the pin and
-so certain to report it.
+The single entry is DuckDB's 2.0 LTS release. The CLI the suites run is the
+one the build produces beside the extension, stamped with the pin and so
+certain to report it. A published build is proven in a second CLI: the one
+that release itself carries, downloaded per platform, which is the engine
+its users run.
 
 | What | Pinned at |
 |---|---|
@@ -392,7 +394,7 @@ so certain to report it.
 | Toolchain | `duckdb/extension-ci-tools` at `78bd1e4abb` |
 | C++ standard | C++17 |
 | Linux C++ compiler | GCC 14 |
-| DuckDB CLI (for `LOAD` testing) | `build/release/duckdb`, built beside the extension and verified to report the pin |
+| DuckDB CLI (for `LOAD` testing) | `build/release/duckdb`, built beside the extension and verified to report the pin; a release is validated against the published CLI for the pin |
 | DuckLake (bundled) | the commit `INSTALL ducklake` resolves to against the pinned CLI, plus `patches/ducklake/` — see "The bundled DuckLake" below |
 
 **Bumping** is `cargo xtask bump-duckdb v2.0.0`: it moves both submodules

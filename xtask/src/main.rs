@@ -27,8 +27,9 @@
 //!   filters against clustered, scattered, and broad matches.
 //! - `check-release-assets <directory>` verifies a release carries a build for
 //!   every supported version on every published platform (see `release.rs`).
-//! - `validate-release-artifact <version> <artifact>` proves one published
-//!   extension's bundled DuckLake records row-ID statistics and prunes files.
+//! - `validate-release-artifact <version> <platform> <artifact>` loads one
+//!   published extension into the stock CLI for that DuckDB and proves its
+//!   bundled DuckLake records row-ID statistics and prunes files.
 //! - `bump-duckdb <version>` moves the primary pin to a new DuckDB release,
 //!   writing every place `check-pins` checks (see `bump.rs`).
 //! - `ducklake-patch` builds the repository's DuckLake patch series as a

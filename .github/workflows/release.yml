@@ -3,10 +3,8 @@ name: Release
 # extension for every platform, and only if that succeeds, publish the crate
 # and cut the v<version> crate release.
 #
-# The ext-v<version> extension release carries the per-platform binaries.
-# It came off while DuckDB 2.0 had no tag, when no released DuckDB
-# reported the version string a build of the pin carried; 2.0.0 tags and
-# publishes, so a build loads into a stock CLI again.
+# The ext-v<version> extension release carries the per-platform binaries,
+# each proven in the stock CLI for the DuckDB it names before publishing.
 on:
   workflow_dispatch:
   push:
@@ -60,37 +58,33 @@ jobs:
   build-extension:
     needs: should-release
     if: needs.should-release.outputs.release == 'true'
-    # Omit duckdb_version to build the pinned submodule. The Makefile stamps
-    # duckdb_tag explicitly; test_config forwards it into Linux containers.
-    # ci_tools_version must match the reusable workflow's ref.
+    # duckdb_version checks DuckDB out at that release and stamps every
+    # version string from it; ci_tools_version must match the ref above.
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@78bd1e4abbd543822166d5b07644751ba1fc6e8d
     with:
       extension_name: moraine
       ci_tools_version: 78bd1e4abbd543822166d5b07644751ba1fc6e8d
-      duckdb_tag: v2.0.0
+      duckdb_version: v2.0.0
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
-      # The bundled DuckLake carries the patch series: prove the build
-      # records row-ID statistics, prunes a scan by row id, and takes
-      # existing delete positions. It runs here rather than in a job of its
-      # own because the only CLI that can load the artifact is the one this
-      # container just built beside it.
-      post_build_command: >-
-        cargo run -q -p xtask -- validate-release-artifact v2.0.0
-        build/release/extension/moraine/moraine.duckdb_extension
       # The Linux builds run in a container with a ccache directory mounted
       # at /ccache_dir and cached between runs, but nothing points ccache at
       # it, so every release recompiles DuckDB from scratch into a cache
       # that dies with the container. `test_env_variables` is appended to
       # the env file that same container is built with, which is the one
       # hook this workflow gives us to set it.
-      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0"}}'
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
+
+  validate:
+    needs: [should-release, build-extension]
+    if: needs.should-release.outputs.release == 'true'
+    uses: ./.github/workflows/validate-extension.yml
 
   publish:
-    needs: [should-release, build-extension, ci]
+    needs: [should-release, build-extension, validate, ci]
     if: needs.should-release.outputs.release == 'true'
     runs-on: ubuntu-latest
     # Bounded rather than left to hold a runner in silence: the releases

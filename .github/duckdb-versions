@@ -3,9 +3,9 @@
 # `<submodule>=<commit>` pin, and only the first line carries them.
 #
 # The first line is the *primary* pin: the version both submodules sit on,
-# the CLI `cargo xtask e2e` downloads, and the one the e2e suite proves
-# the DuckLake chain against. Every other line is built and published by
-# CI, which checks DuckDB out by tag and never touches the submodules.
+# the CLI `cargo xtask e2e` builds, and the one the e2e suite proves the
+# DuckLake chain against. Every line is built and published by CI, which
+# checks DuckDB out at that release and never touches the submodules.
 #
 # Why a list rather than a single pin: a C++-ABI extension carries the
 # exact DuckDB version string in its metadata footer, and DuckDB refuses
@@ -20,8 +20,9 @@
 # carrying it; published assets stay.
 #
 # Pin only a version DuckDB publishes builds for: an extension stamped
-# with any other string has no DuckDB to load it, and `INSTALL httpfs` no
-# build to resolve. The submodule is a shallow checkout with no tags
-# fetched, so the build stamps the version string this file names rather
-# than leaving it to `git describe`.
+# with any other string has no DuckDB to load it, `INSTALL httpfs` no
+# build to resolve, and the release validation no published CLI to load
+# each build into. The distribution build is handed this version as
+# `duckdb_version`, so every string it stamps comes from the release
+# rather than from `git describe` over a shallow checkout.
 v2.0.0 duckdb=d54cbbe3df17e8e5ce68312f483b4155836112aa extension-ci-tools=78bd1e4abbd543822166d5b07644751ba1fc6e8d
