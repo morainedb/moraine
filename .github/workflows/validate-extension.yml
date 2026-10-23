@@ -5,12 +5,27 @@ name: Validate the extension
 # two workflows that publish, each after its build, with the releases that
 # build covered.
 on:
+  workflow_dispatch:
+    inputs:
+      duckdb_versions:
+        description: JSON array of DuckDB releases to validate.
+        required: true
+        default: '["v2.0.0"]'
+        type: string
+      source_run_id:
+        description: Workflow run containing the built extension artifacts.
+        required: true
+        type: string
   workflow_call:
     inputs:
       duckdb_versions:
         description: JSON array of the DuckDB releases to prove a build for.
         required: true
         type: string
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   validate:
@@ -28,10 +43,8 @@ jobs:
             runner: ubuntu-24.04-arm
           - platform: osx_arm64
             runner: macos-15
-          # macos-15 is Apple Silicon, so this build and the CLI that loads
-          # it both run under Rosetta.
           - platform: osx_amd64
-            runner: macos-15
+            runner: macos-15-intel
     runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -39,6 +52,8 @@ jobs:
         with:
           name: moraine-${{ matrix.duckdb_version }}-extension-${{ matrix.target.platform }}
           path: artifact
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
       # Declared after rust-cache so this save fires before rust-cache's
       # post-step cleanup of unrecognized target/ directories.
