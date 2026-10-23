@@ -97,6 +97,9 @@ jobs:
       test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
 
   validate:
+    permissions:
+      contents: read
+      actions: read
     needs: [versions, build-extension]
     uses: ./.github/workflows/validate-extension.yml
     with:
