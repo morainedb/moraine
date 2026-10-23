@@ -83,6 +83,7 @@ jobs:
       ci_tools_version: 78bd1e4abbd543822166d5b07644751ba1fc6e8d
       duckdb_version: ${{ matrix.duckdb_version }}
       enable_rust: true
+      opt_in_archs: "osx_amd64"
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
