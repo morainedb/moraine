@@ -46,7 +46,7 @@ moraine/
 │   ├── workflows/
 │   │   ├── ci.yml                # fmt, clippy, test, doc, deny, e2e
 │   │   └── release.yml           # release-plz (dormant until first release)
-│   ├── dependabot.yml            # weekly updates: cargo + github-actions ecosystems
+│   ├── dependabot.yml            # weekly updates: cargo + npm + github-actions ecosystems
 │   ├── ISSUE_TEMPLATE/           # bug report + feature request
 │   └── PULL_REQUEST_TEMPLATE.md
 ├── crates/
