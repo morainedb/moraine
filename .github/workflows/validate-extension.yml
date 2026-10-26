@@ -48,7 +48,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: moraine-${{ matrix.duckdb_version }}-extension-${{ matrix.target.platform }}
           path: artifact
