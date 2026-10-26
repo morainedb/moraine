@@ -31,6 +31,14 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; transitive via slatedb->foyer" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via slatedb->foyer" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; transitive via slatedb->figment->serde_yaml" },
+    # zstd's fixes land on 0.14/8.x only, and foyer 0.22.6 — the newest, and
+    # the one slatedb pins — is on 0.13/7.x, whose last releases are 0.13.3
+    # and 7.3.0. What it compresses is its own cache entries in one process:
+    # no seekable or legacy frames, and no stream from anywhere else.
+    # Revisit on foyer bumps.
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 context reuse; transitive via slatedb->foyer, unpatched on 0.13" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7.x Seekable::decompress; transitive via slatedb->foyer, unpatched on 7.x" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7.x legacy-frame decompression; transitive via slatedb->foyer, unpatched on 7.x" },
 ]
 
 [sources]
