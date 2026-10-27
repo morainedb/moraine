@@ -1,6 +1,9 @@
 //! Admission for live working allocations, released by their owners.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, Mutex, OnceLock, RwLock},
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 
@@ -112,6 +115,68 @@ impl MemoryReservation {
             _reservation: reservation,
         })
     }
+}
+
+/// What the process does to return freed memory to the operating system.
+///
+/// Moraine frees large working allocations at once — a cold catalog view, a
+/// commit, a row-summary build — and a general-purpose allocator keeps those
+/// pages rather than returning them. The core decides when a release is
+/// worth attempting; the hook decides how, because the host owns the
+/// allocator (`malloc_trim` on glibc, a jemalloc purge, `mi_collect`).
+///
+/// The hook runs on the thread that finished the phase, at most once a
+/// second, so it must return promptly. Installing a second hook replaces
+/// the first.
+pub fn set_memory_release(hook: fn()) {
+    if let Ok(mut installed) = release_hook().write() {
+        *installed = Some(hook);
+    }
+}
+
+/// The hook the host installed, if any.
+type ReleaseHook = RwLock<Option<fn()>>;
+
+/// When a release last ran.
+type ReleaseClock = Mutex<Option<Instant>>;
+
+fn release_hook() -> &'static ReleaseHook {
+    static HOOK: OnceLock<ReleaseHook> = OnceLock::new();
+    HOOK.get_or_init(|| RwLock::new(None))
+}
+
+/// The shortest interval between two releases. Walking a heap costs real
+/// time, and phases end in bursts.
+const RELEASE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The hook to run now, stamping `last` when one is due. Separate from
+/// the process clock so the interval is testable without it.
+fn due_hook(last: &mut Option<Instant>, now: Instant, hook: Option<fn()>) -> Option<fn()> {
+    let hook = hook?;
+    if last.is_some_and(|previous| now.duration_since(previous) < RELEASE_INTERVAL) {
+        return None;
+    }
+    *last = Some(now);
+    Some(hook)
+}
+
+/// Releases retained memory through the installed hook, at most once per
+/// [`RELEASE_INTERVAL`]. Called where a phase has just dropped its working
+/// allocations; cheap enough to call on every one of them.
+pub(crate) fn release_after_phase() {
+    static LAST: OnceLock<ReleaseClock> = OnceLock::new();
+
+    let installed = release_hook().read().ok().and_then(|installed| *installed);
+    let Ok(mut last) = LAST.get_or_init(|| Mutex::new(None)).lock() else {
+        return;
+    };
+    let Some(hook) = due_hook(&mut last, Instant::now(), installed) else {
+        return;
+    };
+    // The hook is the host's code: never hold the clock across it.
+    drop(last);
+
+    hook();
 }
 
 /// Reserved live bytes and the process-wide admission allowance.
@@ -349,5 +414,60 @@ mod host_tests {
         assert!(check_host_envelope(100, 25, 40, 20, 15).is_ok());
         assert!(check_host_envelope(100, 25, 41, 20, 15).is_err());
         assert!(check_host_envelope(u64::MAX, 1, u64::MAX, 1, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_release() {
+        RELEASES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A release runs for the first phase and waits out the interval before
+    /// the next, so a burst of phases costs one heap walk.
+    #[test]
+    fn releases_run_once_per_interval() {
+        let start = Instant::now();
+        let mut last = None;
+
+        let before = RELEASES.load(Ordering::Relaxed);
+        let first = due_hook(&mut last, start, Some(count_release)).expect("the first is due");
+        first();
+        assert_eq!(RELEASES.load(Ordering::Relaxed), before + 1);
+        assert_eq!(last, Some(start));
+
+        assert!(due_hook(&mut last, start, Some(count_release)).is_none());
+        assert!(due_hook(&mut last, start + RELEASE_INTERVAL / 2, Some(count_release)).is_none());
+        assert!(due_hook(&mut last, start + RELEASE_INTERVAL, Some(count_release)).is_some());
+    }
+
+    /// Without a host hook a finished phase does nothing and stamps no clock.
+    #[test]
+    fn a_phase_without_a_hook_releases_nothing() {
+        let mut last = None;
+
+        assert!(due_hook(&mut last, Instant::now(), None).is_none());
+        assert_eq!(last, None);
+    }
+
+    /// What the host installs is what a phase finds.
+    #[test]
+    fn an_installed_hook_is_what_a_phase_runs() {
+        set_memory_release(count_release);
+
+        let installed = release_hook()
+            .read()
+            .expect("the hook lock")
+            .expect("an installed hook");
+
+        let before = RELEASES.load(Ordering::Relaxed);
+        installed();
+        assert_eq!(RELEASES.load(Ordering::Relaxed), before + 1);
     }
 }

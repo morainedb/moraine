@@ -82,6 +82,10 @@ exclude = [
     "INFO",
     "WARNING",
     "ERROR",
+    # glibc's own, declared in `memory.rs` to call it. This header is not
+    # where a libc prototype belongs, and DuckDB's C++ already has it from
+    # <malloc.h>.
+    "malloc_trim",
 ]
 
 # Variants land in the global namespace of a header DuckDB's C++ includes,

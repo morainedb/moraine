@@ -142,6 +142,7 @@ pub unsafe extern "C" fn moraine_move_wal_store(
     let attempt = || -> Result<(), AbiError> {
         // Before anything that could emit an event.
         crate::logging::install();
+        crate::memory::install();
         if out_moved.is_null() {
             return Err(AbiError::invalid_argument("`out_moved` is null"));
         }

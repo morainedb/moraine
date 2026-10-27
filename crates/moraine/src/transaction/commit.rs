@@ -912,6 +912,10 @@ pub(crate) async fn materialize_capturing(
         // A head view stands at the store state the head record names.
         view.batch_seq = head.batch_seq;
 
+        // The scan's decode scratch is gone by here, and a cold build is
+        // the largest allocation burst a session makes.
+        crate::memory::release_after_phase();
+
         Ok((view, Arc::new(current)))
     })
     .await
@@ -1656,6 +1660,9 @@ pub(crate) async fn submit_batch(
             if let (Some(log), Some(sequence)) = (log, won_sequence) {
                 settle_win(log, sequence, folder, projections).await?;
             }
+            // Translation scratch and the write ledger are released by the
+            // time a batch is durable.
+            crate::memory::release_after_phase();
             Ok(Submission::Submitted(Submitted {
                 handle,
                 staged_bytes,

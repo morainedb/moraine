@@ -23,6 +23,15 @@ Arrow C exports retain the allowance until the final buffer owner releases it.
 `working_memory_usage()` returns reserved bytes and capacity. These APIs are
 additive and leave existing owned-result APIs intact.
 
+`set_memory_release(hook)` installs what the process does to return freed
+pages to the kernel. The core calls it after a cold catalog view, a durable
+commit, and a publication window — the phases that free in bursts — at most
+once a second, on the thread that finished the phase. The host supplies the
+call because it owns the allocator: the DuckDB extension installs glibc's
+`malloc_trim`, and a platform with no equivalent leaves the hook
+uninstalled, which skips the release. Admission accounting is unchanged by
+it; a release returns pages the allocator was holding, not reservations.
+
 ## Snapshots and results
 
 Cold head-view materialization is serialized per catalog. Snapshot generations

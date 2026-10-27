@@ -193,6 +193,10 @@ impl RowSummaryProgress {
                 self.after = Some(position);
             }
         }
+        // A summary build sorts and encodes row IDs for every file in the
+        // window; that scratch is gone once the window is done.
+        crate::memory::release_after_phase();
+
         match failure {
             Some(error) => Err(error),
             None => Ok(false),

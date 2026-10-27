@@ -710,6 +710,7 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
     let attempt = || -> Result<Box<MoraineCatalogHandle>, AbiError> {
         // Before anything that could emit an event.
         crate::logging::install();
+        crate::memory::install();
         if out.is_null() {
             return Err(AbiError::invalid_argument("`out` is null"));
         }
@@ -1137,6 +1138,7 @@ pub unsafe extern "C" fn moraine_migrate_with_wal_store(
     let attempt = || -> Result<(), AbiError> {
         // Before anything that could emit an event.
         crate::logging::install();
+        crate::memory::install();
         if out.is_null() {
             return Err(AbiError::invalid_argument("`out` is null"));
         }
