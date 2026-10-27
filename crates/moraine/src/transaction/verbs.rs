@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     ops::Deref,
+    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -335,7 +336,7 @@ impl Transaction {
         self.state
             .tables
             .get(&table.get())
-            .cloned()
+            .map(|value| (**value).clone())
             .ok_or_else(|| Error::NotFound(format!("table {table}")))
     }
 
@@ -496,7 +497,7 @@ impl Transaction {
             .columns
             .get(&table.get())
             .and_then(|cols| cols.get(&column.get()))
-            .cloned()
+            .map(|value| (**value).clone())
             .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
     }
 
@@ -1068,7 +1069,7 @@ impl Transaction {
             .find_map(|(&table_id, per_table)| {
                 per_table
                     .get(&index.get())
-                    .map(|value| (table_id, value.clone()))
+                    .map(|value| (table_id, (**value).clone()))
             })
             .ok_or_else(|| Error::NotFound(format!("index {index}")))
     }
@@ -1305,7 +1306,7 @@ impl Transaction {
         self.state
             .table_stats
             .get(&table.get())
-            .copied()
+            .map(|stats| **stats)
             .ok_or_else(|| Error::Corruption(format!("table {table} has no statistics record")))
     }
 
@@ -1505,7 +1506,7 @@ impl Transaction {
             .data_files
             .get(&table.get())
             .and_then(|files| files.get(&file.get()))
-            .cloned()
+            .map(|value| (**value).clone())
             .ok_or_else(|| Error::NotFound(format!("data file {file} of table {table}")))?;
 
         let cascaded: Vec<u64> = self
@@ -1826,7 +1827,7 @@ impl Transaction {
             dialect: dialect.to_owned(),
             sql: sql.to_owned(),
             begin_snapshot: self.new_snapshot_id,
-            ..value
+            ..(*value).clone()
         });
         self.ops.push(Operation::AlterView {
             view_id: view.get(),
@@ -1976,7 +1977,7 @@ impl Transaction {
             .state
             .options
             .get(&components)
-            .cloned()
+            .map(|record| (**record).clone())
             .unwrap_or_default();
         record
             .options
@@ -2001,7 +2002,7 @@ impl Transaction {
             .state
             .options
             .get(&components)
-            .cloned()
+            .map(|record| (**record).clone())
             .unwrap_or_default();
         record.options.insert(key.to_owned(), value.to_owned());
         self.state.set_option_record(components, record);
@@ -2019,7 +2020,12 @@ impl Transaction {
         self.live_scope(scope)?;
         reserved_option(scope, key)?;
         let components = scope.key_components();
-        let Some(mut record) = self.state.options.get(&components).cloned() else {
+        let Some(mut record) = self
+            .state
+            .options
+            .get(&components)
+            .map(|record| (**record).clone())
+        else {
             return Ok(());
         };
         if record.options.remove(key).is_none() {
@@ -2073,7 +2079,7 @@ impl Transaction {
         let Some(container) = self.state.tags.get_mut(&object_id) else {
             return false;
         };
-        let Some(live) = container
+        let Some(live) = Arc::make_mut(container)
             .entries
             .iter_mut()
             .find(|entry| entry.key == key && entry.end_snapshot.is_none())
@@ -2105,15 +2111,13 @@ impl Transaction {
             key: key.to_owned(),
             value: value.to_owned(),
         };
-        self.state
-            .tags
-            .entry(object_id)
-            .or_insert_with(|| TagValue {
+        let container = self.state.tags.entry(object_id).or_insert_with(|| {
+            Arc::new(TagValue {
                 object_id,
                 entries: Vec::new(),
             })
-            .entries
-            .push(entry);
+        });
+        Arc::make_mut(container).entries.push(entry);
 
         Ok(())
     }
@@ -2661,14 +2665,16 @@ mod tests {
                 },
             )
             .unwrap();
-        transaction
-            .state
-            .indexes
-            .get_mut(&table.get())
-            .unwrap()
-            .get_mut(&index.get())
-            .unwrap()
-            .build_state = Some("maintaining".to_owned());
+        Arc::make_mut(
+            transaction
+                .state
+                .indexes
+                .get_mut(&table.get())
+                .unwrap()
+                .get_mut(&index.get())
+                .unwrap(),
+        )
+        .build_state = Some("maintaining".to_owned());
         transaction.ops.clear();
 
         transaction
@@ -3111,7 +3117,7 @@ mod tests {
             next_column_id: 0,
         };
         let columns = [1u64, 2].map(|id| {
-            EntityRecord::Column(ColumnValue {
+            EntityRecord::Column(Arc::new(ColumnValue {
                 column_id: id,
                 begin_snapshot: 1,
                 end_snapshot: None,
@@ -3126,9 +3132,9 @@ mod tests {
                 default_value_type: None,
                 default_value_dialect: None,
                 tags: vec![],
-            })
+            }))
         });
-        let mut current = vec![EntityRecord::Table(table)];
+        let mut current = vec![EntityRecord::Table(Arc::new(table))];
         current.extend(columns);
         let state = CatalogSnapshot::build_from(snapshot, &current, &[], None);
         let mut transaction = Transaction::new(state, 5);
@@ -3511,7 +3517,7 @@ mod tests {
         let mut transaction = Transaction::new(
             CatalogSnapshot::build_from(
                 snapshot,
-                &[crate::store::read::EntityRecord::Schema(main)],
+                &[crate::store::read::EntityRecord::Schema(Arc::new(main))],
                 &[],
                 None,
             ),

@@ -601,7 +601,7 @@ impl ReadOnlyCatalog {
             .data_files
             .get(&scope.table.get())
             .and_then(|files| files.get(&file_id.get()))
-            .map(data_file_info)
+            .map(|value| data_file_info(value))
             .ok_or_else(|| row_error(first, "file metadata is absent".into()))?;
         let path = resolve_data_path(
             scope.data_prefix,
@@ -875,7 +875,7 @@ impl ReadOnlyCatalog {
         let mut files = std::iter::from_fn(|| {
             files
                 .find(|file| since.is_none_or(|since| file.begin_snapshot > since.get()))
-                .map(data_file_info)
+                .map(|value| data_file_info(value))
         })
         .peekable();
         if files.peek().is_none() {

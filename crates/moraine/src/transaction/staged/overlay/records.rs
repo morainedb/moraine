@@ -20,7 +20,7 @@ macro_rules! versioned_fields {
 
         fn from_record(record: &EntityRecord) -> Option<Self> {
             match record {
-                EntityRecord::$record(value) => Some(value.clone()),
+                EntityRecord::$record(value) => Some((**value).clone()),
                 _ => None,
             }
         }
@@ -112,7 +112,7 @@ impl Unversioned for proto::FileColumnStatsValue {
 
     fn from_record(record: &EntityRecord) -> Option<Self> {
         match record {
-            EntityRecord::FileColumnStats(value) => Some(value.clone()),
+            EntityRecord::FileColumnStats(value) => Some((**value).clone()),
             _ => None,
         }
     }
@@ -144,7 +144,7 @@ impl Unversioned for proto::GcFileValue {
 
     fn from_record(record: &EntityRecord) -> Option<Self> {
         match record {
-            EntityRecord::GcFile(value) => Some(value.clone()),
+            EntityRecord::GcFile(value) => Some((**value).clone()),
             _ => None,
         }
     }
@@ -223,7 +223,7 @@ impl Unversioned for proto::TableStatsValue {
 
     fn from_record(record: &EntityRecord) -> Option<Self> {
         match record {
-            EntityRecord::TableStats(value) => Some(*value),
+            EntityRecord::TableStats(value) => Some(**value),
             _ => None,
         }
     }
@@ -253,7 +253,7 @@ impl Unversioned for proto::TableColumnStatsValue {
 
     fn from_record(record: &EntityRecord) -> Option<Self> {
         match record {
-            EntityRecord::TableColumnStats(value) => Some(value.clone()),
+            EntityRecord::TableColumnStats(value) => Some((**value).clone()),
             _ => None,
         }
     }
@@ -283,7 +283,7 @@ impl Unversioned for proto::MappingValue {
 
     fn from_record(record: &EntityRecord) -> Option<Self> {
         match record {
-            EntityRecord::Mapping(value) => Some(value.clone()),
+            EntityRecord::Mapping(value) => Some((**value).clone()),
             _ => None,
         }
     }

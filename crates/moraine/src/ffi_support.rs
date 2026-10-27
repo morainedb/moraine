@@ -313,7 +313,7 @@ async fn dump_current_entities<T>(
 #[doc(hidden)]
 pub async fn dump_schemas(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::Schema(v) => Some(v.clone()),
+        EntityRecord::Schema(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -323,7 +323,7 @@ pub async fn dump_schemas(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaValue>>
 #[doc(hidden)]
 pub async fn dump_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<TableValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::Table(v) => Some(v.clone()),
+        EntityRecord::Table(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -333,7 +333,7 @@ pub async fn dump_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<TableValue>> {
 #[doc(hidden)]
 pub async fn dump_views(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::View(v) => Some(v.clone()),
+        EntityRecord::View(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -344,7 +344,7 @@ pub async fn dump_views(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewValue>> {
 #[doc(hidden)]
 pub async fn dump_macros(catalog: &ReadOnlyCatalog) -> Result<Vec<MacroValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::Macro(m) => Some(m.clone()),
+        EntityRecord::Macro(m) => Some((**m).clone()),
         _ => None,
     })
     .await
@@ -356,7 +356,7 @@ pub async fn dump_macros(catalog: &ReadOnlyCatalog) -> Result<Vec<MacroValue>> {
 #[doc(hidden)]
 pub async fn dump_mappings(catalog: &ReadOnlyCatalog) -> Result<Vec<MappingValue>> {
     dump_current_entities(catalog, |r| match r {
-        EntityRecord::Mapping(m) => Some(m.clone()),
+        EntityRecord::Mapping(m) => Some((**m).clone()),
         _ => None,
     })
     .await
@@ -366,7 +366,7 @@ pub async fn dump_mappings(catalog: &ReadOnlyCatalog) -> Result<Vec<MappingValue
 #[doc(hidden)]
 pub async fn dump_columns(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::Column(v) => Some(v.clone()),
+        EntityRecord::Column(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -376,7 +376,7 @@ pub async fn dump_columns(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnValue>>
 #[doc(hidden)]
 pub async fn dump_data_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DataFileValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::File(v) => Some(v.clone()),
+        EntityRecord::File(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -399,7 +399,7 @@ pub async fn dump_data_files_of(
         table_id,
         HistoryNeed::Always,
         |record| match record {
-            EntityRecord::File(value) => Some(value.clone()),
+            EntityRecord::File(value) => Some((**value).clone()),
             _ => None,
         },
     )
@@ -410,7 +410,7 @@ pub async fn dump_data_files_of(
 #[doc(hidden)]
 pub async fn dump_delete_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DeleteFileValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::DeleteFile(v) => Some(v.clone()),
+        EntityRecord::DeleteFile(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -433,7 +433,7 @@ pub async fn dump_delete_files_of(
         table_id,
         HistoryNeed::Always,
         |record| match record {
-            EntityRecord::DeleteFile(value) => Some(value.clone()),
+            EntityRecord::DeleteFile(value) => Some((**value).clone()),
             _ => None,
         },
     )
@@ -445,7 +445,7 @@ pub async fn dump_delete_files_of(
 #[doc(hidden)]
 pub async fn dump_partition_info(catalog: &ReadOnlyCatalog) -> Result<Vec<PartitionValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::Partition(v) => Some(v.clone()),
+        EntityRecord::Partition(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -456,7 +456,7 @@ pub async fn dump_partition_info(catalog: &ReadOnlyCatalog) -> Result<Vec<Partit
 #[doc(hidden)]
 pub async fn dump_sort_info(catalog: &ReadOnlyCatalog) -> Result<Vec<SortValue>> {
     dump_entities(catalog, |r| match r {
-        EntityRecord::Sort(v) => Some(v.clone()),
+        EntityRecord::Sort(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -514,7 +514,7 @@ pub async fn dump_table_stats(catalog: &ReadOnlyCatalog) -> Result<Vec<TableStat
         ProjectionCache::table_stats_at,
         ProjectionCache::install_table_stats,
         |r| match r {
-            EntityRecord::TableStats(v) => Some(*v),
+            EntityRecord::TableStats(v) => Some(**v),
             _ => None,
         },
     )
@@ -532,7 +532,7 @@ pub async fn dump_table_column_stats(
         ProjectionCache::table_column_stats_at,
         ProjectionCache::install_table_column_stats,
         |r| match r {
-            EntityRecord::TableColumnStats(v) => Some(v.clone()),
+            EntityRecord::TableColumnStats(v) => Some((**v).clone()),
             _ => None,
         },
     )
@@ -546,7 +546,7 @@ pub async fn dump_file_column_stats(
     catalog: &ReadOnlyCatalog,
 ) -> Result<Vec<FileColumnStatsValue>> {
     dump_current_entities(catalog, |r| match r {
-        EntityRecord::FileColumnStats(v) => Some(v.clone()),
+        EntityRecord::FileColumnStats(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -565,7 +565,7 @@ pub async fn dump_file_column_stats_of(
         table_id,
         HistoryNeed::Never,
         |record| match record {
-            EntityRecord::FileColumnStats(value) => Some(value.clone()),
+            EntityRecord::FileColumnStats(value) => Some((**value).clone()),
             _ => None,
         },
     )
@@ -731,7 +731,7 @@ fn schema_version_floors(
 #[doc(hidden)]
 pub async fn dump_scheduled_deletions(catalog: &ReadOnlyCatalog) -> Result<Vec<GcFileValue>> {
     dump_current_entities(catalog, |r| match r {
-        EntityRecord::GcFile(v) => Some(v.clone()),
+        EntityRecord::GcFile(v) => Some((**v).clone()),
         _ => None,
     })
     .await
@@ -759,7 +759,7 @@ pub struct TagRow {
 pub async fn dump_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<TagRow>> {
     Ok(tag_rows_from(
         dump_current_entities(catalog, |r| match r {
-            EntityRecord::Tag(v) => Some(v.clone()),
+            EntityRecord::Tag(v) => Some((**v).clone()),
             _ => None,
         })
         .await?,
@@ -810,7 +810,7 @@ pub async fn dump_options(catalog: &ReadOnlyCatalog) -> Result<Vec<OptionRow>> {
                 scope_kind,
                 scope_id,
                 value,
-            } => Some((*scope_kind, *scope_id, value.clone())),
+            } => Some((*scope_kind, *scope_id, (**value).clone())),
             _ => None,
         })
         .await?,
@@ -934,7 +934,7 @@ pub fn column_tag_rows_from(columns: impl IntoIterator<Item = ColumnTags>) -> Ve
 #[doc(hidden)]
 pub async fn dump_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnTagRow>> {
     let columns = dump_entities(catalog, |r| match r {
-        EntityRecord::Column(v) => Some(ColumnTags::from(v)),
+        EntityRecord::Column(v) => Some(ColumnTags::from(v.as_ref())),
         _ => None,
     })
     .await?;
@@ -1033,7 +1033,7 @@ pub fn view_column_tag_rows_from(
 #[doc(hidden)]
 pub async fn dump_view_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewColumnTagRow>> {
     let views = dump_entities(catalog, |r| match r {
-        EntityRecord::View(v) => Some(ViewColumnTags::from(v)),
+        EntityRecord::View(v) => Some(ViewColumnTags::from(v.as_ref())),
         _ => None,
     })
     .await?;

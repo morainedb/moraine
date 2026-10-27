@@ -28,52 +28,52 @@ fn scanned_count(view: &CatalogSnapshot) -> usize {
 
 fn record(kind: u8, table_id: u64, id: u64) -> EntityRecord {
     match kind {
-        0 => EntityRecord::Column(ColumnValue {
+        0 => EntityRecord::Column(Arc::new(ColumnValue {
             table_id,
             column_id: id,
             ..Default::default()
-        }),
-        1 => EntityRecord::File(DataFileValue {
+        })),
+        1 => EntityRecord::File(Arc::new(DataFileValue {
             table_id,
             data_file_id: id,
             ..Default::default()
-        }),
-        2 => EntityRecord::DeleteFile(DeleteFileValue {
+        })),
+        2 => EntityRecord::DeleteFile(Arc::new(DeleteFileValue {
             table_id,
             delete_file_id: id,
             ..Default::default()
-        }),
-        3 => EntityRecord::Partition(PartitionValue {
+        })),
+        3 => EntityRecord::Partition(Arc::new(PartitionValue {
             table_id,
             partition_id: id,
             ..Default::default()
-        }),
-        4 => EntityRecord::Sort(SortValue {
+        })),
+        4 => EntityRecord::Sort(Arc::new(SortValue {
             table_id,
             sort_id: id,
             ..Default::default()
-        }),
-        5 => EntityRecord::Mapping(MappingValue {
+        })),
+        5 => EntityRecord::Mapping(Arc::new(MappingValue {
             table_id,
             mapping_id: id,
             ..Default::default()
-        }),
-        6 => EntityRecord::Index(IndexValue {
+        })),
+        6 => EntityRecord::Index(Arc::new(IndexValue {
             table_id,
             index_id: id,
             ..Default::default()
-        }),
-        7 => EntityRecord::TableColumnStats(TableColumnStatsValue {
+        })),
+        7 => EntityRecord::TableColumnStats(Arc::new(TableColumnStatsValue {
             table_id,
             column_id: id,
             ..Default::default()
-        }),
-        _ => EntityRecord::FileColumnStats(FileColumnStatsValue {
+        })),
+        _ => EntityRecord::FileColumnStats(Arc::new(FileColumnStatsValue {
             table_id,
             data_file_id: id,
             column_id: id,
             ..Default::default()
-        }),
+        })),
     }
 }
 

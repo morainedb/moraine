@@ -1433,7 +1433,7 @@ fn live_data_file(
     base.data_files
         .get(&table_id)
         .and_then(|files| files.get(&data_file_id))
-        .cloned()
+        .map(|file| (**file).clone())
         .ok_or_else(|| Error::NotFound(format!("data file {data_file_id} of table {table_id}")))
 }
 

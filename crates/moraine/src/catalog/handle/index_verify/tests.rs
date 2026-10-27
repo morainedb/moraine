@@ -828,13 +828,15 @@ async fn poisoned_indexes_reject_certificates() {
         .await
         .unwrap();
     let mut snapshot = (*catalog.snapshot().await.unwrap()).clone();
-    snapshot
-        .indexes
-        .get_mut(&table.get())
-        .unwrap()
-        .get_mut(&info.id.get())
-        .unwrap()
-        .poisoned = Some(true);
+    std::sync::Arc::make_mut(
+        snapshot
+            .indexes
+            .get_mut(&table.get())
+            .unwrap()
+            .get_mut(&info.id.get())
+            .unwrap(),
+    )
+    .poisoned = Some(true);
     let next = snapshot.current_snapshot().id.get() + 1;
     let mut tx = crate::transaction::Transaction::new(snapshot, next);
     let result =

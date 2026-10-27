@@ -37,7 +37,9 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
             Key::Current(CurrentKey::GcFile { data_file_id }) => match bytes {
                 Some(bytes) => {
                     view.admit((bytes.len() as u64).saturating_mul(4).saturating_add(256))?;
-                    view.put_gc_file(value::decode_value(bytes)?);
+                    view.put_gc_file(value::decode_value::<crate::store::proto::GcFileValue>(
+                        bytes,
+                    )?);
                 }
                 None => view.remove_gc_file(data_file_id),
             },
