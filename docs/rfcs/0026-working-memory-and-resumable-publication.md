@@ -13,9 +13,12 @@ checkpoints remain available.
 `CACHE_MEMORY` limits estimated cache retention. `MORAINE_WORKING_MEMORY_BYTES`
 adds a separate process-wide allowance for admitted live working allocations,
 defaulting to 1 GiB. Positive byte counts are required. Owners reserve before
-known allocations and retain their reservation through use. Estimates include
-conservative space for copies and container overhead; they are not allocator or
-RSS measurements. A refusal releases temporary owners normally.
+known allocations and retain their reservation through use. Estimates are resident-shaped and
+measured: a retained record charges its encoded length, its enum and a
+calibrated per-record cost, and a catalog view charges one entry per record it
+keys plus the values it may outlive. They remain estimates, not allocator or
+RSS measurements, and are calibrated to refuse a little early rather than
+late. A refusal releases temporary owners normally.
 
 `MemoryReservation` supports reservation, resizing, and ownership transfer to
 `Bytes` and Arrow batches. Clones, slices, nested Arrow buffers, null masks, and
@@ -36,7 +39,10 @@ it; a release returns pages the allocator was holding, not reservations.
 
 Cold head-view materialization is serialized per catalog. Snapshot generations
 reserve their estimated metadata storage; held readers retain their generation's
-reservation while a new generation is admitted independently. Time travel streams
+reservation while a new generation is admitted independently. A head view's
+entries point at records the scan retains and charged, so it admits its entries
+alone; a time-travel view outlives the records it was built from and admits
+their values too. Time travel streams
 visible records into its view. Store scan buffers and retained record-set keys
 hold reservations through decoding and projection ownership.
 
