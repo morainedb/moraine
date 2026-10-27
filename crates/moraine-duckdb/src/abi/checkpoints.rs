@@ -140,6 +140,7 @@ pub unsafe extern "C" fn moraine_checkpoints(
     let attempt = || -> Result<(), AbiError> {
         // Before anything that could emit an event.
         crate::logging::install();
+        crate::memory::install();
         if out_items.is_null() || out_len.is_null() {
             return Err(AbiError::invalid_argument("an out-parameter is null"));
         }
@@ -236,6 +237,7 @@ pub unsafe extern "C" fn moraine_delete_checkpoint(
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
         crate::logging::install();
+        crate::memory::install();
         // SAFETY: `path`, `id`, and `s3` validity are this function's own
         // contract.
         let path_str = unsafe { borrow_str(path, "path") }?;

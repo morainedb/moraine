@@ -201,6 +201,7 @@ pub mod dumps;
 pub mod error;
 pub mod inline;
 pub mod logging;
+mod memory;
 pub mod runtime;
 pub mod staged;
 #[cfg(test)]
