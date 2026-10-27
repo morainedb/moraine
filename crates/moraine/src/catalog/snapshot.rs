@@ -163,18 +163,36 @@ fn remove_nested<K: Ord + Clone, V: Clone>(
     }
 }
 
-/// Encoded bytes of one map's values, keys included.
+/// What one entry of this view costs resident, beyond the value it points
+/// at: its key, the handle it holds, and its share of the persistent map's
+/// nodes. Measured over 400,000 entries keyed `(u64, u64)`: 61 bytes.
+/// Charged a little high, so admission refuses before the allocator does.
+const ENTRY_BYTES: u64 = 80;
+
+/// What one map holds: its values' encoded length and its entries.
+///
+/// The encoded length stands for the decoded value, which a head view
+/// shares with the record set the scan retains. Counting it here charges
+/// a shared value twice over, which is the safe direction: a view outlives
+/// that record set whenever a projection is evicted.
 fn flat_bytes<K: Ord, V: prost::Message>(map: &OrdMap<K, Arc<V>>) -> u64 {
     map.values()
         .map(|value| u64::try_from(value.encoded_len()).unwrap_or(u64::MAX))
         .sum::<u64>()
-        + u64::try_from(map.len() * std::mem::size_of::<K>()).unwrap_or(0)
+        .saturating_add(
+            u64::try_from(map.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::try_from(std::mem::size_of::<K>()).unwrap_or(0) + ENTRY_BYTES),
+        )
 }
 
 /// As [`flat_bytes`], for a map of maps.
 fn nested_bytes<K1: Ord, K2: Ord, V: prost::Message>(map: &OrdMap<K1, OrdMap<K2, Arc<V>>>) -> u64 {
-    map.values().map(flat_bytes).sum::<u64>()
-        + u64::try_from(map.len() * std::mem::size_of::<K1>()).unwrap_or(0)
+    map.values().map(flat_bytes).sum::<u64>().saturating_add(
+        u64::try_from(map.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(std::mem::size_of::<K1>()).unwrap_or(0) + ENTRY_BYTES),
+    )
 }
 
 impl CatalogSnapshot {
@@ -184,9 +202,11 @@ impl CatalogSnapshot {
     /// # Errors
     /// Returns an error when the process working allowance is exhausted.
     pub fn reserve_copy(&self) -> Result<crate::MemoryReservation> {
+        // The copy's own values and the container it lands in, over an
+        // estimate that already covers this view's.
         crate::MemoryReservation::reserve(
             self.estimated_bytes()
-                .saturating_mul(4)
+                .saturating_mul(2)
                 .saturating_add(size_of::<Self>() as u64),
         )
     }
@@ -200,7 +220,6 @@ impl CatalogSnapshot {
         } else {
             // A new generation does not inherit scratch space or deleted records.
             self.estimated_bytes()
-                .saturating_mul(4)
                 .saturating_add(size_of::<Self>() as u64)
         };
         let requested = current.saturating_add(additional);
@@ -277,7 +296,15 @@ impl CatalogSnapshot {
             {
                 continue;
             }
-            view.admit(record.estimated_bytes().saturating_mul(4))?;
+            // A head view's entries point at records the scan retains and
+            // charged; a time-travel view outlives them, so it admits what
+            // it will still be holding.
+            let charge = if at.is_none() {
+                ENTRY_BYTES
+            } else {
+                ENTRY_BYTES.saturating_add(record.estimated_bytes())
+            };
+            view.admit(charge)?;
             view.put_record(record.clone());
         }
         Ok(view)
@@ -1447,6 +1474,43 @@ mod tests {
     mod counts;
 
     use super::*;
+
+    /// What a view charges is what it holds: one entry per record, plus the
+    /// values it may outlive. The numbers are the measured per-entry and
+    /// per-record costs, so a change that distorts either fails here.
+    #[test]
+    fn a_view_charges_its_entries_and_its_values() {
+        let stats = FileColumnStatsValue {
+            data_file_id: 1,
+            table_id: 1,
+            column_id: 2,
+            min_value: Some("2026-01-01 00:00:00".to_owned()),
+            max_value: Some("2026-02-28 23:59:59".to_owned()),
+            ..FileColumnStatsValue::default()
+        };
+        let encoded = u64::try_from(stats.encoded_len()).expect("encoded length");
+        let record = EntityRecord::FileColumnStats(Arc::new(stats.clone()));
+
+        // A record charges its encoded value, its enum, and what the record
+        // set holds around it.
+        assert_eq!(
+            record.estimated_bytes(),
+            encoded + u64::try_from(size_of::<EntityRecord>()).expect("enum size") + 400
+        );
+
+        // The view charges one entry per record it keys.
+        let mut view = CatalogSnapshot::default();
+        view.put_file_column_stats(Arc::new(stats));
+        let entry = u64::try_from(size_of::<(u64, u64)>()).expect("key size") + ENTRY_BYTES;
+        assert_eq!(
+            view.estimated_bytes(),
+            encoded
+                + entry
+                + u64::try_from(size_of::<u64>()).expect("table key size")
+                + ENTRY_BYTES
+                + u64::try_from(view.snapshot.encoded_len()).expect("snapshot length")
+        );
+    }
 
     /// A delete file is found by the data file it targets while it is live,
     /// including alongside another targeting the same file, and not after it

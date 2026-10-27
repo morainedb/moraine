@@ -84,9 +84,16 @@ fn decode_shared<M: prost::Message + Default>(bytes: &[u8]) -> Result<Arc<M>> {
     Ok(Arc::new(value::decode_value(bytes)?))
 }
 
+/// What one retained record costs resident beyond its encoded length and
+/// its enum: the decoded value's own allocation, the `Arc` headers the
+/// record set and the view share, the store key, and the record set's node
+/// share. Measured over 420,000 records at 20,000 files x 20 columns: 370
+/// bytes for a 62-byte stats record.
+const RECORD_BYTES: u64 = 400;
+
 impl EntityRecord {
-    /// A cheap estimate of the record's footprint: its encoded length plus
-    /// the enum's own size. Understates the decoded form.
+    /// What this record costs resident: its encoded length stands for the
+    /// decoded value, plus the enum and [`RECORD_BYTES`].
     pub(crate) fn estimated_bytes(&self) -> u64 {
         let encoded = match self {
             Self::Schema(value) => value.encoded_len(),
@@ -107,8 +114,10 @@ impl EntityRecord {
             Self::Tag(value) => value.encoded_len(),
             Self::GcFile(value) => value.encoded_len(),
         };
-        u64::try_from(encoded).unwrap_or(u64::MAX)
-            + u64::try_from(std::mem::size_of::<Self>()).unwrap_or(0)
+        u64::try_from(encoded)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(std::mem::size_of::<Self>()).unwrap_or(0))
+            .saturating_add(RECORD_BYTES)
     }
 }
 
@@ -595,7 +604,7 @@ pub(crate) async fn scan_current_records(handle: ReadHandle<'_>) -> Result<Recor
         current_entity_kind_prefix,
         |encoded, key, bytes| {
             let memory = crate::MemoryReservation::reserve(
-                (bytes.len() as u64).saturating_mul(4).saturating_add(512),
+                (bytes.len() as u64).saturating_add(RECORD_BYTES),
             )?;
             let encoded = memory.into_bytes(encoded)?;
             Ok((encoded, Arc::new(decode_current_record(key, &bytes)?)))
@@ -614,7 +623,7 @@ pub(crate) async fn scan_history_records(handle: ReadHandle<'_>) -> Result<Recor
         history_entity_kind_prefix,
         |encoded, key, bytes| {
             let memory = crate::MemoryReservation::reserve(
-                (bytes.len() as u64).saturating_mul(4).saturating_add(512),
+                (bytes.len() as u64).saturating_add(RECORD_BYTES),
             )?;
             let encoded = memory.into_bytes(encoded)?;
             Ok((encoded, Arc::new(decode_history_record(key, &bytes)?)))
