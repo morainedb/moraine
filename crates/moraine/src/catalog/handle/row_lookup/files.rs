@@ -95,7 +95,7 @@ struct DirectoryScope<'a> {
     data_prefix: &'a str,
     table_prefix: &'a str,
     table: TableId,
-    stats: Option<&'a OrdMap<(u64, u64), FileColumnStatsValue>>,
+    stats: Option<&'a OrdMap<(u64, u64), Arc<FileColumnStatsValue>>>,
 }
 
 /// The files of `selected` a lookup for `row_ids` has to read, plus any the
@@ -105,7 +105,7 @@ fn narrow_to_wanted(
     deferred: &mut OrdMap<u64, (u64, u64)>,
     previous: &FileDirectory,
     scope: &DirectoryScope<'_>,
-    files: &OrdMap<u64, DataFileValue>,
+    files: &OrdMap<u64, Arc<DataFileValue>>,
     row_ids: &[u64],
 ) -> BTreeMap<u64, DataFileInfo> {
     for file in previous.deferred_for(row_ids) {
@@ -134,7 +134,7 @@ fn narrow_to_wanted(
 /// The row-id bounds recorded for `file`, when both are present and parse.
 /// A file without them cannot be excluded and is always summarized.
 fn row_id_bounds(
-    stats: Option<&OrdMap<(u64, u64), FileColumnStatsValue>>,
+    stats: Option<&OrdMap<(u64, u64), Arc<FileColumnStatsValue>>>,
     file: u64,
 ) -> Option<(u64, u64)> {
     let recorded = stats?.get(&(file, crate::data_file::ROW_ID_FIELD_ID))?;
@@ -216,7 +216,7 @@ impl FileDirectory {
     fn advanced(
         &self,
         scope: &DirectoryScope<'_>,
-        files: &OrdMap<u64, DataFileValue>,
+        files: &OrdMap<u64, Arc<DataFileValue>>,
         removed: &HashSet<u64>,
         retry_failed: bool,
         file_bytes: u64,
@@ -249,7 +249,7 @@ impl FileDirectory {
 
     /// Whether this directory already describes `files` with no summary
     /// read due.
-    fn describes(&self, files: &OrdMap<u64, DataFileValue>) -> bool {
+    fn describes(&self, files: &OrdMap<u64, Arc<DataFileValue>>) -> bool {
         self.files.ptr_eq(files) && !self.retry_due()
     }
 
@@ -351,7 +351,11 @@ struct FileChanges {
 impl FileDirectory {
     /// The changes from this directory's file map to `files`. When
     /// `retry_failed`, every failed file still present is selected again.
-    fn changes_to(&self, files: &OrdMap<u64, DataFileValue>, retry_failed: bool) -> FileChanges {
+    fn changes_to(
+        &self,
+        files: &OrdMap<u64, Arc<DataFileValue>>,
+        retry_failed: bool,
+    ) -> FileChanges {
         let mut changes = FileChanges {
             selected: BTreeMap::new(),
             removed: HashSet::new(),
@@ -499,7 +503,7 @@ impl ReadOnlyCatalog {
         &self,
         scope: &DirectoryScope<'_>,
         previous: &FileDirectory,
-        files: &OrdMap<u64, DataFileValue>,
+        files: &OrdMap<u64, Arc<DataFileValue>>,
         row_ids: &[u64],
     ) -> FileDirectory {
         let retry_failed = previous.retry_due();

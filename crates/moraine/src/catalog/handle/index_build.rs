@@ -579,7 +579,7 @@ impl Catalog {
             .indexes
             .values()
             .flat_map(|per_table| per_table.values())
-            .map(snapshot::index_info)
+            .map(|value| snapshot::index_info(value))
             .filter(|index| index.state == IndexState::Maintaining)
             .collect();
 

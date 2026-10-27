@@ -137,7 +137,7 @@ struct FileDirectory {
     identity: CacheIdentity,
     data_prefix: String,
     table_prefix: String,
-    files: OrdMap<u64, DataFileValue>,
+    files: OrdMap<u64, Arc<DataFileValue>>,
     /// Exact position maps, including dense files with permuted row order.
     summaries: OrdMap<u64, FileSummary>,
     ranges: files::DenseRanges,

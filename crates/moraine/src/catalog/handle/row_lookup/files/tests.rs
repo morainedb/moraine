@@ -722,14 +722,14 @@ fn only_a_complete_parsable_range_bounds_a_file() {
         ..FileColumnStatsValue::default()
     };
     let row_id = crate::data_file::ROW_ID_FIELD_ID;
-    let stats: imbl::OrdMap<(u64, u64), FileColumnStatsValue> = [
-        ((1, row_id), stat(Some("10"), Some("20"))),
-        ((2, row_id), stat(Some("10"), None)),
-        ((3, row_id), stat(None, Some("20"))),
-        ((4, row_id), stat(Some("20"), Some("10"))),
-        ((5, row_id), stat(Some("nonsense"), Some("20"))),
-        ((6, row_id), stat(Some("-1"), Some("20"))),
-        ((7, 1), stat(Some("10"), Some("20"))),
+    let stats: imbl::OrdMap<(u64, u64), Arc<FileColumnStatsValue>> = [
+        ((1, row_id), Arc::new(stat(Some("10"), Some("20")))),
+        ((2, row_id), Arc::new(stat(Some("10"), None))),
+        ((3, row_id), Arc::new(stat(None, Some("20")))),
+        ((4, row_id), Arc::new(stat(Some("20"), Some("10")))),
+        ((5, row_id), Arc::new(stat(Some("nonsense"), Some("20")))),
+        ((6, row_id), Arc::new(stat(Some("-1"), Some("20")))),
+        ((7, 1), Arc::new(stat(Some("10"), Some("20")))),
     ]
     .into_iter()
     .collect();
@@ -761,13 +761,15 @@ async fn selection_defers_only_files_whose_bounds_exclude_every_requested_id() {
     let scope_store = DataStore::new(Arc::new(InMemory::new()));
     let row_id = crate::data_file::ROW_ID_FIELD_ID;
 
-    let bounded = |min: u64, max: u64| FileColumnStatsValue {
-        min_value: Some(min.to_string()),
-        max_value: Some(max.to_string()),
-        ..FileColumnStatsValue::default()
+    let bounded = |min: u64, max: u64| {
+        Arc::new(FileColumnStatsValue {
+            min_value: Some(min.to_string()),
+            max_value: Some(max.to_string()),
+            ..FileColumnStatsValue::default()
+        })
     };
     // File 1 holds 0..=9, file 2 holds 100..=109, file 3 records nothing.
-    let stats: OrdMap<(u64, u64), FileColumnStatsValue> = [
+    let stats: OrdMap<(u64, u64), Arc<FileColumnStatsValue>> = [
         ((1, row_id), bounded(0, 9)),
         ((2, row_id), bounded(100, 109)),
     ]
@@ -781,14 +783,16 @@ async fn selection_defers_only_files_whose_bounds_exclude_every_requested_id() {
         table: warm.table,
         stats: Some(&stats),
     };
-    let value = |id: u64| DataFileValue {
-        data_file_id: id,
-        table_id: warm.table.get(),
-        path: format!("f{id}.parquet"),
-        record_count: 10,
-        ..DataFileValue::default()
+    let value = |id: u64| {
+        Arc::new(DataFileValue {
+            data_file_id: id,
+            table_id: warm.table.get(),
+            path: format!("f{id}.parquet"),
+            record_count: 10,
+            ..DataFileValue::default()
+        })
     };
-    let files: OrdMap<u64, DataFileValue> = (1..=3).map(|id| (id, value(id))).collect();
+    let files: OrdMap<u64, Arc<DataFileValue>> = (1..=3).map(|id| (id, value(id))).collect();
     let selected = || -> BTreeMap<u64, crate::catalog::DataFileInfo> {
         files
             .iter()

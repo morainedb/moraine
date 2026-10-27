@@ -34,33 +34,33 @@ use crate::{
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EntityRecord {
     /// A schema record.
-    Schema(SchemaValue),
+    Schema(Arc<SchemaValue>),
     /// A table record.
-    Table(TableValue),
+    Table(Arc<TableValue>),
     /// A view record.
-    View(ViewValue),
+    View(Arc<ViewValue>),
     /// A column record.
-    Column(ColumnValue),
+    Column(Arc<ColumnValue>),
     /// A data file record.
-    File(DataFileValue),
+    File(Arc<DataFileValue>),
     /// A delete file record.
-    DeleteFile(DeleteFileValue),
+    DeleteFile(Arc<DeleteFileValue>),
     /// A partition spec record.
-    Partition(PartitionValue),
+    Partition(Arc<PartitionValue>),
     /// A sort spec record.
-    Sort(SortValue),
+    Sort(Arc<SortValue>),
     /// A macro record.
-    Macro(MacroValue),
+    Macro(Arc<MacroValue>),
     /// A column-mapping record.
-    Mapping(MappingValue),
+    Mapping(Arc<MappingValue>),
     /// An equality-index definition record.
-    Index(IndexValue),
+    Index(Arc<IndexValue>),
     /// File-level column statistics record.
-    FileColumnStats(FileColumnStatsValue),
+    FileColumnStats(Arc<FileColumnStatsValue>),
     /// Table-level statistics record.
-    TableStats(TableStatsValue),
+    TableStats(Arc<TableStatsValue>),
     /// Table-level column statistics record.
-    TableColumnStats(TableColumnStatsValue),
+    TableColumnStats(Arc<TableColumnStatsValue>),
     /// An option-scope record; the scope lives in the key, not the value.
     Option {
         /// Scope kind: global = 0, schema = 1, table = 2.
@@ -68,13 +68,20 @@ pub(crate) enum EntityRecord {
         /// Scope id (0 for global).
         scope_id: u64,
         /// The scope's options map.
-        value: OptionScopeValue,
+        value: Arc<OptionScopeValue>,
     },
     /// A tag container: one record per tagged object, entries embedded.
-    Tag(TagValue),
+    Tag(Arc<TagValue>),
     /// A `ducklake_files_scheduled_for_deletion` row — `current`-only
     /// bookkeeping, not a temporal entity.
-    GcFile(GcFileValue),
+    GcFile(Arc<GcFileValue>),
+}
+
+/// Decodes a value the record set and the catalog view both hold, so a
+/// view built from a scan shares the scan's allocation instead of copying
+/// it.
+fn decode_shared<M: prost::Message + Default>(bytes: &[u8]) -> Result<Arc<M>> {
+    Ok(Arc::new(value::decode_value(bytes)?))
 }
 
 impl EntityRecord {
@@ -439,23 +446,23 @@ pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<Snapsho
 
 pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
     match entity {
-        EntityKey::Schema { .. } => Ok(EntityRecord::Schema(value::decode_value(bytes)?)),
-        EntityKey::Table { .. } => Ok(EntityRecord::Table(value::decode_value(bytes)?)),
-        EntityKey::View { .. } => Ok(EntityRecord::View(value::decode_value(bytes)?)),
-        EntityKey::Column { .. } => Ok(EntityRecord::Column(value::decode_value(bytes)?)),
-        EntityKey::File { .. } => Ok(EntityRecord::File(value::decode_value(bytes)?)),
-        EntityKey::DeleteFile { .. } => Ok(EntityRecord::DeleteFile(value::decode_value(bytes)?)),
-        EntityKey::Partition { .. } => Ok(EntityRecord::Partition(value::decode_value(bytes)?)),
-        EntityKey::Sort { .. } => Ok(EntityRecord::Sort(value::decode_value(bytes)?)),
-        EntityKey::Macro { .. } => Ok(EntityRecord::Macro(value::decode_value(bytes)?)),
-        EntityKey::Mapping { .. } => Ok(EntityRecord::Mapping(value::decode_value(bytes)?)),
-        EntityKey::Index { .. } => Ok(EntityRecord::Index(value::decode_value(bytes)?)),
+        EntityKey::Schema { .. } => Ok(EntityRecord::Schema(decode_shared(bytes)?)),
+        EntityKey::Table { .. } => Ok(EntityRecord::Table(decode_shared(bytes)?)),
+        EntityKey::View { .. } => Ok(EntityRecord::View(decode_shared(bytes)?)),
+        EntityKey::Column { .. } => Ok(EntityRecord::Column(decode_shared(bytes)?)),
+        EntityKey::File { .. } => Ok(EntityRecord::File(decode_shared(bytes)?)),
+        EntityKey::DeleteFile { .. } => Ok(EntityRecord::DeleteFile(decode_shared(bytes)?)),
+        EntityKey::Partition { .. } => Ok(EntityRecord::Partition(decode_shared(bytes)?)),
+        EntityKey::Sort { .. } => Ok(EntityRecord::Sort(decode_shared(bytes)?)),
+        EntityKey::Macro { .. } => Ok(EntityRecord::Macro(decode_shared(bytes)?)),
+        EntityKey::Mapping { .. } => Ok(EntityRecord::Mapping(decode_shared(bytes)?)),
+        EntityKey::Index { .. } => Ok(EntityRecord::Index(decode_shared(bytes)?)),
         EntityKey::FileColumnStats { .. } => {
-            Ok(EntityRecord::FileColumnStats(value::decode_value(bytes)?))
+            Ok(EntityRecord::FileColumnStats(decode_shared(bytes)?))
         }
-        EntityKey::TableStats { .. } => Ok(EntityRecord::TableStats(value::decode_value(bytes)?)),
+        EntityKey::TableStats { .. } => Ok(EntityRecord::TableStats(decode_shared(bytes)?)),
         EntityKey::TableColumnStats { .. } => {
-            Ok(EntityRecord::TableColumnStats(value::decode_value(bytes)?))
+            Ok(EntityRecord::TableColumnStats(decode_shared(bytes)?))
         }
         EntityKey::Option {
             scope_kind,
@@ -463,9 +470,9 @@ pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRec
         } => Ok(EntityRecord::Option {
             scope_kind,
             scope_id,
-            value: value::decode_value(bytes)?,
+            value: decode_shared(bytes)?,
         }),
-        EntityKey::Tag { .. } => Ok(EntityRecord::Tag(value::decode_value(bytes)?)),
+        EntityKey::Tag { .. } => Ok(EntityRecord::Tag(decode_shared(bytes)?)),
     }
 }
 
@@ -502,9 +509,7 @@ pub(crate) type RecordSet = imbl::OrdMap<Bytes, Arc<EntityRecord>>;
 pub(crate) fn decode_current_record(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
     match key {
         Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
-        Key::Current(CurrentKey::GcFile { .. }) => {
-            Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
-        }
+        Key::Current(CurrentKey::GcFile { .. }) => Ok(EntityRecord::GcFile(decode_shared(bytes)?)),
         other => Err(Error::Corruption(format!(
             "non-current key in current scan: {other:?}"
         ))),
@@ -662,7 +667,7 @@ pub(crate) async fn scan_entity_kind(
             ScanShape::Bulk,
             |key, bytes| match key {
                 Key::Current(CurrentKey::GcFile { .. }) => {
-                    Ok(EntityRecord::GcFile(value::decode_value(&bytes)?))
+                    Ok(EntityRecord::GcFile(decode_shared(&bytes)?))
                 }
                 other => Err(Error::Corruption(format!(
                     "non-gc-file key in scheduled-file scan: {other:?}"
@@ -919,17 +924,17 @@ mod tests {
 
         let current = scan_current_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(current.len(), 5);
-        assert!(current.contains(&EntityRecord::Schema(schema.clone())));
-        assert!(current.contains(&EntityRecord::File(file.clone())));
-        assert!(current.contains(&EntityRecord::TableStats(tstat)));
-        assert!(current.contains(&EntityRecord::View(view)));
+        assert!(current.contains(&EntityRecord::Schema(Arc::new(schema.clone()))));
+        assert!(current.contains(&EntityRecord::File(Arc::new(file.clone()))));
+        assert!(current.contains(&EntityRecord::TableStats(Arc::new(tstat))));
+        assert!(current.contains(&EntityRecord::View(Arc::new(view))));
         assert!(current.contains(&EntityRecord::Option {
             scope_kind: 0,
             scope_id: 0,
-            value: option,
+            value: Arc::new(option),
         }));
         let history = scan_history_entities(ReadHandle::Tx(&tx)).await.unwrap();
-        assert_eq!(history, vec![EntityRecord::Schema(ended.clone())]);
+        assert_eq!(history, vec![EntityRecord::Schema(Arc::new(ended.clone()))]);
 
         assert_eq!(
             scan_entity_kind(
@@ -939,7 +944,10 @@ mod tests {
             )
             .await
             .unwrap(),
-            vec![EntityRecord::Schema(schema), EntityRecord::Schema(ended),]
+            vec![
+                EntityRecord::Schema(Arc::new(schema)),
+                EntityRecord::Schema(Arc::new(ended)),
+            ]
         );
         assert_eq!(
             scan_entity_kind(
@@ -949,7 +957,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            vec![EntityRecord::File(file)]
+            vec![EntityRecord::File(Arc::new(file))]
         );
         assert_eq!(
             scan_entity_kind(
@@ -959,7 +967,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            vec![EntityRecord::TableStats(tstat)]
+            vec![EntityRecord::TableStats(Arc::new(tstat))]
         );
         tx.rollback();
         db.close().await.unwrap();

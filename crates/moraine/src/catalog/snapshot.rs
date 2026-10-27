@@ -42,32 +42,32 @@ pub struct CatalogSnapshot {
     pub(crate) batch_seq: u64,
     /// Records in nested entity maps; flat maps already maintain their lengths.
     pub(crate) nested_entity_count: usize,
-    pub(crate) schemas: OrdMap<u64, SchemaValue>,
-    pub(crate) tables: OrdMap<u64, TableValue>,
-    pub(crate) views: OrdMap<u64, ViewValue>,
-    pub(crate) macros: OrdMap<u64, MacroValue>,
-    pub(crate) columns: OrdMap<u64, OrdMap<u64, ColumnValue>>,
+    pub(crate) schemas: OrdMap<u64, Arc<SchemaValue>>,
+    pub(crate) tables: OrdMap<u64, Arc<TableValue>>,
+    pub(crate) views: OrdMap<u64, Arc<ViewValue>>,
+    pub(crate) macros: OrdMap<u64, Arc<MacroValue>>,
+    pub(crate) columns: OrdMap<u64, OrdMap<u64, Arc<ColumnValue>>>,
     pub(crate) schema_names: HashMap<String, u64>,
     pub(crate) table_names: ScopedNames,
     pub(crate) view_names: ScopedNames,
     pub(crate) macro_names: ScopedNames,
-    pub(crate) data_files: OrdMap<u64, OrdMap<u64, DataFileValue>>,
-    pub(crate) delete_files: OrdMap<u64, OrdMap<u64, DeleteFileValue>>,
+    pub(crate) data_files: OrdMap<u64, OrdMap<u64, Arc<DataFileValue>>>,
+    pub(crate) delete_files: OrdMap<u64, OrdMap<u64, Arc<DeleteFileValue>>>,
     /// Each table's live delete files by the data file they target, as
     /// `(data_file_id, delete_file_id)`; derived from `delete_files`.
     pub(crate) delete_file_targets: OrdMap<u64, OrdSet<(u64, u64)>>,
-    pub(crate) partitions: OrdMap<u64, OrdMap<u64, PartitionValue>>,
-    pub(crate) sorts: OrdMap<u64, OrdMap<u64, SortValue>>,
-    pub(crate) mappings: OrdMap<u64, OrdMap<u64, MappingValue>>,
-    pub(crate) indexes: OrdMap<u64, OrdMap<u64, IndexValue>>,
+    pub(crate) partitions: OrdMap<u64, OrdMap<u64, Arc<PartitionValue>>>,
+    pub(crate) sorts: OrdMap<u64, OrdMap<u64, Arc<SortValue>>>,
+    pub(crate) mappings: OrdMap<u64, OrdMap<u64, Arc<MappingValue>>>,
+    pub(crate) indexes: OrdMap<u64, OrdMap<u64, Arc<IndexValue>>>,
     pub(crate) index_names: ScopedNames,
     pub(crate) index_tables: HashMap<u64, u64>,
-    pub(crate) table_stats: OrdMap<u64, TableStatsValue>,
-    pub(crate) table_column_stats: OrdMap<u64, OrdMap<u64, TableColumnStatsValue>>,
-    pub(crate) file_column_stats: OrdMap<u64, OrdMap<(u64, u64), FileColumnStatsValue>>,
-    pub(crate) options: OrdMap<(u64, u64), OptionScopeValue>,
-    pub(crate) tags: OrdMap<u64, TagValue>,
-    pub(crate) gc_files: OrdMap<u64, GcFileValue>,
+    pub(crate) table_stats: OrdMap<u64, Arc<TableStatsValue>>,
+    pub(crate) table_column_stats: OrdMap<u64, OrdMap<u64, Arc<TableColumnStatsValue>>>,
+    pub(crate) file_column_stats: OrdMap<u64, OrdMap<(u64, u64), Arc<FileColumnStatsValue>>>,
+    pub(crate) options: OrdMap<(u64, u64), Arc<OptionScopeValue>>,
+    pub(crate) tags: OrdMap<u64, Arc<TagValue>>,
+    pub(crate) gc_files: OrdMap<u64, Arc<GcFileValue>>,
 }
 
 /// A per-scope name index: schema or table id, then name, to entity id.
@@ -164,7 +164,7 @@ fn remove_nested<K: Ord + Clone, V: Clone>(
 }
 
 /// Encoded bytes of one map's values, keys included.
-fn flat_bytes<K: Ord, V: prost::Message>(map: &OrdMap<K, V>) -> u64 {
+fn flat_bytes<K: Ord, V: prost::Message>(map: &OrdMap<K, Arc<V>>) -> u64 {
     map.values()
         .map(|value| u64::try_from(value.encoded_len()).unwrap_or(u64::MAX))
         .sum::<u64>()
@@ -172,7 +172,7 @@ fn flat_bytes<K: Ord, V: prost::Message>(map: &OrdMap<K, V>) -> u64 {
 }
 
 /// As [`flat_bytes`], for a map of maps.
-fn nested_bytes<K1: Ord, K2: Ord, V: prost::Message>(map: &OrdMap<K1, OrdMap<K2, V>>) -> u64 {
+fn nested_bytes<K1: Ord, K2: Ord, V: prost::Message>(map: &OrdMap<K1, OrdMap<K2, Arc<V>>>) -> u64 {
     map.values().map(flat_bytes).sum::<u64>()
         + u64::try_from(map.len() * std::mem::size_of::<K1>()).unwrap_or(0)
 }
@@ -430,7 +430,10 @@ impl CatalogSnapshot {
     /// All live schemas, ordered by id.
     #[must_use]
     pub fn schemas(&self) -> Vec<SchemaInfo> {
-        self.schemas.values().map(schema_info).collect()
+        self.schemas
+            .values()
+            .map(|value| schema_info(value))
+            .collect()
     }
 
     /// One schema by name.
@@ -439,13 +442,13 @@ impl CatalogSnapshot {
         self.schema_names
             .get(name)
             .and_then(|id| self.schemas.get(id))
-            .map(schema_info)
+            .map(|value| schema_info(value))
     }
 
     /// One schema by id.
     #[must_use]
     pub fn schema_by_id(&self, id: SchemaId) -> Option<SchemaInfo> {
-        self.schemas.get(&id.get()).map(schema_info)
+        self.schemas.get(&id.get()).map(|value| schema_info(value))
     }
 
     /// The live tables of a schema, ordered by id.
@@ -454,7 +457,7 @@ impl CatalogSnapshot {
         self.tables
             .values()
             .filter(|t| t.schema_id == schema.get())
-            .map(table_info)
+            .map(|value| table_info(value))
             .collect()
     }
 
@@ -463,13 +466,13 @@ impl CatalogSnapshot {
     pub fn table_by_name(&self, schema: SchemaId, name: &str) -> Option<TableInfo> {
         scoped_name(&self.table_names, schema.get(), name)
             .and_then(|id| self.tables.get(&id))
-            .map(table_info)
+            .map(|value| table_info(value))
     }
 
     /// One table by id.
     #[must_use]
     pub fn table_by_id(&self, id: TableId) -> Option<TableInfo> {
-        self.tables.get(&id.get()).map(table_info)
+        self.tables.get(&id.get()).map(|value| table_info(value))
     }
 
     /// The live columns of a table, ordered by position.
@@ -525,7 +528,7 @@ impl CatalogSnapshot {
         self.views
             .values()
             .filter(|v| v.schema_id == schema.get())
-            .map(view_info)
+            .map(|value| view_info(value))
             .collect()
     }
 
@@ -534,13 +537,13 @@ impl CatalogSnapshot {
     pub fn view_by_name(&self, schema: SchemaId, name: &str) -> Option<ViewInfo> {
         scoped_name(&self.view_names, schema.get(), name)
             .and_then(|id| self.views.get(&id))
-            .map(view_info)
+            .map(|value| view_info(value))
     }
 
     /// One view by id.
     #[must_use]
     pub fn view_by_id(&self, id: ViewId) -> Option<ViewInfo> {
-        self.views.get(&id.get()).map(view_info)
+        self.views.get(&id.get()).map(|value| view_info(value))
     }
 
     /// The live macros of a schema.
@@ -549,7 +552,7 @@ impl CatalogSnapshot {
         self.macros
             .values()
             .filter(|m| m.schema_id == schema.get())
-            .map(macro_info)
+            .map(|value| macro_info(value))
             .collect()
     }
 
@@ -559,13 +562,13 @@ impl CatalogSnapshot {
     pub fn macro_by_name(&self, schema: SchemaId, name: &str) -> Option<MacroInfo> {
         scoped_name(&self.macro_names, schema.get(), name)
             .and_then(|id| self.macros.get(&id))
-            .map(macro_info)
+            .map(|value| macro_info(value))
     }
 
     /// One macro by id.
     #[must_use]
     pub fn macro_by_id(&self, id: MacroId) -> Option<MacroInfo> {
-        self.macros.get(&id.get()).map(macro_info)
+        self.macros.get(&id.get()).map(|value| macro_info(value))
     }
 
     /// A table's column mappings in `mapping_id` order. Mappings are
@@ -574,7 +577,12 @@ impl CatalogSnapshot {
     pub fn mappings_of(&self, table: TableId) -> Vec<MappingInfo> {
         self.mappings
             .get(&table.get())
-            .map(|per_table| per_table.values().map(mapping_info).collect())
+            .map(|per_table| {
+                per_table
+                    .values()
+                    .map(|value| mapping_info(value))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -586,7 +594,7 @@ impl CatalogSnapshot {
         self.partitions
             .get(&table.get())
             .and_then(|per_table| per_table.values().next())
-            .map(partition_spec)
+            .map(|value| partition_spec(value))
     }
 
     /// The table's sort spec live at this view's snapshot, or `None` when
@@ -597,7 +605,7 @@ impl CatalogSnapshot {
         self.sorts
             .get(&table.get())
             .and_then(|per_table| per_table.values().next())
-            .map(sort_spec)
+            .map(|value| sort_spec(value))
     }
 
     /// A table's live equality indexes, ordered by id.
@@ -605,7 +613,7 @@ impl CatalogSnapshot {
     pub fn indexes_of(&self, table: TableId) -> Vec<IndexInfo> {
         self.indexes
             .get(&table.get())
-            .map(|per_table| per_table.values().map(index_info).collect())
+            .map(|per_table| per_table.values().map(|value| index_info(value)).collect())
             .unwrap_or_default()
     }
 
@@ -614,7 +622,7 @@ impl CatalogSnapshot {
     pub fn index_by_name(&self, table: TableId, name: &str) -> Option<IndexInfo> {
         scoped_name(&self.index_names, table.get(), name)
             .and_then(|id| self.indexes.get(&table.get()).and_then(|m| m.get(&id)))
-            .map(index_info)
+            .map(|value| index_info(value))
     }
 
     /// Resolves a case-insensitive index name within a schema.
@@ -676,14 +684,17 @@ impl CatalogSnapshot {
         self.indexes
             .get(&table.get())
             .and_then(|per_table| per_table.get(&id.get()))
-            .map(index_info)
+            .map(|value| index_info(value))
     }
 
-    pub(crate) fn put_index(&mut self, value: IndexValue) {
+    pub(crate) fn put_index(&mut self, value: impl Into<Arc<IndexValue>>) {
+        let value = value.into();
         self.index_tables.insert(value.index_id, value.table_id);
         let per_table = self.indexes.entry(value.table_id).or_default();
         self.nested_entity_count += usize::from(!per_table.contains_key(&value.index_id));
-        put_named(per_table, &mut self.index_names, value, index_identity);
+        put_named(per_table, &mut self.index_names, value, |value| {
+            index_identity(value)
+        });
     }
 
     pub(crate) fn delete_index(&mut self, table_id: u64, index_id: u64) {
@@ -752,7 +763,8 @@ impl CatalogSnapshot {
             .unwrap_or_default()
     }
 
-    pub(crate) fn put_tag(&mut self, value: TagValue) {
+    pub(crate) fn put_tag(&mut self, value: impl Into<Arc<TagValue>>) {
+        let value = value.into();
         self.tags.insert(value.object_id, value);
     }
 
@@ -770,11 +782,13 @@ impl CatalogSnapshot {
             .collect()
     }
 
-    pub(crate) fn put_gc_file(&mut self, value: GcFileValue) {
+    pub(crate) fn put_gc_file(&mut self, value: impl Into<Arc<GcFileValue>>) {
+        let value = value.into();
         self.gc_files.insert(value.data_file_id, value);
     }
 
-    pub(crate) fn put_schema(&mut self, value: SchemaValue) {
+    pub(crate) fn put_schema(&mut self, value: impl Into<Arc<SchemaValue>>) {
+        let value = value.into();
         if let Some(old) = self.schemas.get(&value.schema_id) {
             self.schema_names.remove(&old.schema_name);
         }
@@ -790,22 +804,17 @@ impl CatalogSnapshot {
         self.remove_option_record(OptionScope::Schema(SchemaId::new(schema_id)).key_components());
     }
 
-    pub(crate) fn put_table(&mut self, value: TableValue) {
-        put_named(
-            &mut self.tables,
-            &mut self.table_names,
-            value,
-            table_identity,
-        );
+    pub(crate) fn put_table(&mut self, value: impl Into<Arc<TableValue>>) {
+        let value = value.into();
+        put_named(&mut self.tables, &mut self.table_names, value, |value| {
+            table_identity(value)
+        });
     }
 
     pub(crate) fn delete_table(&mut self, table_id: u64) {
-        delete_named(
-            &mut self.tables,
-            &mut self.table_names,
-            table_id,
-            table_identity,
-        );
+        delete_named(&mut self.tables, &mut self.table_names, table_id, |value| {
+            table_identity(value)
+        });
         self.nested_entity_count -= self.columns.remove(&table_id).map_or(0, |rows| rows.len());
         self.nested_entity_count -= self
             .data_files
@@ -838,20 +847,21 @@ impl CatalogSnapshot {
         // still resolve through them.
     }
 
-    pub(crate) fn put_view(&mut self, value: ViewValue) {
-        put_named(&mut self.views, &mut self.view_names, value, view_identity);
+    pub(crate) fn put_view(&mut self, value: impl Into<Arc<ViewValue>>) {
+        let value = value.into();
+        put_named(&mut self.views, &mut self.view_names, value, |value| {
+            view_identity(value)
+        });
     }
 
     pub(crate) fn delete_view(&mut self, view_id: u64) {
-        delete_named(
-            &mut self.views,
-            &mut self.view_names,
-            view_id,
-            view_identity,
-        );
+        delete_named(&mut self.views, &mut self.view_names, view_id, |value| {
+            view_identity(value)
+        });
     }
 
-    pub(crate) fn put_mapping(&mut self, value: MappingValue) {
+    pub(crate) fn put_mapping(&mut self, value: impl Into<Arc<MappingValue>>) {
+        let value = value.into();
         put_nested(
             &mut self.mappings,
             &mut self.nested_entity_count,
@@ -861,25 +871,21 @@ impl CatalogSnapshot {
         );
     }
 
-    pub(crate) fn put_macro(&mut self, value: MacroValue) {
-        put_named(
-            &mut self.macros,
-            &mut self.macro_names,
-            value,
-            macro_identity,
-        );
+    pub(crate) fn put_macro(&mut self, value: impl Into<Arc<MacroValue>>) {
+        let value = value.into();
+        put_named(&mut self.macros, &mut self.macro_names, value, |value| {
+            macro_identity(value)
+        });
     }
 
     pub(crate) fn delete_macro(&mut self, macro_id: u64) {
-        delete_named(
-            &mut self.macros,
-            &mut self.macro_names,
-            macro_id,
-            macro_identity,
-        );
+        delete_named(&mut self.macros, &mut self.macro_names, macro_id, |value| {
+            macro_identity(value)
+        });
     }
 
-    pub(crate) fn put_column(&mut self, value: ColumnValue) {
+    pub(crate) fn put_column(&mut self, value: impl Into<Arc<ColumnValue>>) {
+        let value = value.into();
         put_nested(
             &mut self.columns,
             &mut self.nested_entity_count,
@@ -912,7 +918,7 @@ impl CatalogSnapshot {
             return Vec::new();
         };
 
-        files.values().map(data_file_info).collect()
+        files.values().map(|value| data_file_info(value)).collect()
     }
 
     /// The table's delete files live at this view's snapshot, ordered by id.
@@ -922,7 +928,10 @@ impl CatalogSnapshot {
             return Vec::new();
         };
 
-        files.values().map(delete_file_info).collect()
+        files
+            .values()
+            .map(|value| delete_file_info(value))
+            .collect()
     }
 
     /// Statistics for a table. Unversioned: a time-travel view serves
@@ -931,7 +940,7 @@ impl CatalogSnapshot {
     pub fn table_stats(&self, table: TableId) -> Option<TableStats> {
         self.table_stats
             .get(&table.get())
-            .map(table_stats_from_proto)
+            .map(|value| table_stats_from_proto(value))
     }
 
     /// Statistics for a column. Unversioned: a time-travel view serves
@@ -941,10 +950,11 @@ impl CatalogSnapshot {
         self.table_column_stats
             .get(&table.get())
             .and_then(|cols| cols.get(&column.get()))
-            .map(column_stats_from_proto)
+            .map(|value| column_stats_from_proto(value))
     }
 
-    pub(crate) fn put_data_file(&mut self, value: DataFileValue) {
+    pub(crate) fn put_data_file(&mut self, value: impl Into<Arc<DataFileValue>>) {
+        let value = value.into();
         put_nested(
             &mut self.data_files,
             &mut self.nested_entity_count,
@@ -963,7 +973,8 @@ impl CatalogSnapshot {
         );
     }
 
-    pub(crate) fn put_partition(&mut self, value: PartitionValue) {
+    pub(crate) fn put_partition(&mut self, value: impl Into<Arc<PartitionValue>>) {
+        let value = value.into();
         put_nested(
             &mut self.partitions,
             &mut self.nested_entity_count,
@@ -982,7 +993,8 @@ impl CatalogSnapshot {
         );
     }
 
-    pub(crate) fn put_sort(&mut self, value: SortValue) {
+    pub(crate) fn put_sort(&mut self, value: impl Into<Arc<SortValue>>) {
+        let value = value.into();
         put_nested(
             &mut self.sorts,
             &mut self.nested_entity_count,
@@ -1001,7 +1013,8 @@ impl CatalogSnapshot {
         );
     }
 
-    pub(crate) fn put_delete_file(&mut self, value: DeleteFileValue) {
+    pub(crate) fn put_delete_file(&mut self, value: impl Into<Arc<DeleteFileValue>>) {
+        let value = value.into();
         let (table_id, delete_file_id, data_file_id) =
             (value.table_id, value.delete_file_id, value.data_file_id);
         if let Some(previous) = self
@@ -1055,15 +1068,20 @@ impl CatalogSnapshot {
             .get(&table_id)
             .into_iter()
             .flat_map(move |targets| targets.range((data_file_id, 0)..=(data_file_id, u64::MAX)))
-            .filter_map(move |(_, delete_file_id)| live.and_then(|files| files.get(delete_file_id)))
+            .filter_map(move |(_, delete_file_id)| {
+                live.and_then(|files| files.get(delete_file_id))
+                    .map(Arc::as_ref)
+            })
             .filter(move |value| value.data_file_id == data_file_id)
     }
 
-    pub(crate) fn put_table_stats(&mut self, value: TableStatsValue) {
+    pub(crate) fn put_table_stats(&mut self, value: impl Into<Arc<TableStatsValue>>) {
+        let value = value.into();
         self.table_stats.insert(value.table_id, value);
     }
 
-    pub(crate) fn put_table_column_stats(&mut self, value: TableColumnStatsValue) {
+    pub(crate) fn put_table_column_stats(&mut self, value: impl Into<Arc<TableColumnStatsValue>>) {
+        let value = value.into();
         put_nested(
             &mut self.table_column_stats,
             &mut self.nested_entity_count,
@@ -1073,7 +1091,8 @@ impl CatalogSnapshot {
         );
     }
 
-    pub(crate) fn put_file_column_stats(&mut self, value: FileColumnStatsValue) {
+    pub(crate) fn put_file_column_stats(&mut self, value: impl Into<Arc<FileColumnStatsValue>>) {
+        let value = value.into();
         put_nested(
             &mut self.file_column_stats,
             &mut self.nested_entity_count,
@@ -1083,7 +1102,12 @@ impl CatalogSnapshot {
         );
     }
 
-    pub(crate) fn set_option_record(&mut self, components: (u64, u64), value: OptionScopeValue) {
+    pub(crate) fn set_option_record(
+        &mut self,
+        components: (u64, u64),
+        value: impl Into<Arc<OptionScopeValue>>,
+    ) {
+        let value = value.into();
         self.options.insert(components, value);
     }
 
@@ -1102,12 +1126,9 @@ impl CatalogSnapshot {
     /// Removes a table and its name entry, without the child cascade
     /// [`delete_table`](Self::delete_table) applies.
     pub(crate) fn remove_table_only(&mut self, table_id: u64) {
-        delete_named(
-            &mut self.tables,
-            &mut self.table_names,
-            table_id,
-            table_identity,
-        );
+        delete_named(&mut self.tables, &mut self.table_names, table_id, |value| {
+            table_identity(value)
+        });
     }
 
     /// Removes one column, without the column-stats cascade
@@ -1153,7 +1174,9 @@ impl CatalogSnapshot {
             .collect();
         for column_id in &columns {
             if let Some(value) = per_table.get_mut(&(data_file_id, *column_id)) {
-                value.variant_stats.clear();
+                // The record set shares this value: clearing copies it into
+                // this generation and leaves the scan's copy alone.
+                Arc::make_mut(value).variant_stats.clear();
             }
         }
         columns
@@ -1746,10 +1769,10 @@ mod tests {
     #[test]
     fn head_view_indexes_live_entities() {
         let current = vec![
-            EntityRecord::Schema(schema_rec(0, "main", 1, None)),
-            EntityRecord::Table(table_rec(1, 0, "orders", 2)),
-            EntityRecord::Column(column_rec(1, 0, "id", 0, 2)),
-            EntityRecord::Column(column_rec(1, 1, "amount", 1, 2)),
+            EntityRecord::Schema(Arc::new(schema_rec(0, "main", 1, None))),
+            EntityRecord::Table(Arc::new(table_rec(1, 0, "orders", 2))),
+            EntityRecord::Column(Arc::new(column_rec(1, 0, "id", 0, 2))),
+            EntityRecord::Column(Arc::new(column_rec(1, 1, "amount", 1, 2))),
         ];
         let view = CatalogSnapshot::build_from(snap(2), &current, &[], None);
 
@@ -1770,10 +1793,15 @@ mod tests {
         // Schema 0 lived [1, 3); its replacement version lives [3, ∞).
         // Table 1 was created at 4.
         let current = vec![
-            EntityRecord::Schema(schema_rec(0, "renamed", 3, None)),
-            EntityRecord::Table(table_rec(1, 0, "orders", 4)),
+            EntityRecord::Schema(Arc::new(schema_rec(0, "renamed", 3, None))),
+            EntityRecord::Table(Arc::new(table_rec(1, 0, "orders", 4))),
         ];
-        let history = vec![EntityRecord::Schema(schema_rec(0, "original", 1, Some(3)))];
+        let history = vec![EntityRecord::Schema(Arc::new(schema_rec(
+            0,
+            "original",
+            1,
+            Some(3),
+        )))];
 
         let at2 = CatalogSnapshot::build_from(snap(2), &current.clone(), &history.clone(), Some(2));
         assert!(at2.schema_by_name("original").is_some());
@@ -1790,10 +1818,10 @@ mod tests {
         // Column allocation now reads the table's persisted counter, not
         // `history` — so `build` at head must not resurrect a dropped column
         // (or any other purely-historical record) into the live view.
-        let history = vec![EntityRecord::Column(ColumnValue {
+        let history = vec![EntityRecord::Column(Arc::new(ColumnValue {
             end_snapshot: Some(3),
             ..column_rec(1, 5, "gone", 0, 1)
-        })];
+        }))];
         let view = CatalogSnapshot::build_from(snap(3), &[], &history, None);
         assert!(view.columns_of(TableId::new(1)).is_empty());
     }
@@ -1828,7 +1856,7 @@ mod tests {
         view.put_column(column_rec(1, 0, "id", 0, 2));
         assert!(view.table_by_name(SchemaId::new(0), "orders").is_some());
 
-        let mut renamed = view.tables[&1].clone();
+        let mut renamed = (*view.tables[&1]).clone();
         renamed.table_name = "orders_v2".into();
         view.put_table(renamed);
         assert!(view.table_by_name(SchemaId::new(0), "orders").is_none());
@@ -1845,10 +1873,10 @@ mod tests {
     #[test]
     fn data_files_filter_by_version_but_stats_do_not() {
         let current = vec![
-            EntityRecord::File(file_rec(1, 10, 100, 5, None)),
-            EntityRecord::TableStats(tstat_rec(1, 100, 100)),
+            EntityRecord::File(Arc::new(file_rec(1, 10, 100, 5, None))),
+            EntityRecord::TableStats(Arc::new(tstat_rec(1, 100, 100))),
         ];
-        let history = vec![EntityRecord::File(file_rec(1, 9, 50, 1, Some(5)))];
+        let history = vec![EntityRecord::File(Arc::new(file_rec(1, 9, 50, 1, Some(5))))];
 
         // Head view: only the live file; stats present.
         let head = CatalogSnapshot::build_from(snap(6), &current.clone(), &[], None);
@@ -1952,8 +1980,14 @@ mod tests {
 
     #[test]
     fn views_are_versioned_and_indexed() {
-        let current = vec![EntityRecord::View(view_rec(3, 0, "v2", 4, None))];
-        let history = vec![EntityRecord::View(view_rec(3, 0, "v1", 1, Some(4)))];
+        let current = vec![EntityRecord::View(Arc::new(view_rec(3, 0, "v2", 4, None)))];
+        let history = vec![EntityRecord::View(Arc::new(view_rec(
+            3,
+            0,
+            "v1",
+            1,
+            Some(4),
+        )))];
         let head = CatalogSnapshot::build_from(snap(5), &current.clone(), &[], None);
         assert_eq!(
             head.view_by_name(SchemaId::new(0), "v2").unwrap().id,
@@ -1979,8 +2013,12 @@ mod tests {
             }],
         };
         // Unversioned: included regardless of the time-travel target.
-        let past =
-            CatalogSnapshot::build_from(snap(12), &[EntityRecord::Mapping(mapping)], &[], Some(1));
+        let past = CatalogSnapshot::build_from(
+            snap(12),
+            &[EntityRecord::Mapping(Arc::new(mapping))],
+            &[],
+            Some(1),
+        );
         let mappings = past.mappings_of(TableId::new(4));
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].id, MappingId::new(21));
@@ -1991,8 +2029,16 @@ mod tests {
 
     #[test]
     fn macros_are_versioned_and_indexed() {
-        let current = vec![EntityRecord::Macro(macro_rec(1, 5, "add", 10, None))];
-        let history = vec![EntityRecord::Macro(macro_rec(2, 5, "old", 1, Some(10)))];
+        let current = vec![EntityRecord::Macro(Arc::new(macro_rec(
+            1, 5, "add", 10, None,
+        )))];
+        let history = vec![EntityRecord::Macro(Arc::new(macro_rec(
+            2,
+            5,
+            "old",
+            1,
+            Some(10),
+        )))];
         let head = CatalogSnapshot::build_from(snap(12), &current.clone(), &[], None);
         assert_eq!(
             head.macro_by_name(SchemaId::new(5), "add").unwrap().id,
@@ -2043,7 +2089,7 @@ mod tests {
     #[test]
     fn indexes_are_versioned_and_table_scoped() {
         use crate::catalog::types::{IndexId, IndexState};
-        let current = vec![EntityRecord::Index(index_rec(
+        let current = vec![EntityRecord::Index(Arc::new(index_rec(
             7,
             1,
             "by_id",
@@ -2051,8 +2097,8 @@ mod tests {
             true,
             4,
             None,
-        ))];
-        let history = vec![EntityRecord::Index(index_rec(
+        )))];
+        let history = vec![EntityRecord::Index(Arc::new(index_rec(
             8,
             1,
             "old",
@@ -2060,7 +2106,7 @@ mod tests {
             false,
             1,
             Some(4),
-        ))];
+        )))];
 
         let head = CatalogSnapshot::build_from(snap(5), &current.clone(), &[], None);
         let infos = head.indexes_of(TableId::new(1));
@@ -2114,9 +2160,9 @@ mod tests {
         let view = CatalogSnapshot::build_from(
             snap(1),
             &[
-                EntityRecord::Index(building),
-                EntityRecord::Index(poisoned),
-                EntityRecord::Index(maintaining),
+                EntityRecord::Index(Arc::new(building)),
+                EntityRecord::Index(Arc::new(poisoned)),
+                EntityRecord::Index(Arc::new(maintaining)),
             ],
             &[],
             None,

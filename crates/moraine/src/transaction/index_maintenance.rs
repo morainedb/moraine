@@ -746,7 +746,7 @@ pub(crate) fn apply_poison(state: &mut crate::catalog::CatalogSnapshot, poisoned
             .get_mut(&table_id)
             .and_then(|indexes| indexes.get_mut(index_id))
         {
-            value.poisoned = Some(true);
+            Arc::make_mut(value).poisoned = Some(true);
         }
     }
 }
@@ -770,6 +770,7 @@ pub(crate) fn apply_deferred_maintenance(
         else {
             continue;
         };
+        let value = Arc::make_mut(value);
         if value.build_state.is_none() {
             value.begin_snapshot = new_snapshot;
             value.build_state = Some("maintaining".to_owned());

@@ -86,6 +86,8 @@ impl BatchWrite<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -179,11 +181,13 @@ mod tests {
         ));
         assert_eq!(
             decoded[2].value().unwrap(),
-            Some(DecodedValue::Record(EntityRecord::TableStats(stats)))
+            Some(DecodedValue::Record(EntityRecord::TableStats(Arc::new(
+                stats
+            ))))
         );
         assert_eq!(
             decoded[3].value().unwrap(),
-            Some(DecodedValue::Record(EntityRecord::Schema(schema)))
+            Some(DecodedValue::Record(EntityRecord::Schema(Arc::new(schema))))
         );
         assert_eq!(
             decoded[3].key(),

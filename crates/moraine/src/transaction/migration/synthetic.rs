@@ -90,7 +90,7 @@ async fn next_source_record(
                 scope_kind,
                 scope_id,
                 value,
-            } if scope_kind == SOURCE_SCOPE => Some((scope_id, value)),
+            } if scope_kind == SOURCE_SCOPE => Some((scope_id, (*value).clone())),
             _ => None,
         })
         .filter(|(scope_id, _)| start.is_none_or(|start| *scope_id > start))

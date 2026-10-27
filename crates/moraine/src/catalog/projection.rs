@@ -863,7 +863,7 @@ impl ProjectionCache {
                 Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id })) => {
                     self.table_stats.fold(*table_id, || {
                         projected(write, |value| match value {
-                            DecodedValue::Record(EntityRecord::TableStats(stats)) => Some(stats),
+                            DecodedValue::Record(EntityRecord::TableStats(stats)) => Some(*stats),
                             _ => None,
                         })
                     });
@@ -873,7 +873,9 @@ impl ProjectionCache {
                     column_id,
                 })) => self.table_column_stats.fold((*table_id, *column_id), || {
                     projected(write, |value| match value {
-                        DecodedValue::Record(EntityRecord::TableColumnStats(stats)) => Some(stats),
+                        DecodedValue::Record(EntityRecord::TableColumnStats(stats)) => {
+                            Some((*stats).clone())
+                        }
                         _ => None,
                     })
                 }),
@@ -1484,7 +1486,7 @@ mod tests {
             stamp(1, 1),
             half_of(vec![(
                 Key::current(EntityKey::TableStats { table_id: 7 }),
-                EntityRecord::TableStats(stats_value(7, 10)),
+                EntityRecord::TableStats(Arc::new(stats_value(7, 10))),
             )]),
         );
         cache.apply_batch(
@@ -1508,7 +1510,7 @@ mod tests {
             stamp(1, 1),
             half_of(vec![(
                 Key::current(EntityKey::TableStats { table_id: 7 }),
-                EntityRecord::TableStats(stats_value(7, 10)),
+                EntityRecord::TableStats(Arc::new(stats_value(7, 10))),
             )]),
         );
 
@@ -1537,7 +1539,7 @@ mod tests {
         let half = || {
             half_of(vec![(
                 Key::current(EntityKey::TableStats { table_id: 7 }),
-                EntityRecord::TableStats(stats_value(7, 10)),
+                EntityRecord::TableStats(Arc::new(stats_value(7, 10))),
             )])
         };
 
@@ -1594,11 +1596,11 @@ mod tests {
             half_of(vec![
                 (
                     Key::current(EntityKey::Schema { schema_id: 1 }),
-                    EntityRecord::Schema(schema_value(1, None)),
+                    EntityRecord::Schema(Arc::new(schema_value(1, None))),
                 ),
                 (
                     Key::current(EntityKey::Schema { schema_id: 2 }),
-                    EntityRecord::Schema(schema_value(2, None)),
+                    EntityRecord::Schema(Arc::new(schema_value(2, None))),
                 ),
             ]),
         );
@@ -1659,7 +1661,7 @@ mod tests {
             stamp(3, 3),
             half_of(vec![(
                 Key::current(EntityKey::Schema { schema_id: 1 }),
-                EntityRecord::Schema(schema_value(1, None)),
+                EntityRecord::Schema(Arc::new(schema_value(1, None))),
             )]),
         );
         cache.install_history_entities(stamp(3, 3), Arc::default());

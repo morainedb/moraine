@@ -26,6 +26,7 @@ impl CatalogSnapshot {
                 self.mappings
                     .get(&table.get())
                     .and_then(|mappings| mappings.get(&id))
+                    .map(std::sync::Arc::as_ref)
                     .ok_or_else(|| Error::Corruption(format!("no mapping {id} for table {table}")))
             })
             .transpose()?;

@@ -2,6 +2,8 @@
 //! working `CatalogSnapshot`, and assembling the commit's snapshot
 //! record.
 
+use std::sync::Arc;
+
 use super::{
     BTreeSet, CatalogSnapshot, Cell, EntityKey, Error, HashMap, Key, Result, RowOperation,
     TableKind, commit,
@@ -435,15 +437,13 @@ fn apply_tag_insert(
     if table == TableKind::Tag {
         let (object_id, entry) = decode_tag_row(cells)?;
         touched.touch(EntityKey::Tag { object_id });
-        state
-            .tags
-            .entry(object_id)
-            .or_insert_with(|| proto::TagValue {
+        let container = state.tags.entry(object_id).or_insert_with(|| {
+            Arc::new(proto::TagValue {
                 object_id,
                 entries: Vec::new(),
             })
-            .entries
-            .push(entry);
+        });
+        Arc::make_mut(container).entries.push(entry);
         return Ok(());
     }
 
@@ -455,6 +455,7 @@ fn apply_tag_insert(
                 format!("view column tag names an absent view ({view_id})"),
             ));
         };
+        let view = Arc::make_mut(view);
         view.column_tags.push(tag);
         touched.touch(EntityKey::View { view_id });
         return Ok(());
@@ -471,6 +472,7 @@ fn apply_tag_insert(
             format!("column tag names an absent column ({table_id}, {column_id})"),
         ));
     };
+    let column = Arc::make_mut(column);
     column.tags.push(tag);
     touched.touch(EntityKey::Column {
         table_id,
@@ -555,10 +557,7 @@ pub(super) fn apply_insert(
                 scope_kind: components.0,
                 scope_id: components.1,
             });
-            state
-                .options
-                .entry(components)
-                .or_default()
+            Arc::make_mut(state.options.entry(components).or_default())
                 .options
                 .insert(key, value);
         }
@@ -687,7 +686,7 @@ pub(super) fn apply_tag_set_end(
     touched.touch(EntityKey::Tag { object_id });
     let ended = state.tags.get_mut(&object_id).is_some_and(|container| {
         end_live_entry(
-            &mut container.entries,
+            &mut Arc::make_mut(container).entries,
             |e| e.key == key && e.end_snapshot.is_none(),
             |e| e.end_snapshot = Some(new_id),
         )
@@ -728,7 +727,7 @@ pub(super) fn apply_column_tag_set_end(
         .and_then(|cols| cols.get_mut(&column_id))
         .is_some_and(|column| {
             end_live_entry(
-                &mut column.tags,
+                &mut Arc::make_mut(column).tags,
                 |t| t.key == key && t.end_snapshot.is_none(),
                 |t| t.end_snapshot = Some(new_id),
             )
@@ -759,7 +758,7 @@ fn apply_view_column_tag_set_end(
     check_end_snapshot(TableKind::ViewColumnTag, end_snapshot, new_id)?;
     let ended = state.views.get_mut(&view_id).is_some_and(|view| {
         end_live_entry(
-            &mut view.column_tags,
+            &mut Arc::make_mut(view).column_tags,
             |tag| tag.column_name == column_name && tag.key == key && tag.end_snapshot.is_none(),
             |tag| tag.end_snapshot = Some(end_snapshot),
         )
@@ -916,6 +915,7 @@ pub(super) fn apply_update_set_begin(
             format!("no data file ({table_id}, {data_file_id}) to rebase"),
         ));
     };
+    let file = Arc::make_mut(file);
     file.begin_snapshot = begin_snapshot;
     Ok(())
 }
@@ -956,6 +956,7 @@ fn apply_option_delete(
     let Some(record) = state.options.get_mut(&components) else {
         return Ok(());
     };
+    let record = Arc::make_mut(record);
     record.options.remove(&key);
     if record.options.is_empty() {
         state.remove_option_record(components);
@@ -1079,6 +1080,7 @@ pub(super) fn apply_delete(
                 .get_mut(&table_id)
                 .and_then(|cols| cols.get_mut(&column_id))
             {
+                let column = Arc::make_mut(column);
                 column
                     .tags
                     .retain(|t| !(t.key == key && t.begin_snapshot == begin_snapshot));
@@ -1113,6 +1115,7 @@ fn apply_view_column_tag_delete(
 
     touched.touch(EntityKey::View { view_id });
     if let Some(view) = state.views.get_mut(&view_id) {
+        let view = Arc::make_mut(view);
         view.column_tags.retain(|tag| {
             !(tag.column_name == column_name
                 && tag.key == key
@@ -1138,6 +1141,7 @@ pub(super) fn apply_tag_delete(
     touched.touch(EntityKey::Tag { object_id });
 
     let removed = state.tags.get_mut(&object_id).is_some_and(|container| {
+        let container = Arc::make_mut(container);
         let before = container.entries.len();
         container
             .entries

@@ -1108,7 +1108,7 @@ impl StagedTransaction {
                 read::Versions::LiveAndEnded,
                 None,
                 |r| match r {
-                    read::EntityRecord::Tag(v) => Some(v.clone()),
+                    read::EntityRecord::Tag(v) => Some((**v).clone()),
                     _ => None,
                 },
             )
@@ -1134,7 +1134,7 @@ impl StagedTransaction {
                         scope_kind,
                         scope_id,
                         value,
-                    } => Some((*scope_kind, *scope_id, value.clone())),
+                    } => Some((*scope_kind, *scope_id, (**value).clone())),
                     _ => None,
                 },
             )
@@ -2297,7 +2297,7 @@ fn translate(
         if let Some(table) = state.tables.get_mut(table_id)
             && table.next_column_id <= *max_id
         {
-            table.next_column_id = max_id + 1;
+            Arc::make_mut(table).next_column_id = max_id + 1;
             touched.touch(EntityKey::Table {
                 table_id: *table_id,
             });

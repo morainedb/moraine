@@ -6,7 +6,10 @@
 //! means moving every one of those by the distance the head moved, which
 //! is the arithmetic DuckLake's own retry performs when it re-drives.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use imbl::OrdMap;
 
@@ -38,11 +41,11 @@ pub(super) struct Rebase {
     pub(super) schema_version: u64,
     /// Per table the premise appended to since the member's base.
     pub(super) rows: BTreeMap<u64, RowShift>,
-    pub(super) base_table_stats: OrdMap<u64, proto::TableStatsValue>,
-    pub(super) premise_table_stats: OrdMap<u64, proto::TableStatsValue>,
-    pub(super) base_column_stats: OrdMap<u64, OrdMap<u64, proto::TableColumnStatsValue>>,
-    pub(super) premise_column_stats: OrdMap<u64, OrdMap<u64, proto::TableColumnStatsValue>>,
-    pub(super) column_types: OrdMap<u64, OrdMap<u64, proto::ColumnValue>>,
+    pub(super) base_table_stats: OrdMap<u64, Arc<proto::TableStatsValue>>,
+    pub(super) premise_table_stats: OrdMap<u64, Arc<proto::TableStatsValue>>,
+    pub(super) base_column_stats: OrdMap<u64, OrdMap<u64, Arc<proto::TableColumnStatsValue>>>,
+    pub(super) premise_column_stats: OrdMap<u64, OrdMap<u64, Arc<proto::TableColumnStatsValue>>>,
+    pub(super) column_types: OrdMap<u64, OrdMap<u64, Arc<proto::ColumnValue>>>,
 }
 
 impl Rebase {
@@ -196,7 +199,7 @@ impl Rebase {
             return;
         };
         let carry = |written: u64, read: fn(&proto::TableStatsValue) -> u64| {
-            let delta = written.saturating_sub(base.map_or(0, read));
+            let delta = written.saturating_sub(base.map_or(0, |stats| read(stats)));
             read(premise).saturating_add(delta)
         };
         value.record_count = carry(value.record_count, |stats| stats.record_count);
@@ -207,11 +210,11 @@ impl Rebase {
     /// Column statistics: the member's own where nothing moved them in
     /// between, else widened over the premise's by the column's type.
     pub(super) fn table_column_stats(&self, value: &mut proto::TableColumnStatsValue) {
-        let at = |stats: &OrdMap<u64, OrdMap<u64, proto::TableColumnStatsValue>>| {
+        let at = |stats: &OrdMap<u64, OrdMap<u64, Arc<proto::TableColumnStatsValue>>>| {
             stats
                 .get(&value.table_id)
                 .and_then(|columns| columns.get(&value.column_id))
-                .cloned()
+                .map(|stats| (**stats).clone())
         };
         let (Some(premise), base) = (at(&self.premise_column_stats), at(&self.base_column_stats))
         else {

@@ -6,7 +6,7 @@
 //! staged caller supplies touched ids; a verb caller discovers changes by
 //! skipping shared tree nodes. Both use the same versioning and write staging.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use imbl::{OrdMap, ordmap::DiffItem};
 
@@ -269,8 +269,8 @@ fn stage_overwrite<M: prost::Message + PartialEq>(
 fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     ids: Vec<K>,
-    base: &OrdMap<K, M>,
-    state: &OrdMap<K, M>,
+    base: &OrdMap<K, Arc<M>>,
+    state: &OrdMap<K, Arc<M>>,
     make_key: impl Fn(K) -> EntityKey,
     new_snapshot: u64,
     set_end: impl Fn(&M) -> M,
@@ -279,8 +279,8 @@ fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
         stage_transition(
             writes,
             make_key(id),
-            base.get(&id),
-            state.get(&id),
+            base.get(&id).map(Arc::as_ref),
+            state.get(&id).map(Arc::as_ref),
             new_snapshot,
             &set_end,
         );
@@ -292,8 +292,8 @@ fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
 fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     ids: Vec<(u64, K)>,
-    base: &OrdMap<u64, OrdMap<K, M>>,
-    state: &OrdMap<u64, OrdMap<K, M>>,
+    base: &OrdMap<u64, OrdMap<K, Arc<M>>>,
+    state: &OrdMap<u64, OrdMap<K, Arc<M>>>,
     make_key: impl Fn(u64, K) -> EntityKey,
     new_snapshot: u64,
     set_end: impl Fn(&M) -> M,
@@ -302,8 +302,13 @@ fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
         stage_transition(
             writes,
             make_key(table_id, id),
-            base.get(&table_id).and_then(|inner| inner.get(&id)),
-            state.get(&table_id).and_then(|inner| inner.get(&id)),
+            base.get(&table_id)
+                .and_then(|inner| inner.get(&id))
+                .map(Arc::as_ref),
+            state
+                .get(&table_id)
+                .and_then(|inner| inner.get(&id))
+                .map(Arc::as_ref),
             new_snapshot,
             &set_end,
         );
@@ -315,12 +320,17 @@ fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
 fn diff_overwrite_map<K: Copy + Ord, M: prost::Message + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     ids: Vec<K>,
-    base: &OrdMap<K, M>,
-    state: &OrdMap<K, M>,
+    base: &OrdMap<K, Arc<M>>,
+    state: &OrdMap<K, Arc<M>>,
     make_key: impl Fn(K) -> EntityKey,
 ) {
     for id in ids {
-        stage_overwrite(writes, make_key(id), base.get(&id), state.get(&id));
+        stage_overwrite(
+            writes,
+            make_key(id),
+            base.get(&id).map(Arc::as_ref),
+            state.get(&id).map(Arc::as_ref),
+        );
     }
 }
 
@@ -390,8 +400,8 @@ fn diff_tables(
         stage_transition_with_internal(
             writes,
             EntityKey::Table { table_id },
-            base.tables.get(&table_id),
-            state.tables.get(&table_id),
+            base.tables.get(&table_id).map(Arc::as_ref),
+            state.tables.get(&table_id).map(Arc::as_ref),
             new_snapshot,
             |prior| proto::TableValue {
                 end_snapshot: Some(new_snapshot),
@@ -413,8 +423,8 @@ fn diff_views(
         stage_transition_with_internal(
             writes,
             EntityKey::View { view_id },
-            base.views.get(&view_id),
-            state.views.get(&view_id),
+            base.views.get(&view_id).map(Arc::as_ref),
+            state.views.get(&view_id).map(Arc::as_ref),
             new_snapshot,
             |prior| proto::ViewValue {
                 end_snapshot: Some(new_snapshot),
@@ -472,8 +482,8 @@ fn diff_gc_files(
     for data_file_id in flat_ids(scope, &base.gc_files, &state.gc_files, |t| &t.gc_files) {
         let key = Key::Current(CurrentKey::GcFile { data_file_id });
         match (
-            base.gc_files.get(&data_file_id),
-            state.gc_files.get(&data_file_id),
+            base.gc_files.get(&data_file_id).map(Arc::as_ref),
+            state.gc_files.get(&data_file_id).map(Arc::as_ref),
         ) {
             (Some(_), None) => writes.push((key.encode(), None)),
             (prior, Some(next)) if prior != Some(next) => {
@@ -542,7 +552,8 @@ fn diff_mappings(
             },
             base.mappings
                 .get(&table_id)
-                .and_then(|b| b.get(&mapping_id)),
+                .and_then(|b| b.get(&mapping_id))
+                .map(Arc::as_ref),
             Some(value),
         );
     }
@@ -573,11 +584,13 @@ fn diff_columns(
             },
             base.columns
                 .get(&table_id)
-                .and_then(|columns| columns.get(&column_id)),
+                .and_then(|columns| columns.get(&column_id))
+                .map(Arc::as_ref),
             state
                 .columns
                 .get(&table_id)
-                .and_then(|columns| columns.get(&column_id)),
+                .and_then(|columns| columns.get(&column_id))
+                .map(Arc::as_ref),
             new_snapshot,
             |prior| proto::ColumnValue {
                 end_snapshot: Some(new_snapshot),
@@ -745,11 +758,13 @@ fn diff_table_column_stats(
             },
             base.table_column_stats
                 .get(&table_id)
-                .and_then(|columns| columns.get(&column_id)),
+                .and_then(|columns| columns.get(&column_id))
+                .map(Arc::as_ref),
             state
                 .table_column_stats
                 .get(&table_id)
-                .and_then(|columns| columns.get(&column_id)),
+                .and_then(|columns| columns.get(&column_id))
+                .map(Arc::as_ref),
         );
     }
 }
@@ -770,11 +785,13 @@ fn diff_file_column_stats(
             let base_stats = base
                 .file_column_stats
                 .get(&table_id)
-                .and_then(|columns| columns.get(&(data_file_id, column_id)));
+                .and_then(|columns| columns.get(&(data_file_id, column_id)))
+                .map(Arc::as_ref);
             let state_stats = state
                 .file_column_stats
                 .get(&table_id)
-                .and_then(|columns| columns.get(&(data_file_id, column_id)));
+                .and_then(|columns| columns.get(&(data_file_id, column_id)))
+                .map(Arc::as_ref);
             let file_is_known = base
                 .data_files
                 .get(&table_id)
@@ -960,7 +977,7 @@ mod tests {
             (2, "two-rewritten.parquet"),
         ] {
             if let Some(value) = state.data_files.get_mut(&7).and_then(|f| f.get_mut(&id)) {
-                value.path = path.to_string();
+                Arc::make_mut(value).path = path.to_string();
             }
         }
 
@@ -981,7 +998,7 @@ mod tests {
             &{
                 let mut one = base.clone();
                 if let Some(value) = one.data_files.get_mut(&7).and_then(|f| f.get_mut(&1)) {
-                    value.path = "one-rewritten.parquet".to_string();
+                    Arc::make_mut(value).path = "one-rewritten.parquet".to_string();
                 }
                 one
             },

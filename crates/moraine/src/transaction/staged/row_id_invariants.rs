@@ -255,7 +255,7 @@ fn source_records(
     let files = base.data_files.get(&table_id)?;
     file_ids
         .iter()
-        .map(|file_id| files.get(file_id).cloned())
+        .map(|file_id| files.get(file_id).map(|file| (**file).clone()))
         .collect()
 }
 

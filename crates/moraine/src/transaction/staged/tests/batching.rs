@@ -341,7 +341,7 @@ async fn concurrent_inline_inserts_into_an_indexed_table_rebase_their_entries() 
         "the loser's rows moved past the winner's"
     );
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 6);
-    let stats = catalog.snapshot().await.unwrap().table_stats[&1];
+    let stats = catalog.snapshot().await.unwrap().table_stats[&1].clone();
     assert_eq!((stats.record_count, stats.next_row_id), (6, 6));
 }
 
@@ -386,7 +386,7 @@ async fn an_inline_insert_begun_before_a_landed_one_rebases_its_entries() {
         assert_eq!(lookup(value).await, [row_id], "value {value}");
     }
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 6);
-    let stats = catalog.snapshot().await.unwrap().table_stats[&1];
+    let stats = catalog.snapshot().await.unwrap().table_stats[&1].clone();
     assert_eq!((stats.record_count, stats.next_row_id), (6, 6));
 }
 
