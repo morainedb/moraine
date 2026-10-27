@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/morainedb/moraine/compare/v0.8.0...v0.8.1) - 2026-10-27
+
+### Fixed
+
+- *(memory)* charge each structure for what it holds ([#373](https://github.com/morainedb/moraine/pull/373))
+
+### Other
+
+- *(catalog)* share one decoded record between the view and the scan ([#372](https://github.com/morainedb/moraine/pull/372))
+- *(memory)* release retained pages after a phase frees its allocations ([#371](https://github.com/morainedb/moraine/pull/371))
+
 ## [0.8.0](https://github.com/morainedb/moraine/compare/v0.7.0...v0.8.0) - 2026-10-23
 
 ### Added
