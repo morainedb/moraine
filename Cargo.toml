@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexpropp/moraine"
@@ -23,7 +23,7 @@ imbl = "7.0.2"
 hashbrown = { version = "0.17.1", default-features = false }
 lru-slab = "0.1.2"
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
-moraine = { path = "crates/moraine", version = "0.8.0" }
+moraine = { path = "crates/moraine", version = "0.8.1" }
 # 0.22.6 is the floor slatedb pins, and it is what sets the workspace MSRV.
 foyer = { version = "0.22.6", features = ["serde"] }
 object_store = "0.14"
