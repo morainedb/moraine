@@ -22,8 +22,9 @@ namespace {
 // attach option is `MAINTENANCE_<step>` to enable a step with DuckLake's
 // defaults, or `MAINTENANCE_<step>_<parameter>` to pass one through.
 //
-// Flush precedes expiry so retiring snapshots never selectively prunes
-// inline chunks that still contain live rows. Its small files are merge
+// Expiry leads because it is the only step that shrinks the catalog
+// rather than adding to it, and every later step is then served a smaller
+// snapshot projection. Flush precedes merge so its small files are merge
 // input; merge and rewrite precede cleanup because merge schedules its
 // superseded bytes directly and cleanup drains that schedule in the same
 // pass; cleanup precedes orphan detection so the schedule is drained
@@ -35,8 +36,8 @@ struct StepSpec {
 
 const std::vector<StepSpec> &StepSpecs() {
 	static const std::vector<StepSpec> specs = {
-	    {"flush_inlined_data", {}},
 	    {"expire_snapshots", {"older_than", "versions"}},
+	    {"flush_inlined_data", {}},
 	    {"merge_adjacent_files", {}},
 	    {"rewrite_data_files", {"delete_threshold"}},
 	    {"cleanup_old_files", {"older_than", "cleanup_all"}},

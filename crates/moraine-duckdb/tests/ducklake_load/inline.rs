@@ -3,7 +3,7 @@ use crate::helpers::*;
 /// A selective metadata deletion cannot drain unmatched rows in its chunk.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn selective_inline_deletion_refuses_an_incomplete_snapshot_prefix() {
+fn selective_inline_deletion_preserves_unmatched_rows() {
     let store = TempDir::new("inline-selective-store");
     let data = TempDir::new("inline-selective-data");
     run_ducklake_sql(
@@ -13,12 +13,11 @@ fn selective_inline_deletion_refuses_an_incomplete_snapshot_prefix() {
          INSERT INTO lake.main.t VALUES (1), (2), (3);\
          DELETE FROM __ducklake_metadata_lake.ducklake_inlined_data_1_1 WHERE i = 99;",
     );
-    let error = run_ducklake_sql_expect_err(
+    run_ducklake_sql(
         store.path(),
         data.path(),
         "DELETE FROM __ducklake_metadata_lake.ducklake_inlined_data_1_1 WHERE i = 2;",
     );
-    assert!(error.contains("selective inline deletion"), "{error}");
     let read = || {
         csv_rows(&run_ducklake_sql(
             store.path(),
@@ -26,13 +25,13 @@ fn selective_inline_deletion_refuses_an_incomplete_snapshot_prefix() {
             "SELECT i FROM lake.main.t ORDER BY i;",
         ))
     };
-    assert_eq!(read(), vec![vec!["1"], vec!["2"], vec!["3"]]);
+    assert_eq!(read(), vec![vec!["1"], vec!["3"]]);
     run_ducklake_sql(
         store.path(),
         data.path(),
         "CALL ducklake_flush_inlined_data('lake');",
     );
-    assert_eq!(read(), vec![vec!["1"], vec!["2"], vec!["3"]]);
+    assert_eq!(read(), vec![vec!["1"], vec!["3"]]);
 }
 
 #[test]

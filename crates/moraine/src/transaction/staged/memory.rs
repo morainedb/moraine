@@ -106,6 +106,9 @@ fn payload_bytes(op: &RowOperation) -> usize {
         ),
         RowOperation::InlineSchema { arrow_schema, .. } => arrow_schema.capacity(),
         RowOperation::InlineInsert { arrow_body, .. } => arrow_body.len(),
+        RowOperation::InlineRowsDelete { rows, .. } => {
+            rows.capacity().saturating_mul(size_of::<(u64, u64)>())
+        }
         _ => 0,
     }
 }

@@ -20,7 +20,8 @@ DELETEs against snapshot, history, and schedule records), faithful
 **projection** (a real `ducklake_files_scheduled_for_deletion` table), and
 **read-your-writes** (the cascade's SELECTs observe its own uncommitted
 DELETEs). moraine invents no retention policy, computes no dead set, and
-deletes no data bytes.
+does not delete external data files. Inline payloads live in the catalog and
+are pruned with their obsolete row versions.
 
 ## Goals
 
@@ -71,9 +72,10 @@ RFC 0002 established the relevant shape:
   time-versioned entity (no begin/end).
 - `file` / `delfile` records reference object-store paths in their values.
 
-RFC 0005's flush hard-deletes inlined chunks outright (DuckLake's
-delete-at-flush semantics), so the `inline` subspace leaves nothing for
-this RFC to reclaim.
+Inlined data can contain obsolete versions before any flush. Expiry deletes
+only the versions no retained snapshot needs; it does not require a flush.
+Flush separately moves inline history to Parquet and removes the versions
+it materialized.
 
 RFC 0006 fixes the surface this RFC rides: DuckLake speaks generic SQL
 against moraine's row-faithful `ducklake_*` projections, and its writes
@@ -113,10 +115,13 @@ survivors form a suffix.
    `ducklake_inlined_data_tables`, `ducklake_column_mapping`, plus `DROP
    TABLE IF EXISTS ducklake_inlined_data_<t>_<v>`.
 6. The dead-row rule over `ducklake_schema` / `ducklake_view` /
-   `ducklake_tag` / `ducklake_macro`, then orphan-cascade deletes on
-   `ducklake_macro_impl` / `ducklake_macro_parameters` /
-   `ducklake_name_mapping` (NOT EXISTS against their parents — observing
-   step 6's own deletes).
+   `ducklake_tag` / `ducklake_macro`.
+7. The dead-row rule over each registered inlined data table deletes ended
+   versions that no surviving snapshot can see. This is a selective row
+   deletion, not a prefix of `begin_snapshot` values.
+8. Orphan-cascade deletes on `ducklake_macro_impl` /
+   `ducklake_macro_parameters` / `ducklake_name_mapping` (NOT EXISTS against
+   their parents — observing step 6's own deletes).
 
 **No new snapshot row is inserted anywhere in the cascade** — expiry does
 not advance head.
@@ -154,11 +159,26 @@ moraine must translate into one atomic batch:
   `end_snapshot IS NULL` deletes the `current` key, otherwise the
   `history` key. This is a hard prune — nothing moves to history; the
   record ceases to exist.
+- **Inlined versions.** `InlineRowsDelete` names `(row_id, begin_snapshot)`
+  pairs within one `(table_id, schema_version)`. Translation groups all
+  selections for a table, removes wholly selected chunks, and rewrites
+  partially selected chunks as contiguous surviving row-ID runs using the
+  existing Arrow body and locator encodings. A surviving run retains its
+  schema, begin snapshot, row IDs, and user values. The first run reuses the
+  original chunk sequence; further runs use sequences above existing chunks
+  for that schema and begin snapshot. Unselected chunks are unchanged.
+  Deletion events are removed only if no surviving version needs them,
+  including versions in another schema. Missing requested versions fail the
+  transaction. Repeated selections are deduplicated. Prefix drains staged in
+  the same transaction are combined with the exact selections before any
+  chunk is rewritten. A selection proven to include every row in its
+  begin-snapshot prefix can use the existing flush drain. No new snapshot
+  or storage format is introduced.
 - **Embedded rows.** Deletes against tables whose rows embed in a parent
   record (`ducklake_column_tag`, `ducklake_partition_column`,
   `ducklake_sort_expression`, `ducklake_file_partition_value`,
   `ducklake_name_mapping`) ride their parent's deletion in the same cascade
-  and translate as validated no-ops. Step 6's orphan sweep over
+  and translate as validated no-ops. Step 8's orphan sweep over
   `ducklake_name_mapping` is one of these: the rows it looks for were freed
   with the record step 5 deleted, so the sweep is accepted and lands as a
   no-op whether it shares that transaction or follows it.
@@ -193,7 +213,7 @@ moraine must translate into one atomic batch:
 
 ### Read-your-writes projections
 
-Steps 2, 3, and 6 of the cascade compute dead sets with `NOT EXISTS`
+Steps 2, 3, 6, and 7 of the cascade compute dead sets with `NOT EXISTS`
 subqueries over `ducklake_snapshot` *after* the same transaction staged
 its snapshot deletes, and the orphan-cascade deletes read parents deleted
 moments earlier. Projections that serve only committed state would make
@@ -284,8 +304,9 @@ The safety contract is unchanged from DuckLake's own, and is documented
 for operators in the "Operating a lake" guide: **the retention window must
 exceed the maximum expected read/attach duration**, and the cleanup grace period
 (`cleanup_old_files`' `older_than`) must exceed the maximum reader/scan
-duration. Logical expiry deletes no bytes; a reader holding a view of an
-expired snapshot keeps scanning bytes that survive until a cleanup whose
+duration. Logical expiry deletes no external file bytes; a reader holding
+a view of an expired snapshot keeps scanning files that survive until a
+cleanup whose
 grace period has passed. A reader that held a view longer than the window
 may find its snapshot expired and must re-resolve from head
 (`SnapshotExpired`, RFC 0003/0009).

@@ -1,6 +1,8 @@
 //! Inline-data translation: turning staged inline operations into their
 //! `inline/*` store writes.
 
+mod pruning;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use bytes::Bytes;
@@ -160,11 +162,21 @@ fn prune_flushed_tombstones(
     tombstones: &[(u64, proto::InlineInlineDeleteValue)],
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Vec<u64> {
+    prune_removed_tombstones(table_id, rows, |row| flushed[row.chunk], tombstones, writes)
+}
+
+fn prune_removed_tombstones(
+    table_id: u64,
+    rows: &[InlineRow],
+    removed: impl Fn(&InlineRow) -> bool,
+    tombstones: &[(u64, proto::InlineInlineDeleteValue)],
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Vec<u64> {
     let mut drained = Vec::new();
     let mut consumed = HashSet::new();
     let mut retained = HashSet::new();
     for row in rows {
-        if flushed[row.chunk] {
+        if removed(row) {
             drained.push(row.row_id);
             if let Some(end) = row.end_snapshot {
                 consumed.insert((row.row_id, end));
@@ -758,6 +770,11 @@ pub(super) async fn translate_inline(
     let mut chunk_seqs = ChunkSeqAllocator::default();
     // One existence marker per table per commit.
     let mut file_delete_tables: HashSet<u64> = HashSet::new();
+    let selections = pruning::selections(ops);
+    let mut pruned_inline = Vec::new();
+    for (&table_id, selection) in &selections {
+        pruned_inline.push(pruning::translate(db_tx, projections, table_id, selection, ops).await?);
+    }
 
     let removals = async {
         stream::iter(gather_file_delete_removals(ops).into_iter().map(
@@ -782,6 +799,11 @@ pub(super) async fn translate_inline(
     let table_scoped: Vec<&RowOperation> = ops
         .iter()
         .filter(|op| {
+            if let RowOperation::InlineFlushDelete { table_id, .. } = op
+                && selections.contains_key(table_id)
+            {
+                return false;
+            }
             matches!(
                 op,
                 RowOperation::InlineFlushDelete { .. }
@@ -911,6 +933,7 @@ pub(super) async fn translate_inline(
             // belong to `translate`.
             RowOperation::InlineSchemaDrop { .. }
             | RowOperation::InlineFlushDelete { .. }
+            | RowOperation::InlineRowsDelete { .. }
             | RowOperation::InlineDrop { .. }
             | RowOperation::InlineFileDeleteRemove { .. }
             | RowOperation::InlineFileDeleteClear { .. }
@@ -922,6 +945,10 @@ pub(super) async fn translate_inline(
     }
 
     let mut drained: DrainedRows = DrainedRows::new();
+    for (pruned, rows) in pruned_inline {
+        writes.extend(pruned);
+        drained.extend(rows);
+    }
     for (scoped, flushed) in scoped_writes {
         writes.extend(scoped);
         // DuckLake names a drain twice, once as the flush finalizes and

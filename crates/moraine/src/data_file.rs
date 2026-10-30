@@ -71,7 +71,9 @@ pub(crate) use crate::data_file::{
     },
     data_store::WIDEST_PATH_FAN_OUT,
     delete_file::{delete_file_positions, delete_file_positions_at},
-    inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
+    inline_batch::{
+        decode_inline_schema, inline_batch_entries, inline_batch_index_entries, slice_inline_batch,
+    },
     inline_rows::InlineRows,
     located_rows::{inline_rows_batch, located_batch, scoped_read_row_stream},
     metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
