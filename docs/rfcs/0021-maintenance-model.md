@@ -447,6 +447,21 @@ Three properties the scheduler must hold:
   is bounded and overwritten, so it adds neither an unbounded subspace nor a
   cleanup policy.
 
+**Bounded table work is opt-in.** `MAINTENANCE_TABLE_BATCHES true` gives
+flush, merge, and rewrite one DuckLake call per table, including its schema.
+Each completed call commits independently; a failure leaves earlier tables'
+progress durable for the next pass. Snapshot expiry and file cleanup retain
+DuckLake's catalog-wide semantics. `MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES`
+and `MAINTENANCE_REWRITE_DATA_FILES_MAX_COMPACTED_FILES` forward positive file
+counts to DuckLake. A capped compaction that processed files conservatively
+marks the pass pending; a later pass with no candidates clears it. A file
+count does not bound the size of one file or table.
+
+`MAINTENANCE_PROGRESS true` emits immediate step and table boundaries to
+stderr, with Linux RSS and process high-water marks where available. These
+survive a later process failure; the catalog status remains a completed-pass
+record. Both options default off for existing attaches.
+
 **Read-only attaches never schedule.** A `DbReader` never opens a writer, so
 no step runs — including step 8, whose merge only a writer's compactor could
 execute. The census is the one part of this surface a read-only attach

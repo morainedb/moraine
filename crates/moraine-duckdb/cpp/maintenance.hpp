@@ -35,6 +35,9 @@ struct DuckLakeStep {
 	std::string name;
 	// Rendered `name => literal` arguments, in the order supplied.
 	std::vector<std::string> arguments;
+	// A table selected by the scheduler; empty runs the catalog-wide call.
+	std::string table;
+	std::string schema;
 };
 
 // What the attach configured. Steps absent here are reported "skipped":
@@ -46,6 +49,10 @@ struct MaintenanceConfig {
 	// Zero takes the core's own batch default.
 	uint64_t batch_size = 0;
 	bool sweep_indexes = true;
+	// Give each table its own flush/merge/rewrite transaction.
+	bool table_batches = false;
+	// Emit immediate step boundaries and Linux resident memory to stderr.
+	bool progress = false;
 	// Off by default: the merge rewrites whatever the store holds and
 	// pays for every byte in object-store traffic. It destroys nothing a
 	// query can observe, so the default is about cost, not safety.
