@@ -199,8 +199,8 @@ configure:
 
 | # | Step | Configured by | Issues |
 |---|---|---|---|
-| 1 | Expire | `EXPIRE_SNAPSHOTS[_OLDER_THAN\|_VERSIONS]` | `CALL ducklake_expire_snapshots('lake', …)` |
-| 2 | Flush | `FLUSH_INLINED_DATA` | `CALL ducklake_flush_inlined_data('lake')` |
+| 1 | Flush | `FLUSH_INLINED_DATA` | `CALL ducklake_flush_inlined_data('lake')` |
+| 2 | Expire | `EXPIRE_SNAPSHOTS[_OLDER_THAN\|_VERSIONS]` | `CALL ducklake_expire_snapshots('lake', …)` |
 | 3 | Merge | `MERGE_ADJACENT_FILES` | `CALL ducklake_merge_adjacent_files('lake')` |
 | 4 | Rewrite | `REWRITE_DATA_FILES[_DELETE_THRESHOLD]` | `CALL ducklake_rewrite_data_files('lake', …)` |
 | 5 | Cleanup | `CLEANUP_OLD_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_cleanup_old_files('lake', …)` |
@@ -230,7 +230,7 @@ catalog has already stranded.
 **File column statistics carry no snapshot**, so the single record is what
 every read of that file resolves through, including a time-travelling one
 whose file record comes from history. They are reclaimable only once the
-file is absent from **both** live state and history — which is where step 1
+file is absent from **both** live state and history — which is where step 2
 followed by step 5 leaves it, and which is why nothing on the write path
 may cascade them: expiry *ends* a data file into history rather than
 erasing it, and the past still resolves it.
@@ -242,25 +242,25 @@ DuckLake (`tests/ducklake_load/maintenance.rs:47,91,150,230,333`).
 `Catalog::maintain` call reclaims all three; the counts are split across
 three reported steps because what orphans each is different. Index entries
 are orphaned by moraine's own `drop_index`. File column statistics and
-inlined tables are orphaned by expiry, in step 1 — a dropped table's rows
+inlined tables are orphaned by expiry, in step 2 — a dropped table's rows
 stay readable by a time-travelling read for as long as the catalog records
 the table, so they are reclaimable only once it is absent from both live
 state and history, which is where expiry leaves it. Reading one number
 against the other is how a leak in either gets noticed.
 
-**Why this order.** Expiry first, because it is the only step that
-*shrinks* the catalog rather than adding to it, and DuckLake re-reads the
-snapshot projection at the start of every transaction (RFC 0009) — every
-later step is served a smaller one. Flush before merge, so its small
-Parquet files are merge input. Merge and rewrite before cleanup, because
-merge schedules its superseded bytes directly (RFC 0008) and cleanup drains
-that schedule in the same pass. Cleanup before orphan detection, so the
-schedule is drained first. The sweep before the store merge, because its
-input is everything the earlier steps left behind. The store merge last,
-because every step above it writes: expiry tombstones rows and the sweep
-deletes index ranges, and merging first would leave exactly the tombstones
-the pass just created for the next pass to find. The order is a cost
-preference — every step is independently safe and idempotent in any order.
+**Why this order.** Flush first, so expiry never selectively prunes inline
+chunks that also contain live rows. The inline data adapter drains complete
+snapshot prefixes; it refuses a deletion that leaves an unmatched row in that
+prefix. A configured flush failure therefore skips expiry and the remaining
+DuckLake steps. An expiry-only configuration can refuse partial inline pruning
+until the operator flushes the inline data.
+
+Flush also precedes merge, so its small Parquet files are merge input. Merge
+and rewrite precede cleanup, because merge schedules its superseded bytes and
+cleanup drains that schedule in the same pass. Cleanup precedes orphan
+detection. The sweep precedes the store merge, whose input is everything the
+earlier steps left behind. Flush-before-expiry preserves data; the remaining
+ordering reduces repeated work.
 
 **DuckLake compaction — steps 3 and 4, not the store merge — is
 deliberately not placed before expiry.** The tempting

@@ -1,5 +1,89 @@
 use crate::helpers::*;
 
+/// Expiry cannot remove an unchanged live row beside obsolete inline versions.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn expiry_refuses_partial_inline_pruning_without_changing_rows_or_snapshots() {
+    let store = TempDir::new("expiry-inline-store");
+    let data = TempDir::new("expiry-inline-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(id BIGINT, value BIGINT);\
+         INSERT INTO lake.main.t VALUES (0, 99), (1, 1);\
+         UPDATE lake.main.t SET value = 2 WHERE id = 1;\
+         UPDATE lake.main.t SET value = 3 WHERE id = 1;",
+    );
+    let read = |sql| csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+    let rows = read("SELECT * FROM lake.main.t ORDER BY id;");
+    let snapshots =
+        read("SELECT snapshot_id FROM ducklake_snapshots('lake') ORDER BY snapshot_id;");
+    let error = run_ducklake_sql_expect_err(
+        store.path(),
+        data.path(),
+        "CALL ducklake_expire_snapshots('lake', older_than => now());",
+    );
+    assert!(error.contains("selective inline deletion"), "{error}");
+    assert_eq!(read("SELECT * FROM lake.main.t ORDER BY id;"), rows);
+    assert_eq!(
+        read("SELECT snapshot_id FROM ducklake_snapshots('lake') ORDER BY snapshot_id;"),
+        snapshots
+    );
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CALL ducklake_flush_inlined_data('lake');\
+         CALL ducklake_expire_snapshots('lake', older_than => now());",
+    );
+    assert_eq!(read("SELECT * FROM lake.main.t ORDER BY id;"), rows);
+}
+
+/// A successful pass preserves live rows, including application history.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn maintenance_flushes_before_expiry_and_preserves_inline_application_history() {
+    let store = TempDir::new("maint-inline-history-store");
+    let data = TempDir::new("maint-inline-history-data");
+    let options = ", META_MAINTENANCE_FLUSH_INLINED_DATA true, \
+                   META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '0 seconds'";
+    let mut setup = String::from(
+        "CREATE TABLE lake.main.t(id BIGINT, value BIGINT, recorded_from BIGINT, recorded_to BIGINT);\
+         INSERT INTO lake.main.t VALUES (0, 99, 0, NULL);\
+         INSERT INTO lake.main.t VALUES (1, 1, 1, NULL);",
+    );
+    for frontier in 2..=40 {
+        setup.push_str(&format!(
+            "BEGIN; UPDATE lake.main.t SET recorded_to = {frontier} \
+             WHERE id = 1 AND recorded_to IS NULL;\
+             INSERT INTO lake.main.t VALUES (1, {frontier}, {frontier}, NULL); COMMIT;"
+        ));
+    }
+    run_ducklake_sql(store.path(), data.path(), &setup);
+    let read = || {
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT * FROM lake.main.t ORDER BY id, recorded_from;",
+        ))
+    };
+    let before = read();
+    assert_eq!(before.len(), 41);
+    let steps = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        options,
+        "SELECT step, status FROM moraine_maintenance('lake');",
+    ));
+    assert_eq!(
+        &steps[..2],
+        &[
+            vec!["flush_inlined_data", "ran"],
+            vec!["expire_snapshots", "ran"],
+        ]
+    );
+    assert_eq!(read(), before);
+}
+
 /// Snapshot expiry and file cleanup, differential against a stock
 /// DuckLake catalog fed the identical statements: a dropped table's
 /// snapshots expire (all but head), its rows vanish from every
@@ -671,8 +755,8 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
     assert_eq!(
         order,
         vec![
-            "expire_snapshots",
             "flush_inlined_data",
+            "expire_snapshots",
             "merge_adjacent_files",
             "rewrite_data_files",
             "cleanup_old_files",

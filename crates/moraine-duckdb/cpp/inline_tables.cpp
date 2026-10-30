@@ -919,6 +919,9 @@ struct InlineDmlState : public duckdb::GlobalSinkState {
 	// DELETE only: the maximum `begin_snapshot` among matched rows, standing
 	// in for the flush-snapshot threshold.
 	std::optional<uint64_t> max_begin_snapshot;
+	// Source-scan rowids matched by a data-table DELETE. A prefix drain is
+	// valid only when every row it would remove was actually selected.
+	std::vector<bool> matched_inline_rows;
 };
 
 class MoraineInlineDml : public duckdb::PhysicalOperator {
@@ -1095,8 +1098,13 @@ public:
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<InlineDmlState>();
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto old_row =
-			    ResolveRow(state, handle_, table_id_, schema_version_, chunk.GetValue(row_id_chunk_index_, row));
+			auto row_id_value = chunk.GetValue(row_id_chunk_index_, row);
+			auto old_row = ResolveRow(state, handle_, table_id_, schema_version_, row_id_value);
+			auto row_id = static_cast<duckdb::idx_t>(row_id_value.GetValue<int64_t>());
+			if (row_id >= state.matched_inline_rows.size()) {
+				state.matched_inline_rows.resize(row_id + 1, false);
+			}
+			state.matched_inline_rows[row_id] = true;
 			auto begin_snapshot = old_row.begin_snapshot;
 			if (!state.max_begin_snapshot.has_value() || begin_snapshot > *state.max_begin_snapshot) {
 				state.max_begin_snapshot = begin_snapshot;
@@ -1110,6 +1118,13 @@ public:
 	                                         duckdb::OperatorSourceInput &input) const override {
 		auto &state = sink_state->Cast<InlineDmlState>();
 		if (!state.emitted && state.max_begin_snapshot.has_value()) {
+			for (duckdb::idx_t row = 0; row < state.old_rows->rows.size(); row++) {
+				if (state.old_rows->rows[row].begin_snapshot <= *state.max_begin_snapshot &&
+				    (row >= state.matched_inline_rows.size() || !state.matched_inline_rows[row])) {
+					throw duckdb::InvalidInputException(
+					    "moraine: selective inline deletion requires flushing inlined data first");
+				}
+			}
 			auto *tx = StagedTx(context.client);
 			MoraineError err {};
 			auto code =
