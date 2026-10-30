@@ -373,6 +373,16 @@ pub enum RowOperation {
         /// Owning table.
         table_id: u64,
     },
+    /// Removes exactly the named inline row versions, preserving other
+    /// rows in their chunks. Repeated identities are removed once.
+    InlineRowsDelete {
+        /// Owning table.
+        table_id: u64,
+        /// Schema version containing the rows.
+        schema_version: u64,
+        /// Selected `(row_id, begin_snapshot)` identities.
+        rows: Vec<(u64, u64)>,
+    },
     /// Removes every `inline/insert` chunk begun at or before
     /// `flush_snapshot` for `(table_id, schema_version)`, plus the
     /// `inline/inline_delete` tombstones on those chunks' rows.

@@ -261,6 +261,8 @@ because every step above it writes: expiry tombstones rows and the sweep
 deletes index ranges, and merging first would leave exactly the tombstones
 the pass just created for the next pass to find. The order is a cost
 preference — every step is independently safe and idempotent in any order.
+Expiry prunes exact obsolete inline versions; flushing first is not a
+precondition for preserving live rows or retained snapshots.
 
 **DuckLake compaction — steps 3 and 4, not the store merge — is
 deliberately not placed before expiry.** The tempting

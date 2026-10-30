@@ -24,8 +24,11 @@ use crate::{
     error::{Error, Result},
 };
 
+mod pruning;
 #[cfg(test)]
 mod reuse_bench;
+
+pub(crate) use pruning::slice_inline_batch;
 
 /// Decodes one schema-only inline IPC stream.
 pub(crate) fn decode_inline_schema(schema_ipc: Bytes) -> Result<SchemaRef> {

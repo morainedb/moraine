@@ -204,6 +204,7 @@ pub(super) fn apply_op(
         | RowOperation::InlineFileDeleteRemove { .. }
         | RowOperation::InlineFileDeleteClear { .. }
         | RowOperation::InlineFlushDelete { .. }
+        | RowOperation::InlineRowsDelete { .. }
         | RowOperation::InlineDrop { .. }
         | RowOperation::InlineSchemaDrop { .. } => Ok(()),
     }
@@ -220,6 +221,7 @@ pub(super) fn is_inline_op(op: &RowOperation) -> bool {
             | RowOperation::InlineFileDeleteRemove { .. }
             | RowOperation::InlineFileDeleteClear { .. }
             | RowOperation::InlineFlushDelete { .. }
+            | RowOperation::InlineRowsDelete { .. }
             | RowOperation::InlineDrop { .. }
             | RowOperation::InlineSchemaDrop { .. }
     )

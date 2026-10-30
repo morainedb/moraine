@@ -25,6 +25,7 @@ mod body_ownership;
 mod data_path;
 mod inline_commit_bench;
 mod inline_history;
+mod inline_pruning;
 mod located_inline_update;
 mod overlay;
 mod row_id_invariants;

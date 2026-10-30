@@ -1338,6 +1338,14 @@ typedef struct MoraineCell {
   const char *str_value;
 } MoraineCell;
 
+// One physical inline version selected for deletion.
+typedef struct MoraineInlineRowVersion {
+  // Logical row identifier.
+  uint64_t row_id;
+  // Snapshot that inserted this version.
+  uint64_t begin_snapshot;
+} MoraineInlineRowVersion;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -4264,6 +4272,20 @@ int32_t moraine_tx_stage_inline_file_delete_remove(struct MoraineTxHandle *tx,
                                                    uint64_t data_file_id,
                                                    uint64_t row_id,
                                                    struct MoraineError *err);
+
+// Stages exact inline-version deletion, preserving unselected rows.
+//
+// # Safety
+//
+// Same `tx`/`err` contract as [`moraine_tx_stage_inline_inline_delete`].
+// `rows` must address `len` readable elements for this call, or may be
+// null when `len` is zero. The elements are copied before returning.
+int32_t moraine_tx_stage_inline_rows_delete(struct MoraineTxHandle *tx,
+                                            uint64_t table_id,
+                                            uint64_t schema_version,
+                                            const struct MoraineInlineRowVersion *rows,
+                                            size_t len,
+                                            struct MoraineError *err);
 
 // Stages a flush-delete: removes every `inline/insert` chunk begun at or
 // before `flush_snapshot` for `(table_id, schema_version)`, plus the

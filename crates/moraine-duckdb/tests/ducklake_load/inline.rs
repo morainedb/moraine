@@ -1,5 +1,39 @@
 use crate::helpers::*;
 
+/// A selective metadata deletion cannot drain unmatched rows in its chunk.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn selective_inline_deletion_preserves_unmatched_rows() {
+    let store = TempDir::new("inline-selective-store");
+    let data = TempDir::new("inline-selective-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(i BIGINT);\
+         INSERT INTO lake.main.t VALUES (1), (2), (3);\
+         DELETE FROM __ducklake_metadata_lake.ducklake_inlined_data_1_1 WHERE i = 99;",
+    );
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "DELETE FROM __ducklake_metadata_lake.ducklake_inlined_data_1_1 WHERE i = 2;",
+    );
+    let read = || {
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT i FROM lake.main.t ORDER BY i;",
+        ))
+    };
+    assert_eq!(read(), vec![vec!["1"], vec!["3"]]);
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+    assert_eq!(read(), vec![vec!["1"], vec!["3"]]);
+}
+
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_inline_data_round_trip_through_flush() {

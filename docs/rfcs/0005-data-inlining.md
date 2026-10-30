@@ -202,8 +202,10 @@ Flush removes a tombstone only when the versions it ends have been drained;
 a surviving chunk or another schema version retains its required event.
 Drop removes all deletion events with the table.
 
-The insert and versioned tombstone records are append-only on the commit path. The
-file-delete-table record is a marker, and exists because existence cannot be
+Ordinary writes append insert chunks and versioned tombstones. Expiry can
+rewrite a partial chunk into surviving runs without changing their versions.
+
+The file-delete-table record is a marker, and exists because existence cannot be
 derived from the file-delete records: a flush
 materializes a table's inlined deletions into a real delete file and
 clears them, and an emptied SQL table still exists. DuckLake caches that
@@ -418,7 +420,8 @@ Flush reproduces `ducklake_flush_inlined_data` semantics as one catalog
 commit (still one `WriteBatch`, plus the Parquet PUTs that precede it, in
 that order — data before metadata, like any DuckLake write):
 
-1. Write live inlined rows to Parquet data file(s); write a partial
+1. Write inline row versions through the flush snapshot to Parquet data
+   file(s), including ended versions needed by time travel; write a partial
    deletion file consolidating tombstones if any, preserving per-row
    snapshot metadata.
 
@@ -516,6 +519,7 @@ The operation → keyspace mapping (source-verified against DuckLake
 | `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, apply the version-specific `inline/row_tombstone` ends, project and order by `row_id` |
 | `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}`, plus the `inline/file_delete_table` marker for `t` |
 | `DELETE FROM ducklake_inlined_delete_<t>` (the flush's clean-up, once those deletions are written out as a real delete file) | remove the `inline/file_delete` record behind each matched row, keeping the `inline/file_delete_table` marker. Translated per row rather than as a table-wide clear: DuckLake's flush happens to delete every row, but what it issues is an ordinary SQL `DELETE`, so a filtered one removes exactly what it matched. Naming a record the table does not carry is a typed error, not a silent no-op |
+| Selective `DELETE FROM ducklake_inlined_data_<t>_<v>` (snapshot expiry) | stage exact `(row_id, begin_snapshot)` identities; remove selected versions and split partial chunks into surviving dense runs, retaining deletion events needed by any surviving version. No flush is required (RFC 0007) |
 | `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks, their `inline/chunk_range` locators, and consumed `inline/row_tombstone`; write the version's `inline/schema_dropped` marker, retaining its `inline/schema`. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
 | hard `DELETE FROM ducklake_data_file` naming `(t, file_id)` (a merge pruning its sources, cleanup draining the schedule) | remove every `inline/file_delete` record targeting that file, keeping the marker. Silent on a miss, unlike the removal above: this cascade names a file rather than records, and a pruned file carrying no inlined deletion is the ordinary case |
 | `UPDATE ducklake_data_file SET end_snapshot` (a rewrite ending its source) | nothing — see below |
@@ -547,9 +551,9 @@ governed the implementation:
   inline records to `history`"; the accurate behavior — matching DuckLake's
   hard `DELETE` and RFC 0005's flush section — is that `inline/*` records
   are *deleted* at flush (the data survives as the backdated Parquet
-  file). The `inline` subspace is append-then-delete, not begin/end
-  versioned like the entity subspaces, so this slice hard-deletes the
-  consumed records at flush.
+  file). Inline lifetimes remain encoded in chunks and row tombstones, rather
+  than the entity `history` subspace. Flush hard-deletes consumed records;
+  expiry separately prunes obsolete inline versions (RFC 0007).
 - **Schema stored, not derived.** `inline/schema` holds the Arrow schema
   written at `CREATE` time (transcoded from DuckLake's column list), so an
   `inline/insert` chunk decodes self-describingly without coupling to the

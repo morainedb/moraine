@@ -1,4 +1,94 @@
+use std::fmt::Write as _;
+
 use crate::helpers::*;
+
+/// Expiry cannot remove an unchanged live row beside obsolete inline versions.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn expiry_prunes_inline_history_without_changing_live_rows() {
+    let store = TempDir::new("expiry-inline-store");
+    let data = TempDir::new("expiry-inline-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(id BIGINT, value BIGINT);\
+         INSERT INTO lake.main.t VALUES (0, 99), (1, 1);\
+         UPDATE lake.main.t SET value = 2 WHERE id = 1;\
+         UPDATE lake.main.t SET value = 3 WHERE id = 1;",
+    );
+    let read = |sql| csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+    let rows = read("SELECT * FROM lake.main.t ORDER BY id;");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CALL ducklake_expire_snapshots('lake', older_than => now());",
+    );
+    assert_eq!(read("SELECT * FROM lake.main.t ORDER BY id;"), rows);
+    assert_eq!(
+        read("SELECT snapshot_id FROM ducklake_snapshots('lake') ORDER BY snapshot_id;"),
+        vec![vec!["4"]]
+    );
+    assert_eq!(
+        read(
+            "SELECT id, value FROM __ducklake_metadata_lake.ducklake_inlined_data_1_1 ORDER BY id;"
+        ),
+        rows
+    );
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CALL ducklake_flush_inlined_data('lake');\
+         CALL ducklake_expire_snapshots('lake', older_than => now());",
+    );
+    assert_eq!(read("SELECT * FROM lake.main.t ORDER BY id;"), rows);
+}
+
+/// A successful pass preserves live rows, including application history.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn maintenance_expiry_without_flush_preserves_inline_application_history() {
+    let store = TempDir::new("maint-inline-history-store");
+    let data = TempDir::new("maint-inline-history-data");
+    let options = ", META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '0 seconds'";
+    let mut setup = String::from(
+        "CREATE TABLE lake.main.t(id BIGINT, value BIGINT, recorded_from BIGINT, recorded_to BIGINT);\
+         INSERT INTO lake.main.t VALUES (0, 99, 0, NULL);\
+         INSERT INTO lake.main.t VALUES (1, 1, 1, NULL);",
+    );
+    for frontier in 2..=40 {
+        write!(
+            setup,
+            "BEGIN; UPDATE lake.main.t SET recorded_to = {frontier} \
+             WHERE id = 1 AND recorded_to IS NULL;\
+             INSERT INTO lake.main.t VALUES (1, {frontier}, {frontier}, NULL); COMMIT;"
+        )
+        .unwrap();
+    }
+    run_ducklake_sql(store.path(), data.path(), &setup);
+    let read = || {
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT * FROM lake.main.t ORDER BY id, recorded_from;",
+        ))
+    };
+    let before = read();
+    assert_eq!(before.len(), 41);
+    let steps = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        options,
+        "SELECT step, status FROM moraine_maintenance('lake');",
+    ));
+    assert_eq!(
+        &steps[..2],
+        &[
+            vec!["expire_snapshots", "ran"],
+            vec!["flush_inlined_data", "skipped"],
+        ]
+    );
+    assert_eq!(read(), before);
+}
 
 /// Snapshot expiry and file cleanup, differential against a stock
 /// DuckLake catalog fed the identical statements: a dropped table's
@@ -1889,4 +1979,49 @@ fn raising_a_fresh_stores_format_is_idempotent() {
         "SELECT i FROM lake.main.t ORDER BY i;",
     ));
     assert_eq!(rows, vec![vec!["1"]]);
+}
+
+/// Interior expiry retains earlier snapshots and later inline versions.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn expiry_of_an_interior_snapshot_preserves_inline_time_travel() {
+    let store = TempDir::new("expiry-interior-inline-store");
+    let data = TempDir::new("expiry-interior-inline-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(id BIGINT, value BIGINT);\
+         INSERT INTO lake.main.t VALUES (0, 99), (1, 1);\
+         UPDATE lake.main.t SET value = 2 WHERE id = 1;\
+         UPDATE lake.main.t SET value = 3 WHERE id = 1;\
+         UPDATE lake.main.t SET value = 4 WHERE id = 1;\
+         CALL ducklake_expire_snapshots('lake', versions => [3]);",
+    );
+    let read = |sql| csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+    let before = read("SELECT * FROM lake.main.t AT (VERSION => 2) ORDER BY id;");
+    let middle = read("SELECT * FROM lake.main.t AT (VERSION => 4) ORDER BY id;");
+    let head = read("SELECT * FROM lake.main.t ORDER BY id;");
+    assert_eq!(before, vec![vec!["0", "99"], vec!["1", "1"]]);
+    assert_eq!(middle, vec![vec!["0", "99"], vec!["1", "3"]]);
+    assert_eq!(head, vec![vec!["0", "99"], vec!["1", "4"]]);
+    assert_eq!(
+        read(
+            "SELECT begin_snapshot FROM __ducklake_metadata_lake.ducklake_inlined_data_1_1 ORDER BY row_id, begin_snapshot;"
+        ),
+        vec![vec!["2"], vec!["2"], vec!["4"], vec!["5"]]
+    );
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+    assert_eq!(
+        read("SELECT * FROM lake.main.t AT (VERSION => 2) ORDER BY id;"),
+        before
+    );
+    assert_eq!(
+        read("SELECT * FROM lake.main.t AT (VERSION => 4) ORDER BY id;"),
+        middle
+    );
+    assert_eq!(read("SELECT * FROM lake.main.t ORDER BY id;"), head);
 }

@@ -182,6 +182,65 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_remove(
     }
 }
 
+/// One physical inline version selected for deletion.
+#[repr(C)]
+pub struct MoraineInlineRowVersion {
+    /// Logical row identifier.
+    pub row_id: u64,
+    /// Snapshot that inserted this version.
+    pub begin_snapshot: u64,
+}
+
+/// Stages exact inline-version deletion, preserving unselected rows.
+///
+/// # Safety
+///
+/// Same `tx`/`err` contract as [`moraine_tx_stage_inline_inline_delete`].
+/// `rows` must address `len` readable elements for this call, or may be
+/// null when `len` is zero. The elements are copied before returning.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_rows_delete(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    schema_version: u64,
+    rows: *const MoraineInlineRowVersion,
+    len: usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if tx.is_null() || (len != 0 && rows.is_null()) {
+            return Err(AbiError::invalid_argument("null inline deletion input"));
+        }
+        let _memory = moraine::MemoryReservation::reserve(
+            (len as u64).saturating_mul(std::mem::size_of::<(u64, u64)>() as u64),
+        )?;
+        let rows = if len == 0 {
+            &[]
+        } else {
+            // SAFETY: the caller provides `len` readable elements.
+            unsafe { std::slice::from_raw_parts(rows, len) }
+        };
+        let selected = rows
+            .iter()
+            .map(|row| (row.row_id, row.begin_snapshot))
+            .collect();
+        // SAFETY: the caller provides a live transaction, checked non-null.
+        unsafe { &*tx }
+            .lock()?
+            .try_stage(RowOperation::InlineRowsDelete {
+                table_id,
+                schema_version,
+                rows: selected,
+            })?;
+        Ok(())
+    };
+    // SAFETY: the caller provides a null or writable error pointer.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Stages a flush-delete: removes every `inline/insert` chunk begun at or
 /// before `flush_snapshot` for `(table_id, schema_version)`, plus the
 /// `inline/inline_delete` tombstones those chunks' rows consumed.
