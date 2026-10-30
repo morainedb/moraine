@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/morainedb/moraine/compare/v0.8.1...v0.8.2) - 2026-10-30
+
+### Fixed
+
+- *(duckdb)* prune exact inline versions during snapshot expiry ([#375](https://github.com/morainedb/moraine/pull/375))
+- *(maintenance)* cap compaction inputs and batch tables ([#377](https://github.com/morainedb/moraine/pull/377))
+
 ## [0.8.1](https://github.com/morainedb/moraine/compare/v0.8.0...v0.8.1) - 2026-10-27
 
 ### Fixed
