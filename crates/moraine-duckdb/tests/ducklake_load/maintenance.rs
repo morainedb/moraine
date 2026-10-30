@@ -90,6 +90,132 @@ fn maintenance_expiry_without_flush_preserves_inline_application_history() {
     assert_eq!(read(), before);
 }
 
+/// A bounded pass flushes each table and forwards the file-count limit to
+/// DuckLake, retaining all user rows across schemas.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn maintenance_batches_tables_and_bounds_compaction_files() {
+    let store = TempDir::new("maint-bounded-store");
+    let data = TempDir::new("maint-bounded-data");
+    let output = run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        ", META_MAINTENANCE_TABLE_BATCHES true, \
+         META_MAINTENANCE_FLUSH_INLINED_DATA true, \
+         META_MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES 4, \
+         META_MAINTENANCE_REWRITE_DATA_FILES_MAX_COMPACTED_FILES 4",
+        "CREATE SCHEMA lake.other; \
+         CREATE TABLE lake.main.t(i BIGINT); \
+         CREATE TABLE lake.other.t(i BIGINT); \
+         INSERT INTO lake.main.t VALUES (1), (2); \
+         INSERT INTO lake.other.t VALUES (3), (4); \
+         SELECT 'FAILURES', count(*)::VARCHAR FROM moraine_maintenance('lake') WHERE status = 'failed'; \
+         SELECT 'ROWS', sum(i)::VARCHAR FROM (SELECT * FROM lake.main.t UNION ALL SELECT * FROM lake.other.t);",
+    );
+    assert_eq!(
+        parquet_files_under(data.path()).len(),
+        2,
+        "each table must be flushed"
+    );
+    let rows = csv_rows(&output);
+    assert!(
+        rows.contains(&vec!["FAILURES".into(), "0".into()]),
+        "{output}"
+    );
+    assert!(rows.contains(&vec!["ROWS".into(), "10".into()]), "{output}");
+}
+
+/// A file cap applies inside a merge group and marks remaining work pending.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn maintenance_file_cap_limits_inputs_and_resumes() {
+    let store = TempDir::new("maint-file-cap-store");
+    let data = TempDir::new("maint-file-cap-data");
+    let options = ", META_MAINTENANCE_TABLE_BATCHES true, META_MAINTENANCE_PROGRESS true, \
+                   META_MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES 4";
+    let mut seed = String::from(
+        "SET ducklake_default_data_inlining_row_limit = 0; CREATE TABLE lake.t(i BIGINT);",
+    );
+    for batch in 0..8 {
+        write!(
+            seed,
+            "INSERT INTO lake.t SELECT i + {} FROM range(1000) t(i);",
+            batch * 1000
+        )
+        .unwrap();
+    }
+    seed.push_str("SELECT count(*)::VARCHAR FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL;");
+    let seeded = run_ducklake_sql_with_options(store.path(), data.path(), options, &seed);
+    assert!(csv_rows(&seeded).contains(&vec!["8".into()]), "{seeded}");
+    let sql = "SELECT step, status, detail FROM moraine_maintenance('lake'); \
+               SELECT 'FILES', count(*)::VARCHAR FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL; \
+               SELECT 'ROWS', count(*)::VARCHAR, sum(i)::VARCHAR FROM lake.t; \
+               SELECT 'PENDING', work_pending::VARCHAR FROM moraine_maintenance_status('lake') ORDER BY started_at DESC LIMIT 1;";
+    let first = run_ducklake_sql_output(store.path(), data.path(), options, sql);
+    let progress = String::from_utf8_lossy(&first.stderr).into_owned();
+    let first = assert_session_ok(first, "bounded maintenance", sql);
+    let rows = csv_rows(&first);
+    assert!(rows.contains(&vec!["FILES".into(), "5".into()]), "{first}");
+    assert!(
+        rows.contains(&vec!["ROWS".into(), "8000".into(), "31996000".into()]),
+        "{first}"
+    );
+    assert!(
+        rows.contains(&vec!["PENDING".into(), "true".into()]),
+        "{first}"
+    );
+    assert!(
+        progress.contains("step=merge_adjacent_files state=table_ran main.t"),
+        "{progress}"
+    );
+    let mut last = String::new();
+    for _ in 0..3 {
+        last = run_ducklake_sql_with_options(store.path(), data.path(), options, sql);
+    }
+    let rows = csv_rows(&last);
+    assert!(rows.contains(&vec!["FILES".into(), "1".into()]), "{last}");
+    assert!(
+        rows.contains(&vec!["ROWS".into(), "8000".into(), "31996000".into()]),
+        "{last}"
+    );
+    assert!(
+        rows.contains(&vec!["PENDING".into(), "false".into()]),
+        "{last}"
+    );
+}
+
+/// Rewriting deletes obeys the same input cap inside a compaction group.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn rewrite_file_cap_preserves_rows() {
+    let store = TempDir::new("rewrite-file-cap-store");
+    let data = TempDir::new("rewrite-file-cap-data");
+    let mut sql = String::from(
+        "SET ducklake_default_data_inlining_row_limit = 0; CREATE TABLE lake.t(i BIGINT);",
+    );
+    for batch in 0..8 {
+        write!(
+            sql,
+            "INSERT INTO lake.t SELECT i + {} FROM range(1000) t(i);",
+            batch * 1000
+        )
+        .unwrap();
+    }
+    sql.push_str("DELETE FROM lake.t WHERE i % 2 = 0; \
+                  CALL ducklake_rewrite_data_files('lake', 't', max_compacted_files => 4, delete_threshold => 0.4); \
+                  SELECT 'ROWS', count(*)::VARCHAR, sum(i)::VARCHAR FROM lake.t;");
+    let output = run_ducklake_sql(store.path(), data.path(), &sql);
+    let rows = csv_rows(&output);
+    assert!(
+        rows.contains(&vec!["main".into(), "t".into(), "4".into(), "1".into()]),
+        "{output}"
+    );
+    assert!(
+        rows.contains(&vec!["ROWS".into(), "4000".into(), "16000000".into()]),
+        "{output}"
+    );
+}
+
 /// Snapshot expiry and file cleanup, differential against a stock
 /// DuckLake catalog fed the identical statements: a dropped table's
 /// snapshots expire (all but head), its rows vanish from every

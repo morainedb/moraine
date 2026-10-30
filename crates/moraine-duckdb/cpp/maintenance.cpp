@@ -12,6 +12,8 @@
 #include "owned_array.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <iostream>
 
 namespace moraine_duckdb {
 
@@ -38,12 +40,28 @@ const std::vector<StepSpec> &StepSpecs() {
 	static const std::vector<StepSpec> specs = {
 	    {"expire_snapshots", {"older_than", "versions"}},
 	    {"flush_inlined_data", {}},
-	    {"merge_adjacent_files", {}},
-	    {"rewrite_data_files", {"delete_threshold"}},
+	    {"merge_adjacent_files", {"max_compacted_files"}},
+	    {"rewrite_data_files", {"delete_threshold", "max_compacted_files"}},
 	    {"cleanup_old_files", {"older_than", "cleanup_all"}},
 	    {"delete_orphaned_files", {"older_than", "cleanup_all"}},
 	};
 	return specs;
+}
+
+// Progress must leave the process before a later allocation can kill it.
+void Progress(bool enabled, const std::string &step, const std::string &state) {
+	if (!enabled) {
+		return;
+	}
+	std::string memory;
+	std::ifstream status("/proc/self/status");
+	std::string line;
+	while (std::getline(status, line)) {
+		if (line.rfind("VmRSS:", 0) == 0 || line.rfind("VmHWM:", 0) == 0) {
+			memory += " " + line;
+		}
+	}
+	std::cerr << "moraine-maintenance step=" << step << " state=" << state << memory << std::endl;
 }
 
 // A step's accumulating state while options are parsed in arrival order.
@@ -98,6 +116,14 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			if (config.batch_size == 0) {
 				throw duckdb::BinderException("MAINTENANCE_BATCH_SIZE must be positive");
 			}
+			continue;
+		}
+		if (rest == "table_batches") {
+			config.table_batches = option.second.GetValue<bool>();
+			continue;
+		}
+		if (rest == "progress") {
+			config.progress = option.second.GetValue<bool>();
 			continue;
 		}
 		if (rest == "sweep_indexes") {
@@ -170,6 +196,10 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 				    "ducklake_%s takes no parameter named \"%s\"; MAINTENANCE_%s_<parameter> passes "
 				    "DuckLake's own parameters through unchanged",
 				    step, parameter, duckdb::StringUtil::Upper(step));
+			}
+			if (parameter == "max_compacted_files" && option.second.GetValue<uint64_t>() == 0) {
+				throw duckdb::BinderException("MAINTENANCE_%s_MAX_COMPACTED_FILES must be positive",
+				                              duckdb::StringUtil::Upper(step));
 			}
 			matched = true;
 			// Supplying a parameter enables its step.
@@ -477,7 +507,9 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 			report.push_back(MaintenanceStep {spec.name, "skipped", "not configured at attach"});
 			continue;
 		}
+		Progress(config_.progress, spec.name, "started");
 		auto outcome = RunDuckLakeStep(connection, lake, *configured);
+		Progress(config_.progress, spec.name, outcome.status);
 		if (outcome.status == "failed") {
 			aborted_by = spec.name;
 		}
@@ -489,8 +521,11 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	// expiry suppress it would stop the reclamation this pass exists for
 	// on every future pass too, for as long as the misconfiguration
 	// stands, while the leak it fixes kept growing.
+	Progress(config_.progress, "sweep_indexes", "started");
 	report.push_back(config_.sweep_indexes ? RunSweep()
 	                                       : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
+
+	Progress(config_.progress, "sweep_indexes", report.back().status);
 
 	// Reported separately from the pass that does the work, because what
 	// orphans file column statistics is DuckLake's expiry above rather
@@ -509,15 +544,19 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	// files that strand them. Its orphan scan cannot: it matches
 	// `.parquet` only, which is the same suffix rule that keeps it from
 	// deleting a live summary by mistake.
+	Progress(config_.progress, "sweep_row_summaries", "started");
 	report.push_back(RunRowSummarySweep());
+	Progress(config_.progress, "sweep_row_summaries", report.back().status);
 
 	// The store merge runs last, on what every step above it left behind:
 	// expiry tombstones rows and the sweep deletes index ranges, so
 	// merging earlier would leave exactly the tombstones this pass just
 	// created for the next pass to reclaim.
+	Progress(config_.progress, "compact_store", "started");
 	report.push_back(config_.compact_store ? RunStoreMerge()
 	                                       : MaintenanceStep {"compact_store", "skipped", "not configured at attach"});
 
+	Progress(config_.progress, "compact_store", report.back().status);
 	RecordPass(started_at, trigger, report);
 
 	// The pass ran with no ClientContext (its own connection, its own
@@ -581,7 +620,47 @@ void MaintenanceScheduler::RecordPass(duckdb::timestamp_t started_at, const char
 
 MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
                                                       const DuckLakeStep &step) {
+	const bool table_step =
+	    step.name == "flush_inlined_data" || step.name == "merge_adjacent_files" || step.name == "rewrite_data_files";
+
+	if (config_.table_batches && table_step && step.table.empty()) {
+		auto tables = connection.Query("SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = " +
+		                               duckdb::KeywordHelper::WriteQuoted(lake, '\'') +
+		                               " AND NOT internal ORDER BY schema_name, table_name");
+		if (tables->HasError()) {
+			return MaintenanceStep {step.name, "failed", tables->GetError()};
+		}
+		uint64_t completed = 0;
+		bool pending = false;
+		for (auto &row : *tables) {
+			auto schema = row.GetValue<std::string>(0);
+			auto table = row.GetValue<std::string>(1);
+			auto batch = step;
+			batch.table = table;
+			batch.schema = schema;
+			Progress(config_.progress, step.name, "table_started " + schema + "." + table);
+			auto outcome = RunDuckLakeStep(connection, lake, batch);
+			Progress(config_.progress, step.name, "table_" + outcome.status + " " + schema + "." + table);
+			if (outcome.status == "failed") {
+				outcome.detail = schema + "." + table + ": " + outcome.detail;
+				return outcome;
+			}
+			pending = pending || outcome.work_pending;
+			completed++;
+		}
+		return MaintenanceStep {step.name, "ran", "completed " + std::to_string(completed) + " table batches", pending};
+	}
+
 	std::string sql = "CALL ducklake_" + step.name + "(" + duckdb::KeywordHelper::WriteQuoted(lake, '\'');
+	if (!step.table.empty()) {
+		if (step.name == "flush_inlined_data") {
+			sql += ", table_name => " + duckdb::KeywordHelper::WriteQuoted(step.table, '\'') + ", schema_name => " +
+			       duckdb::KeywordHelper::WriteQuoted(step.schema, '\'');
+		} else {
+			sql += ", " + duckdb::KeywordHelper::WriteQuoted(step.table, '\'') + ", schema => " +
+			       duckdb::KeywordHelper::WriteQuoted(step.schema, '\'');
+		}
+	}
 	for (auto &argument : step.arguments) {
 		sql += ", " + argument;
 	}
@@ -591,7 +670,20 @@ MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connec
 	if (result->HasError()) {
 		return MaintenanceStep {step.name, "failed", result->GetError()};
 	}
-	return MaintenanceStep {step.name, "ran", sql};
+	// A capped compaction that made progress may have left more candidates.
+	bool pending = false;
+	const bool capped = std::any_of(step.arguments.begin(), step.arguments.end(),
+	                                [](const std::string &arg) { return arg.rfind("max_compacted_files =>", 0) == 0; });
+	if (capped) {
+		for (duckdb::idx_t column = 0; column < result->ColumnCount(); column++) {
+			if (result->GetNames()[column] == "files_processed") {
+				for (auto &row : *result) {
+					pending = pending || row.GetValue<uint64_t>(column) > 0;
+				}
+			}
+		}
+	}
+	return MaintenanceStep {step.name, "ran", sql, pending};
 }
 
 MaintenanceStep MaintenanceScheduler::RunSweep() {

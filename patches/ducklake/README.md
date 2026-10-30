@@ -80,6 +80,15 @@ ids under a start at the next free id. Either chains onto a neighbour, and
 every row after a gap is renumbered onto ids other rows hold. Covered by
 `cargo xtask e2e`, which merges both shapes and reads the ids back.
 
+`0008-fix-bound-compaction-input-files.patch` makes `max_compacted_files`
+count input files, including files within a single merge group. Previously,
+eight adjacent files could all merge with a limit of four because the
+counter advanced once per group. The inner candidate loop now stops at the
+remaining allowance, and only scheduled inputs consume it. A merge with
+room for just one input skips it because a merge needs two; later passes
+continue the remaining work. The maintenance CLI regressions cover the
+limit, preserved rows, and pending-work status.
+
 `0005` supplies the positional DELETE used by the optimizer when a certified
 index answers the entire equality predicate. The public located-change SQL
 verbs remain withdrawn; ordinary `DELETE ... WHERE` selects this path without

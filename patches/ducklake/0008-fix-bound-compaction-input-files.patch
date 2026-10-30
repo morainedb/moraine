@@ -1,0 +1,37 @@
+diff --git a/src/functions/ducklake_compaction_functions.cpp b/src/functions/ducklake_compaction_functions.cpp
+--- a/src/functions/ducklake_compaction_functions.cpp
++++ b/src/functions/ducklake_compaction_functions.cpp
+@@ -362,7 +362,9 @@
+ 			// check if we can merge this file with subsequent files
+ 			idx_t current_file_size = 0;
+ 			idx_t compaction_idx;
+-			for (compaction_idx = start_idx; compaction_idx < candidate_list.size(); compaction_idx++) {
++			for (compaction_idx = start_idx;
++			     compaction_idx < candidate_list.size() && compaction_idx - start_idx < max_files - compacted_files;
++			     compaction_idx++) {
+ 				auto candidate_idx = candidate_list[compaction_idx];
+ 				auto &candidate = files[candidate_idx];
+ 				idx_t file_size = candidate.file.data.file_size_bytes;
+@@ -384,10 +386,6 @@
+ 				idx_t compaction_file_count = compaction_idx - start_idx;
+ 				if (type == CompactionType::MERGE_ADJACENT_TABLES && compaction_file_count == 1) {
+ 					// If we only have one file to merge, we have nothing to compact
+-					compacted_files++;
+-					if (compacted_files >= max_files) {
+-						break;
+-					}
+ 					continue;
+ 				}
+ 				vector<DuckLakeCompactionFileEntry> compaction_files;
+@@ -397,10 +395,10 @@
+ 				auto command = GenerateCompactionCommand(std::move(compaction_files), bind_to_latest);
+ 				if (command) {
+ 					compactions.push_back(std::move(command));
++					compacted_files += compaction_file_count;
+ 				}
+ 				start_idx += compaction_file_count - 1;
+ 			}
+-			compacted_files++;
+ 			if (compacted_files >= max_files) {
+ 				break;
+ 			}
