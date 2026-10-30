@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::helpers::*;
 
 /// Expiry cannot remove an unchanged live row beside obsolete inline versions.
@@ -52,11 +54,13 @@ fn maintenance_flushes_before_expiry_and_preserves_inline_application_history() 
          INSERT INTO lake.main.t VALUES (1, 1, 1, NULL);",
     );
     for frontier in 2..=40 {
-        setup.push_str(&format!(
+        write!(
+            setup,
             "BEGIN; UPDATE lake.main.t SET recorded_to = {frontier} \
              WHERE id = 1 AND recorded_to IS NULL;\
              INSERT INTO lake.main.t VALUES (1, {frontier}, {frontier}, NULL); COMMIT;"
-        ));
+        )
+        .unwrap();
     }
     run_ducklake_sql(store.path(), data.path(), &setup);
     let read = || {
