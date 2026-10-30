@@ -602,7 +602,13 @@ impl LogCommitter {
             if *stop.borrow() {
                 return;
             }
-            let _held = self.guard.lock().await;
+            // A sprint holds the guard while stopping this poll. Shutdown
+            // must remain observable while the poll waits for that guard.
+            let _held = tokio::select! {
+                biased;
+                _ = stop.changed() => return,
+                held = self.guard.lock() => held,
+            };
             match self.fold_tail().await {
                 Ok(0) => {}
                 Ok(count) => tracing::debug!(count, "folded peers' slots"),
