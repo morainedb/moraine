@@ -447,18 +447,33 @@ Three properties the scheduler must hold:
   is bounded and overwritten, so it adds neither an unbounded subspace nor a
   cleanup policy.
 
-**Bounded table work is opt-in.** `MAINTENANCE_TABLE_BATCHES true` gives
-flush, merge, and rewrite one DuckLake call per table, including its schema.
-Each completed call commits independently; a failure leaves earlier tables'
-progress durable for the next pass. Snapshot expiry and file cleanup retain
-DuckLake's catalog-wide semantics. `MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES`
+**Inline flushes are isolated by table.** Each table gets its own DuckLake
+call and commits independently. A recognized DuckLake transaction conflict
+retries the entire call on a fresh connection and snapshot, up to three total
+attempts with 100 ms and 200 ms waits. Shutdown interrupts those waits; the
+maintenance runner's process deadline still bounds the pass. Other errors,
+including an unknown commit outcome, are not retried.
+
+A table that exhausts those attempts is reported failed and leaves the pass
+pending. Other tables still flush. Merge and rewrite skip deferred tables and
+process the others in separate transactions; catalog-wide cleanup waits for a
+complete pass. A later pass tries the deferred tables again. Other failures
+retain the normal abort behavior for subsequent DuckLake steps.
+
+**Other bounded table work is opt-in.** `MAINTENANCE_TABLE_BATCHES true` gives
+merge and rewrite one DuckLake call per table, including its schema, even when
+no flush was deferred. Each completed call commits independently; a failure
+leaves earlier tables' progress durable for the next pass. Snapshot expiry and
+file cleanup retain DuckLake's catalog-wide semantics.
+`MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES`
 and `MAINTENANCE_REWRITE_DATA_FILES_MAX_COMPACTED_FILES` forward positive file
 counts to DuckLake. A capped compaction that processed files conservatively
 marks the pass pending; a later pass with no candidates clears it. A file
 count does not bound the size of one file or table.
 
 `MAINTENANCE_PROGRESS true` emits immediate step and table boundaries to
-stderr, with Linux RSS and process high-water marks where available. These
+stderr, including retry attempts and deferred tables, with Linux RSS and
+process high-water marks where available. These
 survive a later process failure; the catalog status remains a completed-pass
 record. Both options default off for existing attaches.
 
