@@ -107,7 +107,7 @@ private:
 	// cannot change maintenance work that has already completed.
 	void RecordPass(duckdb::timestamp_t started_at, const char *trigger,
 	                const std::vector<MaintenanceStep> &report) noexcept;
-	// Issues one `CALL ducklake_<step>(...)` on `connection`.
+	// Enumerates tables on `connection` and runs each batch with fresh transactions.
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake, const DuckLakeStep &step,
 	                                std::set<std::pair<std::string, std::string>> &deferred_tables);
 	// Reruns eligible transaction conflicts with bounded, interruptible backoff.

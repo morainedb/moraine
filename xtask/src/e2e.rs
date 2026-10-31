@@ -115,7 +115,8 @@ fn run_credential_bridge_tests() -> anyhow::Result<()> {
     duckdb::run(&mut Command::new(binary))
 }
 
-/// Races real inline flushes against committed updates on another connection.
+/// Exercises maintenance retries, rollback, and table isolation on a real
+/// catalog.
 fn run_maintenance_retry_tests(extension: &Path) -> anyhow::Result<()> {
     let root = duckdb::workspace_root();
     let library = root.join("build/release/src");

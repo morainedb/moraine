@@ -92,7 +92,7 @@ static void CheckPass(const std::string &extension, const std::filesystem::path 
 		steps[row.GetValue<std::string>(0)] = {row.GetValue<std::string>(1), row.GetValue<std::string>(2)};
 	}
 	const auto &flush = steps.at("flush_inlined_data");
-	if (!permanent_error && !unknown_commit && conflicts <= 1) {
+	if (!permanent_error && !unknown_commit && conflicts < 3) {
 		Require(flush.first == "ran", "a transient conflict was not retried: " + flush.second);
 		Require(state.calls["a_busy"] == conflicts + 1, "the flush used an unexpected number of attempts");
 		Require(steps.at("cleanup_old_files").first == "ran", "successful retry blocked later maintenance");
@@ -114,7 +114,7 @@ static void CheckPass(const std::string &extension, const std::filesystem::path 
 	}
 	auto pending = Query(connection, "SELECT work_pending FROM moraine_maintenance_status('lake') "
 	                                 "ORDER BY started_at DESC LIMIT 1");
-	Require(pending->Fetch()->GetValue(0, 0).GetValue<bool>() == (permanent_error || unknown_commit || conflicts > 1),
+	Require(pending->Fetch()->GetValue(0, 0).GetValue<bool>() == (permanent_error || unknown_commit || conflicts >= 3),
 	        "the durable pass status lost pending work");
 	auto rows =
 	    Query(connection, "SELECT value FROM lake.a_busy UNION ALL SELECT value FROM lake.z_healthy ORDER BY value");
@@ -122,7 +122,7 @@ static void CheckPass(const std::string &extension, const std::filesystem::path 
 	Require(chunk->size() == 2 && chunk->GetValue(0, 1).GetValue<int64_t>() == 99, "maintenance lost user rows");
 	Require(chunk->GetValue(0, 0).GetValue<int64_t>() == 1 + (permanent_error ? 0 : std::min(conflicts, 3U)),
 	        "the retry did not preserve the competing committed updates");
-	if (!permanent_error && conflicts > 1) {
+	if (!permanent_error && conflicts >= 3) {
 		state.conflicts = 0;
 		Query(connection, "SELECT * FROM moraine_maintenance('lake')");
 		auto resumed = Query(connection, "SELECT work_pending FROM moraine_maintenance_status('lake') "
@@ -217,7 +217,7 @@ static void CheckOtherStep(const std::string &extension, const std::filesystem::
 		Require(pending->Fetch()->GetValue(0, 0).GetValue<bool>(), "cleanup failure was not retained");
 		return;
 	}
-	const bool exhausted = conflicts > 1;
+	const bool exhausted = conflicts >= 3;
 	Require(steps.at(step).first == (exhausted ? "failed" : "ran"), step + ": " + steps.at(step).second);
 	Require(state.calls["a_busy"] == (exhausted ? 3U : 2U),
 	        step + " did not obey the retry bound: calls=" + std::to_string(state.calls["a_busy"]));
@@ -265,6 +265,7 @@ int main(int argc, char **argv) {
 	try {
 		Require(argc == 2, "usage: maintenance-retry-test <moraine extension>");
 		CheckPass(argv[1], directory / "transient", 1, false, true);
+		CheckPass(argv[1], directory / "third-attempt", 2, false, true);
 		CheckPass(argv[1], directory / "persistent", 10, false, true);
 		CheckPass(argv[1], directory / "permanent", 0, true, true);
 		CheckPass(argv[1], directory / "default", 1, false, false);
