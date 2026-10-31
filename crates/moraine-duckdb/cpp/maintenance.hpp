@@ -28,7 +28,7 @@ struct MaintenanceStep {
 	// Whether the step left work for a later pass beyond a failure: a
 	// merge still pending when the step returned.
 	bool work_pending = false;
-	// Only exhausted inline-flush conflicts permit other table batches to run.
+	// Exhausted table-scoped conflicts permit other table batches to run.
 	bool deferred_conflict = false;
 };
 
@@ -110,6 +110,8 @@ private:
 	// Issues one `CALL ducklake_<step>(...)` on `connection`.
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake, const DuckLakeStep &step,
 	                                std::set<std::pair<std::string, std::string>> &deferred_tables);
+	// Reruns eligible transaction conflicts with bounded, interruptible backoff.
+	MaintenanceStep RunDuckLakeQuery(const DuckLakeStep &step, const std::string &sql);
 	MaintenanceStep RunSweep();
 	// Reports what `RunSweep`'s single pass reclaimed from the file column
 	// statistics of data files no snapshot can still resolve. Runs after

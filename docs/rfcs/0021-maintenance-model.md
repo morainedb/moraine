@@ -447,18 +447,26 @@ Three properties the scheduler must hold:
   is bounded and overwritten, so it adds neither an unbounded subspace nor a
   cleanup policy.
 
-**Inline flushes are isolated by table.** Each table gets its own DuckLake
-call and commits independently. A recognized DuckLake transaction conflict
-retries the entire call on a fresh connection and snapshot, up to three total
-attempts with 100 ms and 200 ms waits. Shutdown interrupts those waits; the
-maintenance runner's process deadline still bounds the pass. Other errors,
-including an unknown commit outcome, are not retried.
+**Transactional maintenance shares one bounded retry policy.** Inline flush,
+merge, rewrite, and snapshot expiration rerun the whole DuckLake call on a
+fresh connection and snapshot after a recognized transaction conflict. Each
+call gets at most three attempts with 100 ms and 200 ms waits. Shutdown
+interrupts those waits; the maintenance runner's process deadline still
+bounds the pass. File cleanup and orphan deletion have external effects and
+are never retried by this policy. Other errors, including an unknown commit
+outcome, are not retried.
 
-A table that exhausts those attempts is reported failed and leaves the pass
-pending. Other tables still flush. Merge and rewrite skip deferred tables and
-process the others in separate transactions; catalog-wide cleanup waits for a
-complete pass. A later pass tries the deferred tables again. Other failures
-retain the normal abort behavior for subsequent DuckLake steps.
+**Table-scoped conflicts defer only that table.** Inline flush always gives
+each table its own call and commit. Merge and rewrite do the same when
+`MAINTENANCE_TABLE_BATCHES` is enabled, as the Lambda runner requires, or when
+an earlier step deferred a table. A table that exhausts its attempts is
+reported failed and leaves the pass pending. Other tables continue; later
+table steps skip the deferred table. Catalog-wide cleanup waits for a complete
+pass and reports which step failed. A later pass tries deferred tables again.
+
+Snapshot expiration is catalog-wide: exhausting its retries stops dependent
+DuckLake steps. The same applies to an unbatched catalog-wide merge or rewrite.
+Other failures retain that abort behavior too; independent sweeps still run.
 
 **Other bounded table work is opt-in.** `MAINTENANCE_TABLE_BATCHES true` gives
 merge and rewrite one DuckLake call per table, including its schema, even when
@@ -483,8 +491,8 @@ execute. The census is the one part of this surface a read-only attach
 reaches, and it reaches it through its own table function rather than
 through a pass.
 
-**A failed step abandons the rest of the DuckLake sequence, but never the
-sweep.** The DuckLake steps depend on each other — cleanup drains what
+**A failed step outside table-conflict deferral abandons the rest of the
+DuckLake sequence, but never the sweep.** The DuckLake steps depend on each other — cleanup drains what
 merge scheduled — so continuing past a failure would do partial work on a
 premise that did not hold. The sweep depends on none of them, and
 suppressing it would be worse than useless: a misconfigured `older_than`

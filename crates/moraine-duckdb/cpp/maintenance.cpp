@@ -52,6 +52,18 @@ bool IsTableStep(const std::string &name) {
 	return name == "flush_inlined_data" || name == "merge_adjacent_files" || name == "rewrite_data_files";
 }
 
+// Only operations whose confirmed transaction abort can be rerun in full.
+bool CanRetryStep(const std::string &name) {
+	return IsTableStep(name) || name == "expire_snapshots";
+}
+
+bool IsTransactionConflict(const duckdb::QueryResult &result) {
+	const auto &error = result.GetError();
+	return result.GetErrorType() == duckdb::ExceptionType::TRANSACTION &&
+	       error.find("Transaction conflict - ") != std::string::npos &&
+	       duckdb::StringUtil::Lower(error).find("commit outcome unknown") == std::string::npos;
+}
+
 // Progress must leave the process before a later allocation can kill it.
 void Progress(bool enabled, const std::string &step, const std::string &state) {
 	if (!enabled) {
@@ -494,9 +506,10 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	duckdb::Connection connection(db_);
 	auto lake = ResolveLakeName(connection);
 
-	// Exhausted flush conflicts defer only those tables. Global cleanup
+	// Exhausted table conflicts defer only those tables. Global cleanup
 	// waits for a complete pass; other failures still abandon the sequence.
 	std::string aborted_by;
+	std::string deferred_by;
 	std::set<std::pair<std::string, std::string>> deferred_tables;
 	for (auto &spec : StepSpecs()) {
 		if (!aborted_by.empty()) {
@@ -504,7 +517,7 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 			continue;
 		}
 		if (!deferred_tables.empty() && !IsTableStep(spec.name)) {
-			report.push_back(MaintenanceStep {spec.name, "skipped", "not attempted: flush_inlined_data failed"});
+			report.push_back(MaintenanceStep {spec.name, "skipped", "not attempted: " + deferred_by + " failed"});
 			continue;
 		}
 		auto configured = std::find_if(config_.ducklake_steps.begin(), config_.ducklake_steps.end(),
@@ -518,6 +531,9 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 		Progress(config_.progress, spec.name, outcome.status);
 		if (outcome.status == "failed" && !outcome.deferred_conflict) {
 			aborted_by = spec.name;
+		}
+		if (outcome.deferred_conflict && deferred_by.empty()) {
+			deferred_by = spec.name;
 		}
 		report.push_back(std::move(outcome));
 	}
@@ -692,35 +708,35 @@ MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connec
 		sql += ", " + argument;
 	}
 	sql += ")";
+	return RunDuckLakeQuery(step, sql);
+}
 
+MaintenanceStep MaintenanceScheduler::RunDuckLakeQuery(const DuckLakeStep &step, const std::string &sql) {
 	duckdb::unique_ptr<duckdb::QueryResult> result;
 	constexpr unsigned max_attempts = 3;
 	for (unsigned attempt = 1;; ++attempt) {
-		if (step.name == "flush_inlined_data") {
+		{
 			// Each whole CALL autocommits on a fresh connection and snapshot.
 			duckdb::Connection fresh(db_);
 			result = fresh.Query(sql);
-		} else {
-			result = connection.Query(sql);
 		}
 		if (!result->HasError()) {
 			break;
 		}
 		const auto error = result->GetError();
-		const bool conflict = step.name == "flush_inlined_data" &&
-		                      result->GetErrorType() == duckdb::ExceptionType::TRANSACTION &&
-		                      error.find("Transaction conflict - ") != std::string::npos &&
-		                      duckdb::StringUtil::Lower(error).find("commit outcome unknown") == std::string::npos;
-		if (!conflict) {
+		if (!CanRetryStep(step.name) || !IsTransactionConflict(*result)) {
 			return MaintenanceStep {step.name, "failed", error};
 		}
 		if (attempt == max_attempts) {
-			return MaintenanceStep {step.name, "failed", "conflict after 3 attempts: " + error, true, true};
+			return MaintenanceStep {step.name, "failed",
+			                        "conflict after " + std::to_string(attempt) + " attempts: " + error, true,
+			                        IsTableStep(step.name) && !step.table.empty()};
 		}
 		auto delay = std::chrono::milliseconds(100 * attempt);
+		auto scope = step.table.empty() ? "retry" : "table_retry " + step.schema + "." + step.table;
 		Progress(config_.progress, step.name,
-		         "table_retry " + step.schema + "." + step.table + " attempt=" + std::to_string(attempt + 1) +
-		             "/3 delay_ms=" + std::to_string(delay.count()));
+		         scope + " attempt=" + std::to_string(attempt + 1) + "/" + std::to_string(max_attempts) +
+		             " delay_ms=" + std::to_string(delay.count()));
 		std::unique_lock<std::mutex> guard(wake_lock_);
 		if (wake_.wait_for(guard, delay, [this]() { return stopping_; })) {
 			return MaintenanceStep {step.name, "failed", "stopped before retry: " + error};

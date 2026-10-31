@@ -28,11 +28,13 @@ struct RaceState {
 	bool permanent_error;
 	bool unknown_commit;
 	std::map<std::string, unsigned> calls;
+	std::string competing_sql = "UPDATE lake.a_busy SET value = value + 1";
+	bool inject_conflict = false;
 };
 
 static RaceState *race_state;
 
-// The real flush has prepared its files but has not committed when this
+// The real maintenance operation has prepared its changes but not committed when this
 // projection commits a competing update on another connection.
 static void Race(DataChunk &input, ExpressionState &, Vector &result) {
 	for (idx_t row = 0; row < input.size(); ++row) {
@@ -45,8 +47,11 @@ static void Race(DataChunk &input, ExpressionState &, Vector &result) {
 			throw InvalidInputException("Transaction conflict is text here, not a retryable transaction error");
 		}
 		if (table == "a_busy" && call <= race_state->conflicts) {
+			if (race_state->inject_conflict) {
+				throw TransactionException("Transaction conflict - injected after the real maintenance operation");
+			}
 			Connection writer(race_state->database);
-			Query(writer, "UPDATE lake.a_busy SET value = value + 1");
+			Query(writer, race_state->competing_sql);
 		}
 		result.SetValue(row, Value::UBIGINT(call));
 	}
@@ -126,6 +131,133 @@ static void CheckPass(const std::string &extension, const std::filesystem::path 
 	}
 }
 
+static void CheckOtherStep(const std::string &extension, const std::filesystem::path &directory,
+                           const std::string &step, unsigned conflicts) {
+	const bool expiry = step == "expire_snapshots";
+	const bool cleanup = step == "cleanup_old_files" || step == "delete_orphaned_files";
+	DBConfig config;
+	config.SetOptionByName("allow_unsigned_extensions", Value(true));
+	DuckDB database(nullptr, &config);
+	RaceState state {database, conflicts, false, false, {}};
+	state.competing_sql = "DELETE FROM lake.a_busy WHERE value = (SELECT min(value) FROM lake.a_busy)";
+	if (step == "merge_adjacent_files") {
+		// Merge excludes files with deletes. Race a different input file each
+		// time, leaving enough clean files for all three attempts to do work.
+		state.competing_sql = "DELETE FROM lake.a_busy WHERE value = "
+		                      "(SELECT min(value) FROM lake.a_busy WHERE value % 50 = 1)";
+	}
+	// Expiry's metadata writes run for real; inject an abort after they are
+	// staged to verify rollback and a fresh retry without relying on timing.
+	state.inject_conflict = expiry || cleanup;
+	race_state = &state;
+	Connection connection(database);
+	connection.BeginTransaction();
+	ScalarFunction race("maintenance_race", {LogicalType::VARCHAR}, LogicalType::UBIGINT, Race);
+	race.SetVolatile();
+	race.SetFallible();
+	CreateScalarFunctionInfo info(race);
+	Catalog::GetSystemCatalog(*connection.context).CreateFunction(*connection.context, info);
+	connection.Commit();
+	auto options = ", META_MAINTENANCE_TABLE_BATCHES true, META_MAINTENANCE_PROGRESS true, META_MAINTENANCE_" +
+	               StringUtil::Upper(step) + " true";
+	if (step != "cleanup_old_files") {
+		options += ", META_MAINTENANCE_CLEANUP_OLD_FILES true";
+	}
+	if (expiry) {
+		options += ", META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '0 seconds', "
+		           "META_MAINTENANCE_FLUSH_INLINED_DATA true";
+	} else if (!cleanup) {
+		options += ", META_MAINTENANCE_REWRITE_DATA_FILES_DELETE_THRESHOLD 0.0";
+	}
+	Query(connection, "SET threads=1; LOAD " + SQLString::ToString(extension) + "; ATTACH " +
+	                      SQLString::ToString("ducklake:moraine:" + (directory / "store").string()) +
+	                      " AS lake (DATA_PATH " + SQLString::ToString((directory / "data").string()) + options + ")");
+	Query(connection, "SET ducklake_default_data_inlining_row_limit=0; "
+	                  "CREATE TABLE lake.a_busy(value BIGINT); CREATE TABLE lake.z_healthy(value BIGINT); "
+	                  "INSERT INTO lake.a_busy SELECT i FROM range(1,51) t(i); "
+	                  "INSERT INTO lake.a_busy SELECT i FROM range(51,101) t(i); "
+	                  "INSERT INTO lake.a_busy SELECT i FROM range(101,151) t(i); "
+	                  "INSERT INTO lake.a_busy SELECT i FROM range(151,201) t(i); "
+	                  "INSERT INTO lake.a_busy SELECT i FROM range(201,251) t(i); "
+	                  "INSERT INTO lake.z_healthy SELECT i FROM range(1,51) t(i); "
+	                  "INSERT INTO lake.z_healthy SELECT i FROM range(51,101) t(i)");
+	if (step == "rewrite_data_files") {
+		Query(connection, "DELETE FROM lake.a_busy WHERE value % 2 = 0; "
+		                  "DELETE FROM lake.z_healthy WHERE value % 2 = 0");
+	}
+	std::string wrapper;
+	if (cleanup) {
+		wrapper = "CREATE MACRO ducklake_" + step +
+		          "(lake_name) AS TABLE "
+		          "SELECT count(*), maintenance_race('a_busy') FROM system.main.ducklake_" +
+		          step + "(lake_name)";
+	} else if (expiry) {
+		wrapper = "CREATE MACRO ducklake_expire_snapshots(lake_name, older_than := NULL) AS TABLE "
+		          "SELECT count(*), maintenance_race('a_busy') FROM "
+		          "system.main.ducklake_expire_snapshots(lake_name, older_than => older_than)";
+	} else {
+		auto threshold = step == "rewrite_data_files" ? ", delete_threshold := 0.0" : "";
+		auto argument = step == "rewrite_data_files" ? ", delete_threshold => delete_threshold" : "";
+		wrapper = "CREATE MACRO ducklake_" + step + "(lake_name, target_table, schema := 'main'" + threshold +
+		          ") AS TABLE SELECT sum(files_processed) AS files_processed, sum(files_created) AS files_created, "
+		          "maintenance_race(target_table) FROM system.main.ducklake_" +
+		          step + "(lake_name, target_table, schema => schema" + argument + ")";
+	}
+	Query(connection, wrapper);
+	auto report = Query(connection, "SELECT step, status, detail FROM moraine_maintenance('lake')");
+	std::map<std::string, std::pair<std::string, std::string>> steps;
+	for (auto &row : *report) {
+		steps[row.GetValue<std::string>(0)] = {row.GetValue<std::string>(1), row.GetValue<std::string>(2)};
+	}
+	if (cleanup) {
+		Require(steps.at(step).first == "failed" && state.calls["a_busy"] == 1,
+		        "an operation with external effects was retried");
+		auto pending = Query(connection, "SELECT work_pending FROM moraine_maintenance_status('lake') "
+		                                 "ORDER BY started_at DESC LIMIT 1");
+		Require(pending->Fetch()->GetValue(0, 0).GetValue<bool>(), "cleanup failure was not retained");
+		return;
+	}
+	const bool exhausted = conflicts > 1;
+	Require(steps.at(step).first == (exhausted ? "failed" : "ran"), step + ": " + steps.at(step).second);
+	Require(state.calls["a_busy"] == (exhausted ? 3U : 2U),
+	        step + " did not obey the retry bound: calls=" + std::to_string(state.calls["a_busy"]));
+	Require(steps.at("cleanup_old_files").first == (exhausted ? "skipped" : "ran"), "incorrect cleanup outcome");
+	if (exhausted) {
+		Require(steps.at("cleanup_old_files").second.find(step + " failed") != std::string::npos,
+		        "cleanup did not name the actual failed step");
+	}
+	if (expiry) {
+		Require(steps.at("flush_inlined_data").first == (exhausted ? "skipped" : "ran"),
+		        "expiry exhaustion did not block dependent work");
+		auto retained = Query(connection, "SELECT count(*) FROM ducklake_snapshots('lake') WHERE snapshot_id=0");
+		Require(retained->Fetch()->GetValue(0, 0).GetValue<int64_t>() == (exhausted ? 1 : 0),
+		        "failed expiry did not roll back its metadata writes");
+	} else {
+		Require(state.calls["z_healthy"] == 1, "a busy table blocked healthy table work");
+		auto count = Query(connection, "SELECT count(*) FROM lake.a_busy");
+		auto initial_rows = step == "rewrite_data_files" ? 125 : 250;
+		Require(count->Fetch()->GetValue(0, 0).GetValue<int64_t>() == initial_rows - (exhausted ? 3 : 1),
+		        "retry lost concurrent committed deletes");
+		auto healthy = Query(connection, "SELECT count(*) FROM lake.z_healthy");
+		Require(healthy->Fetch()->GetValue(0, 0).GetValue<int64_t>() == (step == "rewrite_data_files" ? 50 : 100),
+		        "maintenance lost rows from a healthy table");
+		if (exhausted && step == "merge_adjacent_files") {
+			Require(steps.at("rewrite_data_files").second.find("deferred 1") != std::string::npos,
+			        "rewrite did not skip the table deferred by merge");
+		}
+	}
+	auto pending = Query(connection, "SELECT work_pending FROM moraine_maintenance_status('lake') "
+	                                 "ORDER BY started_at DESC LIMIT 1");
+	Require(pending->Fetch()->GetValue(0, 0).GetValue<bool>() == exhausted, "incorrect durable pending status");
+	if (exhausted) {
+		state.conflicts = 0;
+		Query(connection, "SELECT * FROM moraine_maintenance('lake')");
+		auto resumed = Query(connection, "SELECT work_pending FROM moraine_maintenance_status('lake') "
+		                                 "ORDER BY started_at DESC LIMIT 1");
+		Require(!resumed->Fetch()->GetValue(0, 0).GetValue<bool>(), "a deferred step did not recover on the next pass");
+	}
+}
+
 int main(int argc, char **argv) {
 	auto directory =
 	    std::filesystem::temp_directory_path() /
@@ -139,6 +271,13 @@ int main(int argc, char **argv) {
 		CheckPass(argv[1], directory / "default-persistent", 10, false, false);
 		CheckPass(argv[1], directory / "quiet", 0, false, true);
 		CheckPass(argv[1], directory / "unknown", 0, false, true, true);
+		for (auto step : {"merge_adjacent_files", "rewrite_data_files", "expire_snapshots"}) {
+			CheckOtherStep(argv[1], directory / (std::string(step) + "-transient"), step, 1);
+			CheckOtherStep(argv[1], directory / (std::string(step) + "-persistent"), step, 10);
+		}
+		for (auto step : {"cleanup_old_files", "delete_orphaned_files"}) {
+			CheckOtherStep(argv[1], directory / step, step, 1);
+		}
 		std::filesystem::remove_all(directory);
 		std::cout << "Maintenance conflict retry, isolation, and recovery checks passed\n";
 		return 0;
