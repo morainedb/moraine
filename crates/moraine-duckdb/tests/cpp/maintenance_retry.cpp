@@ -192,9 +192,18 @@ static void CheckOtherStep(const std::string &extension, const std::filesystem::
 		          "SELECT count(*), maintenance_race('a_busy') FROM system.main.ducklake_" +
 		          step + "(lake_name)";
 	} else if (expiry) {
-		wrapper = "CREATE MACRO ducklake_expire_snapshots(lake_name, older_than := NULL) AS TABLE "
-		          "SELECT count(*), maintenance_race('a_busy') FROM "
-		          "system.main.ducklake_expire_snapshots(lake_name, older_than => older_than)";
+		wrapper = R"SQL(
+CREATE MACRO ducklake_expire_snapshots(lake_name, older_than := NULL, versions := NULL, dry_run := false) AS TABLE
+WITH result AS MATERIALIZED (
+    SELECT list(snapshot_id) AS ids,
+           CASE WHEN dry_run THEN 0::UBIGINT ELSE maintenance_race('a_busy') END AS raced
+    FROM query('SELECT * FROM system.main.ducklake_expire_snapshots(''' || lake_name || ''', ' ||
+        CASE WHEN versions IS NOT NULL THEN 'versions => ' || versions::VARCHAR
+             ELSE 'older_than => ''' || older_than::VARCHAR || '''::TIMESTAMPTZ' END ||
+        ', dry_run => ' || dry_run::VARCHAR || ')')
+)
+SELECT unnest(ids) AS snapshot_id FROM result WHERE raced >= 0
+)SQL";
 	} else {
 		auto threshold = step == "rewrite_data_files" ? ", delete_threshold := 0.0" : "";
 		auto argument = step == "rewrite_data_files" ? ", delete_threshold => delete_threshold" : "";
@@ -258,12 +267,114 @@ static void CheckOtherStep(const std::string &extension, const std::filesystem::
 	}
 }
 
+// Several individually bounded writes leave more obsolete metadata rows than
+// one expiry transaction can remove. The runner must keep each commit bounded.
+static void CheckExpiryBatches(const std::string &extension, const std::filesystem::path &directory,
+                               bool indivisible = false, bool selected = false) {
+	DBConfig config;
+	config.SetOptionByName("allow_unsigned_extensions", Value(true));
+	DuckDB database(nullptr, &config);
+	Connection connection(database);
+	Query(connection, "SET threads=1; LOAD " + SQLString::ToString(extension) + "; ATTACH " +
+	                      SQLString::ToString("ducklake:moraine:" + (directory / "store").string()) +
+	                      " AS lake (DATA_PATH " + SQLString::ToString((directory / "data").string()) +
+	                      ", META_MAINTENANCE_CLEANUP_OLD_FILES true, META_MAINTENANCE_PROGRESS true, "
+	                      "META_MAINTENANCE_EXPIRE_SNAPSHOTS" +
+	                      (selected ? "_VERSIONS '[2,3,4]'" : "_OLDER_THAN INTERVAL '0 seconds'") + ")");
+	Query(connection, "CREATE TABLE lake.history(value BIGINT); INSERT INTO lake.history VALUES (99); "
+	                  "INSERT INTO lake.history VALUES (99); INSERT INTO lake.history VALUES (99); "
+	                  "INSERT INTO lake.history VALUES (99)");
+	// Populate real versioned metadata in separate legal commits. Expiring
+	// all three generations together exceeds the core's 100,000-op cap.
+	for (unsigned snapshot = 2; snapshot < 5; ++snapshot) {
+		Query(connection,
+		      "BEGIN; INSERT INTO __ducklake_metadata_lake.ducklake_snapshot "
+		      "SELECT * REPLACE (snapshot_id + 1 AS snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot "
+		      "ORDER BY snapshot_id DESC LIMIT 1; INSERT INTO __ducklake_metadata_lake.ducklake_tag "
+		      "SELECT 1, " +
+		          std::to_string(indivisible ? 2 : snapshot) + ", " + std::to_string(indivisible ? 3 : snapshot + 1) +
+		          ", 'tag-" + std::to_string(snapshot) +
+		          "-' || i::VARCHAR, 'value' FROM range(40000) t(i); "
+		          "INSERT INTO __ducklake_metadata_lake.ducklake_snapshot_changes(snapshot_id, changes_made) "
+		          "SELECT max(snapshot_id) + 1, '' FROM __ducklake_metadata_lake.ducklake_snapshot; COMMIT");
+	}
+	auto refused = connection.Query("CALL ducklake_expire_snapshots('lake', older_than => now())");
+	Require(refused->HasError() && refused->GetError().find("single commit allows") != std::string::npos,
+	        "the fixture did not exceed the real operation cap: " +
+	            (refused->HasError() ? refused->GetError() : "expiry succeeded"));
+	auto report =
+	    Query(connection, "SELECT status, detail FROM moraine_maintenance('lake') WHERE step='expire_snapshots'");
+	auto outcome = report->Fetch();
+	if (indivisible) {
+		Require(outcome->GetValue(0, 0).GetValue<std::string>() == "failed" &&
+		            outcome->GetValue(1, 0).ToString().find("single snapshot exceeds") != std::string::npos,
+		        "oversized single snapshot was not reported clearly");
+		auto pending =
+		    Query(connection, "SELECT work_pending FROM moraine_maintenance_status('lake') LIMIT 1")->Fetch();
+		Require(pending->GetValue(0, 0).GetValue<bool>(), "unfinished expiry was not retained");
+		auto cleanup =
+		    Query(connection, "SELECT status FROM moraine_maintenance_status('lake') WHERE step='cleanup_old_files'")
+		        ->Fetch();
+		Require(cleanup->GetValue(0, 0).ToString() == "skipped", "cleanup ran after incomplete expiry");
+	} else {
+		Require(outcome->GetValue(0, 0).GetValue<std::string>() == "ran",
+		        "batched expiry failed: " + outcome->GetValue(1, 0).ToString());
+	}
+	auto rows = Query(connection, "SELECT count(*), min(value), max(value) FROM lake.history")->Fetch();
+	Require(rows->GetValue(0, 0).GetValue<int64_t>() == 4 && rows->GetValue(1, 0).GetValue<int64_t>() == 99 &&
+	            rows->GetValue(2, 0).GetValue<int64_t>() == 99,
+	        "expiry changed live rows");
+	auto snapshots = Query(connection, "SELECT count(*) FROM ducklake_snapshots('lake')")->Fetch();
+	Require(snapshots->GetValue(0, 0).GetValue<int64_t>() == (indivisible ? 7
+	                                                          : selected  ? 6
+	                                                                      : 1),
+	        "expiry removed the wrong snapshots or lost completed batch progress");
+	auto tags = Query(connection, "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_tag")->Fetch();
+	Require(tags->GetValue(0, 0).GetValue<int64_t>() == (indivisible ? 120000 : 0),
+	        "expiry left obsolete metadata or failed to roll back an oversized batch");
+	if (selected) {
+		auto protected_snapshots =
+		    Query(connection, "SELECT count(*) FROM ducklake_snapshots('lake') WHERE snapshot_id IN (0,1,5,6,7,8)")
+		        ->Fetch();
+		Require(protected_snapshots->GetValue(0, 0).GetValue<int64_t>() == 6,
+		        "expiry crossed its selected version set");
+	}
+}
+
+// A cheap backlog is still split before any commit hits the operation cap.
+static void CheckExpiryPreflight(const std::string &extension, const std::filesystem::path &directory) {
+	DBConfig config;
+	config.SetOptionByName("allow_unsigned_extensions", Value(true));
+	DuckDB database(nullptr, &config);
+	Connection connection(database);
+	Query(connection, "SET threads=1; LOAD " + SQLString::ToString(extension) + "; ATTACH " +
+	                      SQLString::ToString("ducklake:moraine:" + (directory / "store").string()) +
+	                      " AS lake (DATA_PATH " + SQLString::ToString((directory / "data").string()) +
+	                      ", META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '0 seconds')");
+	Query(connection, "CREATE TABLE lake.history(value BIGINT)");
+	for (unsigned snapshot = 0; snapshot < 130; ++snapshot) {
+		Query(connection, "INSERT INTO lake.history VALUES (99)");
+	}
+	auto report =
+	    Query(connection, "SELECT status, detail FROM moraine_maintenance('lake') WHERE step='expire_snapshots'")
+	        ->Fetch();
+	Require(report->GetValue(0, 0).ToString() == "ran" &&
+	            report->GetValue(1, 0).ToString().find("131 selected snapshots in 3 batches") != std::string::npos,
+	        "expiry did not bound its work before the first commit: " + report->GetValue(1, 0).ToString());
+	auto rows = Query(connection, "SELECT count(*) FROM lake.history")->Fetch();
+	Require(rows->GetValue(0, 0).GetValue<int64_t>() == 130, "bounded expiry changed live rows");
+}
+
 int main(int argc, char **argv) {
 	auto directory =
 	    std::filesystem::temp_directory_path() /
 	    ("moraine-maintenance-retry-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	try {
 		Require(argc == 2, "usage: maintenance-retry-test <moraine extension>");
+		CheckExpiryPreflight(argv[1], directory / "expiry-preflight");
+		CheckExpiryBatches(argv[1], directory / "expiry-batches");
+		CheckExpiryBatches(argv[1], directory / "expiry-single", true);
+		CheckExpiryBatches(argv[1], directory / "expiry-selected", false, true);
 		CheckPass(argv[1], directory / "transient", 1, false, true);
 		CheckPass(argv[1], directory / "third-attempt", 2, false, true);
 		CheckPass(argv[1], directory / "persistent", 10, false, true);

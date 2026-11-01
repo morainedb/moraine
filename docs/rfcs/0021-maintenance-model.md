@@ -456,6 +456,23 @@ bounds the pass. File cleanup and orphan deletion have external effects and
 are never retried by this policy. Other errors, including an unknown commit
 outcome, are not retried.
 
+**Expiration selects its work before writing.** The scheduler first calls
+DuckLake expiration with `dry_run => true` and the configured retention
+criterion. This fixes the eligible snapshot IDs for the pass, including
+DuckLake's latest-snapshot exclusion, without duplicating its retention
+logic. It then expires at most 64 selected IDs per transaction, oldest first.
+A dry run reports snapshots, not their metadata-operation cost, so this is a
+snapshot bound rather than a guarantee that every batch fits the commit cap.
+
+After the core's confirmed pre-commit operation-limit refusal, the scheduler
+halves the batch and retries the smaller set. Successful batches remain
+durable. A single snapshot that still exceeds the cap fails explicitly and
+leaves work pending; the scheduler does not weaken the core limit or split
+one snapshot's metadata cleanup across independent commits. Unknown outcomes
+and other errors stop the pass without shrinking or repeating the batch.
+The shared conflict policy applies within each batch. Shutdown is checked
+between batches, and progress logs report batch sizes and completed work.
+
 **Table-scoped conflicts defer only that table.** Inline flush always gives
 each table its own call and commit. Merge and rewrite do the same when
 `MAINTENANCE_TABLE_BATCHES` is enabled, as the Lambda runner requires, or when

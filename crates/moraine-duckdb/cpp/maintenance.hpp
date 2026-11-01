@@ -110,6 +110,8 @@ private:
 	// Enumerates tables on `connection` and runs each batch with fresh transactions.
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake, const DuckLakeStep &step,
 	                                std::set<std::pair<std::string, std::string>> &deferred_tables);
+	// Selects eligible snapshots before expiring them in bounded commits.
+	MaintenanceStep RunSnapshotExpiryBatches(const std::string &lake, const DuckLakeStep &step, const std::string &sql);
 	// Reruns eligible transaction conflicts with bounded, interruptible backoff.
 	MaintenanceStep RunDuckLakeQuery(const DuckLakeStep &step, const std::string &sql);
 	MaintenanceStep RunSweep();

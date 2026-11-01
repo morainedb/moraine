@@ -64,6 +64,15 @@ bool IsTransactionConflict(const duckdb::QueryResult &result) {
 	       duckdb::StringUtil::Lower(error).find("commit outcome unknown") == std::string::npos;
 }
 
+// This refusal happens before the commit is staged; shrinking it is safe.
+bool IsOversizedCommit(const std::string &error) {
+	return error.find("commit stages ") != std::string::npos &&
+	       error.find(" operations, counted as inserts plus twice the updates plus deletes, above the ") !=
+	           std::string::npos &&
+	       error.find(" a single commit allows. Split the work into several smaller commits.") != std::string::npos &&
+	       duckdb::StringUtil::Lower(error).find("commit outcome unknown") == std::string::npos;
+}
+
 // Progress must leave the process before a later allocation can kill it.
 void Progress(bool enabled, const std::string &step, const std::string &state) {
 	if (!enabled) {
@@ -708,7 +717,73 @@ MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connec
 		sql += ", " + argument;
 	}
 	sql += ")";
+	if (step.name == "expire_snapshots") {
+		return RunSnapshotExpiryBatches(lake, step, sql);
+	}
 	return RunDuckLakeQuery(step, sql);
+}
+
+MaintenanceStep MaintenanceScheduler::RunSnapshotExpiryBatches(const std::string &lake, const DuckLakeStep &step,
+                                                               const std::string &sql) {
+	// DuckLake selects the eligible versions, preserving its retention rules
+	// and latest-snapshot exclusion. Freeze that set for all smaller commits.
+	const auto selection = sql.substr(0, sql.size() - 1) + ", dry_run => true)";
+	std::vector<int64_t> snapshots;
+	{
+		duckdb::Connection connection(db_);
+		auto candidates = connection.Query(selection);
+		if (candidates->HasError()) {
+			return MaintenanceStep {step.name, "failed", candidates->GetError()};
+		}
+		for (auto &row : *candidates) {
+			snapshots.push_back(row.GetValue<int64_t>(0));
+		}
+	}
+	std::sort(snapshots.begin(), snapshots.end());
+	size_t completed = 0;
+	size_t batches = 0;
+	size_t batch_size = 64;
+	auto progress = [&]() {
+		return "processed " + std::to_string(completed) + " selected snapshots in " + std::to_string(batches) +
+		       " batches";
+	};
+	while (completed < snapshots.size()) {
+		{
+			std::lock_guard<std::mutex> guard(wake_lock_);
+			if (stopping_) {
+				return MaintenanceStep {step.name, "failed", progress() + "; stopped before next expiry batch", true};
+			}
+		}
+		auto count = std::min(batch_size, snapshots.size() - completed);
+		std::string versions;
+		for (size_t offset = 0; offset < count; ++offset) {
+			versions += (offset == 0 ? "" : ",") + std::to_string(snapshots[completed + offset]);
+		}
+		Progress(config_.progress, step.name,
+		         "batch_started snapshots=" + std::to_string(count) + " completed=" + std::to_string(completed));
+		auto outcome =
+		    RunDuckLakeQuery(step, "CALL ducklake_expire_snapshots(" + duckdb::KeywordHelper::WriteQuoted(lake, '\'') +
+		                               ", versions => [" + versions + "])");
+		if (outcome.status == "failed") {
+			if (IsOversizedCommit(outcome.detail) && count > 1) {
+				batch_size = std::max<size_t>(1, count / 2);
+				Progress(config_.progress, step.name, "batch_reduced snapshots=" + std::to_string(batch_size));
+				continue;
+			}
+			outcome.detail = progress() + "; expiry batch beginning at snapshot " +
+			                 std::to_string(snapshots[completed]) + " failed: " + outcome.detail;
+			if (IsOversizedCommit(outcome.detail) && count == 1) {
+				outcome.detail +=
+				    " A single snapshot exceeds the operation cap; it cannot be split into smaller snapshot batches.";
+			}
+			outcome.work_pending = true;
+			return outcome;
+		}
+		completed += count;
+		++batches;
+		Progress(config_.progress, step.name, "batch_complete " + progress());
+	}
+	return MaintenanceStep {step.name, "ran", "selection: " + selection + "; " + progress()};
 }
 
 MaintenanceStep MaintenanceScheduler::RunDuckLakeQuery(const DuckLakeStep &step, const std::string &sql) {
