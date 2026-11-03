@@ -226,9 +226,11 @@ Every obligation of RFC 0024 stands, re-pointed at the seam. In addition:
   drops back to following and its next commit lands through the log.
 - A commit the store could not take surfaces as an unknown outcome
   naming its sequence, and a reopen folds it.
-- The sequence invariant: a lake demoted, re-adopted, and written to
-  commits at the sequence its head implies, and a batch prepared against
-  a stale head loses rather than being refused.
+- The sequence invariant: a batch prepared against a stale head names a
+  taken slot and loses, never being refused as past the store; a batch
+  prepared against the current head of a committer whose reader was served
+  further than its view wins at the sequence its head implies. A demoted
+  lake is refused re-adoption, as RFC 0001 of the library specifies.
 - The two-process harness of RFC 0024 runs unchanged over the seam.
 
 ## Alternatives considered
