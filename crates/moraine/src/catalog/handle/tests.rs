@@ -17,6 +17,34 @@ async fn open() -> Catalog {
         .unwrap()
 }
 
+/// Stopping the fold poll must not wait for the guard the sprint still holds.
+#[tokio::test(start_paused = true)]
+async fn fold_shutdown_stops_a_poller_waiting_for_the_sprint_guard() {
+    use std::time::Duration;
+
+    let object_store = Arc::new(InMemory::new());
+    let options = CatalogOptions {
+        path: "fold-shutdown".to_owned(),
+        commit_log: Some(Arc::new(
+            crate::commit_log::test_log::TestProvider::default(),
+        )),
+        commit_log_fold_poll: Duration::from_millis(10),
+        ..CatalogOptions::default()
+    };
+    let (db, log) = super::take_store(object_store, &options).await.unwrap();
+    let log = log.unwrap();
+    let held = log.guard.lock().await;
+
+    // Let the real background poll reach its guard acquisition while the
+    // sprint holds that guard, as it does through release_held_store.
+    tokio::time::sleep(options.commit_log_fold_poll * 2).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(1), log.demote()).await;
+
+    drop(held);
+    db.close().await.unwrap();
+    assert!(stopped.is_ok(), "fold shutdown waited for its own guard");
+}
+
 fn snapshot_row(id: u64) -> Vec<Cell> {
     vec![
         Cell::U64(id),

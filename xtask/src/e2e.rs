@@ -44,6 +44,7 @@ pub fn e2e() -> anyhow::Result<()> {
     println!("ok: packaged {}", extension.display());
 
     run_credential_bridge_tests()?;
+    run_maintenance_retry_tests(&extension)?;
 
     let cli = duckdb::ensure_duckdb_cli()?;
     println!("ok: duckdb CLI at {}", cli.display());
@@ -112,6 +113,28 @@ fn run_credential_bridge_tests() -> anyhow::Result<()> {
             .arg(&binary),
     )?;
     duckdb::run(&mut Command::new(binary))
+}
+
+/// Exercises maintenance retries, rollback, and table isolation on a real
+/// catalog.
+fn run_maintenance_retry_tests(extension: &Path) -> anyhow::Result<()> {
+    let root = duckdb::workspace_root();
+    let library = root.join("build/release/src");
+    let binary = root.join("target/maintenance-retry-test");
+    let compiler = duckdb::cpp_compilers()?.map_or("c++", |compilers| compilers.cxx);
+    duckdb::run(
+        Command::new(compiler)
+            .args(["-std=c++17", "-I"])
+            .arg(root.join("duckdb/src/include"))
+            .arg(root.join("crates/moraine-duckdb/tests/cpp/maintenance_retry.cpp"))
+            .arg("-L")
+            .arg(&library)
+            .args(["-lduckdb", "-pthread"])
+            .arg(format!("-Wl,-rpath,{}", library.display()))
+            .arg("-o")
+            .arg(&binary),
+    )?;
+    duckdb::run(Command::new(binary).arg(extension))
 }
 
 /// Builds and packages the extension without running the suites, and

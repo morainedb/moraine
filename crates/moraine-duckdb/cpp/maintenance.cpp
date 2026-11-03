@@ -48,6 +48,31 @@ const std::vector<StepSpec> &StepSpecs() {
 	return specs;
 }
 
+bool IsTableStep(const std::string &name) {
+	return name == "flush_inlined_data" || name == "merge_adjacent_files" || name == "rewrite_data_files";
+}
+
+// Only operations whose confirmed transaction abort can be rerun in full.
+bool CanRetryStep(const std::string &name) {
+	return IsTableStep(name) || name == "expire_snapshots";
+}
+
+bool IsTransactionConflict(const duckdb::QueryResult &result) {
+	const auto &error = result.GetError();
+	return result.GetErrorType() == duckdb::ExceptionType::TRANSACTION &&
+	       error.find("Transaction conflict - ") != std::string::npos &&
+	       duckdb::StringUtil::Lower(error).find("commit outcome unknown") == std::string::npos;
+}
+
+// This refusal happens before the commit is staged; shrinking it is safe.
+bool IsOversizedCommit(const std::string &error) {
+	return error.find("commit stages ") != std::string::npos &&
+	       error.find(" operations, counted as inserts plus twice the updates plus deletes, above the ") !=
+	           std::string::npos &&
+	       error.find(" a single commit allows. Split the work into several smaller commits.") != std::string::npos &&
+	       duckdb::StringUtil::Lower(error).find("commit outcome unknown") == std::string::npos;
+}
+
 // Progress must leave the process before a later allocation can kill it.
 void Progress(bool enabled, const std::string &step, const std::string &state) {
 	if (!enabled) {
@@ -490,15 +515,18 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	duckdb::Connection connection(db_);
 	auto lake = ResolveLakeName(connection);
 
-	// A failed step abandons the rest of the *DuckLake* sequence, whose
-	// steps depend on each other — cleanup drains what merge scheduled,
-	// so running it after a failed merge does partial work on a premise
-	// that did not hold. The abandoned steps are still reported, so every
-	// pass emits the same rows and two passes can be compared.
+	// Exhausted table conflicts defer only those tables. Global cleanup
+	// waits for a complete pass; other failures still abandon the sequence.
 	std::string aborted_by;
+	std::string deferred_by;
+	std::set<std::pair<std::string, std::string>> deferred_tables;
 	for (auto &spec : StepSpecs()) {
 		if (!aborted_by.empty()) {
 			report.push_back(MaintenanceStep {spec.name, "skipped", "not attempted: " + aborted_by + " failed"});
+			continue;
+		}
+		if (!deferred_tables.empty() && !IsTableStep(spec.name)) {
+			report.push_back(MaintenanceStep {spec.name, "skipped", "not attempted: " + deferred_by + " failed"});
 			continue;
 		}
 		auto configured = std::find_if(config_.ducklake_steps.begin(), config_.ducklake_steps.end(),
@@ -508,10 +536,13 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 			continue;
 		}
 		Progress(config_.progress, spec.name, "started");
-		auto outcome = RunDuckLakeStep(connection, lake, *configured);
+		auto outcome = RunDuckLakeStep(connection, lake, *configured, deferred_tables);
 		Progress(config_.progress, spec.name, outcome.status);
-		if (outcome.status == "failed") {
+		if (outcome.status == "failed" && !outcome.deferred_conflict) {
 			aborted_by = spec.name;
+		}
+		if (outcome.deferred_conflict && deferred_by.empty()) {
+			deferred_by = spec.name;
 		}
 		report.push_back(std::move(outcome));
 	}
@@ -619,11 +650,10 @@ void MaintenanceScheduler::RecordPass(duckdb::timestamp_t started_at, const char
 }
 
 MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
-                                                      const DuckLakeStep &step) {
-	const bool table_step =
-	    step.name == "flush_inlined_data" || step.name == "merge_adjacent_files" || step.name == "rewrite_data_files";
-
-	if (config_.table_batches && table_step && step.table.empty()) {
+                                                      const DuckLakeStep &step,
+                                                      std::set<std::pair<std::string, std::string>> &deferred_tables) {
+	const bool table_batches = config_.table_batches || step.name == "flush_inlined_data" || !deferred_tables.empty();
+	if (table_batches && IsTableStep(step.name) && step.table.empty()) {
 		auto tables = connection.Query("SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = " +
 		                               duckdb::KeywordHelper::WriteQuoted(lake, '\'') +
 		                               " AND NOT internal ORDER BY schema_name, table_name");
@@ -631,24 +661,46 @@ MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connec
 			return MaintenanceStep {step.name, "failed", tables->GetError()};
 		}
 		uint64_t completed = 0;
+		uint64_t deferred = 0;
 		bool pending = false;
+		std::string conflicts;
 		for (auto &row : *tables) {
 			auto schema = row.GetValue<std::string>(0);
 			auto table = row.GetValue<std::string>(1);
+			if (deferred_tables.count({schema, table}) != 0) {
+				deferred++;
+				pending = true;
+				Progress(config_.progress, step.name, "table_deferred " + schema + "." + table);
+				continue;
+			}
 			auto batch = step;
 			batch.table = table;
 			batch.schema = schema;
 			Progress(config_.progress, step.name, "table_started " + schema + "." + table);
-			auto outcome = RunDuckLakeStep(connection, lake, batch);
+			auto outcome = RunDuckLakeStep(connection, lake, batch, deferred_tables);
 			Progress(config_.progress, step.name, "table_" + outcome.status + " " + schema + "." + table);
 			if (outcome.status == "failed") {
 				outcome.detail = schema + "." + table + ": " + outcome.detail;
+				if (outcome.deferred_conflict) {
+					deferred_tables.emplace(schema, table);
+					conflicts += (conflicts.empty() ? "" : "; ") + outcome.detail;
+					deferred++;
+					pending = true;
+					continue;
+				}
 				return outcome;
 			}
 			pending = pending || outcome.work_pending;
 			completed++;
 		}
-		return MaintenanceStep {step.name, "ran", "completed " + std::to_string(completed) + " table batches", pending};
+		auto detail = "completed " + std::to_string(completed) + " table batches";
+		if (deferred != 0) {
+			detail += "; deferred " + std::to_string(deferred) + " tables";
+		}
+		if (!conflicts.empty()) {
+			return MaintenanceStep {step.name, "failed", detail + ": " + conflicts, true, true};
+		}
+		return MaintenanceStep {step.name, "ran", detail, pending};
 	}
 
 	std::string sql = "CALL ducklake_" + step.name + "(" + duckdb::KeywordHelper::WriteQuoted(lake, '\'');
@@ -665,10 +717,105 @@ MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connec
 		sql += ", " + argument;
 	}
 	sql += ")";
+	if (step.name == "expire_snapshots") {
+		return RunSnapshotExpiryBatches(lake, step, sql);
+	}
+	return RunDuckLakeQuery(step, sql);
+}
 
-	auto result = connection.Query(sql);
-	if (result->HasError()) {
-		return MaintenanceStep {step.name, "failed", result->GetError()};
+MaintenanceStep MaintenanceScheduler::RunSnapshotExpiryBatches(const std::string &lake, const DuckLakeStep &step,
+                                                               const std::string &sql) {
+	// DuckLake selects the eligible versions, preserving its retention rules
+	// and latest-snapshot exclusion. Freeze that set for all smaller commits.
+	const auto selection = sql.substr(0, sql.size() - 1) + ", dry_run => true)";
+	std::vector<int64_t> snapshots;
+	{
+		duckdb::Connection connection(db_);
+		auto candidates = connection.Query(selection);
+		if (candidates->HasError()) {
+			return MaintenanceStep {step.name, "failed", candidates->GetError()};
+		}
+		for (auto &row : *candidates) {
+			snapshots.push_back(row.GetValue<int64_t>(0));
+		}
+	}
+	std::sort(snapshots.begin(), snapshots.end());
+	size_t completed = 0;
+	size_t batches = 0;
+	size_t batch_size = 64;
+	auto progress = [&]() {
+		return "processed " + std::to_string(completed) + " selected snapshots in " + std::to_string(batches) +
+		       " batches";
+	};
+	while (completed < snapshots.size()) {
+		{
+			std::lock_guard<std::mutex> guard(wake_lock_);
+			if (stopping_) {
+				return MaintenanceStep {step.name, "failed", progress() + "; stopped before next expiry batch", true};
+			}
+		}
+		auto count = std::min(batch_size, snapshots.size() - completed);
+		std::string versions;
+		for (size_t offset = 0; offset < count; ++offset) {
+			versions += (offset == 0 ? "" : ",") + std::to_string(snapshots[completed + offset]);
+		}
+		Progress(config_.progress, step.name,
+		         "batch_started snapshots=" + std::to_string(count) + " completed=" + std::to_string(completed));
+		auto outcome =
+		    RunDuckLakeQuery(step, "CALL ducklake_expire_snapshots(" + duckdb::KeywordHelper::WriteQuoted(lake, '\'') +
+		                               ", versions => [" + versions + "])");
+		if (outcome.status == "failed") {
+			if (IsOversizedCommit(outcome.detail) && count > 1) {
+				batch_size = std::max<size_t>(1, count / 2);
+				Progress(config_.progress, step.name, "batch_reduced snapshots=" + std::to_string(batch_size));
+				continue;
+			}
+			outcome.detail = progress() + "; expiry batch beginning at snapshot " +
+			                 std::to_string(snapshots[completed]) + " failed: " + outcome.detail;
+			if (IsOversizedCommit(outcome.detail) && count == 1) {
+				outcome.detail +=
+				    " A single snapshot exceeds the operation cap; it cannot be split into smaller snapshot batches.";
+			}
+			outcome.work_pending = true;
+			return outcome;
+		}
+		completed += count;
+		++batches;
+		Progress(config_.progress, step.name, "batch_complete " + progress());
+	}
+	return MaintenanceStep {step.name, "ran", "selection: " + selection + "; " + progress()};
+}
+
+MaintenanceStep MaintenanceScheduler::RunDuckLakeQuery(const DuckLakeStep &step, const std::string &sql) {
+	duckdb::unique_ptr<duckdb::QueryResult> result;
+	constexpr unsigned max_attempts = 3;
+	for (unsigned attempt = 1;; ++attempt) {
+		{
+			// Each whole CALL autocommits on a fresh connection and snapshot.
+			duckdb::Connection fresh(db_);
+			result = fresh.Query(sql);
+		}
+		if (!result->HasError()) {
+			break;
+		}
+		const auto error = result->GetError();
+		if (!CanRetryStep(step.name) || !IsTransactionConflict(*result)) {
+			return MaintenanceStep {step.name, "failed", error};
+		}
+		if (attempt == max_attempts) {
+			return MaintenanceStep {step.name, "failed",
+			                        "conflict after " + std::to_string(attempt) + " attempts: " + error, true,
+			                        IsTableStep(step.name) && !step.table.empty()};
+		}
+		auto delay = std::chrono::milliseconds(100 * attempt);
+		auto scope = step.table.empty() ? "retry" : "table_retry " + step.schema + "." + step.table;
+		Progress(config_.progress, step.name,
+		         scope + " attempt=" + std::to_string(attempt + 1) + "/" + std::to_string(max_attempts) +
+		             " delay_ms=" + std::to_string(delay.count()));
+		std::unique_lock<std::mutex> guard(wake_lock_);
+		if (wake_.wait_for(guard, delay, [this]() { return stopping_; })) {
+			return MaintenanceStep {step.name, "failed", "stopped before retry: " + error};
+		}
 	}
 	// A capped compaction that made progress may have left more candidates.
 	bool pending = false;

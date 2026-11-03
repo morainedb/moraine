@@ -447,18 +447,58 @@ Three properties the scheduler must hold:
   is bounded and overwritten, so it adds neither an unbounded subspace nor a
   cleanup policy.
 
-**Bounded table work is opt-in.** `MAINTENANCE_TABLE_BATCHES true` gives
-flush, merge, and rewrite one DuckLake call per table, including its schema.
-Each completed call commits independently; a failure leaves earlier tables'
-progress durable for the next pass. Snapshot expiry and file cleanup retain
-DuckLake's catalog-wide semantics. `MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES`
+**Transactional maintenance shares one bounded retry policy.** Inline flush,
+merge, rewrite, and snapshot expiration rerun the whole DuckLake call on a
+fresh connection and snapshot after a recognized transaction conflict. Each
+call gets at most three attempts with 100 ms and 200 ms waits. Shutdown
+interrupts those waits; the maintenance runner's process deadline still
+bounds the pass. File cleanup and orphan deletion have external effects and
+are never retried by this policy. Other errors, including an unknown commit
+outcome, are not retried.
+
+**Expiration selects its work before writing.** The scheduler first calls
+DuckLake expiration with `dry_run => true` and the configured retention
+criterion. This fixes the eligible snapshot IDs for the pass, including
+DuckLake's latest-snapshot exclusion, without duplicating its retention
+logic. It then expires at most 64 selected IDs per transaction, oldest first.
+A dry run reports snapshots, not their metadata-operation cost, so this is a
+snapshot bound rather than a guarantee that every batch fits the commit cap.
+
+After the core's confirmed pre-commit operation-limit refusal, the scheduler
+halves the batch and retries the smaller set. Successful batches remain
+durable. A single snapshot that still exceeds the cap fails explicitly and
+leaves work pending; the scheduler does not weaken the core limit or split
+one snapshot's metadata cleanup across independent commits. Unknown outcomes
+and other errors stop the pass without shrinking or repeating the batch.
+The shared conflict policy applies within each batch. Shutdown is checked
+between batches, and progress logs report batch sizes and completed work.
+
+**Table-scoped conflicts defer only that table.** Inline flush always gives
+each table its own call and commit. Merge and rewrite do the same when
+`MAINTENANCE_TABLE_BATCHES` is enabled, as the Lambda runner requires, or when
+an earlier step deferred a table. A table that exhausts its attempts is
+reported failed and leaves the pass pending. Other tables continue; later
+table steps skip the deferred table. Catalog-wide cleanup waits for a complete
+pass and reports which step failed. A later pass tries deferred tables again.
+
+Snapshot expiration is catalog-wide: exhausting its retries stops dependent
+DuckLake steps. The same applies to an unbatched catalog-wide merge or rewrite.
+Other failures retain that abort behavior too; independent sweeps still run.
+
+**Other bounded table work is opt-in.** `MAINTENANCE_TABLE_BATCHES true` gives
+merge and rewrite one DuckLake call per table, including its schema, even when
+no flush was deferred. Each completed call commits independently; a failure
+leaves earlier tables' progress durable for the next pass. Snapshot expiry and
+file cleanup retain DuckLake's catalog-wide semantics.
+`MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES`
 and `MAINTENANCE_REWRITE_DATA_FILES_MAX_COMPACTED_FILES` forward positive file
 counts to DuckLake. A capped compaction that processed files conservatively
 marks the pass pending; a later pass with no candidates clears it. A file
 count does not bound the size of one file or table.
 
 `MAINTENANCE_PROGRESS true` emits immediate step and table boundaries to
-stderr, with Linux RSS and process high-water marks where available. These
+stderr, including retry attempts and deferred tables, with Linux RSS and
+process high-water marks where available. These
 survive a later process failure; the catalog status remains a completed-pass
 record. Both options default off for existing attaches.
 
@@ -468,8 +508,8 @@ execute. The census is the one part of this surface a read-only attach
 reaches, and it reaches it through its own table function rather than
 through a pass.
 
-**A failed step abandons the rest of the DuckLake sequence, but never the
-sweep.** The DuckLake steps depend on each other — cleanup drains what
+**A failed step outside table-conflict deferral abandons the rest of the
+DuckLake sequence, but never the sweep.** The DuckLake steps depend on each other — cleanup drains what
 merge scheduled — so continuing past a failure would do partial work on a
 premise that did not hold. The sweep depends on none of them, and
 suppressing it would be worse than useless: a misconfigured `older_than`

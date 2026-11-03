@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +28,8 @@ struct MaintenanceStep {
 	// Whether the step left work for a later pass beyond a failure: a
 	// merge still pending when the step returned.
 	bool work_pending = false;
+	// Exhausted table-scoped conflicts permit other table batches to run.
+	bool deferred_conflict = false;
 };
 
 // A DuckLake step the attach configured, with the arguments to pass.
@@ -49,7 +52,7 @@ struct MaintenanceConfig {
 	// Zero takes the core's own batch default.
 	uint64_t batch_size = 0;
 	bool sweep_indexes = true;
-	// Give each table its own flush/merge/rewrite transaction.
+	// Give each table its own merge/rewrite transaction. Flush always does.
 	bool table_batches = false;
 	// Emit immediate step boundaries and Linux resident memory to stderr.
 	bool progress = false;
@@ -104,8 +107,13 @@ private:
 	// cannot change maintenance work that has already completed.
 	void RecordPass(duckdb::timestamp_t started_at, const char *trigger,
 	                const std::vector<MaintenanceStep> &report) noexcept;
-	// Issues one `CALL ducklake_<step>(...)` on `connection`.
-	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake, const DuckLakeStep &step);
+	// Enumerates tables on `connection` and runs each batch with fresh transactions.
+	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake, const DuckLakeStep &step,
+	                                std::set<std::pair<std::string, std::string>> &deferred_tables);
+	// Selects eligible snapshots before expiring them in bounded commits.
+	MaintenanceStep RunSnapshotExpiryBatches(const std::string &lake, const DuckLakeStep &step, const std::string &sql);
+	// Reruns eligible transaction conflicts with bounded, interruptible backoff.
+	MaintenanceStep RunDuckLakeQuery(const DuckLakeStep &step, const std::string &sql);
 	MaintenanceStep RunSweep();
 	// Reports what `RunSweep`'s single pass reclaimed from the file column
 	// statistics of data files no snapshot can still resolve. Runs after
