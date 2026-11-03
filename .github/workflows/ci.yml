@@ -38,10 +38,15 @@ jobs:
       # reach that store, which is why every build command below is one.
       # The key suffix gives each job its own entry while leaving the
       # generated restore prefixes shared, so a job with no entry of its
-      # own warm-starts from a compatible one.
+      # own warm-starts from a compatible one. Saving from a pull request
+      # is off by default; without it a second push to one starts from
+      # `main` rather than from what the first push compiled. Its entries
+      # live in that pull request's own cache scope, which
+      # `gh cache delete --all --ref refs/pull/<number>/merge` reclaims.
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: fmt
+          save-on-pull-request: true
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
@@ -60,6 +65,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: clippy
+          save-on-pull-request: true
       - run: mbx clippy --workspace --all-targets -- -D warnings
       # The default build never compiles the fault-injection seams, so
       # nothing else would catch the feature rotting.
@@ -72,6 +78,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: test
+          save-on-pull-request: true
       - run: mbx test --workspace --locked
 
   # The declared MSRV, compiled with the toolchain it names. The version is
@@ -93,6 +100,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: msrv
+          save-on-pull-request: true
           toolchain: ${{ steps.declared.outputs.version }}
       - run: mbx +${{ steps.declared.outputs.version }} check --workspace --locked --all-targets
 
@@ -105,6 +113,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: doc
+          save-on-pull-request: true
       - run: mbx doc --workspace --no-deps
 
   deny:
@@ -132,6 +141,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: pins
+          save-on-pull-request: true
       - run: mbx xtask check-pins
       - run: mbx test -p xtask the_build_tag_overrides_the_ci_checkout_version
       # `check-pins` reads files; this one fetches the DuckLake each pin
@@ -154,6 +164,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: e2e
+          save-on-pull-request: true
       - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache gcc-14 g++-14
       - uses: actions/setup-python@v7
         with:
@@ -214,6 +225,7 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: s3
+          save-on-pull-request: true
       # The pinned rustfs binary xtask downloads, keyed on
       # xtask/src/s3.rs, which owns that pin (same ordering caveat as the
       # DuckDB build cache above).
