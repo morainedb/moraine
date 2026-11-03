@@ -47,4 +47,4 @@ directly here as RFCs; there is no separate specs directory.
 | [0024](0024-commit-log-plug-boundary.md) | Commit-log plug boundary |
 | [0025](0025-launch-footprint-budget-and-removal-review.md) | Launch footprint budget and removal review |
 | [0026](0026-working-memory-and-resumable-publication.md) | Working memory and resumable publication |
-| [0027](0027-store-shaped-commit-log-boundary.md) | Store-shaped commit-log boundary |
+| [0027](0027-commit-log-seam.md) | The commit-log seam |
