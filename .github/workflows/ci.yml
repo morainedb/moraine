@@ -17,6 +17,9 @@ concurrency:
   # the second merge starts from what the first one saved.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -28,13 +31,24 @@ jobs:
       # Match the dated formatter used by workspace setup and local hooks.
       - run: rustup toolchain install nightly-2026-08-29 --profile minimal --component rustfmt
       - run: cargo +nightly-2026-08-29 fmt --check
+      # mbx transports the pruned `target/` tree and Cargo's downloads the
+      # way rust-cache did, and keys every compiler output on its inputs in
+      # a store besides, so a restored entry still yields hits for the
+      # crates whose inputs did not change. Only commands run as `mbx`
+      # reach that store, which is why every build command below is one.
+      # The key suffix gives each job its own entry while leaving the
+      # generated restore prefixes shared, so a job with no entry of its
+      # own warm-starts from a compatible one.
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: fmt
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
       - run: |
           python3 -m venv --clear target/clang-tools
           target/clang-tools/bin/python -m pip install "clang-format==$(cat .clang-tools-version)"
-      - run: cargo xtask fmt-cpp --check
+      - run: mbx xtask fmt-cpp --check
 
   # moraine-duckdb is a pure Rust static library (the C++ shim and DuckDB
   # link are owned by the extension toolchain, exercised only by the e2e
@@ -43,18 +57,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: clippy
+      - run: mbx clippy --workspace --all-targets -- -D warnings
       # The default build never compiles the fault-injection seams, so
       # nothing else would catch the feature rotting.
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: mbx clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: test
+      - run: mbx test --workspace --locked
 
   # The declared MSRV, compiled with the toolchain it names. The version is
   # read out of the workspace manifest rather than repeated here, so the
@@ -66,11 +84,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
       - id: declared
         run: echo "version=$(grep -oP '(?<=^rust-version = ")[^"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
       - run: rustup toolchain install ${{ steps.declared.outputs.version }} --profile minimal
-      - run: cargo +${{ steps.declared.outputs.version }} check --workspace --locked --all-targets
+      # A toolchain the command names is the one case the action's probe
+      # cannot see, so this entry would otherwise share the default
+      # toolchain's key and restore a store that matches nothing.
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: msrv
+          toolchain: ${{ steps.declared.outputs.version }}
+      - run: mbx +${{ steps.declared.outputs.version }} check --workspace --locked --all-targets
 
   doc:
     runs-on: ubuntu-latest
@@ -78,8 +102,10 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: doc
+      - run: mbx doc --workspace --no-deps
 
   deny:
     runs-on: ubuntu-latest
@@ -103,15 +129,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo xtask check-pins
-      - run: cargo test -p xtask the_build_tag_overrides_the_ci_checkout_version
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: pins
+      - run: mbx xtask check-pins
+      - run: mbx test -p xtask the_build_tag_overrides_the_ci_checkout_version
       # `check-pins` reads files; this one fetches the DuckLake each pin
       # names and applies the series to it in a throwaway index, so a pin
       # the primary build never touches cannot quietly stop taking the
       # patches. Otherwise that surfaces only in a per-version release
       # build, a whole extension compile later.
-      - run: cargo xtask check-patch-pins
+      - run: mbx xtask check-patch-pins
 
   # e2e builds the loadable extension through the DuckDB toolchain (`make
   # release`), which compiles DuckDB from the `duckdb` submodule and links
@@ -123,7 +151,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: e2e
       - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache gcc-14 g++-14
       - uses: actions/setup-python@v7
         with:
@@ -145,9 +175,10 @@ jobs:
           restore-keys: |
             ccache-e2e-${{ runner.os }}-
       # The Rust half: corrosion builds the core into the cmake tree
-      # rather than the workspace `target/`, so rust-cache above doesn't
-      # reach it. Declared after rust-cache so its save fires before
-      # rust-cache's post-step cleanup of unrecognized target/ dirs — as
+      # rather than the workspace `target/`, and invokes Cargo itself, so
+      # neither the cache the mbx action transports nor its store reaches
+      # those compilations. Declared after that action so this save fires
+      # before its post step strips unrelated state out of `target/` — as
       # does the CLI cache below.
       - uses: actions/cache@v6
         with:
@@ -163,14 +194,13 @@ jobs:
         with:
           path: target/duckdb-extensions
           key: duckdb-extensions-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
-      - run: cargo xtask tidy-cpp
-      - run: cargo xtask e2e
+      - run: mbx xtask tidy-cpp
+      - run: mbx xtask e2e
         env:
           # Room for the whole DuckDB object set with headroom for a few
           # generations of it, well under the 10 GB the repo's caches
-          # share. On this step rather than the job: rust-cache hashes
-          # every job-level variable whose name starts with CC into its
-          # key, so a job-level `CCACHE_*` throws away the Rust cache.
+          # share. Scoped to the step that compiles C++, the only one that
+          # reads it.
           CCACHE_MAXSIZE: 1G
       # A collapsed hit rate is the first sign the cache stopped working,
       # and it is invisible unless the run prints it.
@@ -181,12 +211,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-key-suffix: s3
       # The pinned rustfs binary xtask downloads, keyed on
-      # xtask/src/s3.rs, which owns that pin (same rust-cache cleanup
-      # caveat as the DuckDB build cache above).
+      # xtask/src/s3.rs, which owns that pin (same ordering caveat as the
+      # DuckDB build cache above).
       - uses: actions/cache@v6
         with:
           path: target/rustfs/bin
           key: rustfs-${{ runner.os }}-${{ hashFiles('xtask/src/s3.rs') }}
-      - run: cargo xtask s3
+      - run: mbx xtask s3

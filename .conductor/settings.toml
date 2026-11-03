@@ -88,6 +88,74 @@ if ! command -v ccache >/dev/null 2>&1 && ! command -v sccache >/dev/null 2>&1; 
   fi
 fi
 
+# The Rust half of the same problem: every workspace compiles the same
+# dependency graph in its own worktree. mbx keys each compiler output on its
+# inputs in one store under $HOME, so the second workspace restores what the
+# first compiled, and it moves `target/` into that store, where collection
+# holds every worktree's build output to one budget. CI caches through the
+# same tool.
+#
+# Not fatal if it fails, and not installed over an existing mbx. Bumping the
+# pin only changes how fast a workspace builds.
+mbx_version=v1.29.2
+mbx_bin="$HOME/.local/bin"
+if ! command -v mbx >/dev/null 2>&1 && [ ! -x "$mbx_bin/mbx" ]; then
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-*)      mbx_target=aarch64-apple-darwin ;;
+    Linux-aarch64) mbx_target=aarch64-unknown-linux-musl ;;
+    *)             mbx_target=x86_64-unknown-linux-musl ;;
+  esac
+  mbx_archive="mbx-$mbx_target.tar.gz"
+  mbx_release="https://github.com/jdx/mr-boxington/releases/download/$mbx_version"
+  mbx_staging=$(mktemp -d)
+
+  # The release publishes SHA256SUMS beside the archives; Amazon Linux has
+  # `sha256sum` and a Mac has `shasum`.
+  mbx_verify() {
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum --check --strict -
+    else
+      shasum -a 256 --check --strict -
+    fi
+  }
+  if curl -sSfL --retry 3 -o "$mbx_staging/$mbx_archive" "$mbx_release/$mbx_archive" &&
+     curl -sSfL --retry 3 -o "$mbx_staging/SHA256SUMS" "$mbx_release/SHA256SUMS" &&
+     (cd "$mbx_staging" && grep "  $mbx_archive\$" SHA256SUMS | mbx_verify); then
+    mkdir -p "$mbx_bin"
+    tar -xzf "$mbx_staging/$mbx_archive" -C "$mbx_bin" mbx
+  fi
+  rm -rf "$mbx_staging"
+fi
+
+PATH="$mbx_bin:$PATH"
+if command -v mbx >/dev/null 2>&1; then
+  mbx_executable=$(command -v mbx)
+
+  # Same reasoning as the toolchain above: a hook reads no profile, so mbx
+  # has to answer from the default PATH.
+  if [ "$(uname -s)" = "Linux" ] && [ "$mbx_executable" != /usr/local/bin/mbx ]; then
+    sudo ln -sf "$mbx_executable" /usr/local/bin/mbx || true
+  fi
+
+  # Installs the Cargo shim and points rust-analyzer's background check at
+  # it. It prints the PATH line that sends a Mac shell's plain `cargo`
+  # through mbx too; it never edits a startup file.
+  mbx setup || true
+
+  # A cloud workspace is this checkout's whole machine, so plain `cargo` can
+  # go through the shim there without touching a developer's own Rust setup:
+  # a wrapper ahead of rustup on the PATH the agent and terminals use, which
+  # names the real Cargo because mbx otherwise selects the wrapper again.
+  if [ "$CONDUCTOR_IS_LOCAL" = "0" ] && [ -x "$HOME/.cargo/bin/cargo" ]; then
+    mbx_shim="${XDG_DATA_HOME:-$HOME/.local/share}/mbx/bin/cargo"
+    if [ -x "$mbx_shim" ]; then
+      printf '#!/bin/sh\nexport CARGO="%s"\nexec "%s" "$@"\n' \
+        "$HOME/.cargo/bin/cargo" "$mbx_shim" > "$mbx_bin/cargo"
+      chmod +x "$mbx_bin/cargo"
+    fi
+  fi
+fi
+
 git config core.hooksPath .githooks
 
 # `cargo xtask check-pins` and `cargo xtask e2e` both read the `duckdb` and

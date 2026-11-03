@@ -40,6 +40,14 @@ and DuckDB's cmake finds it on `PATH` by itself, which turns the
 ten-minute rebuild a fresh worktree otherwise pays into about a minute.
 There is nothing else to configure.
 
+[mbx](https://github.com/jdx/mr-boxington) does the same for Rust: install
+it, run `mbx setup`, and prefix Cargo commands with `mbx` — or put the shim
+directory it prints on `PATH` and keep using plain `cargo`. A second
+checkout then restores what the first compiled, and CI caches the same way
+through `jdx/mr-boxington-action`. Conductor workspaces install it in setup.
+mbx holds `target/` in its own store and collects it when the disk runs
+short, so the `clang-tools` venv above needs recreating after that.
+
 ## The local gate
 
 Everything CI enforces, runnable locally:

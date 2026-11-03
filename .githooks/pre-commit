@@ -1,6 +1,15 @@
 #!/bin/sh
 # Local gate: block commits that fail formatting or lints.
 set -e
-cargo +nightly-2026-08-29 fmt --check
-cargo xtask fmt-cpp --check
-cargo clippy --workspace --all-targets -- -D warnings
+
+# Reuse what another worktree on this machine already compiled. A hook runs
+# in a shell that sources no profile, so the Cargo shim mbx installs is not
+# reliably on PATH here; naming mbx is.
+cargo=cargo
+if command -v mbx >/dev/null 2>&1; then
+  cargo=mbx
+fi
+
+"$cargo" +nightly-2026-08-29 fmt --check
+"$cargo" xtask fmt-cpp --check
+"$cargo" clippy --workspace --all-targets -- -D warnings
