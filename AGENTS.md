@@ -87,6 +87,14 @@ cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets 
 `sccache` off `PATH` on its own. Installing one is the difference between
 a ten-minute and a one-minute rebuild in a fresh worktree.
 
+The Rust side of that is `mbx`, which `.conductor/settings.toml` installs
+and CI runs through `jdx/mr-boxington-action`: one store per machine keyed on
+compiler inputs, so a fresh worktree restores what another already compiled.
+A cloud workspace routes plain `cargo` through it; elsewhere prefix the
+command, as `mbx test --workspace`. It also moves `target/` into that store
+and collects it when the disk runs short, which takes `target/clang-tools`
+with it — `CONTRIBUTING.md` has the one command that puts it back.
+
 The Rust/C/C++ formatting and Clippy checks also run as a pre-commit hook from `.githooks/`,
 and a commit-msg hook there rejects non-conventional commit subjects (the
 changelog is generated from them; CI validates PR titles the same way).

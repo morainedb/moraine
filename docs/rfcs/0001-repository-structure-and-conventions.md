@@ -162,7 +162,7 @@ pass — and runs on a nightly schedule rather than per-PR, a fuzz run being
 a search rather than a check. Its corpus is cached between runs so each
 night resumes the search instead of restarting it.
 
-Toolchain pinned via `rust-toolchain.toml`. `rust-version` declared in workspace metadata and gated by an MSRV job that reads the declared value and compiles the workspace with that toolchain, so the promise cannot drift from what builds. Rust build caching (e.g. `Swatinem/rust-cache`) for CI speed. Workflows set a `concurrency` group with cancel-in-progress so superseded pushes don't burn CI minutes. Dependabot keeps both cargo dependencies and pinned GitHub Actions current (weekly, so `deny` advisories surface as PRs rather than red CI).
+Toolchain pinned via `rust-toolchain.toml`. `rust-version` declared in workspace metadata and gated by an MSRV job that reads the declared value and compiles the workspace with that toolchain, so the promise cannot drift from what builds. Rust build caching through `mbx` (`jdx/mr-boxington-action`), the same store that serves a developer's worktrees, for CI speed; the nightly fuzz job keeps `Swatinem/rust-cache`, which saves on a scheduled run where that action does not. Workflows set a `concurrency` group with cancel-in-progress so superseded pushes don't burn CI minutes. Dependabot keeps both cargo dependencies and pinned GitHub Actions current (weekly, so `deny` advisories surface as PRs rather than red CI).
 
 ## Release and git conventions
 

@@ -40,6 +40,9 @@ jobs:
       # cargo-fuzz builds with sanitizer and coverage instrumentation, which
       # is nightly-only.
       - run: rustup toolchain install nightly --profile minimal
+      # rust-cache rather than the mbx action the merge gate uses: that one
+      # saves from a push or an opted-in trigger, and a scheduled run is
+      # neither, so every night would restore an entry and fill none.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
