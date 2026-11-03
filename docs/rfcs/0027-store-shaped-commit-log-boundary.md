@@ -188,6 +188,17 @@ folds it. A fence on a held store is `Error::Fenced`; on a taken store it
 is absorbed, the store is given back, and the write that met it returns
 as landed.
 
+### Compatibility
+
+The provider trait is public, so replacing its methods is a breaking
+change to the crate's API, released as a minor bump as the crate's 0.x
+versioning allows and named in the changelog. The only implementation
+known is the enterprise glue crate, which moves with this RFC; the
+in-tree provider is a test fixture. The old trait is not kept beside the
+new one: an adapter from the old committer to the new store would need
+the loop this RFC deletes, and a deprecated trait nobody implements is
+weight without a reader.
+
 ### Migration
 
 The on-disk format, the slot contents, the WAL-id base, and the format
