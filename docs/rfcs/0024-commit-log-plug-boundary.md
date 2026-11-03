@@ -145,6 +145,9 @@ format 10, it only recognizes it.
 
 ### The committer
 
+RFC 0027 moves this boundary up to a commit store the library owns; the
+behaviour below is what that store must preserve.
+
 The provider also hands the catalog a **committer**, whose contract stays
 protocol-free: it takes a transaction id, the validated head, the
 `changes_made` string, and the staged writes as opaque key and value
