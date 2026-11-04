@@ -30,7 +30,8 @@ use crate::{
         },
     },
     commit_log::{
-        LogCommitter, SlotAdoption, SlotCommit, SlotOffer, SlotWrite, mint_transaction_id,
+        CommitStore, LogCommitter, SlotAdoption, SlotCommit, SlotOffer, SlotWrite,
+        mint_transaction_id,
     },
     error::{Error, Result},
     store::{
@@ -549,22 +550,18 @@ pub(crate) async fn drain_own_log(store: StoreBuilder<'_>) -> Result<()> {
 }
 
 /// Adopts the log for a store below the log-resident format: flushes what
-/// the store holds, races the format stamp at the first slot, and applies
-/// whichever stamp holds it. Returns the format the store is at after.
-pub(crate) async fn adopt_commit_log(log: &mut LogCommitter, format: u64) -> Result<u64> {
+/// the store holds, then races the format stamp at the first slot through
+/// `store`, which applies whichever stamp holds it. Returns the format the
+/// store is at after.
+pub(crate) async fn adopt_commit_log(store: &dyn CommitStore, db: &Db, format: u64) -> Result<u64> {
     if format >= FORMAT_WITH_COMMIT_LOG {
         return Ok(format);
     }
-    let Some(db) = log.db() else {
-        return Err(Error::Configuration(
-            "a process holding no store cannot adopt the commit log".to_string(),
-        ));
-    };
 
     // The plug acknowledges the store's own rows, the bootstrap included,
     // before they are durable; the flush makes them so.
-    flush_memtable(&db).await?;
-    let head = read::read_head(ReadHandle::Writer(&db))
+    flush_memtable(db).await?;
+    let head = read::read_head(ReadHandle::Writer(db))
         .await?
         .unwrap_or_default();
     let stamp = SlotWrite {
@@ -575,23 +572,18 @@ pub(crate) async fn adopt_commit_log(log: &mut LogCommitter, format: u64) -> Res
             commit_log_batch_origin: Some(head.batch_seq),
         })),
     };
-
-    let writes = match log
-        .committer
+    match store
         .adopt(SlotCommit {
             transaction_id: mint_transaction_id(),
             validated_head: head.snapshot_id,
             changes_made: String::new(),
-            writes: vec![stamp.clone()],
+            writes: vec![stamp],
         })
         .await?
     {
-        SlotAdoption::Adopted => vec![stamp],
-        SlotAdoption::AdoptedByPeer(envelope) => envelope.writes().cloned().collect(),
-    };
-    log.fold(1, writes.iter()).await?;
-    log.batch_origin = batch_origin(ReadHandle::Writer(&db)).await?;
-    info!(batch_origin = log.batch_origin, "adopted the commit log");
+        SlotAdoption::Adopted => info!("adopted the commit log"),
+        SlotAdoption::AdoptedByPeer(_) => info!("a peer adopted the commit log first"),
+    }
 
     Ok(FORMAT_WITH_COMMIT_LOG)
 }
@@ -610,39 +602,8 @@ pub(crate) async fn batch_origin(handle: ReadHandle<'_>) -> Result<u64> {
         })
 }
 
-/// Marks a won slot folded. The folder's local commit applied the batch
-/// already; a process reading through its reader folds everything up to
-/// and including the win into the store it holds, if it holds one, and
-/// waits to be served the win, since the reader is where it reads.
-async fn settle_win(
-    log: &LogCommitter,
-    sequence: u64,
-    folder: bool,
-    projections: &std::sync::RwLock<ProjectionCache>,
-) -> Result<()> {
-    if folder {
-        return log.folded(sequence).await;
-    }
-    // A holder reading through its reader may stand on slots the store it
-    // holds has not folded, so the win is folded with everything before
-    // it, read back from the log, rather than from the staged writes.
-    if log.holds_store() {
-        log.fold_tail().await?;
-    }
-    if !log.await_served(sequence).await {
-        invalidate_head_view(projections);
-    }
-    // The slot just landed names whether this committer folds: the
-    // cadence is arithmetic on the sequence, so nothing is measured.
-    log.fold_if_due(sequence).await;
-
-    Ok(())
-}
-
 /// How offering a batch to the log went.
 enum Offered {
-    /// Commits are not slots here.
-    NoLog,
     /// The batch holds this slot.
     Won(u64),
     /// Other committers' slots beat it; they are folded, and the held view
@@ -652,25 +613,20 @@ enum Offered {
     Failed(Error),
 }
 
-/// Offers the batch to the log, folding what beat it on a loss and taking
-/// the store if the tail has grown long.
+/// Offers the batch to the log. On a loss what beat the batch is in this
+/// process's store already, and the held view is dropped for the retry.
 async fn offer_batch(
-    log: Option<&LogCommitter>,
+    log: &LogCommitter,
     head_before: u64,
     head_after: u64,
     staged_writes: &[StagedWrite],
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Offered {
-    let Some(log) = log else {
-        return Offered::NoLog;
-    };
     match offer_slot(log, head_before, head_after, staged_writes).await {
         Ok(SlotOffer::Won { sequence }) => Offered::Won(sequence),
-        Ok(SlotOffer::Lost { slots }) => {
-            if let Err(err) = log.fold_after_loss(slots).await {
-                invalidate_head_view(projections);
-                return Offered::Failed(err);
-            }
+        // What beat the batch is in this process's store already; the held
+        // view is dropped so the retry re-prepares against it.
+        Ok(SlotOffer::Lost { .. }) => {
             invalidate_head_view(projections);
             Offered::Lost
         }
@@ -696,10 +652,10 @@ async fn offer_slot(
         ));
     };
     let sequence = log.sequence_of(stamp.batch_seq);
-    log.committer
-        .offer(
+    log.store
+        .write_at(
             sequence,
-            vec![SlotCommit {
+            SlotCommit {
                 transaction_id: mint_transaction_id(),
                 validated_head: head_before,
                 changes_made: staged_changes_made(writes, head_after),
@@ -710,7 +666,7 @@ async fn offer_slot(
                         value: value.clone(),
                     })
                     .collect(),
-            }],
+            },
         )
         .await
 }
@@ -1601,29 +1557,36 @@ pub(crate) async fn submit_batch(
     // With a commit log the slot is the commit point: win it first, and
     // fold what beat the batch before the retry re-prepares. The slot
     // carries what the session recorded, which is every write staged on it.
-    let folder = db_tx.is_folder();
-    // Everything the session staged, index entries included: what the slot
-    // carries, and what a holder reading through its reader folds itself.
+    // The library applies a won slot to the store it holds, or is served
+    // it, so the session's own transaction is let go rather than committed.
     let (staged_writes, _memory) = db_tx.take_staged()?;
-    // Held through the local commit below, so the folder's idle poll cannot
-    // fold the slot this batch wins before the batch itself lands locally.
-    let _held = match log {
-        Some(log) => Some(Arc::clone(&log.guard).lock_owned().await),
-        None => None,
-    };
-    let won_sequence = match offer_batch(log, heads.before, head, &staged_writes, projections).await
-    {
-        Offered::NoLog => None,
-        Offered::Won(sequence) => Some(sequence),
-        Offered::Lost => {
-            db_tx.rollback();
-            return Ok(Submission::LostRace);
-        }
-        Offered::Failed(err) => {
-            db_tx.rollback();
-            return Err(err);
-        }
-    };
+    if let Some(log) = log {
+        let sequence = match offer_batch(log, heads.before, head, &staged_writes, projections).await
+        {
+            Offered::Won(sequence) => sequence,
+            Offered::Lost => {
+                db_tx.rollback();
+                return Ok(Submission::LostRace);
+            }
+            Offered::Failed(err) => {
+                db_tx.rollback();
+                return Err(err);
+            }
+        };
+        db_tx.rollback();
+        let projection_started = Instant::now();
+        settle_projections(projections, writes, head, head_advanced, head_view_update);
+        debug!(sequence, "the batch holds its slot");
+        crate::memory::release_after_phase();
+        return Ok(Submission::Submitted(Submitted {
+            handle: None,
+            staged_bytes,
+            head,
+            durable_started: projection_started,
+            projection: projection_started.elapsed(),
+        }));
+    }
+
     let durable_started = Instant::now();
     // Bounded, unlike the durability wait below it: this write holds the
     // store's flight slot, so stalling here stalls every later commit.
@@ -1643,23 +1606,7 @@ pub(crate) async fn submit_batch(
     match written {
         Ok(handle) => {
             let projection_started = Instant::now();
-            // `sys/head` is the conflict anchor, so winning it proves no
-            // batch landed between the base's migration check and this
-            // write. A migration start stamps the head, so none began.
-            if let Some(head_after) = staged_head_value(writes) {
-                note_migration_clear(projections, head_after);
-            }
-            // A format stamp is true once its batch lands, not when read.
-            if let Some(stamped) = staged_format_version(writes) {
-                raise_format_floor(projections, stamped);
-            }
-            fold_committed_batch(projections, writes, head);
-            if head_advanced {
-                install_committed_head_view(projections, head_view_update, writes);
-            }
-            if let (Some(log), Some(sequence)) = (log, won_sequence) {
-                settle_win(log, sequence, folder, projections).await?;
-            }
+            settle_projections(projections, writes, head, head_advanced, head_view_update);
             // Translation scratch and the write ledger are released by the
             // time a batch is durable.
             crate::memory::release_after_phase();
@@ -1671,16 +1618,6 @@ pub(crate) async fn submit_batch(
                 projection: projection_started.elapsed(),
             }))
         }
-        Err(err) if won_sequence.is_some() => {
-            // The slot is committed and durable; only this store missed it.
-            // A reopen replays the slot, so nothing is marked folded.
-            invalidate_head_view(projections);
-            Err(Error::CommitOutcomeUnknown(format!(
-                "slot {} is committed but the store did not take its batch ({err}); reopen to \
-                 fold it",
-                won_sequence.unwrap_or_default()
-            )))
-        }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Submission::LostRace),
         Err(err) if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => {
             invalidate_head_view(projections);
@@ -1691,6 +1628,29 @@ pub(crate) async fn submit_batch(
             invalidate_head_view(projections);
             Err(Error::CommitOutcomeUnknown(err.to_string()))
         }
+    }
+}
+
+/// Folds a batch that landed into the projections: `sys/head` is the
+/// conflict anchor, so winning it proves no batch landed between the
+/// base's migration check and this write, and a format stamp is true once
+/// its batch lands.
+fn settle_projections(
+    projections: &std::sync::RwLock<ProjectionCache>,
+    writes: &[StagedWrite],
+    head: u64,
+    head_advanced: bool,
+    head_view_update: HeadViewUpdate,
+) {
+    if let Some(head_after) = staged_head_value(writes) {
+        note_migration_clear(projections, head_after);
+    }
+    if let Some(stamped) = staged_format_version(writes) {
+        raise_format_floor(projections, stamped);
+    }
+    fold_committed_batch(projections, writes, head);
+    if head_advanced {
+        install_committed_head_view(projections, head_view_update, writes);
     }
 }
 

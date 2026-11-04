@@ -1,8 +1,11 @@
-//! The plug boundary for a bucket-resident commit log: a library that keeps
-//! a store's commits as slot objects supplies SlateDB write-ahead-log plugs
-//! and a committer here, and the catalog opens its stores over them. This
-//! crate holds the boundary and nothing of the log; a store stamped for the
-//! log cannot be opened without a provider.
+//! The seam a bucket-resident commit log plugs into. A library that keeps a
+//! store's commits as slot objects hands the catalog a [`CommitStore`]: the
+//! write every process shares, over the SlateDB store or reader the catalog
+//! opened. The catalog decides nothing about slots. It derives the sequence
+//! a batch names, stamps the format, supplies the two hooks the library
+//! needs — how to open the store as its writer, and what a folded slot must
+//! carry — and calls through. This crate holds the seam and nothing of the
+//! log; a store stamped for the log cannot be opened without a provider.
 //!
 //! A host supplies a provider one of two ways: per open, through
 //! [`CatalogOptions::commit_log`](crate::CatalogOptions::commit_log), or
@@ -10,22 +13,23 @@
 //! library linked into the DuckDB extension reaches an attach it never sees
 //! the options of. The per-open provider outranks the registered one.
 //!
-//! Every byte that crosses the boundary is opaque to the library: a
+//! Every byte that crosses the seam is opaque to the library: a
 //! [`SlotWrite`] is a key and a value the catalog encoded, and a
 //! [`SlotCommit`] is a batch of them with what it was validated against.
 
 use std::{
+    any::Any,
     fmt,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use object_store::ObjectStore;
-use slatedb::wal::{WalGc, WalReader, WriterInit};
+use slatedb::{
+    Db, DbReader,
+    wal::{WalGc, WalReader, WriterInit},
+};
 
 use crate::error::{Error, Result};
 
@@ -71,156 +75,282 @@ impl SlotEnvelope {
 /// How an offer ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotOffer {
-    /// The offered commits hold `sequence`. Apply them to the store, then
-    /// report the sequence folded.
+    /// The commit holds `sequence`, and this process's store has applied
+    /// it, or been served it.
     Won {
         /// The sequence won.
         sequence: u64,
     },
-    /// Other committers hold the sequence raced and possibly more beyond it.
-    /// Fold every slot into the store, in order, before offering again.
+    /// Another committer holds the sequence raced. Everything that beat the
+    /// offer is in this process's store already; the caller re-prepares
+    /// against it.
     Lost {
-        /// The slots landed from the sequence raced, in order.
-        slots: Vec<(u64, SlotEnvelope)>,
+        /// The sequence raced.
+        sequence: u64,
+        /// The envelope that holds it.
+        winner: SlotEnvelope,
+        /// The last sequence this process's store now covers.
+        through: u64,
     },
 }
 
-/// How an adoption ended.
+/// How an adoption ended. Either way the stamp that holds the first slot is
+/// in this process's store already.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotAdoption {
-    /// This process's stamp holds the first slot: apply it, then report it
-    /// folded.
+    /// This process's stamp holds the first slot.
     Adopted,
-    /// A peer's stamp holds the first slot; its envelope is returned to
-    /// apply and report folded instead.
+    /// A peer's stamp holds the first slot; here it is, for the catalog to
+    /// check.
     AdoptedByPeer(SlotEnvelope),
 }
 
-/// The log's commit side, for one store. Sequences are the log's: an offer
-/// races the one after the last slot this process has folded or been served,
-/// and a lost race hands back what to fold before the next.
+/// The write every process shares, over the store or reader the catalog
+/// opened. The library behind it offers, folds what beat an offer, flushes
+/// and truncates on its cadence, takes the store when a follower's turn
+/// comes, and gives it back; the catalog sees none of that.
 #[async_trait]
-pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
-    /// Offers `commits` as the slot at `sequence`, which the caller derives
-    /// from the state the commits were prepared against: a stale state
-    /// names a taken slot and loses, so the race is what guards it.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::CommitOutcomeUnknown`] when the library could not reach the
-    /// log or resolve a put whose outcome it could not attribute;
-    /// [`Error::Corruption`] when a slot is not a valid envelope.
-    async fn offer(&self, sequence: u64, commits: Vec<SlotCommit>) -> Result<SlotOffer>;
-
+pub trait CommitStore: Any + fmt::Debug + Send + Sync + 'static {
     /// Whether the log has been adopted: a store's stamp holds its first
-    /// slot. A store not yet adopted keeps its commits in its own log,
-    /// which must be drained into the tree before the plug replaces it.
+    /// slot.
     ///
     /// # Errors
     ///
-    /// As [`offer`](Self::offer).
+    /// [`Error::CommitOutcomeUnknown`] when the log could not be read.
     async fn adopted(&self) -> Result<bool>;
 
-    /// Races `stamp` at the log's first sequence, adopting the log for a
-    /// store that has none yet. Slots are numbered past the store's own
-    /// log: the plug records the store's next WAL id at open, and adoption
-    /// fixes it as the base every slot's WAL id counts from.
+    /// Adopts a log nothing has adopted, with `stamp` as its first slot,
+    /// numbering the slots past the store's own history. Only a process
+    /// holding the store can. A peer may have adopted first; its stamp
+    /// comes back, applied already.
     ///
     /// # Errors
     ///
-    /// As [`offer`](Self::offer).
+    /// As [`write_at`](Self::write_at); [`Error::Constraint`] on a follower
+    /// or a log adopted already.
     async fn adopt(&self, stamp: SlotCommit) -> Result<SlotAdoption>;
 
-    /// The slots landed past the last this process has folded, in order,
-    /// whatever its reader has been served: what the store it holds still
-    /// lacks.
+    /// Offers `commit` as the slot at `sequence`, which the caller derives
+    /// from the state the commit was prepared against: a stale state names
+    /// a taken slot and loses. The sequence may be at most one past what
+    /// this process's store knows.
     ///
     /// # Errors
     ///
-    /// As [`offer`](Self::offer); a hole in the tail is [`Error::Corruption`].
-    async fn tail(&self) -> Result<Vec<(u64, SlotEnvelope)>>;
+    /// [`Error::CommitOutcomeUnknown`] when the log could not be reached, a
+    /// put could not be attributed, or the slot was won and this process's
+    /// store could not take it, in which case the error names the sequence
+    /// and a reopen folds it; [`Error::Fenced`] when another process has
+    /// taken a held store; [`Error::Corruption`] when a slot is not a valid
+    /// envelope or the log is damaged.
+    async fn write_at(&self, sequence: u64, commit: SlotCommit) -> Result<SlotOffer>;
 
-    /// How many slots lie past `replay_point`, the manifest's last folded
-    /// WAL id: what a cold open of the store would replay. One listing.
+    /// Folds what has landed past this process's cursor into the store it
+    /// holds, or refreshes the reader it follows. Returns how many slots
+    /// that was.
     ///
     /// # Errors
     ///
-    /// As [`offer`](Self::offer).
-    async fn unfolded(&self, replay_point: u64) -> Result<u64>;
+    /// As [`write_at`](Self::write_at).
+    async fn fold_tail(&self) -> Result<u64>;
 
-    /// The row sequence numbers one slot reserves when replayed: a replayed
-    /// slot's rows take `base + k * rows_per_slot` for slot `k`.
-    fn rows_per_slot(&self) -> u64;
+    /// Writes a held store out and lets it go, and closes the store or
+    /// reader this was built over. The catalog closes neither itself.
+    ///
+    /// # Errors
+    ///
+    /// The store's error on the close.
+    async fn close(&self) -> Result<()>;
 
-    /// How many rows the folder's store may write for itself before they
-    /// reach the number the next replayed slot would take, as of the
-    /// writer plug's open; rows past it are skipped by the next replay.
-    /// Every slot folded since adds another `rows_per_slot`.
-    fn headroom(&self) -> u64;
-
-    /// Reports that the store has applied every slot through `sequence`.
-    /// Apply before reporting: the store's next memtable freeze records the
-    /// reported sequence as the replay point.
-    fn mark_folded(&self, sequence: u64);
-
-    /// Waits until the store has been handed every slot through `sequence`
-    /// by its reader-side plug, or until `timeout` passes. Returns whether
-    /// it was reached. A reader catches up once per manifest poll. A hint
-    /// for when to read again, never a guard: the plug reports a slot
-    /// served before the reader has applied it.
-    async fn await_served(&self, sequence: u64, timeout: Duration) -> bool;
+    /// The store as the crate that built it knows it, for everything the
+    /// seam does not carry.
+    fn as_any(&self) -> &dyn Any;
 }
 
-/// What a commit-log library hands the catalog: SlateDB write-ahead-log
-/// plugs and the committer, for the store at a path on the store that
-/// holds its log.
+/// One writer open's cursor, shared by its plug and the store built over
+/// it. The provider mints it, the catalog builds the SlateDB writer over
+/// [`writer_init`](Self::writer_init), and hands both back to the provider.
+#[async_trait]
+pub trait WriterSession: Any + Send + Sync + 'static {
+    /// The write-ahead-log plug the writer is built with.
+    fn writer_init(&self) -> Box<dyn WriterInit>;
+
+    /// Whether the log has been adopted, asked before the store is built:
+    /// a store not yet adopted drains its own log into the tree first,
+    /// since the plug replays the log in place of it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CommitOutcomeUnknown`] when the log could not be read.
+    async fn adopted(&self) -> Result<bool>;
+
+    /// The session as the crate that minted it knows it.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// One reader open's cursor, shared by its plug and the store built over
+/// it.
+pub trait ReaderSession: Any + Send + Sync + 'static {
+    /// The write-ahead-log plug the reader is built with.
+    fn reader(&self) -> Arc<dyn WalReader>;
+
+    /// The session as the crate that minted it knows it.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// How the library opens the store as its writer: for the fold a follower
+/// makes on its turn and lets go of, or to hold. The catalog implements it
+/// with its own writer open, over a fresh session from the provider, whose
+/// replay is the fold.
+#[async_trait]
+pub trait TakeStore: Send + Sync + 'static {
+    /// Opens the store as its writer, or declines for now — as when the
+    /// store is at its limit of unmerged files and a fold would stall.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::open`](crate::Catalog::open).
+    async fn take(&self) -> Result<Option<(Db, Arc<dyn WriterSession>)>>;
+}
+
+/// A check the library runs on every slot before it folds it. A slot the
+/// check refuses is not folded, and the fold stops with the refusal.
+pub type Inspect = Arc<dyn Fn(u64, &SlotEnvelope) -> Result<()> + Send + Sync>;
+
+/// What the catalog hands the library with a store or reader: how to open
+/// the store as its writer, what every folded slot must carry, where the
+/// store lives, and the cadence it runs on.
+#[derive(Clone)]
+pub struct CatalogHooks {
+    /// How to open the store as its writer.
+    pub take: Arc<dyn TakeStore>,
+    /// What every slot must carry to be folded.
+    pub inspect: Inspect,
+    /// The store's path, as it was opened: where the manifests are.
+    pub path: String,
+    /// The store's object store, as it was opened.
+    pub object_store: Arc<dyn ObjectStore>,
+    /// The cadence and the waits.
+    pub settings: CommitLogSettings,
+}
+
+impl fmt::Debug for CatalogHooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CatalogHooks")
+            .field("path", &self.path)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The commit-log options of [`CatalogOptions`](crate::CatalogOptions), as
+/// values the library reads. The catalog interprets none of them.
+#[derive(Debug, Clone)]
+pub struct CommitLogSettings {
+    /// Every this many slots, the follower that lands one takes the store,
+    /// folds, writes it out, and lets go. Zero folds on no cadence.
+    pub fold_every: u64,
+    /// After this many folded slots a holder writes its memtable out and
+    /// truncates the log below the replay point.
+    pub flush_every: u64,
+    /// How old a slot must be before truncation may delete it.
+    pub retention: Duration,
+    /// How often a holder looks for slots its peers landed.
+    pub poll: Duration,
+    /// How long a follower waits to be served a slot it knows landed.
+    pub catch_up: Duration,
+    /// How long a follower waits between refreshes while it waits.
+    pub refresh_backoff: Duration,
+}
+
+/// What a commit-log library hands the catalog, for the store at a path on
+/// the object store that holds its log.
 ///
 /// Every method receives the object store the catalog records as its log
 /// store — the catalog store itself unless a separate one was configured —
 /// already wrapped in the catalog's retrying transport, and the catalog's
-/// path within it. Call `session` once per open, then obtain all plugs
-/// and the committer from that session. Each held writer owns its fold cursor.
+/// path within it. One session per open: the catalog builds its SlateDB
+/// handle over the session's plug and hands both back.
 pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
-    /// Creates isolated progress state for one catalog open. Stateless
-    /// providers may return `None`; stateful providers must return a fresh
-    /// session.
-    fn session(&self) -> Option<Arc<dyn CommitLogProvider>> {
-        None
-    }
+    /// A fresh writer session for one read-write open.
+    fn writer_session(&self, log_store: Arc<dyn ObjectStore>, path: &str)
+    -> Arc<dyn WriterSession>;
 
-    /// The writer-side plug one read-write open builds its store with: it
-    /// replays the log past the store's replay point as the fold, and
-    /// reports the fold cursor as the flushed id.
-    fn writer_init(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Box<dyn WriterInit>;
+    /// A fresh reader session for one read-only open. A `tail`ing reader is
+    /// served the unfolded tail and sees a commit the moment its slot
+    /// lands; one that does not follows the folded store.
+    fn reader_session(
+        &self,
+        log_store: Arc<dyn ObjectStore>,
+        path: &str,
+        tail: bool,
+    ) -> Arc<dyn ReaderSession>;
 
-    /// The reader-side plug a read-only open builds its store with. A
-    /// `tail`ing reader replays the unfolded tail and sees a commit the
-    /// moment its slot lands; one that does not follows the folded store.
-    fn reader(&self, log_store: Arc<dyn ObjectStore>, path: &str, tail: bool)
-    -> Arc<dyn WalReader>;
+    /// The commit store over a writer the catalog opened with `session`'s
+    /// plug: a holder, into which every slot folds.
+    fn holding(
+        &self,
+        db: Db,
+        session: Arc<dyn WriterSession>,
+        hooks: CatalogHooks,
+    ) -> Arc<dyn CommitStore>;
 
-    /// The commit side for the store at `path`.
-    fn committer(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn SlotCommitter>;
+    /// The commit store over a reader the catalog opened with `session`'s
+    /// plug: a follower, whose writes land as slots and which takes the
+    /// store on its turn through the hooks.
+    fn following(
+        &self,
+        reader: Arc<DbReader>,
+        session: Arc<dyn ReaderSession>,
+        hooks: CatalogHooks,
+    ) -> Arc<dyn CommitStore>;
 
-    /// The plug SlateDB's garbage collector truncates the log through: it
-    /// deletes slots below every range a live manifest still references.
+    /// The plug SlateDB's garbage collector truncates the log through, for
+    /// a maintenance process collecting on a store's behalf.
     fn garbage_collector(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WalGc>;
 
     /// Whether another process compacts and collects the stores opened
     /// over this provider. A writer then starts neither SlateDB's
-    /// compactor nor its collector, as [`CatalogOptions::external_compaction`]
-    /// would make it; the two fence each other otherwise. Defaults to
-    /// `false`.
+    /// compactor nor its collector, as
+    /// [`CatalogOptions::external_compaction`] would make it; the two fence
+    /// each other otherwise. Defaults to `false`.
     ///
-    /// Returning `true` makes that process load-bearing. Each fold
-    /// writes a file only a compactor merges away, so with none running
-    /// the store reaches its limit of unmerged files and folding stops
-    /// until one does. Commits are unaffected; the log grows in place of
-    /// the fold, and the folded state falls behind.
+    /// Returning `true` makes that process load-bearing. Each fold writes a
+    /// file only a compactor merges away, so with none running the store
+    /// reaches its limit of unmerged files and folding stops until one
+    /// does. Commits are unaffected; the log grows in place of the fold,
+    /// and the folded state falls behind.
     ///
     /// [`CatalogOptions::external_compaction`]: crate::CatalogOptions::external_compaction
     fn external_compaction(&self) -> bool {
         false
+    }
+}
+
+/// The catalog's binding to the commit store it commits through, and the
+/// batch counter the log's first slot stands on: slot `k` carries the head
+/// stamp at `batch_origin + k - 1`, which is how a batch names its slot.
+#[derive(Clone)]
+pub(crate) struct LogCommitter {
+    pub(crate) store: Arc<dyn CommitStore>,
+    pub(crate) batch_origin: u64,
+}
+
+impl fmt::Debug for LogCommitter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LogCommitter")
+            .field("store", &self.store)
+            .field("batch_origin", &self.batch_origin)
+            .finish()
+    }
+}
+
+impl LogCommitter {
+    /// The slot a batch stamping the head at `batch_seq` belongs to.
+    pub(crate) fn sequence_of(&self, batch_seq: u64) -> u64 {
+        batch_seq
+            .saturating_sub(self.batch_origin)
+            .saturating_add(1)
     }
 }
 
@@ -251,529 +381,9 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
     *uuid::Uuid::new_v4().as_bytes()
 }
 
-/// How long a committer over a tailing reader waits for the reader to be
-/// served a sequence before it reads again.
+/// How long a follower waits to be served a slot it knows landed before its
+/// write returns anyway; the slot is durable either way.
 pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long a fold may run before the commit that triggered it says so.
-/// It keeps waiting after that: the point is that a fold which has
-/// stopped making progress leaves a trace, since the usual cause is a
-/// store that has stopped accepting writes and will not start again on
-/// its own.
-const FOLD_OVERRUN: Duration = Duration::from_secs(30);
-
-/// How long a commit waits between refreshes while its slot is not yet
-/// served, so a peer's slot landing between them is not spun on.
-const SLOT_REFRESH_BACKOFF: Duration = Duration::from_millis(2);
-
-/// The log's commit side bound to a process's store: offers go to the
-/// committer, and slots other committers won are applied to `db` when this
-/// process is the folder, or awaited from the tailing reader when it is not.
-#[derive(Clone)]
-pub(crate) struct LogCommitter {
-    pub(crate) committer: Arc<dyn SlotCommitter>,
-    /// The store this process folds into, while it holds one. A process
-    /// takes the store when the tail is long and keeps it until fenced.
-    pub(crate) holder: Arc<std::sync::Mutex<Option<Holder>>>,
-    /// Where this process reads: the store it holds, or a tailing reader.
-    pub(crate) reads: ReadSide,
-    /// How this process takes the store when the tail is long; `None` for
-    /// a process that holds it from its open.
-    pub(crate) folder: Option<Arc<dyn StoreFolder>>,
-    /// Every this many slots, the committer that lands one folds.
-    pub(crate) fold_every: u64,
-    /// The head's batch counter when the log was adopted; slot `k` carries
-    /// the stamp at `batch_origin + k - 1`.
-    pub(crate) batch_origin: u64,
-    /// Serializes the folder's offers, the local commits that follow them,
-    /// and the idle poll's folds, so the poll never folds a slot the
-    /// folder is in the middle of committing itself.
-    pub(crate) guard: Arc<tokio::sync::Mutex<()>>,
-    /// Slots folded since this open, each buying the folder's own rows
-    /// another slot's worth of sequence numbers.
-    pub(crate) folds_since_open: Arc<AtomicU64>,
-    /// How a holder flushes and truncates.
-    pub(crate) flushing: Flushing,
-    /// The reader this process reads the log through, refreshed while a
-    /// commit waits to see its slot. `None` on a folder, which reads the
-    /// store it holds.
-    pub(crate) reader: Option<Arc<slatedb::DbReader>>,
-}
-
-/// The store a process holds, and the idle poll folding into it.
-pub(crate) struct Holder {
-    pub(crate) committer: Arc<dyn SlotCommitter>,
-    pub(crate) db: slatedb::Db,
-    pub(crate) fold_poll: Option<FoldPoll>,
-}
-
-/// Where a process reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadSide {
-    /// Through the store it holds; its own commits land there directly.
-    Store,
-    /// Through a tailing reader, which is served every slot, its own
-    /// included, once the reader polls.
-    Reader,
-}
-
-/// Folds the log into the store once and lets go. Implemented by the
-/// catalog, which owns the open.
-#[async_trait]
-pub(crate) trait StoreFolder: Send + Sync {
-    /// Opens the store, applies every slot it lacks, writes it out,
-    /// truncates the log below it, and closes. Returns how many slots the
-    /// store was behind.
-    async fn fold_now(&self) -> Result<u64>;
-}
-
-/// The idle poll task and the switch that stops it.
-pub(crate) struct FoldPoll {
-    stop: tokio::sync::watch::Sender<bool>,
-    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl FoldPoll {
-    pub(crate) fn spawn(log: LogCommitter, interval: Duration) -> Self {
-        let (stop, stopped) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(log.poll_folds(interval, stopped));
-        Self {
-            stop,
-            task: std::sync::Mutex::new(Some(task)),
-        }
-    }
-
-    pub(crate) async fn stop(&self) {
-        let _ = self.stop.send(true);
-        let task = self
-            .task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(task) = task {
-            let _ = task.await;
-        }
-    }
-
-    /// Tells the task to stop without waiting for it: what the task itself
-    /// calls, since it cannot wait for its own end.
-    fn stop_from_within(&self) {
-        let _ = self.stop.send(true);
-        drop(
-            self.task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take(),
-        );
-    }
-}
-
-/// The folder's flush policy: after `every` folded slots, write the
-/// memtable out so the replay point moves, then run the collector so the
-/// log is truncated below it.
-#[derive(Clone)]
-pub(crate) struct Flushing {
-    pub(crate) every: u64,
-    pub(crate) folded_since: Arc<AtomicU64>,
-    pub(crate) collector: Collector,
-}
-
-/// What builds SlateDB's garbage collector for one store; built per run,
-/// since the collector is configuration and holds nothing.
-#[derive(Clone)]
-pub(crate) struct Collector {
-    pub(crate) path: String,
-    pub(crate) object_store: Arc<dyn ObjectStore>,
-    pub(crate) log_store: Arc<dyn ObjectStore>,
-    pub(crate) wal_gc: Arc<dyn WalGc>,
-    /// How old a slot must be before truncation may delete it.
-    pub(crate) min_age: Duration,
-}
-
-impl Collector {
-    /// Runs the manifest and WAL collectors once.
-    async fn run(&self) {
-        let directory = slatedb::config::GarbageCollectorDirectoryOptions {
-            interval: None,
-            min_age: self.min_age,
-            dry_run: false,
-        };
-        let options = slatedb::config::GarbageCollectorOptions {
-            manifest_options: Some(directory),
-            wal_options: Some(directory),
-            wal_fence_options: None,
-            compacted_options: None,
-            compactions_options: None,
-            ..Default::default()
-        };
-        slatedb::GarbageCollectorBuilder::new(self.path.clone(), Arc::clone(&self.object_store))
-            .with_wal_object_store(Arc::clone(&self.log_store))
-            .with_wal_gc(Arc::clone(&self.wal_gc))
-            .with_options(options)
-            .build()
-            .run_gc_once()
-            .await;
-    }
-}
-
-impl fmt::Debug for LogCommitter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LogCommitter")
-            .field("committer", &self.committer)
-            .field("batch_origin", &self.batch_origin)
-            .field("holds_store", &self.holds_store())
-            .field("reads", &self.reads)
-            .finish_non_exhaustive()
-    }
-}
-
-impl LogCommitter {
-    /// The cursor bound to the held writer, or the reader's committer.
-    pub(crate) fn fold_committer(&self) -> Arc<dyn SlotCommitter> {
-        self.holder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map_or_else(
-                || Arc::clone(&self.committer),
-                |holder| Arc::clone(&holder.committer),
-            )
-    }
-
-    /// The store this process holds, if it does.
-    pub(crate) fn db(&self) -> Option<slatedb::Db> {
-        self.holder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|holder| holder.db.clone())
-    }
-
-    /// Whether this process holds the store.
-    pub(crate) fn holds_store(&self) -> bool {
-        self.db().is_some()
-    }
-
-    /// Takes `db` as the store this process folds into, polling for peers'
-    /// slots every `poll`.
-    pub(crate) fn promote(
-        &self,
-        db: slatedb::Db,
-        committer: Arc<dyn SlotCommitter>,
-        poll: Duration,
-    ) {
-        let fold_poll = FoldPoll::spawn(self.clone(), poll);
-        *self
-            .holder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Holder {
-            db,
-            committer,
-            fold_poll: Some(fold_poll),
-        });
-        self.folds_since_open.store(0, Ordering::Release);
-        tracing::info!("took the store");
-    }
-
-    /// Gives the store up: stops the poll and hands the store back for the
-    /// caller to close. `None` when this process held none.
-    pub(crate) async fn demote(&self) -> Option<slatedb::Db> {
-        let holder = self
-            .holder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()?;
-        if let Some(fold_poll) = holder.fold_poll {
-            fold_poll.stop().await;
-        }
-        Some(holder.db)
-    }
-
-    /// Drops back to committing after another process took the store:
-    /// nothing is lost, since every slot is durable and this process reads
-    /// through its reader. A fence shows at the next flush, since the plug
-    /// journals nothing; the folds made in memory before it are discarded
-    /// with the store.
-    async fn fenced(&self) {
-        // The poll task may be the one here, so the poll is told to stop
-        // rather than waited for.
-        let holder = self
-            .holder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let Some(holder) = holder else {
-            return;
-        };
-        if let Some(fold_poll) = holder.fold_poll {
-            fold_poll.stop_from_within();
-        }
-        tracing::warn!("another process took the store; back to committing");
-        let _ = holder.db.close().await;
-    }
-
-    /// Folds after the slot the caller just landed, when that slot is the
-    /// one this lake's cadence names. The sequence is the whole trigger,
-    /// so nothing is measured and nothing is listed to decide: whichever
-    /// committer lands slot `n * fold_every` does that fold.
-    ///
-    /// A fold that fails is logged and let go. The commit has landed and
-    /// its slot is durable, the next multiple folds what this one did
-    /// not, and a process not permitted to fold simply never succeeds at
-    /// one.
-    pub(crate) async fn fold_if_due(&self, sequence: u64) {
-        let Some(folder) = &self.folder else {
-            return;
-        };
-        if self.fold_every != 0 && !sequence.is_multiple_of(self.fold_every) {
-            return;
-        }
-        match fold_reporting_an_overrun(folder.as_ref(), sequence).await {
-            Ok(0) => {}
-            Ok(slots) => tracing::debug!(sequence, slots, "folded the log into the store"),
-            Err(error) => {
-                tracing::warn!(sequence, %error, "the fold failed; the next one folds this too");
-            }
-        }
-    }
-
-    /// Reports `sequence` folded, and on the folder flushes and truncates
-    /// once enough slots have folded since the last flush: the replay point
-    /// moves, so a cold open replays at most that many slots.
-    pub(crate) async fn folded(&self, sequence: u64) -> Result<()> {
-        self.fold_committer().mark_folded(sequence);
-        self.folds_since_open.fetch_add(1, Ordering::AcqRel);
-        let Some(db) = self.db() else {
-            return Ok(());
-        };
-        let flushing = &self.flushing;
-        if flushing.folded_since.fetch_add(1, Ordering::AcqRel) + 1 < flushing.every {
-            return Ok(());
-        }
-        match crate::transaction::commit::flush_memtable(&db).await {
-            Ok(()) => {}
-            Err(Error::Fenced(_)) => {
-                self.fenced().await;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-        flushing.folded_since.store(0, Ordering::Release);
-        flushing.collector.run().await;
-
-        Ok(())
-    }
-
-    /// Writes the folder's memtable out and truncates the log, whatever the
-    /// count since the last flush; the sprint's last act.
-    pub(crate) async fn flush_now(&self) -> Result<()> {
-        let Some(db) = self.db() else {
-            return Ok(());
-        };
-        crate::transaction::commit::flush_memtable(&db).await?;
-        self.flushing.folded_since.store(0, Ordering::Release);
-        self.flushing.collector.run().await;
-
-        Ok(())
-    }
-
-    /// Folds whatever has landed past this process's cursor. The folder's
-    /// idle poll, and the sprint's catch-up.
-    pub(crate) async fn fold_tail(&self) -> Result<u64> {
-        let slots = self.fold_committer().tail().await?;
-        let count = u64::try_from(slots.len()).unwrap_or(u64::MAX);
-        self.fold_slots(slots).await?;
-
-        Ok(count)
-    }
-
-    /// Runs the idle poll until `stop` says so: every `interval`, under the
-    /// guard, fold whatever peers have landed.
-    pub(crate) async fn poll_folds(
-        self,
-        interval: Duration,
-        mut stop: tokio::sync::watch::Receiver<bool>,
-    ) {
-        loop {
-            tokio::select! {
-                () = tokio::time::sleep(interval) => {}
-                _ = stop.changed() => return,
-            }
-            if *stop.borrow() {
-                return;
-            }
-            // A sprint holds the guard while stopping this poll. Shutdown
-            // must remain observable while the poll waits for that guard.
-            let _held = tokio::select! {
-                biased;
-                _ = stop.changed() => return,
-                held = self.guard.lock() => held,
-            };
-            match self.fold_tail().await {
-                Ok(0) => {}
-                Ok(count) => tracing::debug!(count, "folded peers' slots"),
-                Err(error) => tracing::warn!(%error, "the idle fold failed; it retries next poll"),
-            }
-        }
-    }
-
-    /// The slot a batch stamping the head at `batch_seq` belongs to.
-    pub(crate) fn sequence_of(&self, batch_seq: u64) -> u64 {
-        batch_seq
-            .saturating_sub(self.batch_origin)
-            .saturating_add(1)
-    }
-
-    /// Waits for this process's reader to be served every slot through
-    /// `sequence`; a folder has no reader to wait on. A timeout is reported
-    /// and survived: the next read may lag, and the next offer re-validates.
-    pub(crate) async fn await_served(&self, sequence: u64) -> bool {
-        if self.reads == ReadSide::Store {
-            return true;
-        }
-        let served = self.await_refreshed(sequence).await;
-        if !served {
-            tracing::warn!(
-                sequence,
-                "the reader was not served the slot within the catch-up timeout"
-            );
-        }
-        served
-    }
-
-    /// Refreshes the reader until it has been served every slot through
-    /// `sequence`, or the catch-up timeout passes. Each refresh lists the
-    /// log and replays what it finds, so the wait is round trips rather
-    /// than ticks of a clock.
-    async fn await_refreshed(&self, sequence: u64) -> bool {
-        let Some(reader) = &self.reader else {
-            return self
-                .committer
-                .await_served(sequence, READER_CATCHUP_TIMEOUT)
-                .await;
-        };
-        let deadline = std::time::Instant::now() + READER_CATCHUP_TIMEOUT;
-        loop {
-            if let Err(error) = reader.refresh().await {
-                tracing::warn!(%error, "refreshing the reader failed; retrying");
-            }
-            // The plug reports a slot served as it hands the rows over, so
-            // this is true by the time the refresh that found it returns.
-            if self.committer.await_served(sequence, Duration::ZERO).await {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(SLOT_REFRESH_BACKOFF).await;
-        }
-    }
-
-    /// Applies one slot's writes to the store this process holds, waiting
-    /// on no durability — a slot is durable already — then reports
-    /// `sequence` folded. A process holding no store applies nothing: its
-    /// reader is served the slot. One fenced by another holder gives the
-    /// store up and carries on the same way.
-    pub(crate) async fn fold<'a>(
-        &self,
-        sequence: u64,
-        writes: impl Iterator<Item = &'a SlotWrite>,
-    ) -> Result<()> {
-        let Some(db) = self.db() else {
-            return Ok(());
-        };
-        let mut batch = slatedb::WriteBatch::new();
-        let mut any = false;
-        for write in writes {
-            any = true;
-            match &write.value {
-                Some(value) => batch.put(&write.key, value),
-                None => batch.delete(&write.key),
-            }
-        }
-        if any {
-            // The handle is the durability wait; a slot is durable already.
-            match db
-                .write_with_options(batch, &slatedb::config::WriteOptions::default())
-                .await
-                .map_err(Error::from)
-            {
-                Ok(handle) => drop(handle),
-                Err(Error::Fenced(_)) => {
-                    self.fenced().await;
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.folded(sequence).await?;
-
-        Ok(())
-    }
-
-    /// Folds what beat a batch: everything past the fold cursor when this
-    /// process holds the store, since its reader may have been served slots
-    /// the store has not folded, else the slots the loss handed back.
-    pub(crate) async fn fold_after_loss(&self, slots: Vec<(u64, SlotEnvelope)>) -> Result<()> {
-        if self.holds_store() {
-            self.fold_tail().await?;
-            if let Some((last, _)) = slots.last() {
-                self.await_served(*last).await;
-            }
-            return Ok(());
-        }
-        self.fold_slots(slots).await
-    }
-
-    /// Folds `slots` in order; a committer over a reader waits to be served
-    /// the last of them instead. Every slot past the first carries exactly
-    /// one head stamp, which is what lets a stamp name its slot; one that
-    /// does not is corruption.
-    pub(crate) async fn fold_slots(&self, slots: Vec<(u64, SlotEnvelope)>) -> Result<()> {
-        let last = slots.last().map(|(sequence, _)| *sequence);
-        for (sequence, envelope) in slots {
-            let head_key = crate::store::key::Key::Sys(crate::store::key::SysKey::Head).encode();
-            let stamps = envelope
-                .writes()
-                .filter(|write| write.key == head_key)
-                .count();
-            if sequence > 1 && stamps != 1 {
-                return Err(Error::Corruption(format!(
-                    "slot {sequence} carries {stamps} head stamps; every slot past the first \
-                     carries one"
-                )));
-            }
-            self.fold(sequence, envelope.writes()).await?;
-        }
-        if let Some(last) = last {
-            self.await_served(last).await;
-        }
-
-        Ok(())
-    }
-}
-
-/// The fold, saying so if it outlasts [`FOLD_OVERRUN`] and then
-/// waiting for it anyway. A fold that stops rather than slows is
-/// almost always a store at its L0 limit with nothing compacting it,
-/// which is silent otherwise: the commit simply never returns.
-async fn fold_reporting_an_overrun(folder: &dyn StoreFolder, sequence: u64) -> Result<u64> {
-    let fold = folder.fold_now();
-    tokio::pin!(fold);
-    if let Ok(outcome) = tokio::time::timeout(FOLD_OVERRUN, &mut fold).await {
-        return outcome;
-    }
-    tracing::error!(
-        sequence,
-        waited_s = FOLD_OVERRUN.as_secs(),
-        "the fold has not finished, and the commit that triggered it is waiting. A store on \
-         a commit log is compacted by another process; with none running, each fold leaves a \
-         file behind and the store stops accepting writes once enough have piled up. Check \
-         that a compactor is serving this lake."
-    );
-
-    fold.await
-}
 
 pub(crate) mod asked;
 #[cfg(test)]

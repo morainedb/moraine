@@ -4,17 +4,23 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::{Arc, Mutex};
+use std::{
+    any::Any,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use moraine::{
-    Catalog, CatalogOptions, CommitLogProvider, Error, SlotAdoption, SlotCommit, SlotCommitter,
-    SlotOffer, register_commit_log,
+    Catalog, CatalogHooks, CatalogOptions, CommitLogProvider, CommitStore, Error, ReaderSession,
+    SlotAdoption, SlotCommit, SlotOffer, WriterSession, register_commit_log,
 };
 use object_store::{ObjectStore, memory::InMemory};
-use slatedb::wal::{
-    WalError, WalFileRange, WalGc, WalIterator, WalReader, WalRows, WriterInit, WriterInitResult,
-    WriterManifest,
+use slatedb::{
+    Db, DbReader,
+    wal::{
+        WalError, WalFileRange, WalGc, WalIterator, WalReader, WalRows, WriterInit,
+        WriterInitResult, WriterManifest,
+    },
 };
 
 /// A provider over an empty log that counts the readers asked of it.
@@ -30,26 +36,73 @@ impl Counting {
 }
 
 impl CommitLogProvider for Counting {
-    fn writer_init(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Box<dyn WriterInit> {
-        Box::new(RefusingWriter)
+    fn writer_session(
+        &self,
+        _log_store: Arc<dyn ObjectStore>,
+        _path: &str,
+    ) -> Arc<dyn WriterSession> {
+        Arc::new(EmptySession)
     }
 
-    fn reader(
+    fn reader_session(
         &self,
         _log_store: Arc<dyn ObjectStore>,
         _path: &str,
         _tail: bool,
-    ) -> Arc<dyn WalReader> {
+    ) -> Arc<dyn ReaderSession> {
         *self.readers.lock().unwrap() += 1;
-        Arc::new(EmptyLog)
+        Arc::new(EmptySession)
     }
 
-    fn committer(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn SlotCommitter> {
+    fn holding(
+        &self,
+        _db: Db,
+        _session: Arc<dyn WriterSession>,
+        _hooks: CatalogHooks,
+    ) -> Arc<dyn CommitStore> {
+        Arc::new(NoCommits)
+    }
+
+    fn following(
+        &self,
+        _reader: Arc<DbReader>,
+        _session: Arc<dyn ReaderSession>,
+        _hooks: CatalogHooks,
+    ) -> Arc<dyn CommitStore> {
         Arc::new(NoCommits)
     }
 
     fn garbage_collector(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn WalGc> {
         Arc::new(NoGc)
+    }
+}
+
+/// A session over a log nothing has adopted: its writer refuses to open,
+/// its reader finds nothing.
+struct EmptySession;
+
+#[async_trait]
+impl WriterSession for EmptySession {
+    fn writer_init(&self) -> Box<dyn WriterInit> {
+        Box::new(RefusingWriter)
+    }
+
+    async fn adopted(&self) -> moraine::Result<bool> {
+        Ok(false)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl ReaderSession for EmptySession {
+    fn reader(&self) -> Arc<dyn WalReader> {
+        Arc::new(EmptyLog)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -68,28 +121,14 @@ impl WalGc for NoGc {
     }
 }
 
-/// A committer over a log nothing commits to.
+/// A store over a log nothing commits to.
 #[derive(Debug)]
 struct NoCommits;
 
 #[async_trait]
-impl SlotCommitter for NoCommits {
-    async fn offer(&self, _sequence: u64, _commits: Vec<SlotCommit>) -> moraine::Result<SlotOffer> {
-        Err(Error::Configuration(
-            "the test log takes no commits".to_string(),
-        ))
-    }
-
+impl CommitStore for NoCommits {
     async fn adopted(&self) -> moraine::Result<bool> {
         Ok(false)
-    }
-
-    async fn tail(&self) -> moraine::Result<Vec<(u64, moraine::SlotEnvelope)>> {
-        Ok(Vec::new())
-    }
-
-    async fn unfolded(&self, _replay_point: u64) -> moraine::Result<u64> {
-        Ok(0)
     }
 
     async fn adopt(&self, _stamp: SlotCommit) -> moraine::Result<SlotAdoption> {
@@ -98,18 +137,22 @@ impl SlotCommitter for NoCommits {
         ))
     }
 
-    fn rows_per_slot(&self) -> u64 {
-        u64::MAX
+    async fn write_at(&self, _sequence: u64, _commit: SlotCommit) -> moraine::Result<SlotOffer> {
+        Err(Error::Configuration(
+            "the test log takes no commits".to_string(),
+        ))
     }
 
-    fn headroom(&self) -> u64 {
-        u64::MAX
+    async fn fold_tail(&self) -> moraine::Result<u64> {
+        Ok(0)
     }
 
-    fn mark_folded(&self, _sequence: u64) {}
+    async fn close(&self) -> moraine::Result<()> {
+        Ok(())
+    }
 
-    async fn await_served(&self, _sequence: u64, _timeout: std::time::Duration) -> bool {
-        false
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

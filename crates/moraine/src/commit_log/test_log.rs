@@ -1,23 +1,26 @@
-//! An in-memory commit log implementing the whole boundary: the plugs a
-//! store opens over, and the committer. The reference the open repository
-//! tests the boundary against; it stands in for the library, not for the
-//! store, which stays real SlateDB.
+//! An in-memory commit log implementing the whole seam: the plugs a store
+//! opens over, and the commit store with the loop in miniature — offers,
+//! folds after a loss, the fold cadence through the catalog's taker, flush
+//! by count, and the idle poll. The reference the open repository tests the
+//! seam against; it stands in for the library, not for the store, which
+//! stays real SlateDB.
 
 use std::{
+    any::Any,
     collections::BTreeMap,
     ops::Bound,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::ObjectStore;
 use slatedb::{
-    RowEntry, ValueDeletable,
+    Db, DbReader, RowEntry, ValueDeletable,
     wal::{
         FlushResultFuture, WalError, WalEvent, WalFileRange, WalGc, WalIterator, WalObserver,
         WalReader, WalRows, WalStatus, WalStatusListener, WalWriter, WriterInit, WriterInitResult,
@@ -25,7 +28,11 @@ use slatedb::{
     },
 };
 
-use super::{CommitLogProvider, SlotAdoption, SlotCommit, SlotCommitter, SlotEnvelope, SlotOffer};
+use super::{
+    CatalogHooks, CommitLogProvider, CommitStore, ReaderSession, SlotAdoption, SlotCommit,
+    SlotEnvelope, SlotOffer, WriterSession,
+};
+use crate::error::{Error, Result};
 
 /// The row sequence the first slot takes, above anything a store wrote
 /// before adopting the log.
@@ -42,6 +49,9 @@ fn slot_sequence(stride: u64, ordinal: u64) -> u64 {
 #[derive(Default)]
 pub(crate) struct TestLog {
     slots: Mutex<BTreeMap<u64, SlotEnvelope>>,
+    /// Slots a peer landed after this process last read: no listing shows
+    /// them until an offer meets them.
+    unseen: Mutex<BTreeMap<u64, SlotEnvelope>>,
     /// The WAL id slot 1 counts from, fixed at adoption.
     base: Mutex<Option<u64>>,
 }
@@ -56,9 +66,6 @@ struct Cursor {
     /// The base an adoption would fix: past the store's own WAL, as the
     /// last writer open saw it.
     candidate: AtomicU64,
-    /// Rows the store may write before the next replayed slot's number, as
-    /// of the last writer open.
-    headroom: AtomicU64,
     /// How many times a reader over this cursor has asked for the log's end.
     polls: AtomicU64,
 }
@@ -93,6 +100,37 @@ impl TestLog {
         drop(slots);
     }
 
+    /// Lands `envelope` at `sequence` as a peer would in the moment after
+    /// this process last read the log: no reader is served it until an
+    /// offer runs into it, which is how a race is lost.
+    pub(crate) fn land_unseen(&self, sequence: u64, envelope: SlotEnvelope) {
+        let taken = self
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&sequence);
+        assert!(!taken, "slot {sequence} was already taken");
+        let mut unseen = self.unseen.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            unseen.insert(sequence, envelope).is_none(),
+            "slot {sequence} was already landed unseen"
+        );
+        drop(unseen);
+    }
+
+    /// An offer reaches the log itself, where every landed slot shows.
+    fn reveal(&self) {
+        let unseen =
+            std::mem::take(&mut *self.unseen.lock().unwrap_or_else(PoisonError::into_inner));
+        if unseen.is_empty() {
+            return;
+        }
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(unseen);
+    }
+
     /// The WAL id slot 1 counts from: fixed at adoption, zero for a log
     /// born with its store, unknown before either.
     fn wal_base(&self) -> Option<u64> {
@@ -108,6 +146,14 @@ impl TestLog {
             .next_back()
             .copied()
             .unwrap_or(0)
+    }
+
+    fn slot(&self, sequence: u64) -> Option<SlotEnvelope> {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&sequence)
+            .cloned()
     }
 
     fn rows(stride: u64, sequence: u64, envelope: &SlotEnvelope) -> Vec<RowEntry> {
@@ -149,6 +195,44 @@ impl Cursor {
             last_flushed_wal_id,
             last_flushed_seq: state.acknowledged,
             buffered_wal_entries_count: 0,
+        }
+    }
+
+    fn known(&self) -> u64 {
+        self.folded
+            .load(Ordering::Acquire)
+            .max(*self.served.borrow())
+    }
+
+    fn serve(&self, sequence: u64) {
+        self.served.send_if_modified(|served| {
+            let advanced = sequence > *served;
+            if advanced {
+                *served = sequence;
+            }
+            advanced
+        });
+    }
+
+    /// Reports `sequence` folded, telling the writer its folds notify.
+    fn mark_folded(&self, log: &TestLog, sequence: u64) {
+        let before = self.folded.fetch_max(sequence, Ordering::AcqRel);
+        if sequence <= before {
+            return;
+        }
+        let writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(state) = writer {
+            let (status, listeners) = {
+                let state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                (self.status(log, &state), state.listeners.clone())
+            };
+            for listener in &listeners {
+                listener(WalEvent::WalFlushed(status.clone()));
+            }
         }
     }
 }
@@ -216,13 +300,25 @@ impl TestProvider {
     /// Reports `sequence` served before this process's reader has applied
     /// it: the window a real plug opens for a moment, held open.
     pub(crate) fn report_served(&self, sequence: u64) {
-        self.cursor.served.send_if_modified(|served| {
-            let advanced = sequence > *served;
-            if advanced {
-                *served = sequence;
-            }
-            advanced
-        });
+        self.cursor.serve(sequence);
+    }
+
+    /// Waits until this process's reader has been served every slot
+    /// through `sequence`, or `timeout` passes. Returns whether it was.
+    pub(crate) async fn await_served(&self, sequence: u64, timeout: Duration) -> bool {
+        let mut served = self.cursor.served.subscribe();
+        tokio::time::timeout(timeout, served.wait_for(|reached| *reached >= sequence))
+            .await
+            .is_ok_and(|waited| waited.is_ok())
+    }
+
+    fn session(&self, tail: bool) -> Arc<TestSession> {
+        Arc::new(TestSession {
+            log: Arc::clone(&self.log),
+            cursor: Arc::clone(&self.cursor),
+            stride: self.stride,
+            tail,
+        })
     }
 }
 
@@ -231,7 +327,72 @@ impl CommitLogProvider for TestProvider {
         self.external_compaction
     }
 
-    fn writer_init(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Box<dyn WriterInit> {
+    fn writer_session(
+        &self,
+        _log_store: Arc<dyn ObjectStore>,
+        _path: &str,
+    ) -> Arc<dyn WriterSession> {
+        self.session(false)
+    }
+
+    fn reader_session(
+        &self,
+        _log_store: Arc<dyn ObjectStore>,
+        _path: &str,
+        tail: bool,
+    ) -> Arc<dyn ReaderSession> {
+        self.session(tail)
+    }
+
+    fn holding(
+        &self,
+        db: Db,
+        session: Arc<dyn WriterSession>,
+        hooks: CatalogHooks,
+    ) -> Arc<dyn CommitStore> {
+        let session = own_session(session.as_any());
+        TestStore::new(Side::Holder(db), session, hooks)
+    }
+
+    fn following(
+        &self,
+        reader: Arc<DbReader>,
+        session: Arc<dyn ReaderSession>,
+        hooks: CatalogHooks,
+    ) -> Arc<dyn CommitStore> {
+        let session = own_session(session.as_any());
+        TestStore::new(Side::Follower(reader), session, hooks)
+    }
+
+    fn garbage_collector(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn WalGc> {
+        Arc::new(TestGc {
+            log: Arc::clone(&self.log),
+        })
+    }
+}
+
+/// The session as this log minted it; a catalog never pairs a store with
+/// another library's session.
+fn own_session(session: &dyn Any) -> TestSession {
+    session
+        .downcast_ref::<TestSession>()
+        .expect("the session was minted by this provider")
+        .clone()
+}
+
+/// One open's cursor over the log, shared by the plug the open builds its
+/// store with and the commit store built over both.
+#[derive(Clone)]
+pub(crate) struct TestSession {
+    log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
+    stride: u64,
+    tail: bool,
+}
+
+#[async_trait]
+impl WriterSession for TestSession {
+    fn writer_init(&self) -> Box<dyn WriterInit> {
         Box::new(TestWriterInit {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
@@ -239,32 +400,383 @@ impl CommitLogProvider for TestProvider {
         })
     }
 
-    fn reader(
-        &self,
-        _log_store: Arc<dyn ObjectStore>,
-        _path: &str,
-        tail: bool,
-    ) -> Arc<dyn WalReader> {
+    async fn adopted(&self) -> Result<bool> {
+        Ok(self.log.wal_base().is_some())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl ReaderSession for TestSession {
+    fn reader(&self) -> Arc<dyn WalReader> {
         Arc::new(TestReader {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
             stride: self.stride,
-            tail,
+            tail: self.tail,
         })
     }
 
-    fn committer(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn SlotCommitter> {
-        Arc::new(TestCommitter {
-            log: Arc::clone(&self.log),
-            cursor: Arc::clone(&self.cursor),
-            stride: self.stride,
-        })
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Which side of the log a store is on.
+enum Side {
+    Holder(Db),
+    Follower(Arc<DbReader>),
+}
+
+/// The commit store over the test log: the loop in miniature.
+pub(crate) struct TestStore {
+    log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
+    side: Side,
+    hooks: CatalogHooks,
+    /// Serializes offers and the folds that follow them.
+    guard: tokio::sync::Mutex<()>,
+    folded_since_flush: AtomicU64,
+    closed: AtomicBool,
+    poll: Mutex<
+        Option<(
+            tokio::sync::watch::Sender<bool>,
+            tokio::task::JoinHandle<()>,
+        )>,
+    >,
+}
+
+impl std::fmt::Debug for TestStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestStore")
+            .field("holder", &matches!(self.side, Side::Holder(_)))
+            .field("folded", &self.cursor.folded.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl TestStore {
+    fn new(side: Side, session: TestSession, hooks: CatalogHooks) -> Arc<Self> {
+        let store = Arc::new(Self {
+            log: session.log,
+            cursor: session.cursor,
+            side,
+            hooks,
+            guard: tokio::sync::Mutex::new(()),
+            folded_since_flush: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            poll: Mutex::new(None),
+        });
+        if matches!(store.side, Side::Holder(_)) && !store.hooks.settings.poll.is_zero() {
+            let (stop, mut stopped) = tokio::sync::watch::channel(false);
+            let weak = Arc::downgrade(&store);
+            let interval = store.hooks.settings.poll;
+            let task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(interval) => {}
+                        _ = stopped.changed() => return,
+                    }
+                    let Some(store) = weak.upgrade() else {
+                        return;
+                    };
+                    let _held = tokio::select! {
+                        biased;
+                        _ = stopped.changed() => return,
+                        held = store.guard.lock() => held,
+                    };
+                    if let Side::Holder(db) = &store.side
+                        && let Err(error) = store.fold_from_cursor(db, &store.cursor).await
+                    {
+                        tracing::warn!(%error, "the idle fold failed; it retries next poll");
+                    }
+                }
+            });
+            *store.poll.lock().unwrap_or_else(PoisonError::into_inner) = Some((stop, task));
+        }
+
+        store
     }
 
-    fn garbage_collector(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn WalGc> {
-        Arc::new(TestGc {
-            log: Arc::clone(&self.log),
+    fn refuse_if_closed(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Constraint("the commit store is closed".to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Writes one slot's rows into `db`, last writer wins within it.
+    async fn apply(&self, db: &Db, envelope: &SlotEnvelope) -> Result<()> {
+        let mut collapsed: BTreeMap<&[u8], Option<&[u8]>> = BTreeMap::new();
+        for write in envelope.writes() {
+            collapsed.insert(&write.key, write.value.as_deref());
+        }
+        let mut batch = slatedb::WriteBatch::new();
+        for (key, value) in collapsed {
+            match value {
+                Some(value) => batch.put(key, value),
+                None => batch.delete(key),
+            }
+        }
+        db.write_with_options(batch, &slatedb::config::WriteOptions::default())
+            .await
+            .map(|_| ())
+            .map_err(Error::from)
+    }
+
+    /// Reports `sequence` folded, flushing and collecting on the count.
+    async fn folded(&self, db: &Db, cursor: &Cursor, sequence: u64) -> Result<()> {
+        cursor.mark_folded(&self.log, sequence);
+        let since = self
+            .folded_since_flush
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if since >= self.hooks.settings.flush_every {
+            self.write_out(db).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes the memtable out and collects the log below the replay point.
+    async fn write_out(&self, db: &Db) -> Result<()> {
+        db.flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
         })
+        .await
+        .map_err(Error::from)?;
+        self.folded_since_flush.store(0, Ordering::Release);
+        let directory = slatedb::config::GarbageCollectorDirectoryOptions {
+            interval: None,
+            min_age: self.hooks.settings.retention,
+            dry_run: false,
+        };
+        slatedb::GarbageCollectorBuilder::new(
+            self.hooks.path.clone(),
+            Arc::clone(&self.hooks.object_store),
+        )
+        .with_wal_object_store(Arc::clone(&self.hooks.object_store))
+        .with_wal_gc(Arc::new(TestGc {
+            log: Arc::clone(&self.log),
+        }))
+        .with_options(slatedb::config::GarbageCollectorOptions {
+            manifest_options: Some(directory),
+            wal_options: Some(directory),
+            wal_fence_options: None,
+            compacted_options: None,
+            compactions_options: None,
+            ..Default::default()
+        })
+        .build()
+        .run_gc_once()
+        .await;
+
+        Ok(())
+    }
+
+    /// Folds every slot past `cursor` into `db`, each passed by the
+    /// catalog's check first. Returns how many.
+    async fn fold_from_cursor(&self, db: &Db, cursor: &Cursor) -> Result<u64> {
+        let mut count = 0;
+        loop {
+            let next = cursor.folded.load(Ordering::Acquire).saturating_add(1);
+            let Some(envelope) = self.log.slot(next) else {
+                return Ok(count);
+            };
+            (self.hooks.inspect)(next, &envelope)?;
+            self.apply(db, &envelope).await?;
+            self.folded(db, cursor, next).await?;
+            count += 1;
+        }
+    }
+
+    /// Refreshes the reader until it has been served through `sequence`,
+    /// or the catch-up time passes.
+    async fn await_served(&self, reader: &DbReader, sequence: u64) -> Result<()> {
+        let deadline = Instant::now() + self.hooks.settings.catch_up;
+        loop {
+            reader.refresh().await.map_err(Error::from)?;
+            if *self.cursor.served.borrow() >= sequence {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(sequence, "the reader was not served the slot in time");
+                return Ok(());
+            }
+            tokio::time::sleep(self.hooks.settings.refresh_backoff).await;
+        }
+    }
+
+    /// A follower's turn: take the store through the catalog, fold what it
+    /// lacks past the taken session's cursor, write out, and let go.
+    async fn fold_on_cadence(&self, sequence: u64) {
+        let taken = match self.hooks.take.take().await {
+            Ok(Some(taken)) => taken,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(sequence, %error, "the fold could not take the store");
+                return;
+            }
+        };
+        let (db, session) = taken;
+        let session = own_session(session.as_any());
+        let folded = self.fold_from_cursor(&db, &session.cursor).await;
+        let written = self.write_out(&db).await;
+        let _ = db.close().await;
+        match folded.and(written) {
+            Ok(()) => tracing::debug!(sequence, "folded the log into the store"),
+            Err(error) => tracing::warn!(sequence, %error, "the fold failed"),
+        }
+    }
+}
+
+#[async_trait]
+impl CommitStore for TestStore {
+    async fn adopted(&self) -> Result<bool> {
+        Ok(self.log.wal_base().is_some())
+    }
+
+    async fn adopt(&self, stamp: SlotCommit) -> Result<SlotAdoption> {
+        self.refuse_if_closed()?;
+        let _held = self.guard.lock().await;
+        self.log.reveal();
+        let Side::Holder(db) = &self.side else {
+            return Err(Error::Constraint(
+                "a process holding no store cannot adopt the commit log".to_string(),
+            ));
+        };
+        let adoption = {
+            let mut slots = self
+                .log
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(winner) = slots.get(&1) {
+                SlotAdoption::AdoptedByPeer(winner.clone())
+            } else {
+                let mut base = self.log.base.lock().unwrap_or_else(PoisonError::into_inner);
+                if base.is_none() {
+                    *base = Some(self.cursor.candidate.load(Ordering::Acquire));
+                }
+                drop(base);
+                slots.insert(
+                    1,
+                    SlotEnvelope {
+                        commits: vec![stamp],
+                    },
+                );
+                SlotAdoption::Adopted
+            }
+        };
+        self.fold_from_cursor(db, &self.cursor).await?;
+
+        Ok(adoption)
+    }
+
+    async fn write_at(&self, sequence: u64, commit: SlotCommit) -> Result<SlotOffer> {
+        self.refuse_if_closed()?;
+        let _held = self.guard.lock().await;
+        self.log.reveal();
+        if let Side::Follower(reader) = &self.side {
+            reader.refresh().await.map_err(Error::from)?;
+        }
+        let next = self.cursor.known().saturating_add(1);
+        if sequence > next {
+            return Err(Error::Constraint(format!(
+                "sequence {sequence} is past {next}, the next this store knows"
+            )));
+        }
+        let lost = {
+            let mut slots = self
+                .log
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(winner) = slots.get(&sequence) {
+                Some(winner.clone())
+            } else {
+                slots.insert(
+                    sequence,
+                    SlotEnvelope {
+                        commits: vec![commit],
+                    },
+                );
+                None
+            }
+        };
+        match (lost, &self.side) {
+            (Some(winner), Side::Holder(db)) => {
+                self.fold_from_cursor(db, &self.cursor).await?;
+                Ok(SlotOffer::Lost {
+                    sequence,
+                    winner,
+                    through: self.cursor.known(),
+                })
+            }
+            (Some(winner), Side::Follower(reader)) => {
+                self.await_served(reader, sequence).await?;
+                Ok(SlotOffer::Lost {
+                    sequence,
+                    winner,
+                    through: self.cursor.known(),
+                })
+            }
+            (None, Side::Holder(db)) => {
+                self.fold_from_cursor(db, &self.cursor).await?;
+                Ok(SlotOffer::Won { sequence })
+            }
+            (None, Side::Follower(reader)) => {
+                self.await_served(reader, sequence).await?;
+                let every = self.hooks.settings.fold_every;
+                if every != 0 && sequence.is_multiple_of(every) {
+                    self.fold_on_cadence(sequence).await;
+                }
+                Ok(SlotOffer::Won { sequence })
+            }
+        }
+    }
+
+    async fn fold_tail(&self) -> Result<u64> {
+        self.refuse_if_closed()?;
+        let _held = self.guard.lock().await;
+        match &self.side {
+            Side::Holder(db) => self.fold_from_cursor(db, &self.cursor).await,
+            Side::Follower(reader) => {
+                let before = *self.cursor.served.borrow();
+                reader.refresh().await.map_err(Error::from)?;
+                Ok(self.cursor.served.borrow().saturating_sub(before))
+            }
+        }
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
+        let poll = self
+            .poll
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((stop, task)) = poll {
+            let _ = stop.send(true);
+            let _ = task.await;
+        }
+        match &self.side {
+            Side::Holder(db) => {
+                let _held = self.guard.lock().await;
+                if let Err(error) = self.write_out(db).await {
+                    tracing::info!(%error, "the closing flush failed; the next open replays");
+                }
+                db.close().await.map_err(Error::from)
+            }
+            Side::Follower(reader) => reader.close().await.map_err(Error::from),
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -281,7 +793,7 @@ impl WalGc for TestGc {
         referenced_ranges: Vec<WalFileRange>,
         _min_age: Duration,
         dry_run: bool,
-    ) -> Result<(), WalError> {
+    ) -> std::result::Result<(), WalError> {
         let Some(horizon) = referenced_ranges
             .iter()
             .map(|range| match range.0 {
@@ -306,130 +818,6 @@ impl WalGc for TestGc {
     }
 }
 
-struct TestCommitter {
-    log: Arc<TestLog>,
-    cursor: Arc<Cursor>,
-    stride: u64,
-}
-
-impl std::fmt::Debug for TestCommitter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TestCommitter").finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl SlotCommitter for TestCommitter {
-    async fn offer(&self, sequence: u64, commits: Vec<SlotCommit>) -> crate::Result<SlotOffer> {
-        let mut slots = self
-            .log
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if slots.contains_key(&sequence) {
-            return Ok(SlotOffer::Lost {
-                slots: slots
-                    .range(sequence..)
-                    .map(|(sequence, envelope)| (*sequence, envelope.clone()))
-                    .collect(),
-            });
-        }
-        slots.insert(sequence, SlotEnvelope { commits });
-
-        Ok(SlotOffer::Won { sequence })
-    }
-
-    async fn adopted(&self) -> crate::Result<bool> {
-        Ok(self.log.wal_base().is_some())
-    }
-
-    async fn unfolded(&self, replay_point: u64) -> crate::Result<u64> {
-        let folded = self
-            .log
-            .wal_base()
-            .map_or(0, |base| replay_point.saturating_sub(base));
-        Ok(self.log.last_sequence().saturating_sub(folded))
-    }
-
-    async fn tail(&self) -> crate::Result<Vec<(u64, SlotEnvelope)>> {
-        // Past the fold, never past the served point: a reader is served a
-        // slot before the store it reads beside has folded it.
-        let known = self.cursor.folded.load(Ordering::Acquire);
-        Ok(self
-            .log
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .range(known.saturating_add(1)..)
-            .map(|(sequence, envelope)| (*sequence, envelope.clone()))
-            .collect())
-    }
-
-    async fn adopt(&self, stamp: SlotCommit) -> crate::Result<SlotAdoption> {
-        let mut slots = self
-            .log
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(winner) = slots.get(&1) {
-            return Ok(SlotAdoption::AdoptedByPeer(winner.clone()));
-        }
-        let mut base = self.log.base.lock().unwrap_or_else(PoisonError::into_inner);
-        if base.is_none() {
-            *base = Some(self.cursor.candidate.load(Ordering::Acquire));
-        }
-        drop(base);
-        slots.insert(
-            1,
-            SlotEnvelope {
-                commits: vec![stamp],
-            },
-        );
-
-        Ok(SlotAdoption::Adopted)
-    }
-
-    fn rows_per_slot(&self) -> u64 {
-        self.stride
-    }
-
-    fn headroom(&self) -> u64 {
-        self.cursor.headroom.load(Ordering::Acquire)
-    }
-
-    fn mark_folded(&self, sequence: u64) {
-        let before = self.cursor.folded.fetch_max(sequence, Ordering::AcqRel);
-        if sequence <= before {
-            return;
-        }
-        let writer = self
-            .cursor
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(state) = writer {
-            let (status, listeners) = {
-                let state = state.lock().unwrap_or_else(PoisonError::into_inner);
-                (
-                    self.cursor.status(&self.log, &state),
-                    state.listeners.clone(),
-                )
-            };
-            for listener in &listeners {
-                listener(WalEvent::WalFlushed(status.clone()));
-            }
-        }
-    }
-
-    async fn await_served(&self, sequence: u64, timeout: Duration) -> bool {
-        let mut served = self.cursor.served.subscribe();
-        tokio::time::timeout(timeout, served.wait_for(|reached| *reached >= sequence))
-            .await
-            .is_ok_and(|waited| waited.is_ok())
-    }
-}
-
 struct TestWriterInit {
     log: Arc<TestLog>,
     cursor: Arc<Cursor>,
@@ -441,7 +829,7 @@ impl WriterInit for TestWriterInit {
     async fn fence_and_init(
         &self,
         manifest: &mut WriterManifest,
-    ) -> Result<WriterInitResult, WalError> {
+    ) -> std::result::Result<WriterInitResult, WalError> {
         let replay_after = manifest.replay_after_wal_id();
         let next_wal = manifest.manifest().next_wal_sst_id();
         self.cursor.candidate.fetch_max(
@@ -458,17 +846,6 @@ impl WriterInit for TestWriterInit {
             }
             None => (1, 0),
         };
-        // The store's own rows run from the last row in the tree, or the
-        // last slot replayed, up to the next slot's number.
-        let last_row = manifest.manifest().last_l0_seq().max(if end >= first {
-            slot_sequence(self.stride, end)
-        } else {
-            0
-        });
-        self.cursor.headroom.store(
-            slot_sequence(self.stride, end.saturating_add(1)).saturating_sub(last_row),
-            Ordering::Release,
-        );
 
         let state = Arc::new(Mutex::new(WriterState::default()));
         *self
@@ -511,7 +888,7 @@ fn reported(
     log: &TestLog,
     cursor: &Cursor,
     state: &Arc<Mutex<WriterState>>,
-) -> Result<WalStatus, WalStatus> {
+) -> std::result::Result<WalStatus, WalStatus> {
     let status = cursor.status(log, &state.lock().unwrap_or_else(PoisonError::into_inner));
     match status.closed_reason {
         Some(_) => Err(status),
@@ -521,7 +898,7 @@ fn reported(
 
 #[async_trait]
 impl WalWriter for TestWriter {
-    async fn append(&mut self, write_batch: &[RowEntry]) -> Result<(), WalError> {
+    async fn append(&mut self, write_batch: &[RowEntry]) -> std::result::Result<(), WalError> {
         let Some(last) = write_batch.iter().map(|row| row.seq).max() else {
             return Ok(());
         };
@@ -540,7 +917,7 @@ impl WalWriter for TestWriter {
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<FlushResultFuture, WalError> {
+    async fn flush(&mut self) -> std::result::Result<FlushResultFuture, WalError> {
         Ok(Box::pin(std::future::ready(Ok(()))))
     }
 
@@ -552,11 +929,11 @@ impl WalWriter for TestWriter {
         })
     }
 
-    fn status(&self) -> Result<WalStatus, WalStatus> {
+    fn status(&self) -> std::result::Result<WalStatus, WalStatus> {
         reported(&self.log, &self.cursor, &self.state)
     }
 
-    async fn close(&mut self) -> Result<(), WalError> {
+    async fn close(&mut self) -> std::result::Result<(), WalError> {
         let (closed, listeners) = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.closed_reason = Some(WalError::Closed);
@@ -592,11 +969,11 @@ struct TestObserver {
 
 #[async_trait]
 impl WalObserver for TestObserver {
-    fn status(&self) -> Result<WalStatus, WalStatus> {
+    fn status(&self) -> std::result::Result<WalStatus, WalStatus> {
         reported(&self.log, &self.cursor, &self.state)
     }
 
-    fn subscribe(&self, listener: WalStatusListener) -> Result<(), WalError> {
+    fn subscribe(&self, listener: WalStatusListener) -> std::result::Result<(), WalError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match state.closed_reason {
             Some(_) => {
@@ -620,7 +997,10 @@ struct TestReader {
 
 #[async_trait]
 impl WalReader for TestReader {
-    async fn iterator(&self, range: WalFileRange) -> Result<Box<dyn WalIterator>, WalError> {
+    async fn iterator(
+        &self,
+        range: WalFileRange,
+    ) -> std::result::Result<Box<dyn WalIterator>, WalError> {
         // The range is in WAL ids; slots count from the base.
         let base = self.log.wal_base().unwrap_or(0);
         let next = match range.0 {
@@ -643,9 +1023,18 @@ impl WalReader for TestReader {
         }))
     }
 
-    async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
+    async fn last_wal_file_id(
+        &self,
+        replay_after_wal_id: u64,
+    ) -> std::result::Result<u64, WalError> {
         self.cursor.polls.fetch_add(1, Ordering::AcqRel);
-        Ok(match (self.tail, self.log.wal_base()) {
+        let base = self.log.wal_base();
+        // Everything below the replay point is in the store this reader
+        // follows: served, as far as this process knows.
+        if let Some(base) = base {
+            self.cursor.serve(replay_after_wal_id.saturating_sub(base));
+        }
+        Ok(match (self.tail, base) {
             (true, Some(base)) => base
                 .saturating_add(self.log.last_sequence())
                 .max(replay_after_wal_id),
@@ -674,30 +1063,17 @@ impl TestIterator {
 
 #[async_trait]
 impl WalIterator for TestIterator {
-    async fn next(&mut self) -> Result<Option<WalRows>, WalError> {
+    async fn next(&mut self) -> std::result::Result<Option<WalRows>, WalError> {
         if self.exhausted() {
             return Ok(None);
         }
-        let envelope = self
-            .log
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&self.next)
-            .cloned();
-        let Some(envelope) = envelope else {
+        let Some(envelope) = self.log.slot(self.next) else {
             return Ok(None);
         };
 
         let sequence = self.next;
         self.next = self.next.saturating_add(1);
-        self.cursor.served.send_if_modified(|served| {
-            let advanced = sequence > *served;
-            if advanced {
-                *served = sequence;
-            }
-            advanced
-        });
+        self.cursor.serve(sequence);
 
         // Rows are handed back in WAL ids: the slot counted from the base.
         let base = self.log.wal_base().unwrap_or(0);
