@@ -6,6 +6,8 @@ use std::sync::Arc;
 use imbl::{HashMap, OrdMap, OrdSet};
 use prost::Message as _;
 
+#[cfg(test)]
+use crate::store::read::EntityRecordKind;
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
@@ -23,7 +25,7 @@ use crate::{
             SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
             ViewValue,
         },
-        read::{EntityRecord, EntityRecordKind},
+        read::EntityRecord,
     },
 };
 
@@ -320,40 +322,9 @@ impl CatalogSnapshot {
         Self::try_build_from(snapshot, current, history, at).unwrap()
     }
 
-    /// The live records of `kind` for one table, in store key order. Only
-    /// the kinds this view keys table-major can answer; the rest return
-    /// `None` and the caller reads the kind whole.
-    pub(crate) fn live_records_of(
-        &self,
-        kind: EntityRecordKind,
-        table_id: u64,
-    ) -> Option<Vec<EntityRecord>> {
-        fn of<K: Ord + Clone, V: Clone>(
-            rows: &OrdMap<u64, OrdMap<K, V>>,
-            table_id: u64,
-            wrap: impl Fn(V) -> EntityRecord,
-        ) -> Vec<EntityRecord> {
-            rows.get(&table_id)
-                .map(|inner| inner.values().cloned().map(wrap).collect())
-                .unwrap_or_default()
-        }
-
-        match kind {
-            EntityRecordKind::File => Some(of(&self.data_files, table_id, EntityRecord::File)),
-            EntityRecordKind::DeleteFile => {
-                Some(of(&self.delete_files, table_id, EntityRecord::DeleteFile))
-            }
-            EntityRecordKind::FileColumnStats => Some(of(
-                &self.file_column_stats,
-                table_id,
-                EntityRecord::FileColumnStats,
-            )),
-            _ => None,
-        }
-    }
-
     /// The live records of `kind`, in store key order: what a live scan of
     /// the kind returns at this view's head.
+    #[cfg(test)]
     pub(crate) fn live_records(&self, kind: EntityRecordKind) -> Vec<EntityRecord> {
         fn flat<V: Clone>(
             rows: &OrdMap<u64, V>,
@@ -400,10 +371,12 @@ impl CatalogSnapshot {
                 .collect(),
             EntityRecordKind::Tag => flat(&self.tags, EntityRecord::Tag),
             EntityRecordKind::GcFile => flat(&self.gc_files, EntityRecord::GcFile),
+            EntityRecordKind::Index => nested(&self.indexes, EntityRecord::Index),
         }
     }
 
     /// How many `current` records this view holds.
+    #[cfg(test)]
     pub(crate) fn live_entity_count(&self) -> usize {
         self.nested_entity_count
             + self.schemas.len()

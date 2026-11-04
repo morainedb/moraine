@@ -211,6 +211,7 @@ pub(crate) async fn read_inline_chunk_locator(
     table_id: u64,
     locator: InlineChunkLocator,
 ) -> Result<(InlineOperation, InlineChunkValue)> {
+    tracing::debug!(table_id, "reading inline chunk body");
     let Some(chunk): Option<InlineChunkValue> =
         read_singleton(handle, Key::Inline(InlineKey::Live(locator.operation))).await?
     else {
@@ -372,6 +373,7 @@ pub(crate) async fn scan_inline_chunks(
         ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
+                tracing::debug!(table_id, "reading inline chunk body");
                 Ok((op, value::decode_owned(bytes)?))
             }
             other => Err(Error::Corruption(format!(

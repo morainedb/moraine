@@ -277,3 +277,18 @@ async fn admission_limits_active_attempts_and_abort_releases_the_slot() {
     }
     assert_eq!(slots.available_permits(), 1);
 }
+
+#[tokio::test]
+#[ignore = "reads MORAINE_MEMORY_FIXTURE with a small working-memory allowance"]
+async fn preload_streams_a_persisted_catalog() {
+    let root = std::env::var("MORAINE_MEMORY_FIXTURE").unwrap();
+    let objects =
+        std::sync::Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
+    let mut options = moraine::CatalogOptions::default();
+    options.cache_memory = Some(16 * 1024 * 1024);
+    let catalog = moraine::Catalog::open_read_only(objects, options)
+        .await
+        .unwrap();
+    assert!(Pass::attach(true).run(&catalog, None, "").await);
+    catalog.close().await.unwrap();
+}

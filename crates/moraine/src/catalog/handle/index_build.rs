@@ -6,7 +6,10 @@ use futures::TryStreamExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::{BACKFILL_FILE_READ_CONCURRENCY, Catalog, ReadOnlyCatalog, backfill};
+use super::{
+    BACKFILL_FILE_READ_CONCURRENCY, Catalog, ReadOnlyCatalog, backfill,
+    table_read::{TableRead, load_table},
+};
 use crate::{
     catalog::{
         BuildStep, CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, IndexDef, IndexId,
@@ -291,7 +294,7 @@ impl Committer<'_> {
 
         let committed = self
             .catalog
-            .commit(|tx| {
+            .commit_table(self.table, TableRead::Definition, |tx| {
                 if tx.current_snapshot().id != self.expected_snapshot {
                     return Err(Error::CommitConflict(
                         "catalog changed after staged index derivation".to_owned(),
@@ -311,7 +314,7 @@ impl Committer<'_> {
 
         let state = self
             .catalog
-            .snapshot()
+            .table_snapshot(self.table, TableRead::Definition)
             .await?
             .indexes_of(self.table)
             .into_iter()
@@ -539,7 +542,9 @@ impl Catalog {
         // A cleanup that itself fails is logged, never substituted for the
         // failure that caused it.
         if outcome.is_err()
-            && let Err(cleanup) = self.commit(|tx| tx.drop_index(index)).await
+            && let Err(cleanup) = self
+                .commit_table(table, TableRead::Definition, |tx| tx.drop_index(index))
+                .await
         {
             warn!(
                 index = index.get(),
@@ -574,7 +579,7 @@ impl Catalog {
             ));
         }
 
-        let snapshot = reporting_phase("repair-snapshot", self.snapshot()).await?;
+        let snapshot = reporting_phase("repair-snapshot", self.index_head()).await?;
         let pending: Vec<_> = snapshot
             .indexes
             .values()
@@ -597,12 +602,6 @@ impl Catalog {
 
         let mut repaired = 0u64;
         for index in pending {
-            if data_store.is_none() && !snapshot.data_files_of(index.table_id).is_empty() {
-                return Err(Error::Constraint(format!(
-                    "deferred index {} cannot be repaired without a data-path store",
-                    index.id
-                )));
-            }
             let def = IndexDef {
                 name: index.name.clone(),
                 columns: index.columns.clone(),
@@ -635,7 +634,7 @@ impl Catalog {
         maintenance: IndexMaintenance,
         has_data_store: bool,
     ) -> Result<IndexId> {
-        let snapshot = self.snapshot().await?;
+        let snapshot = self.table_snapshot(table, TableRead::IndexCreation).await?;
         require_data_store(&snapshot, table, has_data_store)?;
         if let Some(existing) = snapshot.index_by_name(table, &def.name) {
             return match existing.state {
@@ -669,7 +668,7 @@ impl Catalog {
         }
 
         let index = std::cell::Cell::new(None);
-        self.commit(|tx| {
+        self.commit_table(table, TableRead::IndexCreation, |tx| {
             require_data_store(tx, table, has_data_store)?;
             let id =
                 tx.create_index_staged_ordered_with_maintenance(table, def, orders, maintenance)?;
@@ -698,7 +697,7 @@ impl Catalog {
         step: BuildStep,
     ) -> Result<()> {
         let expected_keys = self
-            .snapshot()
+            .table_snapshot(table, TableRead::Definition)
             .await?
             .table_stats(table)
             .map_or(0, |stats| stats.record_count);
@@ -714,9 +713,8 @@ impl Catalog {
                 "staged index backfill derivation started"
             );
             let derivation_started = Instant::now();
-            let epoch = super::cache_epoch(&self.projections);
             let session = self.begin_read().await?;
-            let snapshot = self.head_view(session.handle(), epoch).await?;
+            let snapshot = load_table(session.handle(), table, TableRead::Sources).await?;
             require_data_store(&snapshot, table, data_store.is_some())?;
             let source = backfill::BackfillSource {
                 snapshot: &snapshot,

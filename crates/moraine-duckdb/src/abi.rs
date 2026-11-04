@@ -81,7 +81,8 @@ pub(crate) unsafe fn pinned_or_head(
     }
     // SAFETY: caller contract for `snapshot`.
     let snapshot = unsafe { &*snapshot };
-    Ok(std::sync::Arc::clone(&snapshot.snapshot))
+    // SAFETY: caller contract for the cancellation callback and context.
+    unsafe { handle.block_on_cancellable(probe, probe_ctx, snapshot.materialize()) }
 }
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
@@ -204,7 +205,7 @@ pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: imp
 /// be writable.
 unsafe fn snapshot_list<Row, Conversion>(
     snapshot: *mut MoraineSnapshotHandle,
-    selection: moraine::ffi_support::metadata_export::MetadataExport,
+    projection: moraine::ffi_support::catalog_read::SnapshotProjection,
     out_items: *mut *mut Row,
     out_len: *mut usize,
     err: *mut MoraineError,
@@ -218,10 +219,10 @@ unsafe fn snapshot_list<Row, Conversion>(
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         // SAFETY: caller contract for `snapshot`.
-        let snapshot = unsafe { &(*snapshot).snapshot };
+        let snapshot = unsafe { &*snapshot }.project(projection)?;
         let memory =
-            selection.reserve_export(snapshot, size_of::<Row>(), size_of::<Conversion>())?;
-        Ok((produce(snapshot)?, memory))
+            projection.reserve_export(&snapshot, size_of::<Row>(), size_of::<Conversion>())?;
+        Ok((produce(&snapshot)?, memory))
     };
 
     // SAFETY: `err` validity is the caller's contract.

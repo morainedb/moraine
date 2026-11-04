@@ -479,7 +479,7 @@ impl Catalog {
     /// Returns [`Error::Constraint`] if the index is still live, or a store
     /// error.
     pub async fn reclaim_index_entries(&self, index: IndexId, limit: usize) -> Result<usize> {
-        let head = self.snapshot().await?;
+        let head = self.index_head().await?;
         if head
             .indexes
             .values()
@@ -572,10 +572,34 @@ impl Catalog {
             return Ok(report);
         }
 
-        let snapshot = self.snapshot().await?;
+        let snapshot = self.index_head().await?;
         self.reclaim_orphaned_indexes(&snapshot, &request, &mut report)
             .await?;
         Ok(report)
+    }
+
+    pub(super) async fn index_head(&self) -> Result<crate::CatalogSnapshot> {
+        let scope = self
+            .index_read_scope()
+            .await?
+            .ok_or_else(|| Error::Constraint("maintenance requires a fixed read scope".into()))?;
+        let session = scope.reads().begin_read().await?;
+        let mut view = crate::transaction::staged::dependencies::header(session.handle()).await?;
+        let mut records = session
+            .handle()
+            .scan_prefix(
+                crate::store::key::current_entity_kind_prefix(EntityKind::Index),
+                ..,
+                ScanShape::Streaming,
+            )
+            .await?;
+        while let Some(entry) = records.next().await? {
+            let record = store_read::decode_current_record(Key::decode(&entry.key)?, &entry.value)?;
+            view.admit(record.estimated_bytes().saturating_add(80))?;
+            view.put_record(record);
+        }
+        session.finish();
+        Ok(view)
     }
 
     async fn reclaim_orphaned_indexes(
@@ -812,35 +836,31 @@ impl Catalog {
         Ok(CompactStoreReport { merges })
     }
 
-    /// File identities retained in history for time travel.
-    async fn historical_data_files(&self) -> Result<HashSet<(u64, u64)>> {
-        let session = self.begin_read().await?;
-        let mut seen = HashSet::new();
-        // One kind, not the whole subspace: every other kind's history
-        // would be read and decoded only to be discarded.
-        let visited =
-            store_read::visit_history_keys(session.handle(), EntityKind::File, |history| {
-                if let EntityKey::File {
-                    table_id,
-                    data_file_id,
-                } = history.entity
-                {
-                    seen.insert((table_id, data_file_id));
-                }
-            })
-            .await;
-        session.finish();
-        visited?;
-
-        Ok(seen)
-    }
-
     /// Every table id the catalog still records, live or in history — the
     /// tables a read at a resolvable snapshot can name.
     async fn recorded_tables(&self) -> Result<HashSet<u64>> {
-        let mut seen: HashSet<u64> = self.snapshot().await?.tables.keys().copied().collect();
-
-        let session = self.begin_read().await?;
+        let scope = self
+            .index_read_scope()
+            .await?
+            .ok_or_else(|| Error::Constraint("maintenance requires a fixed read scope".into()))?;
+        let session = scope.reads().begin_read().await?;
+        let mut seen = HashSet::new();
+        let mut current = session
+            .handle()
+            .scan_prefix(
+                crate::store::key::current_entity_kind_prefix(EntityKind::Table),
+                ..,
+                ScanShape::Streaming,
+            )
+            .await?;
+        while let Some(entry) = current.next().await? {
+            if let Key::Current(crate::store::key::CurrentKey::Entity(EntityKey::Table {
+                table_id,
+            })) = Key::decode(&entry.key)?
+            {
+                seen.insert(table_id);
+            }
+        }
         // One kind, not the whole subspace: every other kind's history
         // would be read and decoded only to be discarded.
         let visited =
@@ -914,39 +934,76 @@ impl Catalog {
         batch_size: usize,
         pace: Duration,
     ) -> Result<u64> {
-        let snapshot = self.snapshot().await?;
-        let historical = self.historical_data_files().await?;
-
-        let mut victims = Vec::new();
-        for (&table_id, per_file) in &snapshot.file_column_stats {
-            let live = snapshot.data_files.get(&table_id);
-            for &(data_file_id, column_id) in per_file.keys() {
-                let resolvable = live.is_some_and(|files| files.contains_key(&data_file_id))
-                    || historical.contains(&(table_id, data_file_id));
-                if !resolvable {
-                    victims.push(EntityKey::FileColumnStats {
-                        table_id,
-                        data_file_id,
-                        column_id,
-                    });
-                }
-            }
-        }
-
-        let mut total = 0u64;
-        for batch in victims.chunks(batch_size) {
-            // A head-preserving commit: the deletes fold into the maintained
-            // projections like any commit's, and the head stamp moves.
-            self.commit_own_rows(
-                batch
-                    .iter()
-                    .map(|entity| (Key::current(*entity).encode(), None))
-                    .collect(),
+        let scope = self
+            .index_read_scope()
+            .await?
+            .ok_or_else(|| Error::Constraint("maintenance requires a fixed read scope".into()))?;
+        let session = scope.reads().begin_read().await?;
+        let handle = session.handle();
+        let mut stats = handle
+            .scan_prefix(
+                crate::store::key::current_entity_kind_prefix(EntityKind::FileColumnStats),
+                ..,
+                ScanShape::Streaming,
             )
             .await?;
-            total += batch.len() as u64;
-            self.pace_own_rows(pace).await;
+        let mut last_file = None;
+        let mut batch = Vec::new();
+        let mut total = 0;
+        while let Some(entry) = stats.next().await? {
+            let Key::Current(crate::store::key::CurrentKey::Entity(EntityKey::FileColumnStats {
+                table_id,
+                data_file_id,
+                ..
+            })) = Key::decode(&entry.key)?
+            else {
+                return Err(Error::Corruption(
+                    "unexpected key in file statistics scan".into(),
+                ));
+            };
+            let identity = (table_id, data_file_id);
+            let resolvable = if let Some((previous, resolvable)) =
+                last_file.filter(|(previous, _)| *previous == identity)
+            {
+                let _ = previous;
+                resolvable
+            } else {
+                let file = EntityKey::File {
+                    table_id,
+                    data_file_id,
+                };
+                let live = handle.get(Key::current(file).encode()).await?.is_some();
+                let historical = if live {
+                    false
+                } else {
+                    handle
+                        .scan_prefix(
+                            crate::store::key::history_entity_prefix(file),
+                            ..,
+                            ScanShape::Seek,
+                        )
+                        .await?
+                        .next()
+                        .await?
+                        .is_some()
+                };
+                last_file = Some((identity, live || historical));
+                live || historical
+            };
+            if !resolvable {
+                batch.push((entry.key.to_vec(), None));
+            }
+            if batch.len() >= batch_size {
+                total += batch.len() as u64;
+                self.commit_own_rows(std::mem::take(&mut batch)).await?;
+                self.pace_own_rows(pace).await;
+            }
         }
+        if !batch.is_empty() {
+            total += batch.len() as u64;
+            self.commit_own_rows(batch).await?;
+        }
+        session.finish();
         Ok(total)
     }
 
@@ -1041,6 +1098,82 @@ mod tests {
             key::{InlineKey, Key},
         },
     };
+
+    #[tokio::test]
+    async fn statistics_reclamation_reads_keys_in_bounded_batches() {
+        use crate::store::key::EntityKey;
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
+        tx.put(
+            Key::current(EntityKey::View { view_id: 99 }).encode(),
+            [0xff],
+        )
+        .unwrap();
+        tx.put(
+            Key::current(EntityKey::File {
+                table_id: 1,
+                data_file_id: 1,
+            })
+            .encode(),
+            [0xff],
+        )
+        .unwrap();
+        tx.put(
+            Key::history(
+                EntityKey::File {
+                    table_id: 1,
+                    data_file_id: 3,
+                },
+                1,
+            )
+            .encode(),
+            [0xff],
+        )
+        .unwrap();
+        for data_file_id in 1..=3 {
+            tx.put(
+                Key::current(EntityKey::FileColumnStats {
+                    table_id: 1,
+                    data_file_id,
+                    column_id: 1,
+                })
+                .encode(),
+                [0xff],
+            )
+            .unwrap();
+        }
+        catalog.commit_write_tx(tx).await.unwrap();
+        assert_eq!(
+            catalog
+                .reclaim_orphaned_file_column_stats(1, std::time::Duration::ZERO)
+                .await
+                .unwrap(),
+            1
+        );
+        let session = catalog.begin_read().await.unwrap();
+        for (data_file_id, present) in [(1, true), (2, false), (3, true)] {
+            assert_eq!(
+                session
+                    .handle()
+                    .get(
+                        Key::current(EntityKey::FileColumnStats {
+                            table_id: 1,
+                            data_file_id,
+                            column_id: 1
+                        })
+                        .encode()
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                present
+            );
+        }
+        session.finish();
+        catalog.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn index_sweep_preserves_indexes_created_after_its_snapshot() {

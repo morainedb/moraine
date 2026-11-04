@@ -89,11 +89,14 @@ typedef struct MoraineCatalogHandle MoraineCatalogHandle;
 // [`moraine_inline_scan_next`] until [`moraine_inline_scan_close`].
 typedef struct MoraineInlineScanCursor MoraineInlineScanCursor;
 
+// An operation-owned metadata cursor. Its pages use the existing dump free
+// functions.
+typedef struct MoraineMetadataCursor MoraineMetadataCursor;
+
 // An execution-owned cursor, including its pinned read surface and runtime.
 typedef struct MoraineRowScan MoraineRowScan;
 
-// A materialized snapshot view, held across the FFI boundary so
-// listing calls need no further store I/O.
+// A pinned read scope or an explicitly materialized compatibility view.
 //
 // Opaque to C — only ever seen as a `MoraineSnapshotHandle*` obtained
 // from [`moraine_snapshot`](crate::abi::moraine_snapshot) and released
@@ -3640,13 +3643,335 @@ void moraine_register_log_sink(const struct MoraineCatalogHandle *handle,
 // not be called from inside a sink.
 void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
 
+// Opens a fixed metadata scan; `u64::MAX` means no table or live bound.
+//
+// # Safety
+// `handle` must be live; `out` writable; `err` null or writable. The probe
+// must be callable with its context from any thread during this call.
+int32_t moraine_metadata_cursor_open(struct MoraineCatalogHandle *handle,
+                                     int32_t table_kind,
+                                     uint64_t table_id,
+                                     uint64_t live_bound,
+                                     struct MoraineMetadataCursor **out,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
+
+// Releases a cursor and its read scope; null is a no-op.
+//
+// # Safety
+// `cursor` must be null or an unreleased pointer returned by cursor open.
+void moraine_metadata_cursor_free(struct MoraineMetadataCursor *cursor);
+
+// Reads one page of schemas; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_schemas(struct MoraineMetadataCursor *cursor,
+                                        struct MoraineSchemaRow **out_items,
+                                        size_t *out_len,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
+
+// Reads one page of tables; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_tables(struct MoraineMetadataCursor *cursor,
+                                       struct MoraineTableRow **out_items,
+                                       size_t *out_len,
+                                       MoraineInterruptProbe probe,
+                                       void *probe_ctx,
+                                       struct MoraineError *err);
+
+// Reads one page of views; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_views(struct MoraineMetadataCursor *cursor,
+                                      struct MoraineViewRow **out_items,
+                                      size_t *out_len,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      struct MoraineError *err);
+
+// Reads one page of columns; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_columns(struct MoraineMetadataCursor *cursor,
+                                        struct MoraineColumnRow **out_items,
+                                        size_t *out_len,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
+
+// Reads one page of data files; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_data_files(struct MoraineMetadataCursor *cursor,
+                                           struct MoraineDataFileRow **out_items,
+                                           size_t *out_len,
+                                           MoraineInterruptProbe probe,
+                                           void *probe_ctx,
+                                           struct MoraineError *err);
+
+// Reads one page of delete files; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_delete_files(struct MoraineMetadataCursor *cursor,
+                                             struct MoraineDeleteFileRow **out_items,
+                                             size_t *out_len,
+                                             MoraineInterruptProbe probe,
+                                             void *probe_ctx,
+                                             struct MoraineError *err);
+
+// Reads one page of file column stats; the matching dump free function
+// releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_file_column_stats(struct MoraineMetadataCursor *cursor,
+                                                  struct MoraineFileColumnStatsRow **out_items,
+                                                  size_t *out_len,
+                                                  MoraineInterruptProbe probe,
+                                                  void *probe_ctx,
+                                                  struct MoraineError *err);
+
+// Reads one page of table stats; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_table_stats(struct MoraineMetadataCursor *cursor,
+                                            struct MoraineTableStatsRow **out_items,
+                                            size_t *out_len,
+                                            MoraineInterruptProbe probe,
+                                            void *probe_ctx,
+                                            struct MoraineError *err);
+
+// Reads one page of table column stats; the matching dump free function
+// releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_table_column_stats(struct MoraineMetadataCursor *cursor,
+                                                   struct MoraineTableColumnStatsRow **out_items,
+                                                   size_t *out_len,
+                                                   MoraineInterruptProbe probe,
+                                                   void *probe_ctx,
+                                                   struct MoraineError *err);
+
+// Reads one page of partitions; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_partitions(struct MoraineMetadataCursor *cursor,
+                                           struct MorainePartitionInfoRow **out_items,
+                                           size_t *out_len,
+                                           MoraineInterruptProbe probe,
+                                           void *probe_ctx,
+                                           struct MoraineError *err);
+
+// Reads one page of sorts; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_sorts(struct MoraineMetadataCursor *cursor,
+                                      struct MoraineSortInfoRow **out_items,
+                                      size_t *out_len,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      struct MoraineError *err);
+
+// Reads one page of macros; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_macros(struct MoraineMetadataCursor *cursor,
+                                       struct MoraineMacroRow **out_items,
+                                       size_t *out_len,
+                                       MoraineInterruptProbe probe,
+                                       void *probe_ctx,
+                                       struct MoraineError *err);
+
+// Reads one page of mappings; the matching dump free function releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_mappings(struct MoraineMetadataCursor *cursor,
+                                         struct MoraineColumnMappingRow **out_items,
+                                         size_t *out_len,
+                                         MoraineInterruptProbe probe,
+                                         void *probe_ctx,
+                                         struct MoraineError *err);
+
+// Reads one page of scheduled deletions; the matching dump free function
+// releases it.
+//
+// # Safety
+// The live cursor, writable outputs, probe and error follow the cursor-open
+// contract.
+int32_t moraine_metadata_cursor_scheduled_deletions(struct MoraineMetadataCursor *cursor,
+                                                    struct MoraineScheduledDeletionRow **out_items,
+                                                    size_t *out_len,
+                                                    MoraineInterruptProbe probe,
+                                                    void *probe_ctx,
+                                                    struct MoraineError *err);
+
+// Reads a page of tags; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_tags(struct MoraineMetadataCursor *cursor,
+                                     struct MoraineTagRow **out_items,
+                                     size_t *out_len,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
+
+// Reads a page of partition columns; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_partition_columns(struct MoraineMetadataCursor *cursor,
+                                                  struct MorainePartitionColumnRow **out_items,
+                                                  size_t *out_len,
+                                                  MoraineInterruptProbe probe,
+                                                  void *probe_ctx,
+                                                  struct MoraineError *err);
+
+// Reads a page of sort expressions; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_sort_expressions(struct MoraineMetadataCursor *cursor,
+                                                 struct MoraineSortExpressionRow **out_items,
+                                                 size_t *out_len,
+                                                 MoraineInterruptProbe probe,
+                                                 void *probe_ctx,
+                                                 struct MoraineError *err);
+
+// Reads a page of file partition values; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_file_partition_values(struct MoraineMetadataCursor *cursor,
+                                                      struct MoraineFilePartitionValueRow **out_items,
+                                                      size_t *out_len,
+                                                      MoraineInterruptProbe probe,
+                                                      void *probe_ctx,
+                                                      struct MoraineError *err);
+
+// Reads a page of file variant stats; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_file_variant_stats(struct MoraineMetadataCursor *cursor,
+                                                   struct MoraineFileVariantStatsRow **out_items,
+                                                   size_t *out_len,
+                                                   MoraineInterruptProbe probe,
+                                                   void *probe_ctx,
+                                                   struct MoraineError *err);
+
+// Reads a page of macro impls; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_macro_impls(struct MoraineMetadataCursor *cursor,
+                                            struct MoraineMacroImplRow **out_items,
+                                            size_t *out_len,
+                                            MoraineInterruptProbe probe,
+                                            void *probe_ctx,
+                                            struct MoraineError *err);
+
+// Reads a page of macro parameters; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_macro_parameters(struct MoraineMetadataCursor *cursor,
+                                                 struct MoraineMacroParameterRow **out_items,
+                                                 size_t *out_len,
+                                                 MoraineInterruptProbe probe,
+                                                 void *probe_ctx,
+                                                 struct MoraineError *err);
+
+// Reads a page of name mappings; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_name_mappings(struct MoraineMetadataCursor *cursor,
+                                              struct MoraineNameMappingRow **out_items,
+                                              size_t *out_len,
+                                              MoraineInterruptProbe probe,
+                                              void *probe_ctx,
+                                              struct MoraineError *err);
+
+// Reads a page of options; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_options(struct MoraineMetadataCursor *cursor,
+                                        struct MoraineOptionRow **out_items,
+                                        size_t *out_len,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
+
+// Reads a page of snapshots; the snapshot dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_snapshots(struct MoraineMetadataCursor *cursor,
+                                          struct MoraineSnapshotRow **out_items,
+                                          size_t *out_len,
+                                          MoraineInterruptProbe probe,
+                                          void *probe_ctx,
+                                          struct MoraineError *err);
+
+// Reads a page of column tags; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_column_tags(struct MoraineMetadataCursor *cursor,
+                                            struct MoraineColumnTagRow **out_items,
+                                            size_t *out_len,
+                                            MoraineInterruptProbe probe,
+                                            void *probe_ctx,
+                                            struct MoraineError *err);
+
+// Reads a page of view column tags; the dump free function releases it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_view_column_tags(struct MoraineMetadataCursor *cursor,
+                                                 struct MoraineViewColumnTagRow **out_items,
+                                                 size_t *out_len,
+                                                 MoraineInterruptProbe probe,
+                                                 void *probe_ctx,
+                                                 struct MoraineError *err);
+
 // Opens a staged-row transaction at the current head and writes the
 // resulting handle to `*out`.
 //
 // Refuses a caller that has already cancelled with
 // [`codes::INTERRUPTED`], leaving `*out` unwritten and nothing staged.
-// Opening the transaction reaches no object store, so `probe` is read
-// once rather than raced.
+// A lazy read scope's compatibility view is resolved with cancellation.
 //
 // # Safety
 //

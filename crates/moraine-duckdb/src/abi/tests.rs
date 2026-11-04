@@ -1654,6 +1654,89 @@ fn attach_snapshot_and_list_round_trip() {
     }
 }
 
+#[test]
+fn scoped_snapshot_and_schema_listing_do_not_retain_a_catalog_view() {
+    const DIRECTORY: &str = "MORAINE_TEST_DEMAND_CATALOG_DIRECTORY";
+    let Ok(directory) = std::env::var(DIRECTORY) else {
+        let directory = TempDir::new("lazy-snapshot");
+        seed(directory.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(LocalFileSystem::new_with_prefix(directory.path()).unwrap());
+            let catalog = moraine::Catalog::open(store, moraine::CatalogOptions::default())
+                .await
+                .unwrap();
+            let sql = format!("SELECT 1 /*{}*/", "x".repeat(2 * 1024 * 1024));
+            catalog
+                .commit(|transaction| {
+                    transaction.create_view(moraine::SchemaId::new(0), "large", "duckdb", &sql)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+        });
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "abi::tests::scoped_snapshot_and_schema_listing_do_not_retain_a_catalog_view",
+            ])
+            .env(DIRECTORY, directory.path())
+            .env("MORAINE_WORKING_MEMORY_BYTES", "1048576")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let handle = attach_ok(Path::new(&directory));
+    // SAFETY: the attached handle remains live throughout this test.
+    let catalog = unsafe { &*handle };
+    let before = catalog.catalog.reads().memory_tally().projection_bytes;
+    let mut snapshot = ptr::null_mut();
+    let mut error = MoraineError::default();
+    // SAFETY: input handle and output slots are live; no cancellation callback.
+    let code = unsafe {
+        moraine_snapshot_scoped(
+            handle,
+            &raw mut snapshot,
+            None,
+            ptr::null_mut(),
+            &raw mut error,
+        )
+    };
+    assert_eq!(code, codes::OK);
+    assert_eq!(
+        catalog.catalog.reads().memory_tally().projection_bytes,
+        before
+    );
+    let mut schemas = ptr::null_mut();
+    let mut length = 0;
+    // SAFETY: snapshot and output slots remain live.
+    let code = unsafe {
+        moraine_snapshot_schemas(snapshot, &raw mut schemas, &raw mut length, &raw mut error)
+    };
+    assert_eq!(code, codes::OK);
+    assert_eq!(length, 2);
+    assert_eq!(
+        catalog.catalog.reads().memory_tally().projection_bytes,
+        before
+    );
+    // SAFETY: each allocation is freed exactly once after its final use.
+    unsafe {
+        moraine_snapshot_schemas_free(schemas, length);
+        moraine_snapshot_free(snapshot);
+        moraine_detach(handle);
+    }
+}
+
 /// A catalog string with an embedded NUL (reachable via a view's SQL,
 /// since `moraine` stores `\0` verbatim) cannot cross the C boundary:
 /// the listing call must fail with `CORRUPTION`, leaving the outputs

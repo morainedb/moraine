@@ -1,23 +1,11 @@
 //! Admission for selected descriptor copies and their conversion scratch.
 
+use super::SnapshotProjection;
 use crate::{
     CatalogSnapshot, ColumnInfo, MemoryReservation, Result, SchemaInfo, TableInfo, ViewInfo,
 };
 
-/// The descriptors selected by one snapshot export.
-#[derive(Clone, Copy)]
-pub enum MetadataExport {
-    /// All live schemas.
-    Schemas,
-    /// Live tables belonging to a schema.
-    TablesIn(u64),
-    /// Live columns belonging to a table.
-    ColumnsOf(u64),
-    /// Live views belonging to a schema.
-    ViewsIn(u64),
-}
-
-impl MetadataExport {
+impl SnapshotProjection {
     /// Reserves selected Rust descriptors, copied strings, sorting scratch,
     /// and caller-supplied output and conversion row sizes before allocation.
     /// The caller retains this reservation until its exported array is freed.

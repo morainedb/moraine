@@ -23,10 +23,8 @@ use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId, Store, Timestamp,
         projection::{
-            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch,
-            fold_replayed_writes, held_head_view, install_head_view, install_head_view_at,
-            invalidate_head_view, migration_clear_at, note_migration_clear, raise_format_floor,
-            view_head,
+            ProjectionCache, fold_committed_batch, invalidate_head_view, migration_clear_at,
+            note_migration_clear, raise_format_floor,
         },
     },
     commit_log::{
@@ -84,6 +82,7 @@ const INTERVENING_READ_CONCURRENCY: usize = 64;
 
 /// Changelog and current-record reads kept in flight by an incremental head
 /// refresh; sized for a remote object store.
+#[cfg(test)]
 const REFRESH_READ_CONCURRENCY: usize = 256;
 
 /// How long to wait before re-running `attempt` (0-based; the first attempt
@@ -164,7 +163,23 @@ pub(crate) async fn await_durable(
         // The flush the pacer performs or waits for is what puts the
         // batch in object storage.
         CommitDurability::Paced(pacer) => {
-            reporting_stalls(operation, staged, pacer.await_durable(handle, commits)).await
+            let sequence = handle.seqnum();
+            reporting_stalls(operation, staged, pacer.await_durable(handle, commits)).await?;
+            reporting_stalls(
+                "checkpoint publication",
+                staged,
+                pacer.publish_through(sequence),
+            )
+            .await
+            .map_err(|error| {
+                if operation == "bootstrap" {
+                    return error;
+                }
+                slatedb::Error::unavailable(
+                    "write is durable but checkpoint publication was not acknowledged".to_owned(),
+                )
+                .with_source(Box::new(error))
+            })
         }
     }
 }
@@ -460,7 +475,7 @@ async fn open_attempt(
 ) -> std::result::Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>), OpenFailure> {
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
-    let pacer = FlushPacer::new(db.clone(), flush_spacing);
+    let pacer = FlushPacer::publishing(db.clone(), flush_spacing, store.admin());
     info!(
         writer_open_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-write"
@@ -472,6 +487,11 @@ async fn open_attempt(
             let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
             agreed.map_err(OpenFailure::Fatal)?;
+            pacer
+                .publish_through(db.status().durable_seq)
+                .await
+                .map_err(Error::from)
+                .map_err(OpenFailure::Fatal)?;
             return Ok((db, counters, format.format_version, pacer));
         }
         Ok(None) => {}
@@ -877,34 +897,6 @@ pub(crate) async fn materialize_capturing(
     .await
 }
 
-/// Builds a head view from the shared `current` records instead of
-/// scanning, or reports `None` when the store no longer stands at
-/// `expected`.
-pub(crate) async fn materialize_from(
-    tx: ReadHandle<'_>,
-    expected: &proto::HeadValue,
-    current: &RecordSet,
-) -> Result<Option<CatalogSnapshot>> {
-    read::consistent(tx, || async move {
-        let ((), head) = futures::try_join!(refuse_mid_migration(tx), read_head_value(tx))?;
-        if head.snapshot_id != expected.snapshot_id || head.batch_seq != expected.batch_seq {
-            return Ok(None);
-        }
-        let (_, snapshot) = resolve_below(tx, None, head.snapshot_id).await?;
-
-        let mut view = CatalogSnapshot::try_build_from(
-            snapshot,
-            current.values().map(Arc::as_ref),
-            std::iter::empty(),
-            None,
-        )?;
-        view.batch_seq = head.batch_seq;
-
-        Ok(Some(view))
-    })
-    .await
-}
-
 /// The largest changelog a commit records; a batch past it records nothing
 /// and readers rescan. Sized so an ordinary bulk write still leaves a
 /// replayable trail — a batch that records nothing forces every reader
@@ -915,6 +907,7 @@ const MAX_REFRESH_KEYS: usize = 4_096;
 
 /// A refresher rescans rather than replays a gap whose churn exceeds this
 /// share of the live catalog.
+#[cfg(test)]
 const REFRESH_CHURN_SHARE: usize = 2;
 
 /// The `current` keys a batch wrote, sorted and deduplicated. The flag is
@@ -987,6 +980,7 @@ pub(crate) async fn refresh(
 /// As [`refresh`], also handing back the `current` writes it re-read
 /// across the gap, so the shared record set can fold forward with the
 /// view.
+#[cfg(test)]
 pub(crate) async fn refresh_with_writes(
     tx: ReadHandle<'_>,
     base: &CatalogSnapshot,
@@ -1001,6 +995,7 @@ pub(crate) async fn refresh_with_writes(
 
 /// One pass of [`refresh`], against the state `head` names, declining a gap
 /// whose churn passes `churn_limit`.
+#[cfg(test)]
 async fn replay(
     tx: ReadHandle<'_>,
     base: &CatalogSnapshot,
@@ -1071,7 +1066,7 @@ mod group;
 use diff::diff_options;
 pub(crate) use diff::{Touched, diff_touched, diff_writes};
 use group::Outcome;
-pub(crate) use group::{Batch, Coalescer, StageOnto, Staging};
+pub(crate) use group::{Batch, Coalescer, StageOnto, Staging, TableMember};
 
 /// What a batch's durable write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1145,94 +1140,14 @@ where
     }
 }
 
-/// The view a commit attempt stages against: the cached one when it
-/// already matches head, one refreshed across the gap when it has fallen
-/// behind, else a fresh materialization. Every read runs through `db_tx`,
-/// so the view and the conflict-detection window share one start
-/// sequence; the install is compare-and-set against an epoch captured
-/// first.
+/// Explicitly materializes the compatibility verb API's commit premises.
 pub(crate) async fn head_view_for(
     handle: ReadHandle<'_>,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<Arc<CatalogSnapshot>> {
-    let epoch = cache_epoch(projections);
-    // Checked here because a warm cache returns before `materialize`'s
-    // own check. Head comes first because it keys the migration stamp; a
-    // stamped head spends no read at all, an unstamped one spends the same
-    // two this always did.
     let head = read_head_value(handle).await?;
     refuse_mid_migration_at(handle, projections, &head).await?;
-    if let Some(view) = cached_head_view(projections, &head) {
-        return Ok(view);
-    }
-
-    let view = match held_head_view(projections) {
-        Some(behind) => refresh_with_writes(handle, &behind)
-            .await?
-            .map(|(refreshed, writes)| {
-                fold_replayed_writes(
-                    projections,
-                    &view_head(&behind),
-                    view_head(&refreshed),
-                    &writes,
-                );
-                refreshed
-            }),
-        None => None,
-    };
-    let view = match view {
-        Some(refreshed) => Arc::new(refreshed),
-        None => Arc::new(materialize(handle, None).await?),
-    };
-    install_head_view_at(projections, epoch, Arc::clone(&view));
-
-    Ok(view)
-}
-
-/// Folds a just-committed head-advancing batch into `base` and installs the
-/// result as the new head view, or clears the cache when the fold fails.
-/// Head-preserving commits instead clear the cache before they commit
-/// ([`invalidate_head_view`]).
-pub(crate) fn refresh_head_view(
-    projections: &std::sync::RwLock<ProjectionCache>,
-    base: &CatalogSnapshot,
-    writes: &[StagedWrite],
-) {
-    let mut view = base.clone();
-    match fold::fold_batch(&mut view, writes) {
-        Ok(()) => install_head_view(projections, Arc::new(view)),
-        Err(err) => {
-            debug!(error = %err, "head view fold failed; clearing the cached view");
-            invalidate_head_view(projections);
-        }
-    }
-}
-
-/// Applies direct writes not represented by staged-row translation.
-pub(crate) fn finish_translated_head_view(
-    view: &mut CatalogSnapshot,
-    writes: &[StagedWrite],
-) -> Result<()> {
-    fold::fold_batch(view, writes)
-}
-
-/// How a successful head-advancing commit obtains its cached head view.
-pub(crate) enum HeadViewUpdate {
-    /// Derive the view from the commit's base and writes.
-    Rebuild(Arc<CatalogSnapshot>),
-    /// Install the view staged-row translation already produced.
-    Prepared(Arc<CatalogSnapshot>),
-}
-
-fn install_committed_head_view(
-    projections: &std::sync::RwLock<ProjectionCache>,
-    update: HeadViewUpdate,
-    writes: &[StagedWrite],
-) {
-    match update {
-        HeadViewUpdate::Rebuild(base) => refresh_head_view(projections, &base, writes),
-        HeadViewUpdate::Prepared(view) => install_head_view(projections, view),
-    }
+    materialize(handle, None).await.map(Arc::new)
 }
 
 /// What one attempt staged onto its transaction.
@@ -1533,7 +1448,6 @@ pub(crate) async fn submit_batch(
     heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
-    head_view_update: HeadViewUpdate,
     landing: Landing<'_>,
 ) -> Result<Submission> {
     let Landing { projections, log } = landing;
@@ -1575,7 +1489,7 @@ pub(crate) async fn submit_batch(
         };
         db_tx.rollback();
         let projection_started = Instant::now();
-        settle_projections(projections, writes, head, head_advanced, head_view_update);
+        settle_projections(projections, writes, head);
         debug!(sequence, "the batch holds its slot");
         crate::memory::release_after_phase();
         return Ok(Submission::Submitted(Submitted {
@@ -1606,7 +1520,7 @@ pub(crate) async fn submit_batch(
     match written {
         Ok(handle) => {
             let projection_started = Instant::now();
-            settle_projections(projections, writes, head, head_advanced, head_view_update);
+            settle_projections(projections, writes, head);
             // Translation scratch and the write ledger are released by the
             // time a batch is durable.
             crate::memory::release_after_phase();
@@ -1639,8 +1553,6 @@ fn settle_projections(
     projections: &std::sync::RwLock<ProjectionCache>,
     writes: &[StagedWrite],
     head: u64,
-    head_advanced: bool,
-    head_view_update: HeadViewUpdate,
 ) {
     if let Some(head_after) = staged_head_value(writes) {
         note_migration_clear(projections, head_after);
@@ -1649,9 +1561,6 @@ fn settle_projections(
         raise_format_floor(projections, stamped);
     }
     fold_committed_batch(projections, writes, head);
-    if head_advanced {
-        install_committed_head_view(projections, head_view_update, writes);
-    }
 }
 
 /// Waits for a submitted batch to reach object storage.
@@ -1705,20 +1614,10 @@ pub(crate) async fn commit_batch(
     heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
-    head_view_update: HeadViewUpdate,
     landing: Landing<'_>,
     durability: &CommitDurability,
 ) -> Result<Landed> {
-    match submit_batch(
-        db_tx,
-        heads,
-        writes,
-        staged_bytes,
-        head_view_update,
-        landing,
-    )
-    .await?
-    {
+    match submit_batch(db_tx, heads, writes, staged_bytes, landing).await? {
         Submission::LostRace => Ok(Landed::LostRace),
         Submission::Submitted(submitted) => {
             await_submitted(submitted, landing.projections, durability, 1).await
@@ -1736,7 +1635,6 @@ pub(crate) async fn commit_batch_off_task(
     heads: HeadTransition,
     writes: Vec<StagedWrite>,
     staged_bytes: StagedBytes,
-    head_view_update: HeadViewUpdate,
     landing: OwnedLanding,
     durability: CommitDurability,
 ) -> Result<Landed> {
@@ -1747,7 +1645,6 @@ pub(crate) async fn commit_batch_off_task(
             heads,
             &writes,
             staged_bytes,
-            head_view_update,
             landing.borrow(),
             &durability,
         )

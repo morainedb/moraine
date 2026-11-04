@@ -9,29 +9,6 @@ use crate::{store::handle::ReadHandle, transaction::session::CommitSession};
 mod allocation;
 mod durability;
 
-/// A prepared head view is installed by allocation rather than rebuilt.
-#[test]
-fn a_prepared_head_view_is_installed_without_rebuilding() {
-    let projections = std::sync::RwLock::new(ProjectionCache::empty());
-    let prepared = Arc::new(CatalogSnapshot {
-        snapshot: proto::SnapshotValue {
-            snapshot_id: 7,
-            ..proto::SnapshotValue::default()
-        },
-        batch_seq: 11,
-        ..CatalogSnapshot::default()
-    });
-
-    install_committed_head_view(
-        &projections,
-        HeadViewUpdate::Prepared(Arc::clone(&prepared)),
-        &[],
-    );
-
-    let installed = held_head_view(&projections).unwrap();
-    assert!(Arc::ptr_eq(&installed, &prepared));
-}
-
 /// The durable-commit wrapper is transparent: it hands back exactly what
 /// the commit reported. The wait it wraps is unbounded on purpose — a
 /// deadline could not cancel the staged batch, so it would report failure
@@ -3693,7 +3670,7 @@ async fn drop_index_ends_definition_and_keeps_format() {
 /// column drop, and a full table drop — whose child deletes the fold must
 /// apply without over-cascading.
 #[tokio::test]
-async fn folded_head_view_matches_a_fresh_scan() {
+async fn caller_owned_snapshot_matches_a_fresh_scan() {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile, OptionScope};
 
     let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
@@ -3764,22 +3741,18 @@ async fn folded_head_view_matches_a_fresh_scan() {
     let fresh = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
     tx.rollback();
 
-    let cached = catalog
-        .projections()
-        .read()
-        .unwrap()
-        .head_view(&stamp)
-        .expect("the writer caches its head view");
+    let cached = catalog.snapshot().await.unwrap();
+    assert_eq!(catalog.memory_tally().projection_bytes, 0);
 
     assert_eq!(cached.snapshot.snapshot_id, fresh.snapshot.snapshot_id);
     // An empty diff both directions means identical current state.
     assert!(
         diff_writes(&fresh, &cached, head + 1).is_empty(),
-        "folded head view diverged from a fresh scan"
+        "caller snapshot diverged from a fresh scan"
     );
     assert!(
         diff_writes(&cached, &fresh, head + 1).is_empty(),
-        "folded head view diverged from a fresh scan"
+        "caller snapshot diverged from a fresh scan"
     );
     catalog.close().await.unwrap();
 }
@@ -4672,7 +4645,6 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
         },
         &staged,
         staged_bytes,
-        HeadViewUpdate::Rebuild(Arc::clone(&base)),
         Landing {
             projections: catalog.projections(),
             log: None,

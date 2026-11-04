@@ -8,6 +8,7 @@ use tracing::info;
 use super::{
     Catalog, ReadOnlyCatalog, backfill,
     index_build::{EntrySink, IndexEncoder},
+    table_read::{TableRead, load_table},
 };
 use crate::{
     catalog::{IndexState, TableId},
@@ -169,9 +170,8 @@ impl ReadOnlyCatalog {
         data_prefix: &str,
     ) -> Result<IndexVerification> {
         let started = std::time::Instant::now();
-        let epoch = super::cache_epoch(&self.projections);
         let session = self.begin_read().await?;
-        let snapshot = self.head_view(session.handle(), epoch).await?;
+        let snapshot = load_table(session.handle(), table, TableRead::Sources).await?;
         super::index_build::require_data_store(&snapshot, table, data_store.is_some())?;
 
         let info = snapshot
@@ -276,7 +276,7 @@ impl Catalog {
         let mut report = self
             .verify_index(table, index, data_store, data_prefix)
             .await?;
-        let snapshot = self.snapshot().await?;
+        let snapshot = self.table_snapshot(table, TableRead::Definition).await?;
         let info = snapshot
             .index_by_name(table, index)
             .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -289,8 +289,10 @@ impl Catalog {
             return Ok(report);
         };
         let index_id = info.id;
-        self.commit(move |tx| tx.record_index_verification(index_id, observed, at))
-            .await?;
+        self.commit_table(table, TableRead::Definition, move |tx| {
+            tx.record_index_verification(index_id, observed, at)
+        })
+        .await?;
         report.certified_at = at;
         Ok(report)
     }

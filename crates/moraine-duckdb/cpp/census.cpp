@@ -407,9 +407,8 @@ void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 	output.SetValue(4, 0, duckdb::Value::UBIGINT(tally.auxiliary_metadata_bytes));
 	output.SetValue(5, 0, duckdb::Value::UBIGINT(tally.last_commit_index_entries));
 	output.SetValue(6, 0, duckdb::Value::UBIGINT(tally.last_commit_staged_bytes));
-	// The shim's own, not the core's: the rows this attach holds for the
-	// metadata tables it has narrowed or materialized.
-	output.SetValue(7, 0, duckdb::Value::UBIGINT(moraine_catalog.HeldMetadataBytes()));
+	// Retained for SQL compatibility; attaches no longer cache decoded rows.
+	output.SetValue(7, 0, duckdb::Value::UBIGINT(0));
 	output.SetChildCardinality(1);
 }
 

@@ -302,7 +302,7 @@ async fn recent_rows_reads_only_the_chunks_live_rows_reference() {
 }
 
 #[tokio::test]
-async fn index_queries_reuse_views_and_observe_later_commits() {
+async fn index_queries_observe_later_commits_without_retaining_views() {
     use std::{cell::Cell, ops::Bound};
 
     use crate::{ColumnDef, IndexDef};
@@ -339,12 +339,16 @@ async fn index_queries_reuse_views_and_observe_later_commits() {
         .await
         .unwrap();
     let (table, index) = ids.get().unwrap();
+    let corrupt_key =
+        crate::store::key::Key::current(crate::store::key::EntityKey::View { view_id: 999 })
+            .encode();
+    let transaction = catalog.begin_write_tx().unwrap();
+    transaction.put(&corrupt_key, [0xff]).unwrap();
+    catalog.commit_write_tx(transaction).await.unwrap();
 
     for operation in 0..4 {
         projection::invalidate_current_state(catalog.projections());
-        assert!(catalog.writer_head_view().is_none());
-        for repeated in [false, true] {
-            let before = catalog.writer_head_view();
+        for _ in 0..2 {
             let rows = match operation {
                 0 => catalog
                     .index_lookup(
@@ -368,15 +372,13 @@ async fn index_queries_reuse_views_and_observe_later_commits() {
                     .unwrap(),
             };
             assert!(rows.is_empty());
-            let cached = catalog
-                .writer_head_view()
-                .expect("index query must retain its catalog view");
-            if repeated {
-                assert!(Arc::ptr_eq(&before.unwrap(), &cached));
-            }
+            assert_eq!(catalog.memory_tally().projection_bytes, 0);
         }
     }
-    let held = catalog.writer_head_view().unwrap();
+    let transaction = catalog.begin_write_tx().unwrap();
+    transaction.delete(&corrupt_key).unwrap();
+    catalog.commit_write_tx(transaction).await.unwrap();
+    let held = catalog.snapshot().await.unwrap();
     catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
     assert!(held.index_by_id(table, index).is_some());
     assert!(matches!(
@@ -397,14 +399,17 @@ async fn a_late_read_view_cannot_replace_a_committed_view() {
         .commit(|tx| tx.create_schema("new").map(|_| ()))
         .await
         .unwrap();
-    let committed = catalog.writer_head_view().unwrap();
+    let committed = catalog.snapshot().await.unwrap();
     let late = catalog.head_view(session.handle(), epoch).await.unwrap();
     session.finish();
 
     assert_eq!(late.current_snapshot().id, old.current_snapshot().id);
     assert!(late.schema_by_name("new").is_none());
     assert!(committed.schema_by_name("new").is_some());
-    assert!(Arc::ptr_eq(&committed, &catalog.snapshot().await.unwrap()));
+    assert_eq!(
+        committed.current_snapshot().id,
+        catalog.snapshot().await.unwrap().current_snapshot().id
+    );
     catalog.close().await.unwrap();
 }
 
@@ -602,18 +607,8 @@ async fn forgetting_the_head_view_resolves_it_from_the_store_again() {
         .await
         .unwrap();
 
-    let installed = catalog
-        .writer_head_view()
-        .expect("a commit installs the head view");
-
+    let installed = catalog.snapshot().await.unwrap();
     catalog.forget_head_view();
-    assert!(
-        catalog.writer_head_view().is_none(),
-        "forgetting must leave nothing cached to decide against"
-    );
-
-    // Re-resolved rather than merely absent: a cache that cleared but could
-    // not be rebuilt would trade one wrong answer for no answer.
     let snapshot = catalog.snapshot().await.unwrap();
     assert_eq!(
         snapshot.current_snapshot().id,
@@ -730,7 +725,7 @@ async fn a_provider_can_declare_external_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn concurrent_cold_snapshots_share_one_materialization() {
+async fn concurrent_snapshots_are_independent_and_agree() {
     let catalog = open().await;
     catalog
         .commit(|tx| {
@@ -755,7 +750,27 @@ async fn concurrent_cold_snapshots_share_one_materialization() {
     let snapshots = futures::future::join_all(tasks).await;
     let first = snapshots[0].as_ref().unwrap();
     for snapshot in &snapshots[1..] {
-        assert!(Arc::ptr_eq(first, snapshot.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(first, snapshot.as_ref().unwrap()));
+        assert_eq!(
+            first.current_snapshot().id,
+            snapshot.as_ref().unwrap().current_snapshot().id
+        );
     }
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn decoded_snapshots_are_owned_only_by_the_caller() {
+    let catalog = open().await;
+    let view = catalog.snapshot().await.unwrap();
+    let weak = Arc::downgrade(&view);
+    drop(view);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(catalog.memory_tally().projection_bytes, 0);
+    catalog
+        .commit(|tx| tx.create_schema("uncached").map(|_| ()))
+        .await
+        .unwrap();
+    assert_eq!(catalog.memory_tally().projection_bytes, 0);
     catalog.close().await.unwrap();
 }

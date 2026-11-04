@@ -6,15 +6,15 @@
 
 Defines how DuckLake catalog state (spec v1.0) is laid out in SlateDB:
 keyspace structure, key layout, and value codec. The layout serves the two
-read patterns that matter: loading the **current** catalog (the hot path,
-every attach) and reconstructing the catalog **at a past snapshot** (time
-travel, rare). Inlined data (RFC 0005) gets a reserved subspace but is
+read patterns that matter: reading **current** entities by key or scoped
+range and reconstructing those entities **at a past snapshot**. Explicit
+full-catalog materialization remains available. Inlined data (RFC 0005) gets a reserved subspace but is
 otherwise out of scope.
 
 ## Goals
 
-- Loading the current catalog costs proportional to the live catalog, never
-  to its history.
+- Reading current entities touches only their requested key ranges, never
+  unrelated entities or their history.
 - Time travel may scan an entity range's history, never unrelated tables'
   state.
 - Every DuckLake v1.0 catalog table has a defined home in the keyspace.
@@ -99,8 +99,11 @@ bump that alters encoding) fails CI before it can reach a store.
   files and column mappings from `next_file_id` (RFC 0018), columns from a
   per-table counter (RFC 0012).
   Names live in values; name→id resolution runs against the in-memory
-  snapshot built by scanning `current` at attach (a persistent name index is
-  complexity without payoff at catalog scale).
+  materialized snapshot for the compatibility API. Demand-loaded name
+  resolution requires a separate persistent index maintained atomically with
+  entity changes, including rename/drop and historical visibility. Specify
+  its encoding and migration here before introduction; an incomplete index
+  must never answer absence.
 - `history` keys append the version's `end_snapshot` as the final component,
   making ended versions of one entity distinct and time-ordered.
 - SlateDB iterates **forward only**; the layout depends on no descending

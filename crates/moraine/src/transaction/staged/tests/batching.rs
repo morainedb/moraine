@@ -27,8 +27,13 @@ fn table_stats_row(table_id: u64, record_count: u64, next_row_id: u64, bytes: u6
 /// allocated from 1.
 async fn catalog_with_two_tables() -> Catalog {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().unwrap();
-    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    seed_two_tables(&catalog).await;
+    catalog
+}
+
+async fn seed_two_tables(catalog: &Catalog) {
+    let mut tx =
+        crate::ffi_support::staged::staged_begin(catalog, None, String::new(), None).unwrap();
     for (table_id, name) in [(1, "t"), (2, "u")] {
         tx.stage(RowOperation::Insert {
             table: TableKind::Table,
@@ -52,7 +57,6 @@ async fn catalog_with_two_tables() -> Catalog {
         cells: snapshot_changes_row(1, r#"created_table:"main"."t",created_table:"main"."u""#),
     });
     tx.commit().await.unwrap();
-    catalog
 }
 
 /// One file of ten rows appended to `table_id`, authored against head
@@ -645,4 +649,53 @@ async fn the_batch_yields_to_a_commit_it_could_not_take_after_it_lost() {
         "the batch yielded only {:?} to a loss found while staging",
         started.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coalesced_log_appends_rebase_against_pending_members() {
+    let objects = Arc::new(InMemory::new());
+    Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+    let catalog = Catalog::open(
+        objects,
+        CatalogOptions {
+            commit_log: Some(Arc::new(
+                crate::commit_log::test_log::TestProvider::default(),
+            )),
+            ..CatalogOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    seed_two_tables(&catalog).await;
+    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let mut first = crate::ffi_support::staged::staged_begin_scoped(
+        &catalog,
+        None,
+        String::new(),
+        scope.reads().clone(),
+    )
+    .unwrap();
+    let mut second = crate::ffi_support::staged::staged_begin_scoped(
+        &catalog,
+        None,
+        String::new(),
+        scope.reads().clone(),
+    )
+    .unwrap();
+    stage_append(&mut first, 1, 1, 1, 0);
+    stage_append(&mut second, 1, 1, 1, 0);
+    let (first, second) = tokio::join!(first.commit(), second.commit());
+    first.unwrap();
+    second.unwrap();
+    let view = catalog.snapshot().await.unwrap();
+    assert_eq!(view.snapshot.snapshot_id, 3);
+    assert_eq!(view.data_files[&1].len(), 2);
+    assert_eq!(view.table_stats[&1].next_row_id, 20);
+    assert_eq!(view.table_stats[&1].record_count, 20);
+    catalog.close().await.unwrap();
 }

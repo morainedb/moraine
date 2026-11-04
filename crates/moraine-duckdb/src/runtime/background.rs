@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use moraine::{DataStore, ReadOnlyCatalog, RowSummaryProgress, SnapshotId, TableId};
+use moraine::{
+    DataStore, ReadOnlyCatalog, RowSummaryProgress, SnapshotId, TableId,
+    ffi_support::{metadata_cursor::MetadataCursor, staged::TableKind},
+};
 use tokio::{
     runtime::Runtime,
     sync::{Notify, Semaphore},
@@ -41,8 +44,48 @@ impl Default for Policy {
 
 #[derive(Default)]
 struct Progress {
-    warming: Option<VecDeque<TableId>>,
+    warming: Option<Warming>,
     publishing: Option<RowSummaryProgress>,
+}
+
+struct Warming {
+    tables: VecDeque<TableId>,
+    cursor: Option<MetadataCursor>,
+    complete: bool,
+}
+
+impl Warming {
+    fn new(tables: Option<&BTreeSet<TableId>>) -> Self {
+        Self {
+            tables: tables.into_iter().flatten().copied().collect(),
+            cursor: None,
+            complete: tables.is_some(),
+        }
+    }
+
+    async fn next(&mut self, catalog: &ReadOnlyCatalog) -> moraine::Result<Option<TableId>> {
+        if self.tables.is_empty() && !self.complete {
+            // Cancellation discards the cursor; retrying may repeat warming,
+            // but cannot skip a partially consumed page.
+            let mut cursor = match self.cursor.take() {
+                Some(cursor) => cursor,
+                None => {
+                    MetadataCursor::open(catalog, TableKind::Table, None, Some(u64::MAX)).await?
+                }
+            };
+            let page = cursor.tables().await?;
+            self.complete = page.records.is_empty();
+            self.tables.extend(
+                page.records
+                    .into_iter()
+                    .map(|table| TableId::new(table.table_id)),
+            );
+            if !self.complete {
+                self.cursor = Some(cursor);
+            }
+        }
+        Ok(self.tables.front().copied())
+    }
 }
 
 #[derive(Clone)]
@@ -84,35 +127,27 @@ impl Pass {
 
     async fn run(self, catalog: &ReadOnlyCatalog, store: Option<&DataStore>, prefix: &str) -> bool {
         let mut progress = self.progress.lock().await;
-        if progress.warming.is_none() {
-            let tables = match &self.tables {
-                Some(tables) => tables.iter().copied().collect(),
-                None => match catalog.snapshot().await {
-                    Ok(snapshot) => snapshot
-                        .schemas()
-                        .into_iter()
-                        .flat_map(|schema| snapshot.tables_in(schema.id))
-                        .map(|table| table.id)
-                        .collect(),
-                    Err(error) => {
-                        warn!(%error, "table warming will retry");
-                        return false;
-                    }
-                },
-            };
-            progress.warming = Some(tables);
-        }
+        let warming = progress
+            .warming
+            .get_or_insert_with(|| Warming::new(self.tables.as_ref()));
         let mut warmed = true;
-        if let Some(tables) = &mut progress.warming {
-            while let Some(&table) = tables.front() {
-                if let Err(error) = catalog.warm_tables(&[table]).await {
-                    warn!(%error, "table warming will retry");
+        loop {
+            let table = match warming.next(catalog).await {
+                Ok(Some(table)) => table,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(%error, "table discovery will retry");
                     warmed = false;
                     break;
                 }
-                tables.pop_front();
-                tokio::task::yield_now().await;
+            };
+            if let Err(error) = catalog.warm_tables(&[table]).await {
+                warn!(%error, "table warming will retry");
+                warmed = false;
+                break;
             }
+            warming.tables.pop_front();
+            tokio::task::yield_now().await;
         }
         let Some(store) = store else {
             return warmed;

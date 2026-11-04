@@ -9,7 +9,10 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path;
 
-use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog};
+use super::{
+    BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog,
+    table_read::{TableRead, load_table},
+};
 use crate::{
     catalog::{
         ColumnId, DataFileInfo, DeleteFileInfo, FileIndexEntry, IndexEntry, IndexId, TableId,
@@ -263,10 +266,9 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let epoch = super::cache_epoch(&self.projections);
         let session = self.begin_read().await?;
 
-        let snapshot = self.head_view(session.handle(), epoch).await?;
+        let snapshot = load_table(session.handle(), table, TableRead::Sources).await?;
         let positions = snapshot.column_positions(table, columns)?;
 
         let table_prefix = snapshot.table_data_prefix(table)?;
@@ -323,10 +325,9 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let epoch = super::cache_epoch(&self.projections);
         let session = self.begin_read().await?;
 
-        let snapshot = self.head_view(session.handle(), epoch).await?;
+        let snapshot = load_table(session.handle(), table, TableRead::Definition).await?;
         let entries = inline_backfill_entries_at(
             BackfillSource {
                 snapshot: &snapshot,

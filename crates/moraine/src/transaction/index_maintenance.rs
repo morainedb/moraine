@@ -833,7 +833,7 @@ fn unique_violation(index_id: u64, claimant: u64, holder: u64, collided: Collide
 /// Drains a scan over `multi` entries into their row ids, which live in
 /// the key. `context` names the scan in a corruption error.
 async fn collect_multi_row_ids(
-    iter: &mut slatedb::DbIterator,
+    iter: &mut crate::store::handle::ScanIterator,
     context: &str,
     limit: usize,
 ) -> Result<Vec<u64>> {

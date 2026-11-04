@@ -5,7 +5,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use moraine::ffi_support::metadata_export::MetadataExport;
+use moraine::ffi_support::catalog_read::SnapshotProjection;
 
 use super::{free_array, free_c_string, guard, snapshot_list, to_c_string};
 use crate::{
@@ -116,7 +116,7 @@ pub unsafe extern "C" fn moraine_snapshot_schemas(
     unsafe {
         snapshot_list::<MoraineSchemaDesc, (u64, CString)>(
             snapshot,
-            MetadataExport::Schemas,
+            SnapshotProjection::Schemas,
             out_items,
             out_len,
             err,
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn moraine_snapshot_tables_in(
     unsafe {
         snapshot_list::<MoraineTableDesc, (u64, u64, CString)>(
             snapshot,
-            MetadataExport::TablesIn(schema_id),
+            SnapshotProjection::TablesIn(schema_id),
             out_items,
             out_len,
             err,
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn moraine_snapshot_columns_of(
     unsafe {
         snapshot_list::<MoraineColumnDesc, (u64, CString, CString, bool, Option<u64>)>(
             snapshot,
-            MetadataExport::ColumnsOf(table_id),
+            SnapshotProjection::ColumnsOf(table_id),
             out_items,
             out_len,
             err,
@@ -363,7 +363,7 @@ pub unsafe extern "C" fn moraine_snapshot_views_in(
     unsafe {
         snapshot_list::<MoraineViewDesc, (u64, u64, CString, CString, CString)>(
             snapshot,
-            MetadataExport::ViewsIn(schema_id),
+            SnapshotProjection::ViewsIn(schema_id),
             out_items,
             out_len,
             err,
@@ -442,8 +442,7 @@ pub unsafe extern "C" fn moraine_snapshot_stamp(
         }
         // SAFETY: caller contract for `snapshot`.
         let snapshot = unsafe { &*snapshot };
-        let stamp = moraine::ffi_support::snapshot_stamp(&snapshot.snapshot);
-        Ok((stamp.snapshot_id, stamp.batch_seq))
+        Ok(snapshot.stamp)
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
@@ -482,7 +481,7 @@ pub unsafe extern "C" fn moraine_snapshot_id(
         }
         // SAFETY: caller contract for `snapshot`.
         let snapshot = unsafe { &*snapshot };
-        Ok(snapshot.snapshot.current_snapshot().id.get())
+        Ok(snapshot.stamp.0)
     };
 
     // SAFETY: `err` validity is this function's own safety contract.

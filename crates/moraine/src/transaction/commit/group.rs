@@ -14,8 +14,8 @@ use tokio::{
 };
 
 use super::{
-    CommitDurability, HeadTransition, HeadViewUpdate, Landed, Prepared, StagedWrite, Submission,
-    await_submitted, fold, head_view_for, prepare_and_stage, submit_batch,
+    CommitDurability, HeadTransition, Landed, Prepared, StagedWrite, Submission, await_submitted,
+    fold, head_view_for, prepare_and_stage, submit_batch,
 };
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, Store, projection::ProjectionCache},
@@ -76,12 +76,14 @@ pub(crate) struct Batch {
     pub(crate) db_tx: Arc<CommitSession>,
     /// The head view the batch opened at.
     base: Arc<CatalogSnapshot>,
+    complete_base: bool,
     /// `base` folded forward through the members staged so far; `None`
     /// until a second member needs it.
     premise: Option<CatalogSnapshot>,
     /// How much of `writes` the premise already reflects.
     folded: usize,
     head_before: u64,
+    sequence_before: u64,
     /// The id the batch will leave at the head pointer: its last
     /// snapshot-minting member's.
     head: u64,
@@ -150,24 +152,73 @@ where
     }
 }
 
+/// A closure whose premises are restricted to one table operation.
+pub(crate) struct TableMember<F> {
+    pub(crate) table: crate::TableId,
+    pub(crate) selection: crate::transaction::table_read::TableRead,
+    pub(crate) mutate: F,
+}
+
+impl<F> StageOnto for TableMember<F>
+where
+    F: Fn(&mut Transaction) -> Result<()>,
+{
+    async fn stage_onto(
+        &self,
+        batch: &mut Batch,
+        _db: &Store,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging> {
+        let mut view = crate::transaction::table_read::load_table(
+            batch.db_tx.handle(),
+            self.table,
+            self.selection,
+        )
+        .await?;
+        batch.apply_pending(&mut view)?;
+        batch.count_member();
+        let prepared = prepare_and_stage(&batch.db_tx, projections, &self.mutate, &view).await?;
+        let (snapshot, ours) = match prepared {
+            Prepared::Nothing { head } => (head, Vec::new()),
+            Prepared::Staged {
+                ours,
+                commits,
+                writes,
+                staged_bytes,
+            } => {
+                let changes = vec![(*ours).clone()];
+                batch.admit_member(commits, *ours, writes, staged_bytes);
+                (commits, changes)
+            }
+        };
+        Ok(Staging::Staged {
+            ids: vec![SnapshotId::new(snapshot)],
+            ours,
+        })
+    }
+}
+
 impl Batch {
-    async fn open(db: &Store, projections: &std::sync::RwLock<ProjectionCache>) -> Result<Self> {
+    async fn open(db: &Store, _projections: &std::sync::RwLock<ProjectionCache>) -> Result<Self> {
         let db_tx = db.begin_commit_session()?;
-        let base = match head_view_for(db_tx.handle(), projections).await {
-            Ok(base) => base,
+        let base = match crate::transaction::staged::dependencies::header(db_tx.handle()).await {
+            Ok(base) => Arc::new(base),
             Err(err) => {
                 db_tx.rollback();
                 return Err(err);
             }
         };
         let head_before = base.snapshot.snapshot_id;
+        let sequence_before = base.batch_seq;
 
         Ok(Self {
             db_tx: Arc::new(db_tx),
             base,
+            complete_base: false,
             premise: None,
             folded: 0,
             head_before,
+            sequence_before,
             head: head_before,
             members: 0,
             writes: Vec::new(),
@@ -185,6 +236,8 @@ impl Batch {
         }
         let mut premise = self.premise.take().unwrap_or_else(|| (*self.base).clone());
         fold::fold_batch(&mut premise, &self.writes[self.folded..])?;
+        // Members mint separate snapshots but share one durable batch/slot.
+        premise.batch_seq = self.sequence_before;
         self.folded = self.writes.len();
         self.premise = Some(premise);
         Ok(())
@@ -194,6 +247,13 @@ impl Batch {
     /// through every member so far. Call [`Self::refold`] first.
     pub(crate) fn premise(&self) -> &CatalogSnapshot {
         self.premise.as_ref().unwrap_or(&self.base)
+    }
+
+    /// Applies this batch's pending writes to an operation-owned projection.
+    pub(crate) fn apply_pending(&self, view: &mut CatalogSnapshot) -> Result<()> {
+        fold::fold_batch(view, &self.writes)?;
+        view.batch_seq = self.sequence_before;
+        Ok(())
     }
 
     /// What every member so far changed, in staging order.
@@ -230,6 +290,13 @@ impl Batch {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
+        if !self.complete_base {
+            self.base = head_view_for(self.db_tx.handle(), projections).await?;
+            Arc::make_mut(&mut self.base).batch_seq = self.sequence_before;
+            self.complete_base = true;
+            self.premise = None;
+            self.folded = self.writes.len();
+        }
         let mut ids = Vec::with_capacity(members.len());
         let mut ours = Vec::new();
 
@@ -457,7 +524,6 @@ impl Coalescer {
     async fn land(self: Arc<Self>, batch: Batch, flight: Flight) {
         let Batch {
             db_tx,
-            base,
             head_before,
             head,
             writes,
@@ -478,7 +544,6 @@ impl Coalescer {
                 },
                 &writes,
                 staged_bytes,
-                HeadViewUpdate::Rebuild(base),
                 super::Landing {
                     projections: &self.projections,
                     log: self.commit_log.as_ref(),

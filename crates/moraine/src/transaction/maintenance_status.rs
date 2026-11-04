@@ -42,9 +42,10 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
         }
 
         let session = store.begin_commit_session()?;
-        let base = commit::head_view_for(session.handle(), catalog.projections()).await?;
+        let base = commit::read_head_value(session.handle()).await?;
+        commit::refuse_mid_migration_at(session.handle(), catalog.projections(), &base).await?;
         let status = read::read_maintenance_status(session.handle()).await?;
-        pass.head_snapshot_id = base.snapshot.snapshot_id;
+        pass.head_snapshot_id = base.snapshot_id;
         pass.head_batch_seq = base.batch_seq;
         let mut status = status.unwrap_or_default();
         status.passes.push(encode_pass(pass.clone()));
@@ -53,7 +54,7 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
             status.passes.drain(..remove);
         }
 
-        let head = base.snapshot.snapshot_id;
+        let head = base.snapshot_id;
         let mut writes: Vec<StagedWrite> = vec![(
             Key::Sys(SysKey::MaintenanceStatus).encode(),
             Some(value::encode_value(&status)),
@@ -69,7 +70,6 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
             },
             &writes,
             staged,
-            commit::HeadViewUpdate::Rebuild(base),
             commit::Landing {
                 projections: catalog.projections(),
                 log: store.commit_log(),
@@ -119,4 +119,40 @@ fn decode_pass(pass: MaintenanceStatusPassValue) -> MaintenanceStatusPass {
     decoded.head_batch_seq = pass.head_batch_seq;
     decoded.work_pending = pass.work_pending;
     decoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn maintenance_writes_do_not_decode_catalog_entities() {
+        let catalog = Catalog::open(
+            Arc::new(object_store::memory::InMemory::new()),
+            crate::CatalogOptions::default(),
+        )
+        .await
+        .unwrap();
+        let transaction = catalog.begin_write_tx().unwrap();
+        transaction
+            .put(
+                Key::current(crate::store::key::EntityKey::File {
+                    table_id: 99,
+                    data_file_id: 1,
+                })
+                .encode(),
+                [0xff],
+            )
+            .unwrap();
+        catalog.commit_write_tx(transaction).await.unwrap();
+        record(
+            &catalog,
+            MaintenanceStatusPass::new(Timestamp::from_micros(1), "test", Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&catalog).await.unwrap().len(), 1);
+        catalog.commit_own_rows_durably(Vec::new()).await.unwrap();
+        catalog.close().await.unwrap();
+    }
 }

@@ -106,14 +106,8 @@ protected:
 		return moraine_tx.StagedTxFor(spec_);
 	}
 
-	// Resolves a rowid the metadata scan emitted back to the row it stands
-	// for, through the run that scan registered with this transaction.
-	//
-	// The registry holds the very rows the scan handed out, so no second
-	// materialization is taken and none has to agree with the first: a
-	// commit landing under this statement, or a narrowed scan reading a
-	// different list from the one a re-dump would build, cannot move what a
-	// rowid names.
+	// Resolves a row id against the scan's original read point. The returned
+	// row is consumed before another lookup can replace its retained page.
 	const std::vector<duckdb::Value> &ResolveRow(const duckdb::Value &row_id, duckdb::ClientContext &client) const {
 		if (row_id.IsNull()) {
 			throw duckdb::InternalException("moraine: staged write received a NULL rowid");

@@ -215,30 +215,6 @@ impl ReadOnlyCatalog {
         if requested.is_empty() {
             return Ok(HashSet::new());
         }
-        // The warm pass walks locators only, which needs the directory
-        // verified complete; the verification itself needs a session.
-        if projection::inline_directory_complete(&self.projections, table.get())
-            && let Some((view, handle)) = self.warm_writer_read()?
-        {
-            let head = HeadValue {
-                snapshot_id: view.snapshot.snapshot_id,
-                batch_seq: view.batch_seq,
-            };
-            let outcome = self
-                .lookup_inline(
-                    handle,
-                    Some(head),
-                    table,
-                    requested,
-                    visible_at,
-                    live_row_ids,
-                )
-                .await;
-            if self.still_holds(&view) {
-                return outcome;
-            }
-        }
-
         let session = self.begin_read().await?;
         let outcome = self
             .lookup_inline(

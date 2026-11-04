@@ -366,7 +366,8 @@ async fn measure_attach_latency_against_endpoint() {
             println!("# compact_store completed {completed} subspace merges");
         }
 
-        let (fixed_options, checkpoint) = fixed_checkpoint_options(store.clone(), &options).await;
+        let (fixed_options, checkpoint) =
+            Box::pin(fixed_checkpoint_options(store.clone(), &options)).await;
         let census_reader = Catalog::open_read_only(store.clone(), fixed_options.clone())
             .await
             .unwrap();

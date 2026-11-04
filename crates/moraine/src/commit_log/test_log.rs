@@ -548,6 +548,7 @@ impl TestStore {
         })
         .await
         .map_err(Error::from)?;
+        self.hooks.publish(db).await?;
         self.folded_since_flush.store(0, Ordering::Release);
         let directory = slatedb::config::GarbageCollectorDirectoryOptions {
             interval: None,
@@ -608,6 +609,23 @@ impl TestStore {
             }
             tokio::time::sleep(self.hooks.settings.refresh_backoff).await;
         }
+    }
+
+    async fn publish_through(&self, sequence: u64) -> Result<()> {
+        let (db, session) = self.hooks.take.take_for_publication().await?;
+        let session = own_session(session.as_any());
+        let publication = if session.cursor.folded.load(Ordering::Acquire) >= sequence {
+            self.hooks.publish(&db).await
+        } else {
+            Err(Error::CommitOutcomeUnknown(format!(
+                "checkpoint publisher has not replayed committed slot {sequence}",
+            )))
+        };
+        let closed = db
+            .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+            .await;
+        publication?;
+        closed.map_err(Into::into)
     }
 
     /// A follower's turn: take the store through the catalog, fold what it
@@ -725,7 +743,14 @@ impl CommitStore for TestStore {
                 })
             }
             (None, Side::Holder(db)) => {
-                self.fold_from_cursor(db, &self.cursor).await?;
+                let publication = async {
+                    self.fold_from_cursor(db, &self.cursor).await?;
+                    self.hooks.publish(db).await
+                }
+                .await;
+                publication.map_err(|error| Error::CommitOutcomeUnknown(format!(
+                    "slot {sequence} is durable but its checkpoint was not acknowledged: {error}",
+                )))?;
                 Ok(SlotOffer::Won { sequence })
             }
             (None, Side::Follower(reader)) => {
@@ -734,6 +759,11 @@ impl CommitStore for TestStore {
                 if every != 0 && sequence.is_multiple_of(every) {
                     self.fold_on_cadence(sequence).await;
                 }
+                self.publish_through(sequence).await.map_err(|error| {
+                    Error::CommitOutcomeUnknown(format!(
+                        "slot {sequence} is durable but its checkpoint was not acknowledged: {error}",
+                    ))
+                })?;
                 Ok(SlotOffer::Won { sequence })
             }
         }

@@ -17,7 +17,7 @@ use std::{
 pub use dumps::*;
 pub use inline::*;
 use moraine::ffi_support::staged::{
-    Cell, RowOperation, StagedTransaction, TableKind, staged_begin,
+    Cell, RowOperation, StagedTransaction, TableKind, staged_begin, staged_begin_scoped,
 };
 use tracing::warn;
 
@@ -141,8 +141,7 @@ unsafe fn decode_cells(cells: *const MoraineCell, len: usize) -> Result<Vec<Cell
 ///
 /// Refuses a caller that has already cancelled with
 /// [`codes::INTERRUPTED`], leaving `*out` unwritten and nothing staged.
-/// Opening the transaction reaches no object store, so `probe` is read
-/// once rather than raced.
+/// A lazy read scope's compatibility view is resolved with cancellation.
 ///
 /// # Safety
 ///
@@ -173,22 +172,28 @@ pub unsafe extern "C" fn moraine_tx_begin(
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
         // SAFETY: caller contract for `snapshot`: null, or a live handle.
-        let read_view =
-            unsafe { snapshot.as_ref() }.map(|snapshot| std::sync::Arc::clone(&snapshot.snapshot));
-        // Opening the transaction reaches no object store, so there is
-        // nothing to race the probe against — only a caller who has
-        // already cancelled to refuse.
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         if unsafe { crate::runtime::already_cancelled(probe, probe_ctx) } {
             return Err(AbiError::interrupted());
         }
-        let tx = staged_begin(
-            handle_ref.catalog.writer()?,
-            handle_ref.data_store.clone(),
-            handle_ref.data_prefix.clone(),
-            read_view,
-        )?;
+        // SAFETY: caller contract for the optional snapshot.
+        let snapshot = unsafe { snapshot.as_ref() };
+        let tx = if let Some(scope) = snapshot.and_then(|snapshot| snapshot.read_alias.as_ref()) {
+            staged_begin_scoped(
+                handle_ref.catalog.writer()?,
+                handle_ref.data_store.clone(),
+                handle_ref.data_prefix.clone(),
+                scope.catalog.reads().clone(),
+            )?
+        } else {
+            staged_begin(
+                handle_ref.catalog.writer()?,
+                handle_ref.data_store.clone(),
+                handle_ref.data_prefix.clone(),
+                snapshot.and_then(|snapshot| snapshot.snapshot.clone()),
+            )?
+        };
         Ok(Box::new(MoraineTxHandle {
             catalog: handle,
             tx: Mutex::new(tx),

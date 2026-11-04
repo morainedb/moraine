@@ -38,6 +38,20 @@ pub fn staged_begin(
     ))
 }
 
+/// Begins a staged transaction retaining the caller's fixed authored read
+/// point. Dependencies are decoded only when the completed batch is translated.
+///
+/// # Errors
+/// Returns an error if the underlying store transaction cannot be opened.
+pub fn staged_begin_scoped(
+    catalog: &Catalog,
+    data_store: Option<DataStore>,
+    data_prefix: String,
+    scope: crate::ReadOnlyCatalog,
+) -> Result<StagedTransaction> {
+    Ok(staged_begin(catalog, data_store, data_prefix, None)?.with_read_scope(scope))
+}
+
 // Each child projection below is its parents' rows plus the rows the
 // transaction staged for parents it is inserting. A staged child naming a
 // parent the transaction is not inserting is dropped here; commit refuses

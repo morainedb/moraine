@@ -4,97 +4,150 @@
 
 ## Summary
 
-RFC 0003 defines `CatalogSnapshot` as "an immutable, materialized read view
-built by scanning `current` (or `current` + `history`)" that "touches the store never"
-after construction. It does not say how that view is built *consistently*
-while a committer writes concurrently, how a long-lived reader learns of new
-commits, or what happens to a held view when RFC 0007 reclaims the files it
-references. This RFC fills those gaps: a `CatalogSnapshot` is built at a
-**single read point** so its scans are mutually consistent — pinned on a
-read-write handle, validated against a per-batch head stamp on a read-only
-one; it is **refreshed incrementally** from a changelog of the keys each
-commit wrote rather than rematerialized; it observes **snapshot isolation**
-(a fixed catalog snapshot `S`, never a torn mix); and it carries a
-**validity window** tied to RFC 0007's retention horizon, past which a
-reader must re-resolve from head. This is the read-side companion to RFC
-0004's write-side commit protocol.
+Ordinary metadata reads are demand-loaded at a stable read point. SlateDB's
+process-shared Foyer block cache, including its optional disk tier, provides
+reuse. Moraine does not retain decoded catalog snapshots, record sets, or
+metadata result arrays between operations. Native DuckDB catalog entries and
+bounded row-lookup results have their own ownership and limits.
 
-It also names the cache stack end to end, assigns every byte to one tier,
-and collapses the catalog's physical tier to one process-shared block
-cache — SST metadata pinned in memory, data blocks tiered to disk — under
-one budget. Data bytes get no moraine cache: they are the engine's to
-hold, and the fact that DuckLake does not yet hold them is upstream's to
-close rather than moraine's to work around.
+Writers use SlateDB snapshots; independent reader transactions share fixed
+checkpoint readers at writer-published durable boundaries. Explicit
+`CatalogSnapshot` calls remain a materializing compatibility API, with all
+returned memory owned by the caller.
 
 ## Goals
 
-- **Consistent materialization.** The `current` / `history` / `snapshot` scans that build
-  one `CatalogSnapshot` observe a single, consistent store state — never a mix
-  of pre- and post-commit records torn by a concurrent commit.
-- **Snapshot isolation for reads.** Every accessor on a `CatalogSnapshot`
-  reflects exactly the catalog at one snapshot id `S`. Reads never block
-  writes and a concurrent commit never mutates a held view (RFC 0004
-  append-only + immutable `snapshot`).
-- **Cheap refresh.** Advancing a long-lived reader from `S` to head costs work
-  proportional to *churn* (the entities changed between `S` and head), not to
-  live catalog size — replaying the `current` keys each commit in the gap
-  recorded in its `snapshot` record (RFC 0002).
-- **Committer read-your-writes.** The single committer (RFC 0004) advances its
-  own view by folding in the batch it just committed, without a re-read.
-- **A defined validity window.** A held `CatalogSnapshot` is valid only within
-  RFC 0007's retention window; a reader that outlives it gets a typed error and
-  re-resolves, never a silent dereference of reclaimed files.
-- **No new coordination.** All of this holds under RFC 0004's single-writer /
-  many-uncoordinated-readers topology. Readers learn of commits by reading
-  `sys/head`, never by being notified. Nothing pushes a commit to a reader,
-  so a read-only catalog's freshness is bounded by how often it polls —
-  an explicit, configurable property of the handle rather than an accident
-  of the store layer's default.
-- **One cache per byte, one budget per host.** Catalog bytes live in one
-  shared block cache with explicit memory and disk budgets; data bytes in
-  DuckDB's external-file cache under `memory_limit`. No tier duplicates
-  another, and no cache is invisible to sizing.
-- **One store scan per head.** At a given head stamp, `current` (and
-  `history` when needed) is scanned and decoded at most once; every
-  logical cache derives from the shared record set.
+- Every transaction reads one consistent store revision across calls.
+- Ordinary reads and staged writes decode only their required records.
+- Enumeration and maintenance keep bounded working batches, including for one
+  table larger than memory.
+- A successful commit is covered by a published durable checkpoint.
+- Catalog cache reuse stays in Foyer; decoding is operation work.
+- Store checkpoint protection and external data-file retention remain separate.
 
-Non-goals:
-
-- **The read *API*** — `CatalogSnapshot`, its accessors, `snapshot()` /
-  `snapshot_at()` — RFC 0003. This RFC is the machinery behind them.
-- **The physical `current` / `history` layout and the current-vs-time-travel split**
-  — RFC 0002. This RFC consumes that layout; it does not change it.
-- **Reclamation policy** — RFC 0007. This RFC defines only how a reader
-  *reacts* to a view falling outside the retention window.
-- **The sync↔async / runtime model** under the DuckDB extension — RFC 0010.
-- **The attach-option surface** that configures the cache tiers — RFC
-  0006. This RFC defines the machinery those options drive.
-
-## Background
-
-RFC 0002 makes the current-catalog load a scan of `current` and time travel a scan
-of `current` + the relevant `history` ranges; it merges `ducklake_snapshot` and
-`ducklake_snapshot_changes` into one immutable `snapshot` record per snapshot, and
-notes that `snapshot` is append-only and `sys/head` holds the latest committed
-`snapshot_id`. It also chose *not* to maintain a persistent name index —
-name→id resolution runs "against the in-memory catalog snapshot that a client
-builds by scanning `current` at attach."
-
-RFC 0004 fixes the topology: readers attach through read-only handles
-(SlateDB `DbReader`) that follow the manifest with no coordination and no
-bound on their number, and a commit is one atomic batch that advances
-`sys/head` under transactional write-write conflict detection.
-
-RFC 0003 makes `CatalogSnapshot` an immutable value — "Reads issue no store
-I/O after the snapshot is built; a `CatalogSnapshot` is a value, not a cursor"
-— and has `commit` read a *fresh* `CatalogSnapshot` on every attempt.
-
-RFC 0007 introduces the retention horizon `H` (snapshots `< H` are reclaimed)
-and the grace window `G` (bytes survive `G` past scheduling), and states the
-operator contract that the retention window must exceed the maximum reader
-duration. This RFC honors that contract on the reader side.
+The physical key layout is in RFC 0002, the API in RFC 0003, the commit
+protocol in RFC 0004, and data-file reclamation in RFC 0007.
 
 ## Design
+
+### Demand-loaded scopes and admission
+
+Writer read scopes retain `DbSnapshot` without loading catalog entities.
+Independent readers retain fixed checkpoint readers across calls, using
+SlateDB's existing APIs without a dependency patch. Legacy unscoped
+materializations still verify their read boundary; scopes never silently
+downgrade isolation.
+
+#### Reader scopes using existing checkpoint APIs
+
+The patch-free approach is to rotate checkpoint readers. The writer publishes
+a checkpoint with `Db::create_checkpoint(CheckpointScope::Durable, ...)`.
+A reader process opens `DbReaderMode::Checkpoint(id)` and shares that reader
+among transactions starting at that revision. Each transaction retains its
+reader until completion. Publishing a newer reader changes what new
+transactions see without changing any existing transaction's view. Reuse the
+same process-wide Foyer cache and store identity; retain no decoded catalog
+object cache. `store/checkpoint.rs` publishes and leases these boundaries;
+`catalog/handle/reader_scopes.rs` shares the fixed readers. At most eight
+local generations may remain live; acquisition refuses another generation
+until an older transaction or cursor finishes. Reader leases last five
+minutes and renew every minute, with a thirty-second renewal timeout.
+Every point read and scan yield checks expiry.
+
+Checkpoint publication and ownership have separate lifetimes. A reader can
+create its own checkpoint with `CheckpointOptions::source` set to the
+published checkpoint, then renew that checkpoint while local scopes use it.
+The source must still exist when acquired; retry discovery if acquisition
+loses a race with retirement. Close the reader and release its checkpoint
+only after its last scope and cursor finish. Finite leases handle crashes;
+renewal failures must invalidate scopes before their protection expires.
+SlateDB checkpoints protect store files, not DuckLake's external Parquet
+files; the existing catalog retention contract still applies to those.
+
+Do not substitute `Admin::create_detached_checkpoint` against the latest
+manifest for writer publication. It does not advance the manifest's WAL
+boundary. A following reader can already see durable commits that such a
+checkpoint omits. On the pinned SlateDB revision, an in-memory object-store
+experiment with automatic writer manifest polling disabled confirmed:
+
+- A following reader saw a WAL-durable overwrite while a newly created
+  detached checkpoint still returned the previous value.
+- A writer-created durable checkpoint included the overwrite.
+- Opening the next checkpoint reader advanced new reads while the old reader
+  continued returning its original value, with the writer still operational.
+- A checkpoint copied from the old checkpoint remained readable after the
+  publisher deleted its own checkpoint.
+
+Publish after WAL durability and before acknowledging each commit group.
+One publication may cover multiple groups whose writes are already durable;
+each acknowledgement waits for a checkpoint covering its group. A WAL-durable
+write whose publication fails is potentially committed, never a conflict
+that authorizes replaying the mutation. Retry publication or return an
+unacknowledged outcome for reconciliation, as specified in RFC 0004.
+
+Reader discovery can lag publication. A new scope with a required commit
+position must acquire a checkpoint whose stored head covers that position.
+Existing scopes never switch readers to satisfy a newer position. Commit-log
+acknowledgements publish a checkpoint covering the won slot. A committer
+holding the writer publishes after replaying its tail; another committer
+opens a temporary publisher, verifies the recovered head covers its slot,
+and closes without forcing an L0 flush. Publication errors report an unknown
+acknowledgement outcome rather than permitting mutation replay. This can add
+writer-open and fencing costs under competing committers; measure those
+costs before choosing a retained publisher or another publication cadence.
+
+Periodic publication is not the initial policy: it would add visibility delay
+and could leave acknowledged WAL commits unpublished after a writer crash.
+Changing that policy requires an explicit freshness contract and measurements.
+
+A clean writer shutdown flushes memtables and republishes the resulting
+manifest even if its sequence was already acknowledged. Otherwise an idle
+reader can keep replaying a WAL-heavy publication after those same rows have
+reached SSTs. This does not change the commit acknowledgement boundary.
+
+Sharing a reader per checkpoint amortizes open and WAL replay costs across
+transactions. Old generations still retain separate manifests and replayed
+WAL memtables even when their Foyer blocks are shared. Admit those allocations
+and bound live generations; do not assume that a per-memtable size setting
+bounds total replay memory. Measure publication latency, reader-open latency,
+manifest writes, retained SST bytes, and overlapping-generation memory before
+changing publication policy. The experiment above validates visibility,
+not remote-store performance, lease-expiry behavior, or GC under load.
+
+Other patch-free approaches have different contracts:
+
+- Validate every operation against the transaction's original `sys/head`
+  stamp and abort the entire transaction if it changes. This can fail safely
+  without retaining a catalog, but any visible catalog change can abort a
+  long read. Per-call retries at newer stamps do not provide repeatable reads;
+  emitted batches cannot be transparently retried independently.
+- Reconstruct a fixed DuckLake snapshot through catalog history. Existing
+  history is insufficient: options, statistics, and mappings do not all
+  retain previous values, and maintenance can change state without advancing
+  the DuckLake snapshot id. Extending versioning and retention is a larger
+  key-layout and commit-protocol change.
+- Increase the reader poll interval or add a Moraine mutex. Neither freezes
+  SlateDB's internal refresh task and neither establishes a snapshot.
+
+The source references for these APIs are SlateDB's
+[checkpoint reader modes](https://github.com/slatedb/slatedb/blob/v0.18.0/slatedb/src/db_reader.rs),
+[writer checkpoint API](https://github.com/slatedb/slatedb/blob/v0.18.0/slatedb/src/checkpoint.rs),
+[detached checkpoint and lease APIs](https://github.com/slatedb/slatedb/blob/v0.18.0/slatedb/src/admin.rs),
+and [checkpoint lifecycle documentation](https://slatedb.io/docs/design/checkpoints/).
+
+#### Cache admission
+
+Point lookups and table metadata scans admit fetched blocks to Foyer.
+Table scans use bounded read-ahead even for millions of files. Catalog
+listings, exhaustive cascades, expiry, GC, and backfills stream without
+admitting scan data blocks. SST indexes and filters retain their cache
+policy. Admission changes neither visibility nor result completeness.
+
+Entity cursors emit current records followed by ended records, each in
+encoded-key order. Time travel applies begin/end visibility at the selected
+snapshot. Test with real SlateDB that a scoped read never decodes unrelated
+records, including across commits, eviction, cancellation, and migration.
+Measure memory, decode CPU, warm/cold latency, and remote reads.
 
 ### Consistency of lookup and inline operations
 
@@ -110,318 +163,31 @@ operation returns `RetryBudgetExhausted`; it must not fall back to an
 unguarded scan. Writer-backed isolated transactions run the operation once.
 This boundary covers a single call, not several independent API calls.
 
-### Materialization rests on one read point
+### Explicit materialization
 
-The correctness foundation: building a `CatalogSnapshot` issues *many* store
-reads (a `current` range scan, `history` ranges for time travel, the `snapshot` record,
-`sys/head`). These must observe one consistent store state, or a commit
-landing mid-build could yield a view that has a table's new `column` record
-but not its new `file` record — a torn read.
+`snapshot()` and `snapshot_at()` materialize a caller-owned `CatalogSnapshot`.
+Writer reads use an isolated store read point. An unscoped following reader
+validates the complete head stamp before and after the materialization and
+retries a changed pass. A pinned reader uses its checkpoint throughout.
 
-So materialization **issues every get and scan against one read point**.
-On a read-write handle that read point is a SlateDB primitive, not a
-hoped-for one: the pinned SlateDB version (0.14.x) exposes both
-`Db::snapshot()` — a `DbSnapshot` fixed at a sequence number, with the same
-`get`/`scan`/`scan_prefix` surface as the live handle — and a
-`DbTransaction`, which reads the MVCC view at its own start sequence and is
-what a commit attempt uses (see below). The moraine snapshot id `S` is the
-`sys/head` value read *under the same handle*. The result: the entire
-`CatalogSnapshot` is a consistent cut at `S`, immune to concurrent commits,
-with no lock or reader/writer coordination — the consistency is inherited
-from SlateDB's read isolation, not re-implemented. The handle is released
-once the in-memory view is built; per RFC 0003 the finished
-`CatalogSnapshot` touches the store never again.
+The catalog handle retains neither the resulting snapshot nor the decoded
+records used to construct it. Repeated calls decode again through Foyer.
+Concurrent explicit materializations therefore require independent working
+memory. Callers that need several reads at one revision should hold a read
+scope and use point reads or cursors.
 
-A read-only handle has no such primitive; the next section is what it does
-instead.
-
-Holding a read-snapshot is cheap: a `DbSnapshot` is a `(uuid, started_seq)`
-pair registered with an in-process snapshot manager, so open and drop are
-O(1) with no store I/O and no manifest write. The one holding cost is
-version retention — the manager's `min_active_seq` feeds SlateDB's flush
-and compaction paths, so a live snapshot keeps pre-snapshot versions from
-being reclaimed in-process for as long as it is held. moraine holds one
-only for the duration of a single materialization and releases it before
-the `CatalogSnapshot` is returned, so the retention window is one
-materialization long.
-
-Materialization also reads the **`sys/migration` marker** (RFC 0002 /
-RFC 0015) under the same handle. If the marker is present, a structural
-migration is rewriting the keyspace and any scan of it may be missing
-records mid-move; materialization fails loudly with the typed `Migration`
-error (RFC 0003) rather than returning a silently partial catalog. This
-check is part of every materialization and refresh from format version 1
-onward — it must predate the first migration ever run, or old readers
-would have no way to know to refuse (RFC 0015).
-
-`snapshot_at(S')` (time travel) pins the same way, reads `sys/head` only to
-validate `S'` is resolvable (≥ RFC 0007's horizon `H`), and materializes from
-`current` + `history` filtered by begin/end per RFC 0002.
-
-### A read-only handle validates its cut rather than pinning one
-
-The paragraph above holds for a read-write handle, which materializes
-through a `DbTransaction` (or could open a `DbSnapshot`) and so reads at one
-sequence by construction. A **read-only** handle has neither. SlateDB
-0.14's `DbReader` offers exactly two modes and neither is a live consistent
-cut: pinned to an explicit `checkpoint_id` it never spawns a manifest
-poller, so its state is fixed and no later commit is ever visible; with no
-checkpoint it polls, and every `get`/`scan` takes a fresh clone of whatever
-state the poller last installed. Two reads of one materialization can
-therefore straddle a refresh.
-
-Validating optimistically on `DbReader::manifest()` does not work, and this
-is worth stating because it is the obvious thing to try: the reader's
-WAL-replay path rebuilds its state carrying `manifest: current.manifest
-.clone()`, so the manifest id is *unchanged* by exactly the refresh that
-makes a new commit visible. A manifest-id check would validate every read
-it needed to reject. `DbStatus::durable_seq` does move on both refresh
-paths, but it is advanced *before* the state is installed, so a reader can
-observe the new sequence and then read the old state.
-
-So moraine does not look for the answer in SlateDB's metadata; it puts a
-stamp in its own keyspace. **`sys/head` carries a batch count alongside the
-snapshot id, and every batch writes the record and increments the count** —
-a maintenance batch that reuses the snapshot id included (RFC 0004). The
-pair therefore changes whenever any committed state does. A read-only
-materialization reads the head record, runs its scans, reads it again, and
-accepts the result only if the stamp did not move; a pass that straddled a
-refresh is discarded and re-run. The reader's state advances only when its
-manifest poller runs, not on every commit, so a pass that loses one round
-very rarely loses the next, and a bounded budget of them ends in a typed
-error rather than a torn view.
-
-### A read-write handle resolves the head without reading it
-
-The stamp above is what a *read-only* handle needs, because it follows
-another process's commits and cannot know when one landed. A **read-write**
-handle is in the opposite position: it holds the writer epoch, so it is the
-store's only writer and nothing can move `sys/head` under it. Reading the
-record back to learn where head is asks the store a question the handle
-already knows the answer to — and that point read is on every catalog
-read, every metadata dump, and so under every DuckLake statement.
-
-So a read-write handle resolves the head from **the view it already
-holds**: a `CatalogSnapshot` carries the snapshot id and batch count it was
-built at, which on a sole writer *is* the head. The premise is that a held
-view is never behind the store, and that rests on four rules, all in the
-commit path:
-
-- A head-advancing batch folds the view forward as it lands, or drops it if
-  the fold cannot be applied faithfully.
-- A head-preserving batch drops the view *before* its write becomes
-  visible, since it reuses the snapshot id and only the batch count would
-  give it away.
-- A durable write that fails for any reason other than a lost race drops
-  the view: a lost race provably did not land, and everything else leaves
-  that open.
-- A durable write whose task never reports back drops it too, for the same
-  reason.
-
-The held view is only ever a **lookup key**, never an answer inferred in
-place of one. A dump whose projection does not stand at that stamp falls
-through to the ordinary session path and reads the head there, so rows are
-never installed under a stamp the store did not supply.
-
-An index lookup, and the inline membership check under a row location, go
-one step further on a warm read-write handle: they open **no session**. The
-definition each needs is in the held view, and what each then reads is a
-set of live-only keys, so the probes run as plain reads against the
-writer's `Db` rather than through a `DbTransaction`. Opening a transaction
-takes SlateDB's transaction manager lock — a global write lock, measured
-in `BENCHMARK.md` as the ceiling on concurrent lookups — and on this
-handle it bought nothing: the store's only writer is the handle itself, so
-the only commit that can land during a probe is its own, and a lookup is
-head-only by contract. The pass re-reads the held view after its probes;
-if a commit replaced it in between, the pass is discarded and re-run
-under a session, so a result served warm is one a session at that view
-would have returned. The inline check takes this path only for a table
-whose chunk directory has already been verified complete — the
-verification needs an isolated session, and the locator-only walk the
-warm pass uses rests on it. A read-only handle keeps the session path for
-both: it follows another process's commits, and only a session gives it a
-cut.
-
-What a warm read does not skip is the fence check, because a handle that
-served its cache past its own displacement would answer from a catalog the
-store has moved on from, and quietly. It does not open a session to perform
-it: SlateDB reports a close by setting it on a status channel the handle
-subscribes to at open, so the check is a watch borrow — no store read, no
-manifest copy, and no entry in the transaction manager, which is what
-opening a session takes a global write lock to make. The reach is identical,
-since closing the `Db` is what the fence does. The difference is that a
-watch borrow shares between readers and the lock does not: measured, warm
-throughput plateaus where it used to fall away (`BENCHMARK.md`).
-
-What a warm read *does* skip, on a writer only, is the `sys/migration`
-refusal a session otherwise carries. The marker exists to stop a scan of a keyspace
-being rewritten, and a read served from the held view performs no scan —
-but the deeper reason is that on a read-write handle the probe was never
-the guard. A migrator takes the writer epoch before it writes anything, so
-a handle it displaces is fenced before a marker exists, and a fenced handle
-reads its own state, which that marker never reached: it reports `Fenced`,
-never `Migration`. The probe fires on a writer only for a marker written
-through that handle's *own* transaction, which no migrator does. The fence
-check is the guard, and that is the one the session still performs.
-
-A **read-only** handle is the one a migration can start under — a migrator
-fences a writer but leaves a reader following the store — so every session
-it opens re-establishes the marker's absence, and its cold-open refuses a
-store already carrying a marker. A writer establishes it while cold too,
-which is what catches a migration a crashed predecessor left behind.
-
-What re-establishing costs, though, is no longer a marker read per
-session. The marker is an absent key on every store that is not
-mid-migration, and an absent key is the store's most expensive read — a
-bloom filter answers "might be present", never "absent", so the read walks
-every level before it can say no. Warm-cache microbenchmarks made that
-walk look free (6.4 µs, no object-store GET — `BENCHMARK.md`); production
-flush telemetry showed it as a fixed cache-missing term under every commit
-and every read session. So a handle keys the marker's absence on the
-**head it observed it at**: a session whose head matches the recorded
-stamp opens without re-reading the marker, and one whose head moved
-re-reads and re-stamps. Soundness comes from the start batch, not the
-cache — a migration start moves the head in the same batch as the marker,
-and `migration::start` is the marker's only writer (RFC 0015), so a marker
-cannot appear under an unmoved head. A committer maintains the stamp from
-the other side without any read at all: winning the head CAS proves no
-batch — a migration start included — landed since its base, so a landed
-commit records its own resulting head as marker-free.
-
-Carrying the migration state as a field on the head record would buy the
-same skip, and that design stays **rejected**, because the encoding is the
-easy half and the version gate is not. A reader may trust such a field
-only if every migration maintains it, so a durable field means nothing
-until a format bump forces every writer onto it — a one-way door, taken by
-default, closing the store to yesterday's binary. The head-keyed stamp
-needs no gate: it is an in-memory judgment each handle re-derives from
-reads it was making anyway, and the start-batch invariant it rests on has
-no legacy violations to grandfather (no released binary has ever written
-the marker — RFC 0015).
-
-Making the head write unconditional has a second effect the design wants:
-`sys/head` becomes the one key every batch touches, so SlateDB's
-write-write detection makes it the single conflict anchor. A maintenance
-batch staged against a base another commit has since moved now loses its
-race and re-drives, where before it could land on stale premises.
-
-**Commit attempts materialize through the transaction, not a
-read-snapshot.** SlateDB's write-write conflict detection sees only commits
-that land after the transaction's start sequence. If a commit attempt
-materialized its planning `CatalogSnapshot` from a `DbSnapshot` pinned at
-sequence `X` and then opened its `DbTransaction` at sequence `Y > X`, a
-concurrent commit landing in the `X → Y` gap would invalidate the attempt's
-premises *without* tripping conflict detection — the attempt's `sys/head`
-write only conflicts with writes after `Y`. The commit would land on stale
-premises: a silent lost update. So the rule is: a `CatalogSnapshot` built
-for a commit attempt (RFC 0003 `commit`, each retry included) is
-materialized **through the `DbTransaction` itself** — SlateDB transactions
-expose the same `get`/`scan`/`scan_prefix` surface, reading the MVCC view
-at the transaction's own start sequence — so the premise view and the
-conflict-detection window are anchored to the same sequence number by
-construction, and no gap exists. Concretely, materialization is generic
-over its read source: `DbSnapshot` (or `DbReader`) for plain readers,
-`DbTransaction` for commit attempts. The finished `CatalogSnapshot` is
-identical in both cases; only the handle it was built through differs.
-
-### Snapshot isolation is free
-
-Because `snapshot` is immutable and every entity version is append-only with an
-`end_snapshot` that is only ever *set once, at commit* (RFC 0002/0004), the set
-of records visible at `S` never changes after `S` exists. A concurrent commit
-`S+1` adds records and ends others *for `S+1`*, but nothing it does alters what
-`begin ≤ S < end` selects. A held `CatalogSnapshot` is therefore a stable
-snapshot-isolated view for its whole lifetime with no defensive copying beyond
-the initial materialization — this is why RFC 0003 can promise "no store I/O
-after build."
-
-### Incremental refresh from the changelog
-
-A long-lived reader advances from `S` to a newer head `S+k` without
-rescanning `current`:
-
-1. Read the head stamp and the `sys/migration` marker (refusing with
-   `Migration` if the marker is present, as in materialization). If the
-   stamp is unchanged, done — the cached view is current.
-2. Otherwise read `changelog/{S+1 .. head}`. Each record holds the
-   **`current` keys its batch wrote** — moraine's own entity-grained
-   changelog, recorded from the write set the commit already assembled.
-3. Point-read the union of those keys, still under the same handle — a
-   refresh, like a materialization, is one consistent cut. Each key's value
-   at head is that entity's new state and an absent key is one that ended,
-   which is precisely the shape of a staged write set, so the replay is
-   applied by the same fold the committer uses on its own batch. Stamp the
-   view with head's snapshot record and batch count.
-
-Entity maps use structurally shared ordered trees (`imbl::OrdMap`), including
-both levels of table-scoped maps. Name and index-owner lookups use persistent
-hash maps. Cloning a view shares these trees; applying a change copies only
-the affected paths, preserving held readers. The snapshot record itself is
-copied. Replay work scales with changed records and tree height. The churn
-heuristic reads the base entity count in constant time: flat maps retain their
-lengths, and snapshot mutators maintain one total for nested records. Replacements
-leave that total unchanged; removals and cascades subtract only records actually
-removed, including staged statistics deletions. Historical mappings and file
-statistics retained by a table cascade remain counted. No step restates entity rules: the changelog is encoded
-keys and application uses the existing fold.
-
-The changelog lives in a subspace of its own rather than in the snapshot
-record. Measured in the record it grew snapshot rows 6.8× and slowed their
-scan 1.45× (`BENCHMARK.md`), and snapshot rows are read by DuckLake at every
-transaction — a cost on the hot path for a benefit only a refresh takes.
-Moved out, the serve path pays nothing. Storage is bounded without help from
-expiry or a sweep: each commit writes its own record and deletes the one a
-fixed window back, so the subspace is flat at the window size whatever the
-commit count.
-
-DuckLake's `snapshot_changes` grammar is deliberately *not* the changelog
-here. It names tables, not entities; it carries created relations by name
-rather than id; and moraine's own stats-only and schema-tag commits produce
-no entry in it at all, so replaying it would silently miss writes. The
-keys the batch wrote miss nothing by construction.
-
-**Fallback to full rematerialization** when incremental is impossible or not
-worth it:
-
-- **A batch in the gap minted no snapshot.** Maintenance reclaims state
-  under a reused snapshot id (RFC 0007, RFC 0008) and so writes no
-  changelog. The head stamp's batch count still records that it landed:
-  when the count moves further than the gap has snapshots, part of the gap
-  is unrecorded and the reader rematerializes.
-- **`S` fell below the horizon** (`S < H`, RFC 0007). This needs no rule of
-  its own: the retained changelog window is far shorter than any retention
-  horizon, so a base that old lost its changelogs long before it lost its
-  snapshots and reaches the fallback above. (If the reader specifically
-  wanted the *old* `S`, that snapshot is gone — see validity window.)
-- **The changelog is not there.** Either the commit declined to record one
-  — it wrote more keys than the cap — or later commits swept it out of the
-  retained window. Both read as an absent record and both mean rescan. The
-  cap (4,096 keys) bounds the record, not the replay decision, and it is
-  sized generously on purpose: a commit that records nothing forces every
-  reader behind it to rematerialize, which costs far more than the
-  changelog it declined to write, so an ordinary bulk flush — production
-  showed one at 259 keys — must land inside it. The churn threshold below
-  still decides whether a replay pays; the cap only decides whether the
-  choice exists.
-- **The gap is large** relative to catalog size: a full `current` rescan is
-  cheaper than replaying a huge changelog. The crossover is measured, not
-  reasoned — it sits at a churn share of **~0.57** of the live entity count
-  (`BENCHMARK.md` → Changelog replay vs. rematerialization) — and the
-  threshold is set at **half**, declining just before replay stops paying.
-  The two paths produce identical views, so the choice is purely a cost
-  optimization.
+The changelog remains a compatible stored record. Ordinary demand-loaded
+reads do not replay it to maintain decoded catalog maps.
 
 ### Committer read-your-writes
 
-The single committer (RFC 0004) holds a planning `CatalogSnapshot`. After it
-commits `N → N+1`, it must see its own write to plan the next commit. It does
-**not** re-read: it already assembled the `WriteBatch`, so it folds the exact
-staged mutations into its in-memory view and stamps it `N+1`. This is strictly
-cheaper than incremental refresh (no `snapshot` scan, no re-read) and is always
-correct because the committer *is* the source of the delta. Under RFC 0004
-group commit, the committer folds in the whole committed group at once. A
-committer that loses the CAS and retries simply rebuilds from the new head like
-any reader.
+A staged transaction reads its fixed authored scope and overlays its pending
+rows. Coalesced commits additionally fold earlier members' pending writes into
+each member's operation-owned premises. No transaction retains committed
+entity, snapshot, or schema-version result caches.
+
+After acknowledgement, a new reader scope acquires a published checkpoint
+covering the commit. An already-open scope continues seeing its old revision.
 
 ### Validity window and expiry reaction
 
@@ -459,164 +225,27 @@ The reader never silently dereferences a reclaimed file: either its `S` is
 still retained (files present) or materialization/refresh fails loudly with
 `SnapshotExpired`.
 
-### A DuckLake transaction reads one materialization per metadata table
+### DuckDB metadata ownership
 
-Everything above concerns a reader holding a `CatalogSnapshot`. DuckLake
-holds none: it reads the synthesized `ducklake_*` tables (RFC 0006) as
-SQL, and each scan of one is a separate dump served at whatever `sys/head`
-is when it runs. The `SnapshotExpired` contract is therefore unreachable
-from that path — a table hands back a row set, not a typed error, so a
-snapshot that vanished mid-statement reaches DuckLake as a missing *row*
-and it has nothing to re-resolve from.
+A DuckDB transaction retains a lightweight read scope. Every metadata scan
+reads that scope, so two scans of `ducklake_snapshot` agree even when another
+connection commits between them. Transactions overlay their own staged rows.
+Neither the attach nor the transaction retains a general metadata-row cache.
 
-That matters because DuckLake reads one table twice in one statement.
-`GetSnapshot` is `SELECT ... WHERE snapshot_id = (SELECT MAX(snapshot_id)
-...)` over `ducklake_snapshot` — two table references, two binds, two
-dumps. Served at two heads, an expiry (or an ordinary commit) landing
-between them leaves the maximum naming a row the other scan never saw, and
-DuckLake reports the tear as "No snapshot found".
+The cursor ABI currently streams 64-record pages for schemas, tables, views,
+columns, files, delete files, statistics, partitions, sorts, macros, mappings,
+scheduled deletions, partition columns and values, sort expressions, tags,
+variant statistics, macro implementations and parameters, name mappings, snapshot headers and
+changes, and column/view-column tags.
+Working-memory reservations cover a decoded page
+through ABI conversion; freeing the page releases its rows. Cancellation or a
+failed read invalidates that cursor. An expired checkpoint lease also rejects
+prefetched scan entries.
 
-So the shim pins the read the same way the core pins a materialization,
-one level up: **a synthesized table is dumped once per DuckDB transaction
-and every reader of it in that transaction is served the same rows.** The
-`MoraineTransaction` that already owns one `moraine_snapshot` for its
-catalog entries owns these too, and releases them with itself.
-
-Two boundaries are deliberate:
-
-- **The pin is per table, not per transaction.** Each table is materialized
-  at the head its first scan observed, so a statement joining two of them
-  can still straddle a commit. Closing that needs one read point across
-  dumps — an ABI-level read session — which would hold a SlateDB
-  transaction open for a whole user transaction and contradicts this RFC's
-  one-materialization-long retention. Left open deliberately, not by
-  oversight.
-- **A writing transaction is not pinned this way.** Once it opens a staged
-  transaction, every read of a writable kind goes through that
-  transaction's dumps: those already read at one fixed point *and* overlay
-  the rows staged so far, which is both the pinning and the read-your-
-  writes a writer needs. Nothing caches over them, because that is the
-  surface DuckLake's commit loop re-reads between attempts (RFC 0007) and
-  a retry served its first attempt's state would re-check its conflict
-  matrix against a premise that already lost.
-
-### Caching is per-handle, in-memory, logical
-
-The materialized in-memory catalog *is* the cache. A `Catalog` handle (RFC
-0003, an `Arc`-backed clone-cheap handle over `slatedb::Db`) holds the
-latest `CatalogSnapshot` and shares it; a refresh replaces it. Every head
-read — the public `snapshot()` and a commit attempt's planning view alike —
-serves from it when its stamp matches, advances it across the gap when it
-does not and the gap replays, and rematerializes otherwise. The view is
-shared, never copied out: a warm read costs one point read on `sys/head`
-and nothing else.
-
-The cached view is keyed by the **whole head stamp**, snapshot id and batch
-count together, so a maintenance commit that reuses the id cannot leave a
-view of the state it reclaimed serving. A read-write handle additionally
-invalidates the cache before such a commit's write becomes visible, since
-it is the writer and knows. That alone would not make installing safe from
-a read path: a reader that read head and then installed could land its
-now-stale view *after* an invalidation, resurrecting content the
-invalidation existed to discard. So the cache carries an **install epoch**,
-bumped on every invalidation. A reader captures the epoch before its first
-store read and installs only if the epoch still matches; any interleaved
-invalidation makes the install a no-op and the reader simply keeps the view
-it computed. Installation is thus compare-and-set, and no path needs to
-discard a view it has already paid for.
-
-All head-view consumers, including equality, batched equality, range, and NULL
-index lookups, install their computed catalog view under this rule. Capture the
-epoch before opening the read session. Index entries are still resolved anew
-inside that session against the same head as the cached metadata; only the
-catalog view is reused.
-
-**Read-only handles cache too.** A reader folds no batch of its own — it
-has none — so the changelog replay above is the only way it advances, and
-the head stamp tells it exactly which store state its held view stands at.
-That is what the validated cut buys: without it a torn view would persist
-and compound rather than being discarded with the read that built it.
-
-The migration marker's absence is established before the cache is
-consulted — from the head-keyed stamp when the head has not moved, from
-the store when it has — so a warm handle refuses a mid-migration store
-exactly as a cold one does: a cached view must never be the reason a
-reader sails through a keyspace move.
-
-There is:
-
-- **No cross-process cache.** RFC 0004's "many readers" are independent
-  processes/handles; each materializes its own view. Coordinating a shared
-  logical cache would reintroduce exactly the coordination the topology avoids.
-- **One physical cache, specified below.** Beneath the logical caches sits
-  exactly one byte-tier cache for the catalog ("One block cache: two
-  slots, one budget") and none beside it. This RFC's cache is the
-  *logical* materialized catalog; the block cache keeps its rebuild cheap
-  when the store is remote.
-
-The view is whole-catalog, and that fixes where filtering can usefully
-happen. DuckDB pushes projection into the `ducklake_*` scans but never a row
-filter, so no predicate reaches the store on the serve path; every metadata
-read is a full range scan of its entity kind, and DuckDB filters over the
-returned rows. Server-side filter pushdown therefore cannot reduce work while
-the whole view is resident — there is nothing left to avoid fetching. Pushdown
-becomes worth building only if moraine stops materializing the whole catalog,
-because lazy materialization needs predicates to know what to fetch. The two
-are one decision, and this RFC rejects both: the full view keeps every accessor
-store-free, and no profile has shown its memory or the replay base-view copy to
-be a problem. A measured live-catalog memory problem would replace this
-decision and take predicate pushdown with it; it does not leave an unbounded
-implementation task in the meantime.
-
-### Maintained served projections
-
-The DuckDB shim serves row-faithful `ducklake_*` projections through the
-`dump_*` functions, and DuckLake re-reads three of them — snapshots, table
-stats, table column stats — at the start of **every** transaction. Rebuilding
-each from a subspace scan per statement makes small-commit latency scale with
-history. Those three projections are therefore *maintained*, by the same
-principle as committer read-your-writes:
-
-- A read-write `Catalog` holds a decoded projection state keyed by the head
-  snapshot id it was built at. The first serve pays the full scan and installs
-  the state; every commit **folds its own committed batch** into it (the
-  committer is the source of the delta), stamping the new head.
-- Every serve re-reads `sys/head` (one point read). If the state's head does
-  not match, the serve rebuilds from a full scan and reinstalls — it never
-  serves a mismatched state. Correctness rests on this head check, not on
-  fold-in completeness: a missed or undecodable fold clears the state and
-  degrades to a rescan, never to wrong rows.
-- The serving contract is row-faithfulness: a maintained projection is equal
-  to a fresh scan at the same head, always.
-- Scope: **both**, on one key. A read-write handle folds each batch forward
-  and a read-only one folds nothing, but folding is not what decides whether
-  a projection may be served — the head stamp is, and a reader reads the
-  same stamp the writer wrote. So every projection here is keyed on the
-  whole stamp rather than the snapshot id, and a reader serves from it on a
-  match and rescans on a miss.
-  The distinction is load-bearing rather than pedantic: a maintenance batch
-  reuses the snapshot id while changing what a scan finds, so an id-keyed
-  projection would serve a reader the state that batch reclaimed. A writer
-  never noticed, because it folds every batch and is therefore never stale.
-  Keying on the stamp is what makes the reader's case safe, and once it is
-  safe there is no reason left to withhold it — each of these dumps scans
-  the whole of `current`, so a reader rescanning per call pays for it on
-  every query, not once at attach. A reader's scan runs under the same
-  validated cut every read-only pass does, so the two scans of the entity
-  dump observe one store state.
-- The fold reads its stamp out of the batch it is folding. Every batch
-  writes `sys/head` (RFC 0004), so the head record is among the staged
-  writes, and taking it from there rather than being told alongside them
-  makes it impossible for the two to disagree. A batch arriving without one
-  cannot be attributed to a state, so it clears the projections rather than
-  advancing them — unreachable by construction, and a guard rather than a
-  path.
-
-- The dumps clone only what they return. The record set behind them is
-  shared, and a per-kind dump filters it by reference rather than copying
-  it whole — populating DuckLake's metadata tables issues two dozen of
-  them, and copying the catalog per call would make the cache the expensive
-  path.
+Synthetic option rows, schema-version projections, and staged metadata overlays
+still have array-based paths. These must move to bounded cursors before claiming that every metadata
+operation is independent of result size. Streaming row IDs resolve through a replay cursor; array-based overlays still
+retain their operation rows for mutation resolution.
 
 ### Store facts outlive view invalidation
 
@@ -646,31 +275,22 @@ invalidation discipline. Invalidation leaves all three standing.
   and monotone from there; RFC 0005 owns who verifies, who heals, and
   which sessions may judge.
 
-### The stack, named end to end
+### Ownership layers
 
-The caches a moraine-backed query crosses, top to bottom:
+- Foyer shares SST metadata and blocks across handles and checkpoint generations.
+- A read scope retains its store snapshot or leased checkpoint reader.
+- One operation owns its decoded records and output page.
+- DuckDB owns native catalog entries and query execution state.
+- Bounded row lookup and Parquet metadata facilities retain their separately
+  budgeted data-path results; they do not retain full catalog snapshots.
 
-| tier | holds | keyed by | budget | who evicts |
-|---|---|---|---|---|
-| DuckDB external-file cache | Parquet byte ranges of data files | path + version tag | `memory_limit` (buffer-manager blocks) | DuckDB buffer manager |
-| DuckDB metadata caches | Parquet footers, HTTP metadata | path | unbounded, opt-in | never / on error |
-| DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
-| shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
-| core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size, reported by `projection_bytes` | replaced on stamp move |
-| row-lookup directories | file summaries/ranges and inline chunk locators | catalog + table, validated against file scope or head stamp | 64 MiB accounted entries and 256 tables **per source kind** (file and inline) per catalog; container slack also reported in `projection_bytes` | least-recently-used eviction; oversized directories serve the current lookup without admission |
-| scoped index probes | canonical query and resolved row IDs | attachment + pinned store sequence + table/index + mode/arguments | 8 MiB accounted entries and 4096 entries per catalog; container slack also reported in `projection_bytes` | least-recently-used eviction; oversized results bypass admission |
-| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary-v2` | byte-bounded LRU (foyer), recovered on restart |
-| SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | one cache per attached store: an even share of the process budget in memory over `CACHE_DIR/<store>/blocks` | LRU-ish (foyer), recovered on restart |
+A local end-to-end metadata scan measurement is recorded in
+[demand-loaded catalog memory](../demand-loaded-catalog-memory.md). It includes
+default background preloading and reports its limitations separately from the
+bounds required here.
 
-Two findings drove this section. Before consolidation, one catalog byte could
-be resident in five tiers at once, four of them refilled from the tier below on
-every miss — duplication that costs copies as well as memory. And SlateDB's
-per-store cache defaults (hundreds of MiB in memory, 16 GiB on disk,
-*multiplied by attached stores*) were bounded by nothing DuckDB could see, so a
-host attaching several catalogs was over-committed by construction. The
-subsections below take the row tiers (duplication), DuckLake's tier (composed
-with, not consolidated), the byte tier (consolidated), and the data tier
-(DuckDB's, untouched).
+Each live checkpoint generation can also replay WAL into its own memtables.
+The generation cap limits overlap but is not an RSS limit.
 
 ### Shared budget, separate cache engines
 
@@ -784,31 +404,12 @@ ordering, admission, and error semantics changes that have to be maintained
 twice for no saving: moving `Bytes` is constant-time, and a decoder that does
 not retain it can borrow it locally.
 
-### One scan pair per head
+### Materialized compatibility views
 
-View materialization and the entity dumps each scan the store and each
-hold their own decoded copy of the same records at the same head. The rule
-replacing that: **at one head stamp, `current` and `history` are each
-scanned and decoded at most once, into a shared record set every logical
-cache derives from by reference.** Whichever read misses first runs the
-scan under its consistent cut and installs; the halves install
-independently (a head view needs `current` only and must not grow a
-`history` scan; the dumps add `history` when first to want it). The commit
-fold and the changelog replay advance view and record set together — one
-cache entry with two faces, installed and invalidated under the existing
-install-epoch rule.
-
-Each half is keyed by encoded store key, so it iterates in scan order and
-takes a write the way the store does: a put replaces the record at its key,
-a delete removes it. A committed batch folds its `current` writes into the
-`current` half and its `history` writes into the `history` half, then
-restamps both; a batch that touches neither restamps them untouched. A
-reader's changelog replay folds the `current` keys it re-read into the
-`current` half and drops the `history` half, which the changelog does not
-name. A value the binary cannot decode drops the half it was bound for,
-never the other. Before this rule the halves were dropped by any batch
-into their subspace, so a write-then-read workload rescanned the live
-catalog from the store on every commit.
+A compatibility materialization may collect the requested record set under
+working-memory admission. The set is local to that call and is never installed
+on the catalog handle. Exhausting the allowance returns a typed error; it does
+not authorize an unbounded allocation.
 
 ### A reader that cannot match an ended version does not read them
 
@@ -859,75 +460,23 @@ an unnarrowed read of one table could stand at two heads — the tear
 transaction the read point is pinned for the transaction's life, so no such
 tear exists, and that is where the flush path lives.
 
-A scan emitting row ids narrows like any other. Its rows are resolved back
-from those ids by the staged-write Sink, against the run that scan
-registered — which is the narrowed list itself — so an id names the row the
-scan handed it out for, whatever that scan left unread. The list a *second*
-materialization would build never enters it. That is what makes narrowing a
-writing scan safe, and it is the property the row-id resolution suite pins
-against a table holding versions in both halves.
+A scan emitting row IDs uses the same bounds and fixed scope. Streaming runs
+reserve an identity range and reconstruct requested rows by replaying that
+cursor, retaining at most one page during mutation resolution. Sequential
+resolutions advance the cursor; an out-of-order resolution restarts it and
+can therefore cost additional reads. Array-based overlay paths still resolve
+against their operation-owned scan rows.
 
-A live-only read inside a staged transaction — one bounded at the read
-point, or of an unversioned kind — is served from the head view the
-transaction resolved at that read point, which holds every live record in
-store key order, and scans nothing. Only a read that needs ended versions
-scans, and it scans both subspaces through the transaction as one cut.
+Staged reads decode the requested committed range for each operation and
+apply pending mutations. Neither full nor narrowed results are cached.
 
-The narrowed materialization is cached beside the full one, never in place
-of it, and staging into the table drops both.
+### The read scope crosses the ABI
 
-### The stamp crosses the ABI
-
-The shim's per-transaction pin is correct but wasteful as a lifetime:
-DuckLake re-reads metadata at every transaction start, autocommit makes
-every statement a transaction, and each rebuild pays the full ABI
-crossing for rows that are byte-identical whenever no commit landed in
-between. So the head stamp crosses the ABI: the attach holds one dumped
-row set per synthesized table under the stamp it was dumped at, and a
-transaction compares held rows against the stamp its own snapshot stands
-at before paying to re-dump. The pin becomes what it logically was —
-the transaction's snapshot names the stamp, every table is served at it
-— and steady-state reads cross the ABI once per table per *commit*, not
-per transaction.
-
-The stamp costs nothing to obtain: the transaction already took its
-snapshot at start, and the view carries the head id and batch count it
-was materialized at, so no table read asks the store where it stands.
-On a read-only handle that removes one point read per table per
-statement; on a read-write handle it removes the crossing.
-
-Rows that straddled a commit are not held. The stamp is read before and
-after the dump and they must agree, because rows spanning two states
-stand at neither, and holding them under the earlier one would serve a
-concurrent reader at that stamp a row set from beyond it. The writer rule
-outranks all of this: staged dumps are never cached over. And the stamp
-is the whole stamp, id and batch count, because a maintenance batch
-reuses the id.
-
-### DuckLake's caches sit on top, and the stamps compose
-
-DuckLake keeps two caches above all this: the per-transaction snapshot
-(which the validity-window section already leans on), and a
-schema-metadata cache keyed on the snapshot record's `schema_version`,
-which RFC 0004 advances only on shape-changing commits. Its freshness
-protocol is a read of `ducklake_snapshot` at every transaction start;
-`schema_version` then decides whether any *other* metadata table is read
-at all. So the tables DuckLake touches unconditionally — snapshots and
-the stats kinds — are exactly the maintained projections, and the read
-that validates DuckLake's cache is the read the stamp work above makes
-one point read. The same validate-by-comparison runs at three altitudes
-on one signal, which makes `schema_version` honesty a cache-stack
-obligation, not only a protocol one: always-increment defeats DuckLake's
-tier and re-fetches every table's columns through every tier below;
-never-increment serves stale schema from a perfectly coherent moraine
-stack.
-
-The granularity seam is safe by construction: a maintenance batch moves
-neither snapshot id nor `schema_version` — invisible to DuckLake's
-caches, correctly, since it changes files and history, never schema — and
-what DuckLake cannot see is what the batch count exists for, one tier
-down. DuckLake's own catalog-cache race (`SET threads=1`) is upstream's
-bug in upstream's tier, tracked by the presence test and nothing more.
+A snapshot ABI handle carries the head stamp and a read alias backed by one
+fixed scope. Descriptor listing projects only the requested descriptor kind;
+explicit materialization is separate. Metadata cursors retain the same scope.
+Native transaction schema entries live for the transaction; a new transaction
+resolves entries from its new scope.
 
 ### One block cache: two priorities, one budget
 
@@ -1414,175 +963,36 @@ guidance beside the attach options (RFC 0006).
 
 ### Test obligations
 
-Per RFC 0001, integration tests run against real SlateDB on in-memory
-`object_store` — no mocks of the store:
+Use real SlateDB on in-memory object storage. Cover consistent reads across
+commits and maintenance; checkpoint publication after WAL durability; lease
+ownership, renewal, expiry, and release; coalesced commit counters; staged
+read-your-writes; cancellation; migration refusal; and typed errors after an
+unknown commit outcome.
 
-- **Consistent cut.** A commit forced to land mid-materialization yields a view
-  that is entirely pre- or entirely post-commit, never torn. Both halves are
-  staged rather than raced: on a read-write handle the commit lands between
-  the pass's head read and its `current` scan and is invisible to both; on a
-  read-only one the pass commits from inside itself and waits for the reader
-  to observe it, and the stamp check discards and re-runs it.
-- **Isolation.** A `CatalogSnapshot` built at `S`, then `k` commits applied,
-  still returns exactly the `S` view from every accessor.
-- **Incremental == full.** Refreshing `S → head` incrementally yields a view
-  identical to a full rematerialization at head — entity maps *and* name
-  indexes, so a rename that left a stale name entry behind is caught.
-- **Every batch moves the stamp.** A snapshot-minting batch moves both
-  halves of the head record; a maintenance batch that reuses the snapshot id
-  still moves the batch count.
-- **The refresh declines what it cannot replay.** A gap holding a batch
-  that minted no snapshot, a gap whose changelogs later commits swept out of
-  the retained window, and a gap whose churn passes the size backstop each
-  fall back to a full rematerialization rather than replaying part of it.
-- **The window bounds the subspace.** However many commits land, the
-  changelog subspace holds no more records than the window.
-- **Committer read-your-writes.** After `commit`, the committer's folded view
-  reflects the just-committed entities without a store re-read.
-- **A warm read equals a cold one.** A handle that has served reads across a
-  sequence of commits answers exactly as a freshly opened handle does.
-- **Install is compare-and-set.** An invalidation interleaved between a
-  reader's first store read and its install voids that install; the cache
-  never serves the resurrected view.
-- **The marker outranks the cache.** A read against a mid-migration store
-  returns the typed `Migration` error even when the handle holds a valid
-  cached view.
-- **Fallback.** A reader whose `S` fell below the horizon rematerializes at
-  head; a reader asking for an expired `S` gets `SnapshotExpired`.
-- **No dangling file.** A view within the retention window resolves every file
-  it names; a view driven past the window fails loudly rather than naming a
-  reclaimed file.
-- **Migration marker refusal.** A materialization or refresh attempted while
-  `sys/migration` is present returns the typed `Migration` error and never
-  yields a partial view (RFC 0015's mid-migration reader contract).
-- **No conflict-window gap.** A commit forced to land between a commit
-  attempt's materialization and its batch write is always detected: the
-  attempt either observes it (materialized through the transaction, so the
-  premise view includes it) or conflicts on `sys/head`. There is no
-  interleaving in which the attempt commits against premises that omit a
-  landed commit. Staged, not raced: a transaction opens and materializes,
-  a commit lands through the catalog, and only then does the first write.
-- **Maintained == scanned.** After every commit in a randomized operation
-  sequence (creates, file registrations, stats updates, renames, expiry), each
-  maintained projection equals a fresh scan of the same subspaces at the same
-  head.
-- **A metadata table is one materialization per DuckDB transaction.** Over
-  two connections on one instance: a commit landing under an open reader does
-  not change what that reader's transaction sees of `ducklake_snapshot`, the
-  two-scan resolution shape still resolves to a row inside it, and the
-  reader's next transaction sees the commit. A *writing* transaction is
-  exempt — it reads its own uncommitted rows across statements.
-- **Reads survive an expiry pass under them.** With the scheduler expiring
-  everything below head on a sub-second tick, a session that keeps reading
-  and committing never sees "No snapshot found".
-- **One scan pair per head.** Populating every metadata table and
-  materializing the head view at one head costs one `current` scan and at
-  most one `history` scan; a head view alone scans no `history`.
-- **The stamp crosses the ABI.** A read transaction following another with
-  no commit between serves the same metadata rows without a dump rebuild;
-  with a commit it re-dumps; a staged-write transaction is served staged
-  dumps regardless.
-- **A warm probe costs no store read.** An index lookup repeated against
-  a resident working set issues no GET and fetches no bytes.
-- **A warm writer probes without a session.** Index lookups and row
-  locations repeated on a warm read-write handle read `sys/head` no
-  further and open no read transaction, and return what the session path
-  returns.
-- **One budget across attaches.** Several attached stores share one cache
-  and one tally; a later attach's differing options are reported as
-  ignored rather than silently applied.
-- **Unused allowances remain available.** Eight empty stores attaching beside
-  a warmed writer do not cause another GET. Read fills and admitted updates
-  retain the working set with or without a disk cache. A newly busy store
-  reclaims capacity, concurrent flushes remain within the shared allowance,
-  oversubscription evicts blocks, and final detach releases memory capacity.
-- **Restart persistence and isolation.** Two stores with colliding WAL and
-  L0 ids are warmed by one process; a fresh process attaching them in the
-  same order reads both without a cache miss, and one attaching them in
-  reverse reads the correct store from both. The test is cross-process so
-  the scope counter actually resets.
-- **Scans cannot evict the probe path.** After a whole-subspace scan and a
-  compaction through a warm cache, a probe that was GET-free stays
-  GET-free.
-- **Admission follows the declared shape.** A bulk scan admits no data
-  blocks; a probe admits its own.
-- **Preload warms before the first read.** An attach that preloads has
-  consulted the cache by the time it returns, and warms no `index` data
-  blocks at either level.
-- **The cache reports what it served.** A cold read moves the tally, the
-  slots are counted apart, and a rate is absent rather than zero until
-  something has been looked up.
-- **The data path is cached by DuckDB.** A lake read that touches data
-  populates `duckdb_external_file_cache()` for its file, and forcing the
-  prefetch a remote path takes anyway extends that from the footer to the
-  data ranges — so the tier stays inside `memory_limit`, and a regression
-  that routes lake reads around the caching file system fails the test. A
-  lake `count(*)`, answered from catalog statistics, is pinned as reading
-  no file at all: it is the shape that makes a working cache look absent.
-- **Owned and borrowed value decoding share one scan.** An inline protobuf's
-  shared body remains inside the allocation yielded by SlateDB, while an
-  ordinary protobuf decoded by borrowing observes the same key order and
-  errors at the same entry. Neither path copies the framed value in the scan
-  loop.
-- **Concurrent parsed-metadata misses coalesce.** Two scoped readers starting
-  cold against the same file issue one footer/page-index fill and retain one
-  parsed value, while each continues to read its own projected data ranges.
-- **Delete-file reads preserve the crossover.** A small delete file is fetched
-  once in full, and a later read of the same object fetches nothing. A large
-  one uses its recorded file and footer sizes, fetches only `pos`, and reuses
-  parsed metadata on a later read.
+Corrupt unrelated records to prove scoped operations never decode them. Check
+that dropping an explicit snapshot releases its decoded objects, repeated
+metadata reads retain no catalog result cache, and pages remain bounded.
+Measure fresh-process DuckDB peak RSS, latency, cache activity, and object-store
+traffic as catalog size grows, including a single large table. Keep fixture
+creation outside the measured process and report cache settings and remaining
+array-based paths alongside the results.
 
 ## Alternatives considered
 
-- **Per-get consistency (no single read point).** Rejected: independent gets
-  across a concurrent commit can observe a torn view (new `column`, missing
-  `file`). One read point — pinned where SlateDB offers one, validated where
-  it does not — is the only cheap way to get a consistent cut without
-  locking writers.
-- **Re-scanning `current` on every read (no cache / no incremental refresh).**
-  Rejected: defeats RFC 0003's "no store I/O after build" and pays the full
-  scan per refresh. The write set a commit already assembles is a precise,
-  cheap changelog; record it and use it.
-- **Driving the refresh off DuckLake's `snapshot_changes` instead of a
-  moraine-native key list.** Rejected: the grammar is table-grained, names
-  created relations by name rather than id, and has no entry at all for a
-  stats-only or schema-tag commit — a replay of it would silently miss
-  writes. Keeping the two side by side costs a bounded per-commit list and
-  buys a changelog that is exact by construction.
-- **Validating a read-only cut on `DbReader::manifest()`'s id.** Rejected
-  on inspection: the reader's WAL-replay refresh carries the manifest
-  forward unchanged, so the id does not move for exactly the commits a live
-  reader is trying to see. `DbStatus::durable_seq` does move, but leads the
-  state install rather than following it. A stamp in moraine's own keyspace
-  is under moraine's control and needs no assumption about SlateDB
-  internals.
-- **Pinning a read-only handle to a checkpoint.** Rejected as the general
-  answer: it is genuinely consistent, and moraine keeps it as an explicit
-  option for credentials that cannot write the manifest at all, but it
-  spawns no poller and so never sees another commit. Liveness is not
-  optional for a reader that is meant to follow a lake.
-- **Push-based invalidation (committer notifies readers of new commits).**
-  Rejected: contradicts RFC 0004's no-coordination, cross-process topology and
-  reintroduces a notification channel the design deliberately omits. Readers
-  poll `sys/head`; that is the whole protocol.
-- **A persistent name→id index to skip materialization.** Already rejected by
-  RFC 0002 (complexity without payoff at live-catalog scale); nothing here
-  changes that calculus. Name resolution stays against the in-memory view.
-- **Partial or lazy materialization.** Rejected with server-side filter
-  pushdown while the live catalog fits comfortably: lazy reads need predicates
-  to know what to fetch, and predicates save nothing while the whole view is
-  already resident. This also leaves the replay base-view copy proportional to
-  catalog size. A profile showing either memory term to be material would be
-  evidence for replacing both choices together.
-- **Rematerializing fully on every refresh (no incremental path).** Rejected as
-  the default: correct but pays catalog-size cost per refresh for a
-  churn-sized delta. Kept only as the fallback when the gap is large or the base
-  snapshot was reclaimed.
-- **Holding files alive for any live reader (reference-tracking readers against
-  expiry).** Rejected: it is exactly the cross-process reader coordination RFC
-  0004 forbids and RFC 0007's reference-counting alternative already rejected.
-  The retention *window* plus a typed `SnapshotExpired` is the coordination-free
-  contract.
+- **Per-get consistency:** independent gets can observe torn metadata across
+  commits. Fixed read scopes preserve one revision across calls.
+- **Retained decoded catalog maps:** rejected. They make memory proportional
+  to catalog size and duplicate Foyer's reuse layer.
+- **A permanently pinned following reader:** cannot observe new commits.
+  Explicit checkpoint attaches support this intentionally; ordinary readers
+  rotate between transactions.
+- **Reader-created latest checkpoints:** can omit WAL-durable commits.
+  Readers copy checkpoints published by the writer instead.
+- **Cross-process invalidation messages:** unnecessary with published
+  checkpoints and independent acquisition.
+- **Using catalog history as the store snapshot:** insufficient for
+  unversioned metadata and head-preserving maintenance changes.
+
 - **Keeping SlateDB's object cache as the disk tier.** Rejected: per-store
   caps, 4 MiB parts against a point-probe workload, and it cannot coexist
   with a hybrid cache without double-writing disk. Prefetch is covered by
@@ -1664,3 +1074,10 @@ results, byte/Arrow buffers, staging, and translation use separate working-memor
 admission. Legacy caller-owned vectors require caller reservations. These controls,
 publication progress, and host sizing are specified in
 [RFC 0026](0026-working-memory-and-resumable-publication.md).
+
+Internal index builds and certification commits load operation-specific table
+premises, then fold the batch's pending writes into that projection. Creating an
+index also reads table and index names in its schema to preserve name checks.
+Backfill and row-location reads omit unrelated tables and file-column statistics;
+their operation-owned file inventories remain proportional to the addressed
+table. The explicit public closure-commit API still materializes its premises.

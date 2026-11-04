@@ -63,9 +63,8 @@ catalog, so the sleep is never entered for them.
   head-derived values rather than re-running anything of DuckLake's, and
   only for the commit shapes the rebase re-derives exactly; every other
   shape surfaces its lost race to DuckLake as before.
-- Commit latency floor is one durable WAL flush; the protocol enables group
-  commit so throughput under a funnel of concurrent transactions is not
-  one-flush-per-commit.
+- Acknowledgement waits for WAL durability and checkpoint publication. Group
+  commit amortizes both across transactions; publication is not per query.
 - Faithful to DuckLake's own concurrency semantics — moraine implements
   DuckLake's conflict model, it does not invent a stricter or looser one.
 
@@ -110,6 +109,51 @@ schema-cache key. This RFC defines the protocol that maintains all of these
 under optimistic concurrency.
 
 ## Design
+
+### Checkpoint publication before acknowledgement
+
+Demand-loaded independent readers use the rotating checkpoint readers in
+RFC 0009. A successful commit acknowledgement guarantees that the writes
+are durable and a published checkpoint includes them. Direct writes share
+the flush pacer's publisher; commit-log writes wait for publication covering
+the won slot before reporting success.
+
+For each commit group:
+
+1. Submit its atomic catalog batch and await WAL durability.
+2. Publish a durable checkpoint through the writer's existing
+   `Db::create_checkpoint(CheckpointScope::Durable, ...)` API. Publication
+   must finish before success is reported; requesting it is insufficient.
+3. Acknowledge every group covered by the completed publication. Groups
+   whose writes became durable later await a subsequent publication.
+
+The checkpoint adds manifest metadata, not another catalog mutation or
+DuckLake snapshot. The catalog batch remains the atomicity boundary.
+Readers discover published checkpoints and retain their own leases;
+discovery may lag publication, so a reader requiring a particular commit
+position verifies that its chosen checkpoint covers that position.
+
+If publication fails after the catalog write became durable, retry
+publication without resubmitting the mutation, or return
+`CommitOutcomeUnknown` for reconciliation. Cancellation and writer fencing
+after submission must also preserve the potentially committed outcome;
+neither authorizes replaying a mutation whose durable write may exist.
+Recovery publishes a checkpoint covering recovered durable progress before
+acknowledging further groups.
+
+Commit-log clients need the same coverage: a durable slot can precede its
+fold into SlateDB. Their acknowledgement gate must await a published
+checkpoint covering that slot, including fold progress or recovery when
+needed. A temporary publisher replays the log and closes without an L0
+flush, so publication does not require room for another L0 file. A coalesced
+group advances the batch counter once, even when its members mint several
+DuckLake snapshot ids; otherwise it would skip a log slot.
+
+Validation must exercise publication stalls and failures after WAL
+durability, cancellation, recovery after writer loss, grouped acknowledgements,
+and readers requiring a commit position newer than their discovered checkpoint.
+No successful acknowledgement may escape before the covering checkpoint is
+published, and no publication-only failure may re-run the catalog mutation.
 
 ### Topology
 
@@ -209,6 +253,18 @@ the extension-surface RFC). The `main` row's id comes from the ordinary
 counter, so the first user allocation follows it.
 
 ### Mutation-sized verb preparation
+
+Demand-loaded commit translation reads changed entities and the dependency
+ranges needed for validation, applying staged changes through an
+operation-owned overlay. Allocation, unique constraints, conflict detection,
+read-your-writes, retry classification, and atomic publication retain their
+existing semantics. Cold small mutations must not load unrelated catalog
+metadata. A partial operation view must never be installed as a complete
+catalog snapshot.
+
+The materialized closure API below remains a compatibility path; migrating
+the extension's staged-row commits must remove its full-view dependency too.
+
 
 Verb transactions clone the structurally shared `CatalogSnapshot` maps.
 Mutations copy affected tree paths; untouched maps and nested subtrees remain
@@ -724,8 +780,8 @@ maintenance stages only `index/*` keys as it streams — a subspace the
 inline translation never reads — and hands its chunk-directory repairs
 back unstaged, while the translation stages nothing at all. Neither can
 observe the other, so running them together is indistinguishable from
-running them in order. The head view resolves first (it is maintenance's
-base input, and a warm handle answers it from memory); maintenance still
+running them in order. The operation-owned dependency projection resolves
+first; maintenance still
 completes before the batch is assembled, so a poisoned definition rides
 the writes it produces; and its directory repairs are ordered ahead of the
 batch's own inline writes, so a flush draining a repaired chunk still
@@ -781,7 +837,7 @@ the lost batch before reporting that premise's snapshot id. A no-op against
 committed state alone may return immediately.
 
 Steps 1–3 run once per member, against a premise folded forward from the
-member before it (the same fold that refreshes the cached head view), so
+member before it, so
 member *i* allocates its ids and detects its name collisions against
 everything members *1..i* did. That is what makes intra-batch conflicts
 unreachable rather than unlikely. Step 4 then runs once.

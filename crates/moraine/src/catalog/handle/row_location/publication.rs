@@ -1,12 +1,18 @@
 //! Bounded publication steps with a resumable file frontier.
 
-use std::{collections::BTreeSet, ops::Bound, sync::Arc};
+use std::{collections::BTreeSet, ops::Bound};
 
 use futures::{StreamExt, stream};
 
 use super::{
-    CatalogSnapshot, DataStore, Error, ReadOnlyCatalog, Result, SnapshotId, TableId, data_file,
-    data_file_info, retry_queue::RetryQueue,
+    DataStore, Error, ReadOnlyCatalog, Result, SnapshotId, TableId, data_file,
+    retry_queue::RetryQueue,
+};
+use crate::store::{
+    handle::ScanShape,
+    key::{EntityKey, EntityKind, Key, current_entity_kind_prefix},
+    proto::DataFileValue,
+    value,
 };
 
 pub(super) type Position = (u64, u64);
@@ -15,7 +21,7 @@ pub(super) type Position = (u64, u64);
 /// Successful steps survive cancellation of a later step. Drop this value to
 /// release its snapshot; progress is local to this process.
 pub struct RowSummaryProgress {
-    snapshot: Option<Arc<CatalogSnapshot>>,
+    handle: Option<crate::store::handle::OwnedReadHandle>,
     tables: Option<BTreeSet<TableId>>,
     since: Option<SnapshotId>,
     after: Option<Position>,
@@ -32,7 +38,7 @@ impl RowSummaryProgress {
     #[must_use]
     pub fn new(tables: Option<Vec<TableId>>, since: Option<SnapshotId>) -> Self {
         Self {
-            snapshot: None,
+            handle: None,
             tables: tables.map(|tables| tables.into_iter().collect()),
             since,
             after: None,
@@ -57,7 +63,10 @@ impl RowSummaryProgress {
         progress
     }
 
-    async fn select(&mut self, snapshot: &CatalogSnapshot) -> Result<Vec<Position>> {
+    async fn select(
+        &mut self,
+        handle: crate::store::handle::ReadHandle<'_>,
+    ) -> Result<Vec<Position>> {
         if self.retrying {
             return self.retries.peek(data_file::PUBLISH_CONCURRENCY).await;
         }
@@ -68,49 +77,49 @@ impl RowSummaryProgress {
                 .copied()
                 .collect());
         }
+
+        let prefix = current_entity_kind_prefix(EntityKind::File);
         let lower = self
             .after
-            .map_or(Bound::Unbounded, |(table, _)| Bound::Included(table));
+            .map_or(Bound::Unbounded, |(table_id, data_file_id)| {
+                Bound::Excluded(
+                    Key::current(EntityKey::File {
+                        table_id,
+                        data_file_id,
+                    })
+                    .encode()[prefix.len()..]
+                        .to_vec(),
+                )
+            });
+        let mut cursor = handle
+            .scan_prefix(prefix, (lower, Bound::Unbounded), ScanShape::Streaming)
+            .await?;
         let mut selected = Vec::new();
-        let mut inspected = 0_usize;
-        for (&table, files) in snapshot.data_files.range((lower, Bound::Unbounded)) {
-            tokio::task::yield_now().await;
+        while let Some(entry) = cursor.next().await? {
+            let file: DataFileValue = value::decode_value(&entry.value)?;
             if self
                 .tables
                 .as_ref()
-                .is_some_and(|tables| !tables.contains(&TableId::new(table)))
+                .is_some_and(|tables| !tables.contains(&TableId::new(file.table_id)))
+                || self
+                    .since
+                    .is_some_and(|since| file.begin_snapshot <= since.get())
             {
+                if selected.is_empty() {
+                    self.after = Some((file.table_id, file.data_file_id));
+                }
                 continue;
             }
-            let lower = match self.after {
-                Some((previous, file)) if previous == table => Bound::Excluded(file),
-                _ => Bound::Unbounded,
-            };
-            for (&file, value) in files.range((lower, Bound::Unbounded)) {
-                inspected += 1;
-                if inspected.is_multiple_of(1024) {
-                    tokio::task::yield_now().await;
-                }
-                if self
-                    .since
-                    .is_some_and(|since| value.begin_snapshot <= since.get())
-                {
-                    if selected.is_empty() {
-                        self.after = Some((table, file));
-                    }
-                    continue;
-                }
-                selected.push((table, file));
-                if selected.len() == data_file::PUBLISH_CONCURRENCY {
-                    return Ok(selected);
-                }
+            selected.push((file.table_id, file.data_file_id));
+            if selected.len() == data_file::PUBLISH_CONCURRENCY {
+                break;
             }
         }
         Ok(selected)
     }
 
     fn finish_round(&mut self) -> Result<bool> {
-        self.snapshot = None;
+        self.handle = None;
         if self.failed.is_empty() {
             self.complete = true;
             return Ok(true);
@@ -139,39 +148,43 @@ impl RowSummaryProgress {
         if self.complete {
             return Ok(true);
         }
-        let snapshot = if let Some(snapshot) = &self.snapshot {
-            Arc::clone(snapshot)
-        } else {
-            let snapshot = catalog.snapshot().await?;
-            self.snapshot = Some(Arc::clone(&snapshot));
-            snapshot
-        };
-        let selected = self.select(&snapshot).await?;
+        if self.handle.is_none() {
+            let scope = catalog.index_read_scope().await?.ok_or_else(|| {
+                Error::Constraint("publication requires a fixed read scope".into())
+            })?;
+            self.handle = Some(scope.reads().owned_read_handle());
+        }
+        let handle = self
+            .handle
+            .clone()
+            .ok_or_else(|| Error::Corruption("publication has no read scope".into()))?;
+        let selected = self.select(handle.borrow()).await?;
         if selected.is_empty() {
             return self.finish_round();
         }
         let mut results = stream::iter(selected)
             .map(|position| {
-                let snapshot = &snapshot;
+                let handle = handle.borrow();
                 async move {
                     let result = async {
-                        let Some(file) = snapshot
-                            .data_files
-                            .get(&position.0)
-                            .and_then(|files| files.get(&position.1))
+                        use crate::store::{
+                            key::{EntityKey, Key},
+                            proto::DataFileValue,
+                            read::read_singleton,
+                        };
+                        let Some(file): Option<DataFileValue> = read_singleton(
+                            handle,
+                            Key::current(EntityKey::File {
+                                table_id: position.0,
+                                data_file_id: position.1,
+                            }),
+                        )
+                        .await?
                         else {
                             return Ok(false);
                         };
-                        let table = TableId::new(position.0);
-                        let table_prefix = snapshot.table_data_prefix(table)?;
                         catalog
-                            .publish_file(
-                                data_store,
-                                data_prefix,
-                                &table_prefix,
-                                table,
-                                data_file_info(file),
-                            )
+                            .publish_registered_file(handle, data_store, data_prefix, &file)
                             .await
                     }
                     .await;
@@ -206,7 +219,29 @@ impl RowSummaryProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    #[tokio::test]
+    async fn empty_publication_does_not_decode_unrelated_entities() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let catalog = crate::Catalog::open(store.clone(), crate::CatalogOptions::default())
+            .await
+            .unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
+        tx.put(
+            crate::store::key::Key::current(crate::store::key::EntityKey::View { view_id: 99 })
+                .encode(),
+            [0xff],
+        )
+        .unwrap();
+        catalog.commit_write_tx(tx).await.unwrap();
+        let mut progress = RowSummaryProgress::for_files(Vec::new());
+        let data = DataStore::new(store);
+        assert!(progress.advance(&catalog, &data, "").await.unwrap());
+        catalog.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn retry_queue_spills_without_losing_or_revisiting_files() {

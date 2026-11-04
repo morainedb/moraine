@@ -129,8 +129,13 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
 
             let reads = handle_ref.catalog.reads();
             // SAFETY: caller contract for `probe` and `probe_ctx`.
-            let view =
-                unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, reads.snapshot()) }?;
+            let view = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    moraine::ffi_support::catalog_read::table_sources(reads, schema, table),
+                )
+            }?;
             let table_id = resolve_table(&view, schema, table)?;
 
             let data_store = handle_ref.data_store.as_ref().ok_or_else(|| {
