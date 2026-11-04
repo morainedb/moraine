@@ -1,10 +1,19 @@
 name: Release
-# On push to main, when Cargo.toml's version isn't on crates.io yet: build the
-# extension for every platform, and only if that succeeds, publish the crate
-# and cut the v<version> crate release.
+# When the release PR merges: build the extension for every platform, and
+# only if that succeeds, publish the crate and cut the v<version> crate
+# release.
 #
 # The ext-v<version> extension release carries the per-platform binaries,
 # each proven in the stock CLI for the DuckDB it names before publishing.
+#
+# The merged release commit is what says a release was asked for. Deciding
+# from the version alone -- release whenever Cargo.toml's version is not on
+# crates.io yet -- cannot distinguish "not published yet" from "cannot be
+# published": with 0.8.1 in Cargo.toml and crates.io stuck at 0.7.0, every
+# ordinary merge re-ran the whole release and re-uploaded the binaries over
+# the existing ext-v0.8.1, so four feature merges each silently changed what
+# that tag held. The version check stays below, as the guard against
+# publishing a version twice, but it no longer decides whether to run.
 on:
   workflow_dispatch:
   push:
@@ -19,6 +28,12 @@ jobs:
   # when a release is happening, and a second job for it would put another
   # runner start and another `cargo run` ahead of a half-hour build.
   should-release:
+    # release-plz titles the PR `chore: release v<version>`, and a squash
+    # merge carries that title as the commit subject. `workflow_dispatch` is
+    # the way to release when that subject is not what landed.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || startsWith(github.event.head_commit.message, 'chore: release')
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.check.outputs.release }}
