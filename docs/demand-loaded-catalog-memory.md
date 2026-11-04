@@ -1,9 +1,9 @@
 # Demand-loaded catalog memory measurement
 
 A fresh DuckDB process scanned two million file-column statistics records with
-81.8 MiB peak RSS, a 16 MiB Moraine working-memory allowance, and a 16 MiB Foyer
+80.9 MiB peak RSS, a 16 MiB Moraine working-memory allowance, and a 16 MiB Foyer
 budget. Increasing the catalog from 20,000 to two million statistics records
-increased the observed scan peak by 5.6 MiB. These are whole-process measurements,
+increased the observed scan peak by 6.4 MiB. These are whole-process measurements,
 including DuckDB, Rust runtime, SlateDB, preloading, and the query.
 
 Measured on 2026-11-04 in the Linux x86_64 Conductor workspace, using this change's
@@ -14,9 +14,9 @@ contains metadata only; this query reads no Parquet files.
 
 | Registered files | Statistics records | Attach peak RSS (MiB) | Scan peak RSS (MiB) | Attach seconds | Scan seconds |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 20,000 | 72.8 | 76.2 | 0.110 | 0.226 |
-| 10,000 | 200,000 | 68.0 | 73.5 | 0.094 | 0.738 |
-| 100,000 | 2,000,000 | 71.2 | 81.8 | 0.099 | 8.460 |
+| 1,000 | 20,000 | 72.0 | 74.5 | 0.121 | 0.167 |
+| 10,000 | 200,000 | 67.2 | 73.9 | 0.079 | 0.798 |
+| 100,000 | 2,000,000 | 71.0 | 80.9 | 0.080 | 7.759 |
 
 Each cell is one fresh process. Times include process startup, extension loading,
 attach, query, and shutdown. The query was `SELECT count(*) FROM
