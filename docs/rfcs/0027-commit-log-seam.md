@@ -61,7 +61,9 @@ pub trait CommitStore: Any + fmt::Debug + Send + Sync + 'static {
     async fn adopted(&self) -> Result<bool>;
     async fn adopt(&self, stamp: SlotCommit) -> Result<SlotAdoption>;
     async fn write_at(&self, sequence: u64, commit: SlotCommit) -> Result<SlotOffer>;
+    async fn fold_tail(&self) -> Result<u64>;
     async fn close(&self) -> Result<()>;
+    fn as_any(&self) -> &dyn Any;
 }
 
 pub enum SlotOffer {
@@ -83,8 +85,11 @@ names a taken slot and loses.
 
 `adopted` and `adopt` serve the open path alone: a read-write open on a
 format below the log's flushes, then adopts with the format stamp, and
-folds whichever stamp won — the library's, now. `close` writes out and
-lets go.
+folds whichever stamp won — the library's, now. `fold_tail` folds what has
+landed past the store's cursor into a held store, or refreshes a followed
+reader, and returns how many slots that was; demoting uses it to fold the
+tail and then to prove no committer is still writing. `close` writes out
+and lets go.
 
 `SlotCommit` keeps its shape — the transaction id, the validated head,
 `changes_made`, the writes — and the library carries all four in the slot
@@ -98,14 +103,23 @@ carry.
 pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     fn writer_session(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WriterSession>;
     fn reader_session(&self, log_store: Arc<dyn ObjectStore>, path: &str, tail: bool) -> Arc<dyn ReaderSession>;
-    fn holding(&self, db: slatedb::Db, session: Arc<dyn WriterSession>, catalog: CatalogHooks) -> Arc<dyn CommitStore>;
-    fn following(&self, reader: Arc<slatedb::DbReader>, session: Arc<dyn ReaderSession>, catalog: CatalogHooks) -> Arc<dyn CommitStore>;
+    fn holding(&self, db: slatedb::Db, session: Arc<dyn WriterSession>, hooks: CatalogHooks) -> Arc<dyn CommitStore>;
+    fn following(&self, reader: Arc<slatedb::DbReader>, session: Arc<dyn ReaderSession>, hooks: CatalogHooks) -> Arc<dyn CommitStore>;
     fn garbage_collector(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WalGc>;
     fn external_compaction(&self) -> bool;
 }
 
-pub trait WriterSession: Any + Send + Sync { fn writer_init(&self) -> Box<dyn WriterInit>; }
-pub trait ReaderSession: Any + Send + Sync { fn reader(&self) -> Arc<dyn WalReader>; }
+#[async_trait]
+pub trait WriterSession: Any + Send + Sync + 'static {
+    fn writer_init(&self) -> Box<dyn WriterInit>;
+    async fn adopted(&self) -> Result<bool>;
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub trait ReaderSession: Any + Send + Sync + 'static {
+    fn reader(&self) -> Arc<dyn WalReader>;
+    fn as_any(&self) -> &dyn Any;
+}
 ```
 
 A **session** is the cursor one open shares with its plug: the provider
@@ -113,6 +127,10 @@ mints it, the catalog builds the SlateDB store or reader over the plug it
 yields, and hands both back to the provider, which recognizes the session
 as its own and builds the commit store over it. This replaces
 `CommitLogProvider::session` and the per-path plug methods of RFC 0024.
+A writer session answers `adopted` before the store is built: the plug
+replays the log in place of the store's own, so a store on a log nobody
+has adopted drains its own log into the tree first, as RFC 0024's open
+does.
 
 `garbage_collector` stays, for maintenance's collector, and so does
 `external_compaction`. Registration and the per-open option are as in RFC
@@ -124,7 +142,9 @@ as its own and builds the commit store over it. This replaces
 pub struct CatalogHooks {
     pub take: Arc<dyn TakeStore>,
     pub inspect: Arc<dyn Fn(u64, &SlotEnvelope) -> Result<()> + Send + Sync>,
-    pub options: CommitLogSettings,
+    pub path: String,
+    pub object_store: Arc<dyn ObjectStore>,
+    pub settings: CommitLogSettings,
 }
 
 #[async_trait]
@@ -145,6 +165,9 @@ pub trait TakeStore: Send + Sync + 'static {
   sequence a committer races", run by the library on every slot before it
   folds it; a refused slot is not folded and the fold stops with the
   refusal, as corruption, as today.
+- **`path`** and **`object_store`** are where the store lives, as it was
+  opened: what the library's collector run needs to read the manifests and
+  the checkpoints that pin the log.
 - **`CommitLogSettings`** carries the existing `commit_log_*` options —
   the fold cadence, the flush count, the retention, the fold poll, and the
   committer's poll — as values the library reads. The catalog interprets
@@ -153,9 +176,13 @@ pub trait TakeStore: Send + Sync + 'static {
 The catalog also exposes two things for the enterprise maintenance crate,
 which today reaches the loop through catalog verbs:
 
-- `Catalog::store_taker(object_store, options) -> Arc<dyn TakeStore>`: the
-  hook alone, so a maintenance process can fold a lake once, measure its
-  unfolded tail, or hold its store with the library and no live catalog.
+- `Catalog::commit_log_hooks(object_store, options) -> CatalogHooks`: the
+  hooks as a live catalog would hand them, so a maintenance process can
+  fold a lake once, measure its unfolded tail, or hold its store with the
+  library and no live catalog; the inspection is the catalog's to supply,
+  since it reads the catalog's own keys.
+  `Catalog::store_taker(object_store, options) -> Arc<dyn TakeStore>` is
+  its `take` alone.
 - `Catalog::commit_store(&self) -> Option<Arc<dyn CommitStore>>`: the
   store behind a live catalog, for the same crate to reach through `Any`.
 
@@ -174,8 +201,8 @@ maintenance crate, which performs them with the library over the taker
 and the store above. The read-only tailing attach and the committer's poll
 interval stay as options; they configure the seam, not the loop.
 
-**Stays in this repository**: the traits above and their in-tree
-implementation; the sequence a batch races, derived from its head stamp's
+**Stays in this repository**: the traits above and their in-tree test
+fixture; the sequence a batch races, derived from its head stamp's
 counter and the adoption's recorded origin; the format stamp and
 migration; `submit_batch`'s staging against a commit session and its
 lost-race outcome; the conflict the DuckDB path surfaces; the L0-ceiling
@@ -217,15 +244,19 @@ the same loop in miniature for the tests.
 Every obligation of RFC 0024 stands, re-pointed at the seam. In addition:
 
 - An in-tree commit store on each side: a holder applies its win and
-  folds a loss; a follower is served its win and waits for a loss; a
-  promoted follower folds into the store and reads through its reader.
+  folds a loss; a follower is served its win and waits for a loss. The
+  in-tree store holds only for adoption, demotion, and the cadence's take;
+  promotion, the fence that demotes it, and a won slot the store could not
+  take are the library's, tested where the library is.
 - The cadence: with no holder alive, the follower that lands slot
   `n × fold_every` takes the store through the catalog's taker, folds,
   writes out, and lets go, and the manifest's replay point moves to it.
-- The fence that demotes: a promoted follower another process fences
-  drops back to following and its next commit lands through the log.
+- The fence that demotes, in the library: a promoted follower another
+  process fences drops back to following and its next commit lands through
+  the log.
 - A commit the store could not take surfaces as an unknown outcome
-  naming its sequence, and a reopen folds it.
+  naming its sequence, and a reopen folds it; the library's error, mapped
+  by the provider that carries it.
 - The sequence invariant: a batch prepared against a stale head names a
   taken slot and loses, never being refused as past the store; a batch
   prepared against the current head of a committer whose reader was served

@@ -1,7 +1,8 @@
-//! The plug boundary over the in-tree log: readers tail it, a folder adopts
-//! it and commits through it, a lost race folds the winner, and a store
-//! stamped for the log is refused without a provider. The process-wide
-//! registry is covered by its own test binary, since it is global.
+//! The seam over the in-tree log: readers tail it, a committer adopts it and
+//! commits through it, a lost race is served the winner, the cadence takes
+//! the store through the catalog's taker, and a store stamped for the log
+//! is refused without a provider. The process-wide registry is covered by
+//! its own test binary, since it is global.
 
 use std::sync::Arc;
 
@@ -9,7 +10,10 @@ use object_store::memory::InMemory;
 
 use crate::{
     Catalog, CatalogOptions,
-    commit_log::{CommitLogProvider, SlotCommit, SlotEnvelope, SlotWrite, test_log::TestProvider},
+    commit_log::{
+        CommitLogProvider, SlotCommit, SlotEnvelope, SlotOffer, SlotWrite,
+        test_log::{TestProvider, TestStore},
+    },
     store::{
         key::{Key, SysKey},
         open::StoreBuilder,
@@ -31,9 +35,14 @@ async fn bootstrapped(object_store: Arc<InMemory>, path: &str) {
     writer.close().await.unwrap();
 }
 
-/// A peer's slot at `sequence`: one write under `key`, with the head stamp
+/// The provider's log store, which the in-tree log ignores.
+fn any_log_store() -> Arc<dyn object_store::ObjectStore> {
+    Arc::new(InMemory::new())
+}
+
+/// A peer's commit at `sequence`: one write under `key`, with the head stamp
 /// every slot carries, at the counter `sequence` implies.
-fn peer_slot(provider: &TestProvider, sequence: u64, key: &[u8], value: &[u8]) -> SlotEnvelope {
+fn peer_commit(provider: &TestProvider, sequence: u64, key: &[u8], value: &[u8]) -> SlotCommit {
     // The adoption stamp records the origin; once truncation has taken it,
     // any slot's head stamp implies it, since slot k stamps origin + k - 1.
     let format_key = Key::Sys(SysKey::Format).encode();
@@ -59,23 +68,38 @@ fn peer_slot(provider: &TestProvider, sequence: u64, key: &[u8], value: &[u8]) -
         .expect("some slot records or implies the batch origin");
     let (head_key, head_value) = crate::transaction::commit::head_stamp(0, origin + sequence - 2);
 
-    SlotEnvelope {
-        commits: vec![SlotCommit {
-            transaction_id: [u8::try_from(sequence).unwrap(); 16],
-            validated_head: 0,
-            changes_made: String::new(),
-            writes: vec![
-                SlotWrite {
-                    key: key.to_vec(),
-                    value: Some(value.to_vec()),
-                },
-                SlotWrite {
-                    key: head_key,
-                    value: head_value,
-                },
-            ],
-        }],
+    SlotCommit {
+        transaction_id: [u8::try_from(sequence).unwrap(); 16],
+        validated_head: 0,
+        changes_made: String::new(),
+        writes: vec![
+            SlotWrite {
+                key: key.to_vec(),
+                value: Some(value.to_vec()),
+            },
+            SlotWrite {
+                key: head_key,
+                value: head_value,
+            },
+        ],
     }
+}
+
+/// A peer's slot at `sequence`, as [`peer_commit`].
+fn peer_slot(provider: &TestProvider, sequence: u64, key: &[u8], value: &[u8]) -> SlotEnvelope {
+    SlotEnvelope {
+        commits: vec![peer_commit(provider, sequence, key, value)],
+    }
+}
+
+/// The sequences the log holds, in order.
+fn sequences(provider: &TestProvider) -> Vec<u64> {
+    provider
+        .log
+        .slots()
+        .iter()
+        .map(|(sequence, _)| *sequence)
+        .collect()
 }
 
 /// A tailing read-only open builds its store over the provider's reader
@@ -85,9 +109,9 @@ async fn a_tailing_read_only_open_is_served_the_logs_slots() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
 
-    // A folder adopts the log, so slots count from the store's own WAL.
+    // A committer adopts the log, so slots count from the store's own WAL.
     let provider = Arc::new(TestProvider::default());
-    let folder = Catalog::open(
+    let committer = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -96,7 +120,7 @@ async fn a_tailing_read_only_open_is_served_the_logs_slots() {
     )
     .await
     .unwrap();
-    folder.close().await.unwrap();
+    committer.close().await.unwrap();
 
     provider
         .log
@@ -115,7 +139,6 @@ async fn a_tailing_read_only_open_is_served_the_logs_slots() {
 
     assert!(
         provider
-            .committer(Arc::new(InMemory::new()), "lake")
             .await_served(2, std::time::Duration::from_secs(5))
             .await,
         "the tailing reader replayed the slot"
@@ -129,14 +152,14 @@ async fn a_tailing_read_only_open_is_served_the_logs_slots() {
 
 /// A read-write open with a provider adopts the log — its format stamp is
 /// the first slot — and from then on each commit is a slot, which a
-/// tailing reader of the same log serves before the folder has flushed.
+/// tailing reader of the same log serves before anything has folded.
 #[tokio::test]
-async fn a_folder_adopts_the_log_and_commits_through_it() {
+async fn a_committer_adopts_the_log_and_commits_through_it() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
 
-    let folder = Catalog::open(
+    let committer = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -152,9 +175,13 @@ async fn a_folder_adopts_the_log_and_commits_through_it() {
         slots[0].1.writes().any(|write| write.key == stamp),
         "the first slot is the format stamp"
     );
-    assert_eq!(provider.folded_sequence(), 1);
+    assert_eq!(
+        provider.folded_sequence(),
+        1,
+        "the adoption folded its own stamp into the store it held"
+    );
 
-    folder
+    committer
         .commit(|tx| tx.create_schema("s").map(|_| ()))
         .await
         .unwrap();
@@ -168,7 +195,7 @@ async fn a_folder_adopts_the_log_and_commits_through_it() {
     assert_eq!(
         provider.folded_sequence(),
         1,
-        "the adoption folded; the commit waits for a slot the cadence names"
+        "the commit waits for a slot the cadence names"
     );
 
     let reader = Catalog::open_read_only(
@@ -191,18 +218,19 @@ async fn a_folder_adopts_the_log_and_commits_through_it() {
         "a tailing reader serves the slot before any flush"
     );
     reader.close().await.unwrap();
-    folder.close().await.unwrap();
+    committer.close().await.unwrap();
 }
 
-/// A commit that loses its slot race folds what beat it into the store and
-/// retries, landing after the winner.
+/// A commit prepared against a head a peer has moved past names a taken
+/// slot and loses: the committer is served the winner and the retry lands
+/// after it, and the next writer open replays the winner into the store.
 #[tokio::test]
-async fn a_lost_race_folds_the_winner_before_the_retry_lands() {
+async fn a_lost_race_is_served_the_winner_before_the_retry_lands() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
 
-    let folder = Catalog::open(
+    let committer = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -212,34 +240,30 @@ async fn a_lost_race_folds_the_winner_before_the_retry_lands() {
     .await
     .unwrap();
 
-    // A peer lands a slot this folder has not seen.
+    // A peer lands a slot in the moment after this committer last read.
     provider
         .log
-        .land(2, peer_slot(&provider, 2, b"\xffpeer", b"landed"));
+        .land_unseen(2, peer_slot(&provider, 2, b"\xffpeer", b"landed"));
 
-    folder
+    committer
         .commit(|tx| tx.create_schema("s").map(|_| ()))
         .await
         .unwrap();
-    let slots = provider.log.slots();
     assert_eq!(
-        slots
-            .iter()
-            .map(|(sequence, _)| *sequence)
-            .collect::<Vec<_>>(),
+        sequences(&provider),
         vec![1, 2, 3],
         "the retry landed after the peer's slot"
     );
     assert_eq!(
         provider.folded_sequence(),
         1,
-        "only the adoption folded; the cadence names when the rest does"
+        "a follower is served, and folds nothing"
     );
-    folder.close().await.unwrap();
+    committer.close().await.unwrap();
 
-    // The peer's write was folded into this store before the retry.
+    // The next writer open's replay is the fold: the peer's write is there.
     let (db, _counters) = StoreBuilder::new("lake", object_store)
-        .commit_log(Some(provider.clone()))
+        .writer_session(Some(provider.writer_session(any_log_store(), "lake")))
         .open_writer()
         .await
         .unwrap();
@@ -250,16 +274,16 @@ async fn a_lost_race_folds_the_winner_before_the_retry_lands() {
     db.close().await.unwrap();
 }
 
-/// A second read-write process commits over a tailing reader: it needs no
-/// store of its own, lands its batch as a slot, sees it once its reader is
-/// served, and the folder folds it before the folder's next commit lands.
+/// Two read-write processes commit over tailing readers: neither needs a
+/// store of its own, each lands its batch as a slot, and each is served
+/// the other's the moment it reads.
 #[tokio::test]
-async fn a_committer_over_a_reader_commits_through_the_log() {
+async fn two_committers_commit_through_one_log() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
 
-    let folder = Catalog::open(
+    let first = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -268,17 +292,17 @@ async fn a_committer_over_a_reader_commits_through_the_log() {
     )
     .await
     .unwrap();
-    folder
+    first
         .commit(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
 
     // Another process over the same log: its own cursor, the same slots.
-    let committer_provider = Arc::new(provider.sharing());
-    let committer = Catalog::open(
+    let second_provider = Arc::new(provider.sharing());
+    let second = Catalog::open(
         object_store.clone(),
         CatalogOptions {
-            commit_log: Some(committer_provider.clone()),
+            commit_log: Some(second_provider.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
             reader_poll_interval: std::time::Duration::from_millis(10),
             ..options_at("lake")
@@ -286,69 +310,53 @@ async fn a_committer_over_a_reader_commits_through_the_log() {
     )
     .await
     .unwrap();
-    committer
+    second
         .commit(|tx| tx.create_schema("b").map(|_| ()))
         .await
         .unwrap();
     assert_eq!(
-        provider
-            .log
-            .slots()
-            .iter()
-            .map(|(sequence, _)| *sequence)
-            .collect::<Vec<_>>(),
+        sequences(&provider),
         vec![1, 2, 3],
-        "the committer's batch is the third slot"
+        "the second committer's batch is the third slot"
     );
-    let seen = committer.snapshot().await.unwrap();
+    let seen = second.snapshot().await.unwrap();
     assert!(
         seen.schema_by_name("a").is_some(),
-        "the folder's commit, served"
+        "the first committer's commit, served"
     );
     assert!(seen.schema_by_name("b").is_some(), "its own commit, served");
 
-    // The folder has not seen slot 3: its next commit loses and folds it.
-    // Both commits touch the schema list, so the loss is a conflict, which
-    // surfaces after the fold rather than being retried past.
-    let conflict = folder.commit(|tx| tx.create_schema("c").map(|_| ())).await;
+    // The first is served slot 3 as it reads, and lands after it.
     assert!(
-        matches!(conflict, Err(crate::Error::CommitConflict(_))),
-        "{conflict:?}"
+        first
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("b")
+            .is_some(),
+        "a read is served the peer's slot"
     );
-    assert_eq!(
-        provider.folded_sequence(),
-        1,
-        "the loss catches the reader up without folding into a store"
-    );
-    let after_fold = folder.snapshot().await.unwrap();
-    assert!(
-        after_fold.schema_by_name("b").is_some(),
-        "the committer's slot was folded"
-    );
-
-    // Re-driven against the folded state, it lands after the peer's slot.
-    folder
+    first
         .commit(|tx| tx.create_schema("c").map(|_| ()))
         .await
         .unwrap();
-    assert_eq!(provider.log.slots().len(), 4);
+    assert_eq!(sequences(&provider), vec![1, 2, 3, 4]);
     assert_eq!(
         provider.folded_sequence(),
         1,
-        "the loss folded nothing: this committer keeps no store"
+        "no process holds the store; nothing folds until the cadence"
     );
 
-    // And the committer is served the folder's slot in turn: a read asks,
-    // and the listing it causes serves the slot.
-    committer.snapshot().await.unwrap();
+    // And the second is served the first's slot in turn: a read asks, and
+    // the listing it causes serves the slot.
+    second.snapshot().await.unwrap();
     assert!(
-        committer_provider
-            .committer(Arc::new(InMemory::new()), "lake")
+        second_provider
             .await_served(4, std::time::Duration::from_secs(5))
             .await
     );
     assert!(
-        committer
+        second
             .snapshot()
             .await
             .unwrap()
@@ -356,8 +364,8 @@ async fn a_committer_over_a_reader_commits_through_the_log() {
             .is_some()
     );
 
-    committer.close().await.unwrap();
-    folder.close().await.unwrap();
+    second.close().await.unwrap();
+    first.close().await.unwrap();
 }
 
 /// A committer told a slot is served that its reader has not applied
@@ -369,7 +377,7 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
 
-    let folder = Catalog::open(
+    let adopter = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -378,11 +386,11 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
     )
     .await
     .unwrap();
-    folder
+    adopter
         .commit(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
-    folder.close().await.unwrap();
+    adopter.close().await.unwrap();
 
     // The committer never takes the store, so only its own reading can
     // save it from offering against a state it has not caught up to.
@@ -412,40 +420,45 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
         "the refresh before the offer applies the slot: {outcome:?}"
     );
     assert_eq!(
-        provider.log.slots().last().map(|(sequence, _)| *sequence),
-        Some(4),
+        sequences(&provider).last(),
+        Some(&4),
         "and the commit lands past the slot it was told of"
     );
     committer.close().await.unwrap();
 }
 
-/// After the configured number of folded slots the folder writes its
-/// memtable out and truncates the log: a reader following the folded store
-/// alone sees the commits, and the slots below the replay point are gone.
+/// A follower that lands a slot the cadence names takes the store through
+/// the catalog's taker, folds, writes the memtable out and truncates the
+/// log, and lets go: a reader following the folded store alone sees the
+/// commits, and the slots below the replay point are gone.
 #[tokio::test]
-async fn folder_flushes_and_truncates_after_enough_folded_slots() {
+async fn the_cadence_takes_the_store_folds_and_truncates() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
 
-    let folder = Catalog::open(
+    let committer = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
+            // Every slot folds, and every fold writes out.
             commit_log_fold_slots: 1,
-            commit_log_flush_slots: 2,
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
-    // Two folds of this handle's own: the adoption was folded by the open.
     for name in ["a", "b"] {
-        folder
+        committer
             .commit(|tx| tx.create_schema(name).map(|_| ()))
             .await
             .unwrap();
     }
+    assert_eq!(
+        provider.folded_sequence(),
+        3,
+        "each slot's fold took the store and replayed through it"
+    );
     // This process's own tailing reader pins the log through its checkpoint
     // until its next poll moves the checkpoint past the flush, so the
     // collector truncates at the flush after that one.
@@ -455,7 +468,7 @@ async fn folder_flushes_and_truncates_after_enough_folded_slots() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     for name in ["c", "d"] {
-        folder
+        committer
             .commit(|tx| tx.create_schema(name).map(|_| ()))
             .await
             .unwrap();
@@ -478,22 +491,15 @@ async fn folder_flushes_and_truncates_after_enough_folded_slots() {
             .unwrap()
             .schema_by_name("d")
             .is_some(),
-        "the flush carried the commits into the manifest"
+        "the fold carried the commits into the manifest"
     );
     folded_only.close().await.unwrap();
-    // The collector keeps the slot at the replay point itself and deletes
-    // everything below it.
-    let remaining: Vec<u64> = provider
-        .log
-        .slots()
-        .iter()
-        .map(|(sequence, _)| *sequence)
-        .collect();
+    let remaining = sequences(&provider);
     assert!(
-        remaining.iter().all(|sequence| *sequence >= 4) && remaining.last() == Some(&5),
-        "slots below the previous flush point were truncated: {remaining:?}"
+        remaining.first().is_some_and(|first| *first > 1) && remaining.last() == Some(&5),
+        "slots below the replay point were truncated: {remaining:?}"
     );
-    folder.close().await.unwrap();
+    committer.close().await.unwrap();
 }
 
 /// Rows a handle writes for itself, the sweeps and the status record,
@@ -504,7 +510,7 @@ async fn a_handles_own_rows_land_as_head_preserving_slots() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
-    let folder = Catalog::open(
+    let committer = Catalog::open(
         object_store,
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -513,14 +519,14 @@ async fn a_handles_own_rows_land_as_head_preserving_slots() {
     )
     .await
     .unwrap();
-    folder
+    committer
         .commit(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
     let before = provider.log.slots().len();
-    let head_before = folder.snapshot().await.unwrap().current_snapshot().id;
+    let head_before = committer.snapshot().await.unwrap().current_snapshot().id;
 
-    folder
+    committer
         .commit_own_rows(vec![(b"\xffown".to_vec(), Some(b"row".to_vec()))])
         .await
         .unwrap();
@@ -541,142 +547,108 @@ async fn a_handles_own_rows_land_as_head_preserving_slots() {
         "the slot carries the rows"
     );
     assert_eq!(
-        folder.snapshot().await.unwrap().current_snapshot().id,
+        committer.snapshot().await.unwrap().current_snapshot().id,
         head_before
     );
-    folder.close().await.unwrap();
+    committer.close().await.unwrap();
 }
 
-/// A holder that first meets its fence at close closes cleanly: every
-/// slot it folded is durable in the log, so there is nothing to report.
+/// The holder side of the in-tree store, at the seam: built over the store
+/// the catalog's taker opened, it folds a loss into the store and applies
+/// its win, and its fold finds nothing more.
 #[tokio::test]
-async fn a_holder_fenced_unseen_closes_quietly() {
+async fn a_holder_folds_a_loss_and_applies_its_win() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
+    let options = CatalogOptions {
+        commit_log: Some(provider.clone()),
+        ..options_at("lake")
+    };
 
-    let holder = Catalog::open(
-        object_store.clone(),
-        CatalogOptions {
-            commit_log: Some(provider.clone()),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    // Only an explicit take holds the store now; committers fold and
-    // let go.
-    assert!(holder.take_store().await.unwrap());
-    assert!(holder.holds_store());
-    holder
-        .commit(|tx| tx.create_schema("h").map(|_| ()))
+    let committer = Catalog::open(object_store.clone(), options.clone())
         .await
         .unwrap();
+    committer
+        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .await
+        .unwrap();
+    committer.close().await.unwrap();
 
-    // Another process takes the store; the holder has not flushed since.
-    let usurper = Catalog::open(
-        object_store.clone(),
-        CatalogOptions {
-            commit_log: Some(Arc::new(provider.sharing())),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    assert!(usurper.take_store().await.unwrap());
+    let object_store: Arc<dyn object_store::ObjectStore> = object_store;
+    let (db, session) = Catalog::store_taker(Arc::clone(&object_store), &options)
+        .take()
+        .await
+        .unwrap()
+        .expect("nothing stalls the take");
+    let holder = provider.holding(
+        db.clone(),
+        session,
+        Catalog::commit_log_hooks(&object_store, &options),
+    );
 
-    holder.close().await.unwrap();
-    usurper.close().await.unwrap();
-
-    let reader = Catalog::open_read_only(
-        object_store,
-        CatalogOptions {
-            commit_log: Some(Arc::new(provider.sharing())),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
+    // A peer's slot lands after the take's replay: the offer meets it,
+    // loses, and the holder folds the winner into the store it holds.
+    provider
+        .log
+        .land_unseen(3, peer_slot(&provider, 3, b"\xffpeer", b"landed"));
+    let lost = holder
+        .write_at(3, peer_commit(&provider, 3, b"\xffmine", b"raced"))
+        .await
+        .unwrap();
     assert!(
-        reader
-            .snapshot()
-            .await
-            .unwrap()
-            .schema_by_name("h")
-            .is_some()
+        matches!(
+            lost,
+            SlotOffer::Lost {
+                sequence: 3,
+                through: 3,
+                ..
+            }
+        ),
+        "{lost:?}"
+    );
+    assert_eq!(
+        db.get(b"\xffpeer").await.unwrap().as_deref(),
+        Some(&b"landed"[..]),
+        "the loss folded the winner"
+    );
+    assert_eq!(db.get(b"\xffmine").await.unwrap(), None);
+
+    // Past the winner, the holder's own offer wins and is applied.
+    let won = holder
+        .write_at(4, peer_commit(&provider, 4, b"\xffmine", b"won"))
+        .await
+        .unwrap();
+    assert_eq!(won, SlotOffer::Won { sequence: 4 });
+    assert_eq!(
+        db.get(b"\xffmine").await.unwrap().as_deref(),
+        Some(&b"won"[..]),
+        "the win was applied to the held store"
+    );
+    assert_eq!(holder.fold_tail().await.unwrap(), 0, "nothing is behind");
+    assert_eq!(provider.folded_sequence(), 4);
+    holder.close().await.unwrap();
+
+    // The close wrote the fold out: a reader of the folded store alone
+    // has what the holder folded and what it won.
+    let (reader, _counters) = StoreBuilder::new("lake", object_store)
+        .reader_session(Some(provider.reader_session(
+            any_log_store(),
+            "lake",
+            false,
+        )))
+        .open_reader()
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.get(b"\xffpeer").await.unwrap().as_deref(),
+        Some(&b"landed"[..])
+    );
+    assert_eq!(
+        reader.get(b"\xffmine").await.unwrap().as_deref(),
+        Some(&b"won"[..])
     );
     reader.close().await.unwrap();
-}
-
-/// A holder fenced by another process gives the store up and keeps
-/// committing through its reader.
-#[tokio::test]
-async fn a_fenced_holder_drops_back_to_committing() {
-    let object_store = Arc::new(InMemory::new());
-    bootstrapped(object_store.clone(), "lake").await;
-    let provider = Arc::new(TestProvider::default());
-
-    let holder = Catalog::open(
-        object_store.clone(),
-        CatalogOptions {
-            commit_log: Some(provider.clone()),
-            commit_log_poll_interval: std::time::Duration::from_millis(10),
-            commit_log_fold_poll: std::time::Duration::from_millis(10),
-            // A holder learns it was fenced at its next flush; flush every
-            // fold so the fence surfaces at once.
-            commit_log_flush_slots: 1,
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    // Only an explicit take holds the store now; committers fold and
-    // let go.
-    assert!(holder.take_store().await.unwrap());
-    assert!(holder.holds_store());
-
-    // Another process takes the store outright, then commits past it.
-    let usurper_provider = Arc::new(provider.sharing());
-    let usurper = Catalog::open(
-        object_store.clone(),
-        CatalogOptions {
-            commit_log: Some(usurper_provider.clone()),
-            commit_log_poll_interval: std::time::Duration::from_millis(10),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    assert!(usurper.take_store().await.unwrap());
-    usurper
-        .commit(|tx| tx.create_schema("u").map(|_| ()))
-        .await
-        .unwrap();
-
-    // The holder meets the fence at its next fold, whether its poll folds
-    // the usurper's slot first or its own commit loses to it; either way it
-    // demotes. A loss surfaces as a conflict, since both commits touch the
-    // schema list, and the re-driven commit lands through the log.
-    match holder.commit(|tx| tx.create_schema("h").map(|_| ())).await {
-        Ok(_) => {}
-        Err(crate::Error::CommitConflict(_)) => {
-            holder
-                .commit(|tx| tx.create_schema("h").map(|_| ()))
-                .await
-                .unwrap();
-        }
-        Err(other) => panic!("{other:?}"),
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while holder.holds_store() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(!holder.holds_store(), "fenced: back to committing");
-    let seen = holder.snapshot().await.unwrap();
-    assert!(seen.schema_by_name("u").is_some() && seen.schema_by_name("h").is_some());
-
-    holder.close().await.unwrap();
-    usurper.close().await.unwrap();
 }
 
 /// An adopted store opens read-only through a provider and is refused
@@ -687,7 +659,7 @@ async fn an_adopted_store_needs_a_provider_to_open() {
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
 
-    let folder = Catalog::open(
+    let committer = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -696,7 +668,7 @@ async fn an_adopted_store_needs_a_provider_to_open() {
     )
     .await
     .unwrap();
-    folder.close().await.unwrap();
+    committer.close().await.unwrap();
 
     let reader = Catalog::open_read_only(
         object_store.clone(),
@@ -764,7 +736,7 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
-    let folder = Catalog::open(
+    let adopter = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -773,7 +745,7 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
     )
     .await
     .unwrap();
-    folder.close().await.unwrap();
+    adopter.close().await.unwrap();
 
     let options = |provider: Arc<TestProvider>| CatalogOptions {
         commit_log: Some(provider),
@@ -822,7 +794,7 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
-    let folder = Catalog::open(
+    let adopter = Catalog::open(
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
@@ -831,7 +803,7 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     )
     .await
     .unwrap();
-    folder.close().await.unwrap();
+    adopter.close().await.unwrap();
 
     let committer_provider = Arc::new(provider.sharing());
     let committer = Catalog::open(
@@ -883,25 +855,22 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     committer.close().await.unwrap();
 }
 
-/// The unfolded tail is readable without folding it, so a lake whose
-/// committers fold nothing can be watched rather than only discovered.
+/// The catalog's taker opens the store as its writer with no live catalog,
+/// and the open's replay is the fold: a lake whose committers fold nothing
+/// is folded once by a process that holds nothing else.
 #[tokio::test]
-async fn a_committer_reports_how_far_behind_the_folded_store_is() {
+async fn the_taker_folds_the_tail_without_a_live_catalog() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
-    let committer = Catalog::open(
-        object_store.clone(),
-        CatalogOptions {
-            commit_log: Some(provider.clone()),
-            commit_log_fold_slots: u64::MAX,
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    let behind = committer.unfolded_slots().await.unwrap();
-
+    let options = CatalogOptions {
+        commit_log: Some(provider.clone()),
+        commit_log_fold_slots: u64::MAX,
+        ..options_at("lake")
+    };
+    let committer = Catalog::open(object_store.clone(), options.clone())
+        .await
+        .unwrap();
     for name in ["a", "b", "c"] {
         committer
             .commit(|tx| tx.create_schema(name).map(|_| ()))
@@ -909,48 +878,77 @@ async fn a_committer_reports_how_far_behind_the_folded_store_is() {
             .unwrap();
     }
     assert_eq!(
-        committer.unfolded_slots().await.unwrap(),
-        behind.map(|slots| slots + 3),
-        "three commits, three more slots the store lacks"
+        provider.folded_sequence(),
+        1,
+        "three commits, three slots the store lacks"
     );
-
-    // A sprint drains it, and what the sprint reports is what was behind.
-    let behind = committer.unfolded_slots().await.unwrap().unwrap();
     committer.close().await.unwrap();
-    let folded = Catalog::fold_sprint(
-        object_store.clone(),
-        CatalogOptions {
-            commit_log: Some(provider.clone()),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(folded, behind, "the sprint folded exactly what was behind");
 
-    let drained = Catalog::open(
+    let object_store: Arc<dyn object_store::ObjectStore> = object_store;
+    let (db, session) = Catalog::store_taker(Arc::clone(&object_store), &options)
+        .take()
+        .await
+        .unwrap()
+        .expect("nothing stalls the take");
+    assert!(session.adopted().await.unwrap());
+    assert_eq!(
+        provider.folded_sequence(),
+        4,
+        "the take's replay folded exactly what was behind"
+    );
+    db.close().await.unwrap();
+
+    let folded_only = Catalog::open_read_only(
         object_store,
         CatalogOptions {
-            commit_log: Some(provider),
-            commit_log_fold_slots: u64::MAX,
+            commit_log_tail: false,
+            ..options
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        folded_only
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("c")
+            .is_some(),
+        "the store's close wrote the fold out"
+    );
+    folded_only.close().await.unwrap();
+}
+
+/// A catalog's commit store is the library's, reachable through `Any`,
+/// and only a catalog on a log has one.
+#[tokio::test]
+async fn the_commit_store_is_the_librarys_and_only_on_a_log() {
+    let object_store = Arc::new(InMemory::new());
+    let plain = Catalog::open(object_store.clone(), options_at("plain"))
+        .await
+        .unwrap();
+    assert!(plain.commit_store().is_none());
+    plain.close().await.unwrap();
+
+    bootstrapped(object_store.clone(), "lake").await;
+    let committer = Catalog::open(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(Arc::new(TestProvider::default())),
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
-    assert_eq!(drained.unfolded_slots().await.unwrap(), Some(0));
-    drained.close().await.unwrap();
-}
-
-/// A catalog with no commit log has no tail to be behind.
-#[tokio::test]
-async fn a_catalog_without_a_log_reports_no_tail() {
-    let object_store = Arc::new(InMemory::new());
-    let catalog = Catalog::open(object_store, options_at("lake"))
-        .await
-        .unwrap();
-    assert_eq!(catalog.unfolded_slots().await.unwrap(), None);
-    catalog.close().await.unwrap();
+    let store = committer
+        .commit_store()
+        .expect("a committer commits through a store");
+    assert!(
+        store.as_any().downcast_ref::<TestStore>().is_some(),
+        "the store is the provider's own: {store:?}"
+    );
+    assert!(store.adopted().await.unwrap());
+    committer.close().await.unwrap();
 }
 
 /// Two committers over one lake each read what the other just committed,
@@ -1010,7 +1008,8 @@ async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
 
 /// The slot a commit lands names whether it folds: every `fold_slots`th
 /// one does, whichever committer wrote it, and no process measures
-/// anything to find out.
+/// anything to find out. The fold moves the replay point to the slot and
+/// lets the store go.
 #[tokio::test]
 async fn the_committer_that_lands_the_nth_slot_folds() {
     let object_store = Arc::new(InMemory::new());
@@ -1024,29 +1023,57 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
         ..options_at("lake")
     };
 
-    let committer = Catalog::open(object_store, options(provider.clone()))
+    let committer = Catalog::open(object_store.clone(), options(provider.clone()))
         .await
         .unwrap();
 
     // Slot 1 is the adoption; these commits are slots 2..8, so slot 4 and
     // slot 8 are folded by whichever committer lands them.
-    for index in 0..7 {
+    for index in 0..3 {
         committer
             .commit(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
             .await
             .unwrap();
     }
+    assert_eq!(provider.folded_sequence(), 4, "slot 4 folded");
+    for index in 3..6 {
+        committer
+            .commit(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(provider.folded_sequence(), 4, "slots 5..7 wait for slot 8");
+    committer
+        .commit(|tx| tx.create_schema("s6").map(|_| ()))
+        .await
+        .unwrap();
     assert_eq!(
-        committer.unfolded_slots().await.unwrap(),
-        Some(0),
+        provider.folded_sequence(),
+        8,
         "the slot that landed last was a multiple, so nothing is behind"
     );
-    assert!(
-        !committer.holds_store(),
-        "and the fold let the store go again"
-    );
-
     committer.close().await.unwrap();
+
+    // The fold wrote out and let go: a reader of the folded store alone
+    // sees every commit, and a writer opens with nothing to replay.
+    let folded_only = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log_tail: false,
+            ..options(Arc::new(provider.sharing()))
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        folded_only
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("s6")
+            .is_some()
+    );
+    folded_only.close().await.unwrap();
 }
 
 /// A read-only tailing catalog lists the log for a read, not for its
@@ -1096,7 +1123,6 @@ async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
     reader.snapshot().await.unwrap();
     assert!(
         reader_provider
-            .committer(Arc::new(InMemory::new()), "lake")
             .await_served(2, std::time::Duration::from_secs(5))
             .await,
         "the read's listing served the slot"
@@ -1104,71 +1130,6 @@ async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
     assert!(reader_provider.polls() > idle);
 
     reader.close().await.unwrap();
-    committer.close().await.unwrap();
-}
-
-/// A fold slower than the overrun is reported and then waited for, not
-/// abandoned: a slow fold still folds, and only a stopped one is a
-/// problem the report is there to name.
-#[tokio::test(start_paused = true)]
-async fn a_fold_past_the_overrun_is_reported_and_still_awaited() {
-    struct Slow(Arc<std::sync::atomic::AtomicBool>);
-
-    #[async_trait::async_trait]
-    impl super::StoreFolder for Slow {
-        async fn fold_now(&self) -> crate::Result<u64> {
-            tokio::time::sleep(super::FOLD_OVERRUN * 4).await;
-            self.0.store(true, std::sync::atomic::Ordering::Release);
-
-            Ok(7)
-        }
-    }
-
-    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let folded = super::fold_reporting_an_overrun(&Slow(Arc::clone(&finished)), 16)
-        .await
-        .unwrap();
-
-    assert_eq!(folded, 7, "the fold's own answer is what comes back");
-    assert!(
-        finished.load(std::sync::atomic::Ordering::Acquire),
-        "the fold was abandoned at the overrun rather than waited for"
-    );
-}
-
-/// The tail a watcher sees from outside is the one the lake has: asked
-/// statically, without opening the lake, and without folding anything.
-#[tokio::test]
-async fn the_unfolded_tail_can_be_read_without_opening_the_lake() {
-    let object_store = Arc::new(InMemory::new());
-    bootstrapped(object_store.clone(), "lake").await;
-    let provider = Arc::new(TestProvider::default());
-    let options = CatalogOptions {
-        commit_log: Some(provider.clone()),
-        commit_log_fold_slots: 0,
-        ..options_at("lake")
-    };
-
-    // No provider, no tail to be behind.
-    assert_eq!(
-        Catalog::unfolded_slots_of(object_store.clone(), &options_at("lake"))
-            .await
-            .unwrap(),
-        None
-    );
-
-    let committer = Catalog::open(object_store.clone(), options.clone())
-        .await
-        .unwrap();
-    let outside = Catalog::unfolded_slots_of(object_store.clone(), &options)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        Some(outside),
-        committer.unfolded_slots().await.unwrap(),
-        "the figure from outside is the one the lake reports for itself"
-    );
     committer.close().await.unwrap();
 }
 

@@ -3031,13 +3031,15 @@ async fn indexed(
     index.get().unwrap()
 }
 
-/// Counts every entry left in the `index` subspace, across both kinds.
+/// Counts every entry left in the `index` subspace, across both kinds, as
+/// the catalog reads: through a writer's transaction or a committer's reader.
 async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
     use crate::store::key::{IndexKind, index_kind_prefix};
-    let tx = catalog.begin_write_tx().unwrap();
+    let session = catalog.begin_read().await.unwrap();
     let mut total = 0;
     for kind in [IndexKind::Unique, IndexKind::Multi] {
-        let mut iter = ReadHandle::Tx(&tx)
+        let mut iter = session
+            .handle()
             .scan_prefix(
                 index_kind_prefix(kind),
                 ..,
@@ -3049,7 +3051,7 @@ async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
             total += 1;
         }
     }
-    tx.rollback();
+    session.finish();
     total
 }
 
@@ -4889,7 +4891,6 @@ async fn catalog_with_a_reclaimed_snapshot() -> (
         counters: crate::store::cache::store_counters(),
         db: db.clone(),
         pacer,
-        commit_log: None,
     };
 
     for name in ["a", "b", "c"] {
@@ -5178,15 +5179,14 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     catalog.close().await.unwrap();
 }
 
-/// A folder holding the store, with a two-column table, over `provider`.
+/// A committer with a two-column table, over `provider`. Called the folder
+/// for the tests' sake: the first process on the lake, which adopted the log.
 async fn folder_with_table(
     backing: Arc<dyn ObjectStore>,
     provider: Arc<crate::commit_log::test_log::TestProvider>,
 ) -> (crate::catalog::Catalog, crate::catalog::TableId) {
     use crate::catalog::{Catalog, ColumnDef};
     let folder = Catalog::open(backing, log_options(provider)).await.unwrap();
-    // Committers fold and let go, so this one takes the store explicitly.
-    assert!(folder.take_store().await.unwrap());
     let table = std::cell::Cell::new(None);
     folder
         .commit(|tx| {
@@ -5234,7 +5234,7 @@ async fn settles(mut check: impl AsyncFnMut() -> bool) -> bool {
 
 /// A committer that holds no store sweeps a dropped index through the log:
 /// every batch is a head-preserving slot, the head snapshot stands, and
-/// the folder folds the deletes into the store it holds.
+/// the folder is served the deletes through the log.
 #[tokio::test]
 async fn a_committer_sweeps_a_dropped_index_through_the_log() {
     use crate::{
@@ -5256,10 +5256,6 @@ async fn a_committer_sweeps_a_dropped_index_through_the_log() {
     )
     .await
     .unwrap();
-    assert!(
-        !committer.holds_store(),
-        "a second open commits over a reader"
-    );
     let request = MaintenanceRequest {
         batch_size: 2,
         pace: std::time::Duration::ZERO,
@@ -5271,7 +5267,7 @@ async fn a_committer_sweeps_a_dropped_index_through_the_log() {
 
     assert!(
         settles(async || index_entry_count(&folder).await == 0).await,
-        "the folder folds the sweep's slots into its store"
+        "the folder is served the sweep's slots"
     );
     assert_eq!(
         folder.snapshot().await.unwrap().snapshot.snapshot_id,
@@ -5308,7 +5304,7 @@ async fn a_committer_records_a_pass_against_the_head() {
 
     assert!(
         settles(async || !folder.maintenance_status().await.unwrap().is_empty()).await,
-        "the folder folds the record"
+        "the folder is served the record"
     );
     let recorded = folder.maintenance_status().await.unwrap();
     assert_eq!(recorded.len(), 1);

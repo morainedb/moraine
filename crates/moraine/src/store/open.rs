@@ -111,8 +111,12 @@ pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
-    commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
-    commit_log_tail: bool,
+    /// The commit-log session a writer is built over, when its commits are
+    /// slots; the plug replays the log in place of the store's own.
+    writer_session: Option<Arc<dyn crate::WriterSession>>,
+    /// The commit-log session a reader is built over, when it follows a
+    /// log: served the folded store, or the tail, as the session was minted.
+    reader_session: Option<Arc<dyn crate::ReaderSession>>,
     /// What a read-only reader lists the log for; without one the plug
     /// lists on every poll.
     read_asked: Option<Arc<crate::commit_log::asked::Asked>>,
@@ -143,8 +147,8 @@ impl<'a> StoreBuilder<'a> {
             path,
             object_store: retry::Store::wrap(object_store),
             wal_object_store: None,
-            commit_log: None,
-            commit_log_tail: false,
+            writer_session: None,
+            reader_session: None,
             read_asked: None,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
@@ -174,22 +178,18 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Opens the store over `provider`'s write-ahead-log plugs, so a
-    /// bucket-resident commit log is the store's log: a writer replays it
-    /// on open and reports its folds through the plug, and a reader follows
-    /// the folded store or tails the log.
-    pub(crate) fn commit_log(
-        mut self,
-        provider: Option<Arc<dyn crate::CommitLogProvider>>,
-    ) -> Self {
-        self.commit_log = provider;
+    /// Builds the writer over `session`'s write-ahead-log plug, so a
+    /// bucket-resident commit log is the store's log: the open replays it
+    /// in place of the store's own, and the session is what the commit
+    /// store is then built over. Writer only.
+    pub(crate) fn writer_session(mut self, session: Option<Arc<dyn crate::WriterSession>>) -> Self {
+        self.writer_session = session;
         self
     }
 
-    /// Makes a reader over a commit log tail the log rather than follow the
-    /// folded store. Reader only.
-    pub(crate) fn commit_log_tail(mut self, tail: bool) -> Self {
-        self.commit_log_tail = tail;
+    /// Builds the reader over `session`'s write-ahead-log plug. Reader only.
+    pub(crate) fn reader_session(mut self, session: Option<Arc<dyn crate::ReaderSession>>) -> Self {
+        self.reader_session = session;
         self
     }
 
@@ -342,8 +342,8 @@ impl<'a> StoreBuilder<'a> {
         if let Some(wal) = &self.wal_object_store {
             builder = builder.with_wal_object_store(Arc::clone(wal));
         }
-        if let Some(provider) = &self.commit_log {
-            builder = builder.with_wal_writer(provider.writer_init(self.log_store(), self.path));
+        if let Some(session) = &self.writer_session {
+            builder = builder.with_wal_writer(session.writer_init());
         }
 
         let location = self.location();
@@ -396,8 +396,8 @@ impl<'a> StoreBuilder<'a> {
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
         }
-        if let Some(provider) = &self.commit_log {
-            let reader = provider.reader(self.log_store(), self.path, self.commit_log_tail);
+        if let Some(session) = &self.reader_session {
+            let reader = session.reader();
             let reader: Arc<dyn slatedb::wal::WalReader> = match &self.read_asked {
                 Some(asked) => Arc::new(crate::commit_log::asked::AskedReader::new(
                     reader,
