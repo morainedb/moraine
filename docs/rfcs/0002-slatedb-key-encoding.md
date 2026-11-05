@@ -248,8 +248,9 @@ Per RFC 0001:
   append-only and elegant, but live-version reads become reverse scans and
   the live-catalog load still filters ended versions. Rejected; the split
   buys O(live) reads for one extra delete+put per ended version.
-- **Names in keys:** renames become key churn across every child range.
-  Rejected; attach-time maps suffice.
+- **Names in primary entity keys:** renames become key churn across every
+  child range. Rejected; entity identity remains stable across renames. A
+  secondary name index does not change that primary layout.
 - **Postcard/bincode values:** positional — adding a field is a format
   break. Rejected for durable state.
 - **Arrow IPC for entity values:** a columnar-batch model for
@@ -272,6 +273,5 @@ Per RFC 0001:
   configured, writer and reader alike, so RFC 0011's crash cases exercise
   the segmented path by construction — and the decision can still flip for
   free before first release.
-  Prefix bloom filters (the other half of SlateDB's prefix machinery) stay
-  unused — a catalog this small doesn't earn them; they can be enabled per
-  open at any time.
+  Prefix bloom filters (the other half of SlateDB's prefix machinery) remain
+  disabled; enabling them per open does not require a layout migration.
