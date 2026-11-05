@@ -187,7 +187,7 @@ covering the commit. An already-open scope continues seeing its old revision.
 
 ### Validity window and expiry reaction
 
-A held `CatalogSnapshot` at `S` names object-store files (`data_files_of`,
+A held `ReadScope` at `S` names object-store files (`data_files_of`,
 `delete_files_of`). RFC 0007 may schedule those files for deletion once `S`
 passes below the horizon and delete their bytes after the grace window `G`. So
 a view is safe to *use for data access* only while `S` remains within the
@@ -196,8 +196,8 @@ retention window.
 This RFC states the reader-side contract that RFC 0007's operator obligation
 implies:
 
-- A `CatalogSnapshot` whose `S` is still `≥ H` is fully valid.
-- A reader that tries to materialize or refresh at an `S` that has fallen below
+- A `ReadScope` whose `S` is still `≥ H` is fully valid.
+- A reader that tries to open a scope at an `S` that has fallen below
   `H` — detected because its `snapshot`/`history` range is no longer resolvable —
   receives a typed **`SnapshotExpired`** error (RFC 0003 error taxonomy, one
   variant per failure domain) and must re-resolve from head.

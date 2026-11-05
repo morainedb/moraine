@@ -619,7 +619,7 @@ the kind discriminant — `idx_index_prefix(kind, index_id)` covers exactly
 `INDEX_KIND_PREFIX_LEN + size_of::<u64>()` bytes (`store/key.rs:551`) — so
 the subspace is ordered by index id within each kind. For each kind: seek
 to the start, read one key, decode its `index_id`; if live in the
-`CatalogSnapshot` at `S`, seek past the whole index at
+index metadata at `S`, seek past the whole index at
 `idx_index_prefix(kind, index_id + 1)`; otherwise delete the range in
 batches and continue. Cost is one seek per *distinct index id present*, not
 one read per entry. A store whose indexes are all live pays two seeks per
@@ -1201,10 +1201,10 @@ and sibling-versus-nested prefixes without needing a lake.
 
 - **Unifying the retention windows.** DuckLake's `older_than`, cleanup's
   grace, SlateDB's GC `min_age`, and `checkpoint_lifetime` look like one
-  knob stated four times. They are not: RFC 0009 releases the SlateDB read
-  handle as soon as a `CatalogSnapshot` is materialized, so no moraine
-  reader outlives a 5-minute `min_age`, and the DuckLake windows govern
-  Parquet and catalog history, which SlateDB's collector never touches.
+  knob stated four times. They are not: fixed read scopes retain SlateDB
+  snapshots or checkpoint leases for their lifetime, while the DuckLake
+  windows govern Parquet and catalog history, which SlateDB's collector
+  never touches.
   Deriving one from another would invent a coupling that does not exist.
 
 - **Two rejected parameter alignments.** *One shared `older_than`* across
