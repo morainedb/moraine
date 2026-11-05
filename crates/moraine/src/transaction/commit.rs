@@ -63,7 +63,11 @@ pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
 pub(crate) const FORMAT_WITH_COMMIT_LOG: u64 = 10;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_DELETE_TARGETS;
+/// Current schemas and tables have an atomic exact-name directory.
+pub(crate) const FORMAT_WITH_NAMES: u64 = 11;
+/// Current delete files have an atomic target-data-file directory.
+pub(crate) const FORMAT_WITH_DELETE_TARGETS: u64 = 12;
 /// The lowest format this binary reads directly; a store below it must be
 /// migrated up first. Rises only when a format rewrites the keyspace.
 pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;
@@ -226,21 +230,15 @@ pub(crate) async fn validate_format(
         ));
     }
     match format {
-        Some(format) if format.format_version == FORMAT_WITH_COMMIT_LOG => {
-            if log_resident {
-                Ok(Some(format))
-            } else {
-                Err(Error::Migration(format!(
-                    "store format {FORMAT_WITH_COMMIT_LOG} keeps its commits in a bucket-resident \
-                     commit log; opening it needs the commit-log library linked in and \
-                     registered, or the lake demoted off its log by a binary that has it"
-                )))
-            }
-        }
         Some(format) if format.format_version > MAX_FORMAT_VERSION => {
             Err(Error::Migration(format!(
-                "store format {} is newer than this binary understands (max {MAX_FORMAT_VERSION}); \
-             upgrade the binary",
+                "store format {} is newer than this binary understands (max {MAX_FORMAT_VERSION}); upgrade the binary",
+                format.format_version
+            )))
+        }
+        Some(format) if uses_commit_log(&format) && !log_resident => {
+            Err(Error::Migration(format!(
+                "store format {} keeps its commits in a bucket-resident commit log; opening it needs the commit-log library linked in and registered, or the lake demoted off its log by a binary that has it",
                 format.format_version
             )))
         }
@@ -256,6 +254,11 @@ pub(crate) async fn validate_format(
         Some(format) => Ok(Some(format)),
         None => Ok(None),
     }
+}
+
+/// Whether a format stamp requires the bucket-resident commit log.
+pub(crate) fn uses_commit_log(format: &proto::FormatValue) -> bool {
+    format.format_version == FORMAT_WITH_COMMIT_LOG || format.commit_log_batch_origin.is_some()
 }
 
 /// The log store the catalog records, `None` when its log is in the
@@ -333,7 +336,7 @@ fn stage_bootstrap(
     stage(
         Key::Sys(SysKey::Format),
         value::encode_value(&proto::FormatValue {
-            format_version: MIN_FORMAT_VERSION,
+            format_version: MAX_FORMAT_VERSION,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
             commit_log_batch_origin: None,
         }),
@@ -404,6 +407,16 @@ fn stage_bootstrap(
         }),
     );
 
+    writes.push((
+        Key::Name(crate::store::key::NameKey {
+            kind: crate::store::key::NameKind::Schema,
+            parent: 0,
+            name: "main".into(),
+            entity_id: 0,
+        })
+        .encode(),
+        Some(Vec::new()),
+    ));
     stage_writes(tx, &writes)
 }
 
@@ -524,7 +537,7 @@ async fn open_attempt(
                 encrypted,
                 data_path, wal_path, "bootstrapped a fresh catalog store"
             );
-            Ok((db, counters, MIN_FORMAT_VERSION, pacer))
+            Ok((db, counters, MAX_FORMAT_VERSION, pacer))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
@@ -574,9 +587,14 @@ pub(crate) async fn drain_own_log(store: StoreBuilder<'_>) -> Result<()> {
 /// `store`, which applies whichever stamp holds it. Returns the format the
 /// store is at after.
 pub(crate) async fn adopt_commit_log(store: &dyn CommitStore, db: &Db, format: u64) -> Result<u64> {
-    if format >= FORMAT_WITH_COMMIT_LOG {
+    if read::read_format(ReadHandle::Writer(db))
+        .await?
+        .as_ref()
+        .is_some_and(uses_commit_log)
+    {
         return Ok(format);
     }
+    let adopted_format = format.max(FORMAT_WITH_COMMIT_LOG);
 
     // The plug acknowledges the store's own rows, the bootstrap included,
     // before they are durable; the flush makes them so.
@@ -587,7 +605,7 @@ pub(crate) async fn adopt_commit_log(store: &dyn CommitStore, db: &Db, format: u
     let stamp = SlotWrite {
         key: Key::Sys(SysKey::Format).encode(),
         value: Some(value::encode_value(&proto::FormatValue {
-            format_version: FORMAT_WITH_COMMIT_LOG,
+            format_version: adopted_format,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
             commit_log_batch_origin: Some(head.batch_seq),
         })),
@@ -605,7 +623,7 @@ pub(crate) async fn adopt_commit_log(store: &dyn CommitStore, db: &Db, format: u
         SlotAdoption::AdoptedByPeer(_) => info!("a peer adopted the commit log first"),
     }
 
-    Ok(FORMAT_WITH_COMMIT_LOG)
+    Ok(adopted_format)
 }
 
 /// The batch counter the commit log's first slot stands on, from the format
@@ -1252,7 +1270,7 @@ where
         }
         // The unchanged head is re-put as the conflict anchor.
         writes.push(head_stamp(head, base.batch_seq));
-        let staged_bytes = stage_writes_on(db_tx, &writes)?;
+        let staged_bytes = stage_writes_on(db_tx, &writes).await?;
         return Ok(Prepared::Staged {
             ours: Box::default(),
             commits: head,
@@ -1306,7 +1324,7 @@ where
         Some(value::encode_value(&snapshot)),
     ));
     writes.push(head_stamp(new_id, base.batch_seq));
-    let mut staged_bytes = stage_writes_on(db_tx, &writes)?;
+    let mut staged_bytes = stage_writes_on(db_tx, &writes).await?;
     staged_bytes.0 = staged_bytes.0.saturating_add(entries.bytes);
     tracing::debug!(
         snapshot = new_id,
@@ -1328,11 +1346,14 @@ where
 
 /// Stages `writes` on a batch's session, which records them for the slot
 /// the batch becomes.
-pub(crate) fn stage_writes_on(
+pub(crate) async fn stage_writes_on(
     session: &CommitSession,
     writes: &[StagedWrite],
 ) -> Result<StagedBytes> {
-    let mut staged = StagedBytes::default();
+    let mut staged = super::names::stage(session, writes).await?;
+    staged.0 = staged
+        .0
+        .saturating_add(super::file_targets::stage(session, writes).await?.0);
     for (key, write) in writes {
         staged.add(key.len(), write.as_ref().map_or(0, Vec::len));
         match write {

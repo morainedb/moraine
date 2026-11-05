@@ -624,6 +624,26 @@ void MergeStoredMetadataRows(MetadataRows &rows, MetadataRows stored) {
 	}
 }
 
+MetadataRows ProvideStoredOptionPage(MoraineMetadataCursor *cursor, MoraineInterruptProbe probe, void *probe_ctx) {
+	while (true) {
+		auto stored = ProvidePage<moraine_metadata_cursor_options, moraine_dump_options_free, OptionShape>(
+		    cursor, probe, probe_ctx);
+		if (stored.empty()) {
+			return {};
+		}
+		MetadataRows rows;
+		MergeStoredMetadataRows(rows, std::move(stored));
+		if (!rows.empty()) {
+			return rows;
+		}
+	}
+}
+
+template <bool EXTENDED>
+MetadataRows ProvideFixedMetadata(MoraineCatalogHandle *handle, MoraineInterruptProbe probe, void *probe_ctx) {
+	return FixedMetadataRows(handle, probe, probe_ctx, EXTENDED);
+}
+
 template <bool EXTENDED>
 MetadataRows ProvideMetadata(MoraineCatalogHandle *handle, MoraineInterruptProbe probe, void *probe_ctx) {
 	auto rows = FixedMetadataRows(handle, probe, probe_ctx, EXTENDED);
@@ -1261,6 +1281,48 @@ std::vector<MetadataTableSpec> MetadataTableSpecsImpl() {
 	}
 	for (auto &spec : specs) {
 		switch (spec.write_table_kind) {
+		case 0:
+		case 1:
+		case 11:
+		case 13:
+		case 14:
+		case 16:
+		case 17:
+		case 21:
+		case 22:
+		case 24:
+		case 25:
+		case 27:
+		case 2:
+		case 3:
+		case 4:
+		case 5:
+		case 6:
+		case 7:
+		case 8:
+		case 9:
+		case 10:
+		case 12:
+		case 15:
+		case 19:
+		case 20:
+		case 23:
+		case 18:
+		case 26:
+			spec.staged_page_supported = true;
+			break;
+		default:
+			break;
+		}
+		switch (spec.write_table_kind) {
+		case 25:
+			spec.page_provider = ProvideStoredOptionPage;
+			spec.fixed_page_provider = ProvideFixedMetadata<EXTENDED>;
+			break;
+		case 11:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_schema_versions, moraine_dump_schema_versions_free,
+			                                 SchemaVersionShape>;
+			break;
 		case 18:
 			spec.page_provider =
 			    ProvidePage<moraine_metadata_cursor_column_tags, moraine_dump_column_tags_free, ColumnTagShape>;

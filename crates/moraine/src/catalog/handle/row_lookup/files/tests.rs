@@ -167,8 +167,15 @@ async fn file_lookups_remain_correct_without_directory_retention() {
 async fn retained_summaries_preserve_positions_and_validate_the_source() {
     let warm = warm_table().await;
     let directory = super::super::lookup(&warm.catalog.row_lookups.files, warm.table).unwrap();
-    let file =
-        crate::catalog::snapshot::data_file_info(directory.files.get(&warm.ids[1].get()).unwrap());
+    let file = warm
+        .catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .data_files_of(warm.table)
+        .into_iter()
+        .find(|file| file.id == warm.ids[1])
+        .unwrap();
     let scope = super::DirectoryScope {
         stats: None,
         store: &warm.store,
@@ -236,8 +243,14 @@ async fn retained_permuted_summaries_survive_auxiliary_eviction() {
         .await
         .unwrap();
     let directory = super::super::lookup(&catalog.row_lookups.files, table).unwrap();
-    let file =
-        crate::catalog::snapshot::data_file_info(directory.files.get(&ids[0].get()).unwrap());
+    let file = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .into_iter()
+        .find(|file| file.id == ids[0])
+        .unwrap();
     crate::data_file::evict_summary(
         &store,
         table.get(),
@@ -825,14 +838,55 @@ async fn selection_defers_only_files_whose_bounds_exclude_every_requested_id() {
 }
 
 #[test]
-fn directory_weights_include_decoded_file_fields_and_spare_strings() {
-    let mut file = super::DataFileValue {
-        path: String::with_capacity(1024),
+fn source_signatures_change_with_file_metadata() {
+    let value = super::DataFileValue {
+        path: "file.parquet".into(),
         ..Default::default()
     };
-    file.path.push('x');
-    assert!(
-        super::retained_file_bytes(&file)
-            >= (size_of::<super::DataFileValue>() + file.path.capacity()) as u64
+    let before = crate::catalog::snapshot::data_file_info(&value);
+    let mut after = before.clone();
+    assert_eq!(
+        super::source_signature(&before),
+        super::source_signature(&after)
     );
+    after.row_id_start = Some(42);
+    assert_ne!(
+        super::source_signature(&before),
+        super::source_signature(&after)
+    );
+    after = before.clone();
+    after.path = "other.parquet".into();
+    assert_ne!(
+        super::source_signature(&before),
+        super::source_signature(&after)
+    );
+}
+
+#[tokio::test]
+async fn row_candidates_page_the_file_inventory() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let data = Arc::new(InMemory::new());
+    let mut files = Vec::new();
+    for ordinal in 0..300 {
+        files.push(dense_file(&data, ordinal, 3).await);
+    }
+    let (table, ids) = table_with(&catalog, files).await;
+    let found = catalog
+        .locate_row_ids(Some(DataStore::new(data)), "", table, vec![0, 450, 899])
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|row| row.data_file_id).collect::<Vec<_>>(),
+        vec![Some(ids[0]), Some(ids[150]), Some(ids[299])]
+    );
+    let retained = super::super::lookup(&catalog.row_lookups.files, table).unwrap();
+    assert!(
+        retained.files.len() <= 128,
+        "retained {} file descriptors",
+        retained.files.len()
+    );
+    drop(retained);
+    catalog.close().await.unwrap();
 }

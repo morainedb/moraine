@@ -15,6 +15,11 @@ use crate::{
     store::index_encoding::CanonicalKey,
 };
 
+mod delete_targets;
+mod names;
+pub(crate) use delete_targets::delete_target_prefix;
+pub(crate) use names::{NameKey, NameKind, name_prefix};
+
 /// Length in bytes of the encoded subspace prefix — one discriminant
 /// byte. The segment extractor and the prefix builders must agree on
 /// this.
@@ -60,6 +65,17 @@ pub(crate) enum Key {
     Changelog {
         /// The snapshot whose batch wrote these keys.
         snapshot_id: u64,
+    },
+    /// Exact-name entries for current metadata entities.
+    Name(NameKey),
+    /// Current delete files ordered by their target data file.
+    DeleteTarget {
+        /// Owning table.
+        table_id: u64,
+        /// Target data file.
+        data_file_id: u64,
+        /// Referenced current delete-file record.
+        delete_file_id: u64,
     },
 }
 
@@ -537,12 +553,16 @@ pub(crate) enum Subspace {
     SchemaVersion,
     /// Per-commit changelogs.
     Changelog,
+    /// Persistent current-entity names.
+    Name,
+    /// Current delete files ordered by target.
+    DeleteTarget,
 }
 
 impl Subspace {
     /// Every subspace, in discriminant order. A census walks this, so a
     /// subspace added to [`Key`] and left out here goes unreported.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::System,
         Self::Snapshot,
         Self::Current,
@@ -551,6 +571,8 @@ impl Subspace {
         Self::Index,
         Self::SchemaVersion,
         Self::Changelog,
+        Self::Name,
+        Self::DeleteTarget,
     ];
 
     /// The subspace whose keys carry exactly `prefix`, or `None` for a
@@ -581,6 +603,17 @@ impl Subspace {
                 begin_snapshot: 0,
             },
             Self::Changelog => Key::Changelog { snapshot_id: 0 },
+            Self::DeleteTarget => Key::DeleteTarget {
+                table_id: 0,
+                data_file_id: 0,
+                delete_file_id: 0,
+            },
+            Self::Name => Key::Name(NameKey {
+                kind: NameKind::Schema,
+                parent: 0,
+                name: String::new(),
+                entity_id: 0,
+            }),
         }
     }
 }
@@ -1114,6 +1147,11 @@ pub(crate) fn even_points_between(low: &[u8], high: &[u8], parts: usize) -> Vec<
 /// Byte prefix of every key in a subspace (exactly `TAG_PREFIX_LEN`
 /// bytes — the same prefix the segment extractor derives).
 pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
+    if subspace == Subspace::Name {
+        let mut prefix = names::name_prefix(NameKind::Schema, 0, "");
+        prefix.truncate(TAG_PREFIX_LEN);
+        return prefix;
+    }
     prefix_of(&subspace.sample(), TAG_PREFIX_LEN)
 }
 
@@ -1146,6 +1184,17 @@ pub(crate) fn history_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
 /// The ended versions of one entity, excluding the final fixed-width end id.
 pub(crate) fn history_entity_prefix(entity: EntityKey) -> Vec<u8> {
     let mut encoded = Key::history(entity, 0).encode();
+    encoded.truncate(encoded.len() - size_of::<u64>());
+    encoded
+}
+
+/// Schema versions belonging to one table, ordered by begin snapshot.
+pub(crate) fn schema_version_table_prefix(table_id: u64) -> Vec<u8> {
+    let mut encoded = Key::SchemaVersion {
+        table_id,
+        begin_snapshot: 0,
+    }
+    .encode();
     encoded.truncate(encoded.len() - size_of::<u64>());
     encoded
 }
@@ -2072,6 +2121,18 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn schema_version_prefix_covers_exactly_one_table(table_id in any::<u64>(), begin_snapshot in any::<u64>(), schema_version in any::<u64>()) {
+            let key = Key::SchemaVersion { table_id, begin_snapshot };
+            let encoded = key.encode();
+            prop_assert_eq!(Key::decode(&encoded).unwrap(), key);
+            prop_assert!(encoded.starts_with(&schema_version_table_prefix(table_id)));
+            prop_assert!(!encoded.starts_with(&schema_version_table_prefix(table_id.wrapping_add(1))));
+            let value = crate::store::proto::SchemaVersionValue { schema_version };
+            let decoded: crate::store::proto::SchemaVersionValue = crate::store::value::decode_value(&crate::store::value::encode_value(&value)).unwrap();
+            prop_assert_eq!(decoded, value);
+        }
+
         #[test]
         fn entity_history_prefix_covers_exactly_one_identity(
             table_id in any::<u64>(), data_file_id in any::<u64>(), end_snapshot in any::<u64>(),

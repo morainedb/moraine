@@ -27,6 +27,63 @@ pub struct MoraineMetadataCursor {
     handle: MoraineCatalogHandle,
 }
 
+impl MoraineMetadataCursor {
+    pub(crate) fn new(cursor: MetadataCursor, handle: &MoraineCatalogHandle) -> Box<Self> {
+        Box::new(Self {
+            cursor: Mutex::new(Some(cursor)),
+            handle: handle.read_alias(handle.catalog.reads().clone()),
+        })
+    }
+}
+
+/// Restarts a scan with the same read point and frozen authored rows.
+///
+/// # Safety
+/// The cursor must be live; outputs, error, and probe follow the open contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_metadata_cursor_fork(
+    cursor: *mut MoraineMetadataCursor,
+    out: *mut *mut MoraineMetadataCursor,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || {
+        if cursor.is_null() || out.is_null() {
+            return Err(AbiError::invalid_argument(
+                "null cursor fork input or output",
+            ));
+        }
+        // SAFETY: caller supplies a live cursor.
+        let owned = unsafe { &*cursor };
+        let held = owned
+            .cursor
+            .lock()
+            .map_err(|_| AbiError::new(codes::INTERNAL, "metadata cursor poisoned"))?;
+        let cursor = held
+            .as_ref()
+            .ok_or_else(|| AbiError::invalid_argument("metadata cursor failed previously"))?;
+        // SAFETY: caller supplies the callback and context lifetime.
+        let fork = unsafe {
+            owned
+                .handle
+                .block_on_cancellable(probe, probe_ctx, cursor.fork())
+        }?;
+        Ok(MoraineMetadataCursor::new(fork, &owned.handle))
+    };
+    // SAFETY: caller supplies a writable error slot if non-null.
+    match unsafe { guard(err, attempt) } {
+        Ok(cursor) => {
+            // SAFETY: output was checked non-null and is writable by contract.
+            unsafe {
+                *out = Box::into_raw(cursor);
+            }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// Opens a fixed metadata scan; `u64::MAX` means no table or live bound.
 ///
 /// # Safety
@@ -64,10 +121,7 @@ pub unsafe extern "C" fn moraine_metadata_cursor_open(
                 ),
             )
         }?;
-        Ok(Box::new(MoraineMetadataCursor {
-            cursor: Mutex::new(Some(cursor)),
-            handle: handle.read_alias(handle.catalog.reads().clone()),
-        }))
+        Ok(MoraineMetadataCursor::new(cursor, handle))
     };
     // SAFETY: the caller supplies a writable error pointer, if present.
     match unsafe { guard(err, attempt) } {
@@ -861,6 +915,34 @@ pub unsafe extern "C" fn moraine_metadata_cursor_view_column_tags(
             probe_ctx,
             err,
             MetadataCursor::view_column_tags,
+        )
+    }
+}
+
+/// Reads a page of schema versions; the matching dump free function releases
+/// it.
+///
+/// # Safety
+/// The cursor, outputs, probe, and error follow the cursor-open contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_metadata_cursor_schema_versions(
+    cursor: *mut MoraineMetadataCursor,
+    out_items: *mut *mut crate::dumps::MoraineSchemaVersionRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        next_page(
+            cursor,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            MetadataCursor::schema_versions,
         )
     }
 }

@@ -1,14 +1,8 @@
-// A duckdb::TransactionManager backed by moraine: snapshot-per-transaction.
-// StartTransaction pins one moraine read scope and hands out a
-// MoraineTransaction that owns it; CommitTransaction commits the staged tx
-// (if one was opened) and RollbackTransaction discards it, both releasing
-// the snapshot.
+// One pinned Moraine read scope and staged write set per DuckDB transaction.
 #pragma once
 
 #include "duckdb.hpp"
 
-// Defines duckdb::StorageExtensionInfo, named by
-// MoraineTransactionManager::Create's signature.
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -26,10 +20,7 @@ namespace moraine_duckdb {
 
 class MoraineCatalog;
 
-// One DuckDB transaction's view of a moraine catalog: the snapshot
-// pinned at StartTransaction, plus the schema-entry cache built
-// lazily against it. Cached CatalogEntry objects must outlive every
-// reference to them returned within the transaction.
+// Schema catalog entries must outlive every reference returned within the transaction.
 class MoraineTransaction : public duckdb::Transaction {
 public:
 	MoraineTransaction(duckdb::TransactionManager &manager, duckdb::ClientContext &context,
@@ -45,10 +36,7 @@ public:
 		return scoped && !StagedTxIfOpen() ? scoped : catalog_handle_;
 	}
 
-	// The handle index probes read through: the revision this transaction
-	// started on, whether or not it has staged writes since. Index entries
-	// carry no staged overlay, so the pin stays the one view consistent with
-	// the DuckLake snapshot the transaction scans at.
+	// Index entries have no staged overlay; probes always use the original read point.
 	MoraineCatalogHandle *IndexReadHandle() const {
 		auto scoped = moraine_snapshot_read_handle(snapshot_);
 		return scoped ? scoped : catalog_handle_;
@@ -64,44 +52,22 @@ public:
 	void PutSchema(uint64_t schema_id, duckdb::unique_ptr<duckdb::SchemaCatalogEntry> entry);
 	void ForEachSchema(const std::function<void(duckdb::SchemaCatalogEntry &)> &callback) const;
 
-	// Frees the snapshot and marks it released, so the destructor's
-	// defensive free becomes a no-op.
+	// Releases the snapshot once, including during destructor cleanup.
 	void ReleaseSnapshot();
 
-	// The store stamp this transaction's snapshot stands at, resolved once
-	// from the snapshot rather than read from the store per table. False
-	// when the snapshot is gone or reports no stamp.
+	// Resolves the pinned store stamp once; false if absent or released.
 	bool SnapshotStamp(uint64_t &snapshot_id, uint64_t &batch_seq);
 
-	// Lazily opens (on the first call) the one staged-row transaction this
-	// DuckDB transaction stages every write into, and returns it. Every
-	// subsequent INSERT/UPDATE/DELETE within the same DuckDB transaction
-	// reuses it: one moraine staged tx per DuckDB transaction.
-	//
-	// For a caller staging only `inline/*` rows. No metadata table's
-	// overlay reads those, so every held materialization stands.
-	MoraineTxHandle *StagedTxForInline();
+	// Lazily opens the shared staged transaction for all writes.
+	MoraineTxHandle *StagedTx();
 
-	// The same, for a caller staging against exactly `spec`. Only that
-	// table's overlay can change, so only its materialization is dropped.
-	MoraineTxHandle *StagedTxFor(const MetadataTableSpec &spec);
-
-	// The staged tx if one has been opened, else null — a peek for read
-	// paths that must observe the transaction's own staged writes without
-	// ever opening a write transaction themselves.
+	// Observes staged writes without opening a write transaction.
 	MoraineTxHandle *StagedTxIfOpen() const;
 
-	// Hands ownership of the staged tx (if one was opened) to the caller,
-	// clearing this transaction's reference so the destructor's defensive
-	// rollback becomes a no-op. Returns null if no write ever opened one.
+	// Transfers ownership to the caller; null if no write transaction was opened.
 	MoraineTxHandle *TakeStagedTx();
 
-	// Takes the rows one metadata scan emits row ids for, returning the id
-	// its first row carries. Ids come from a counter this transaction never
-	// rewinds, so a run stays addressable however its table is scanned or
-	// staged into afterwards — the write that resolves those ids reaches
-	// the very rows the scan handed out, not a second materialization of
-	// them.
+	// Assigns stable row IDs that remain addressable after later scans and writes.
 	uint64_t RegisterScannedRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows);
 	using ScannedRowResolver = std::function<const std::vector<duckdb::Value> *(uint64_t)>;
 	static constexpr uint64_t kScannedRunCapacity = uint64_t(1) << 40;
@@ -131,15 +97,12 @@ private:
 	MoraineTxHandle *staged_tx_ = nullptr;
 	// Serializes opening and taking the staged transaction.
 	mutable std::mutex staged_state_lock_;
-	// Registered runs, by ascending base, and the next id to hand out.
-	// Guarded, because scans of one transaction init on the executor's
-	// threads while another statement's Sink resolves against them.
+	// Ascending runs; executor scans and write sinks may access these concurrently.
 	std::vector<ScannedRun> scanned_runs_;
 	uint64_t next_scanned_row_id_ = 0;
 	mutable std::mutex scanned_runs_lock_;
 
-	// Opens the staged tx if this transaction has none, leaving what the
-	// two public accessors hold to them. Caller holds `staged_state_lock_`.
+	// Caller holds staged_state_lock_.
 	MoraineTxHandle *OpenStagedTx();
 };
 

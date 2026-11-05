@@ -2,14 +2,15 @@
 //! probes.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState},
+    hash::BuildHasher,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU32, Ordering},
     },
 };
 
-use imbl::{OrdMap, ordmap::DiffItem};
+use imbl::OrdMap;
 use tracing::{debug, warn};
 
 use super::{FileDirectory, Intervals};
@@ -25,6 +26,8 @@ use crate::{
         proto::{DataFileValue, FileColumnStatsValue},
     },
 };
+
+mod paging;
 
 type Placements = HashMap<u64, Vec<DataFileId>>;
 
@@ -169,7 +172,7 @@ impl FileDirectory {
             .saturating_add(
                 u64::try_from(self.failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX),
             )
-            .saturating_add(self.file_bytes)
+            .saturating_add((self.files.len() * size_of::<(u64, [u64; 2])>()) as u64)
             .saturating_add(u64::try_from(metadata_bytes).unwrap_or(u64::MAX))
     }
 
@@ -178,7 +181,7 @@ impl FileDirectory {
         scope: &DirectoryScope<'_>,
         file: &DataFileInfo,
     ) -> Option<FileSummary> {
-        if !self.built_under(scope) || data_file_info(self.files.get(&file.id.get())?) != *file {
+        if !self.built_under(scope) || *self.files.get(&file.id.get())? != source_signature(file) {
             return None;
         }
         let mut summary = self.summaries.get(&file.id.get())?.clone();
@@ -200,7 +203,6 @@ impl FileDirectory {
             failed: Vec::new(),
             failed_retries: 0,
             retry_skip: AtomicU32::new(0),
-            file_bytes: 0,
             bytes: 0,
         }
     }
@@ -219,13 +221,15 @@ impl FileDirectory {
         files: &OrdMap<u64, Arc<DataFileValue>>,
         removed: &HashSet<u64>,
         retry_failed: bool,
-        file_bytes: u64,
     ) -> FileDirectory {
         FileDirectory {
             identity: scope.store.cache_identity(),
             data_prefix: scope.data_prefix.into(),
             table_prefix: scope.table_prefix.into(),
-            files: files.clone(),
+            files: files
+                .iter()
+                .map(|(id, value)| (*id, source_signature(&data_file_info(value))))
+                .collect(),
             summaries: self.summaries.clone(),
             ranges: self.ranges.clone(),
             spanned: self.spanned.clone(),
@@ -242,7 +246,6 @@ impl FileDirectory {
             failed_retries: self.failed_retries,
             retry_skip: AtomicU32::new(self.retry_skip.load(Ordering::Relaxed)),
             deferred: self.deferred.clone(),
-            file_bytes,
             bytes: 0,
         }
     }
@@ -250,7 +253,11 @@ impl FileDirectory {
     /// Whether this directory already describes `files` with no summary
     /// read due.
     fn describes(&self, files: &OrdMap<u64, Arc<DataFileValue>>) -> bool {
-        self.files.ptr_eq(files) && !self.retry_due()
+        !self.retry_due()
+            && self.files.len() == files.len()
+            && files.iter().all(|(id, value)| {
+                self.files.get(id) == Some(&source_signature(&data_file_info(value)))
+            })
     }
 
     /// Whether every deferred file's bounds exclude every one of `row_ids`,
@@ -345,7 +352,6 @@ impl FileDirectory {
 struct FileChanges {
     selected: BTreeMap<u64, DataFileInfo>,
     removed: HashSet<u64>,
-    file_bytes: u64,
 }
 
 impl FileDirectory {
@@ -359,35 +365,23 @@ impl FileDirectory {
         let mut changes = FileChanges {
             selected: BTreeMap::new(),
             removed: HashSet::new(),
-            file_bytes: self.file_bytes,
         };
-        for change in self.files.diff(files) {
-            match change {
-                DiffItem::Add(id, value) => {
-                    changes.selected.insert(*id, data_file_info(value));
-                    changes.file_bytes = changes
-                        .file_bytes
-                        .saturating_add(retained_file_bytes(value));
-                }
-                DiffItem::Update {
-                    old: (id, before),
-                    new: (_, after),
-                } => {
+        for (id, value) in files {
+            let info = data_file_info(value);
+            let signature = source_signature(&info);
+            if self.files.get(id) != Some(&signature) {
+                if self.files.contains_key(id) {
                     changes.removed.insert(*id);
-                    changes.selected.insert(*id, data_file_info(after));
-                    changes.file_bytes = changes
-                        .file_bytes
-                        .saturating_sub(retained_file_bytes(before))
-                        .saturating_add(retained_file_bytes(after));
                 }
-                DiffItem::Remove(id, value) => {
-                    changes.removed.insert(*id);
-                    changes.file_bytes = changes
-                        .file_bytes
-                        .saturating_sub(retained_file_bytes(value));
-                }
+                changes.selected.insert(*id, info);
             }
         }
+        changes.removed.extend(
+            self.files
+                .keys()
+                .filter(|id| !files.contains_key(*id))
+                .copied(),
+        );
 
         if retry_failed {
             for id in &self.failed {
@@ -406,29 +400,12 @@ impl FileDirectory {
     }
 }
 
-fn retained_file_bytes(value: &DataFileValue) -> u64 {
-    let strings = value
-        .path
-        .capacity()
-        .saturating_add(value.file_format.capacity())
-        .saturating_add(value.encryption_key.as_ref().map_or(0, String::capacity));
-    let partitions = value
-        .partition_values
-        .iter()
-        .map(|partition| partition.partition_value.capacity())
-        .fold(
-            value
-                .partition_values
-                .capacity()
-                .saturating_mul(size_of::<crate::store::proto::FilePartitionValue>()),
-            usize::saturating_add,
-        );
-    u64::try_from(
-        size_of::<DataFileValue>()
-            .saturating_add(strings)
-            .saturating_add(partitions),
-    )
-    .unwrap_or(u64::MAX)
+/// Process-local source signatures validate retained data summaries without
+/// retaining decoded catalog file records.
+fn source_signature(file: &DataFileInfo) -> [u64; 2] {
+    static HASHERS: LazyLock<[RandomState; 2]> =
+        LazyLock::new(|| [RandomState::new(), RandomState::new()]);
+    [HASHERS[0].hash_one(file), HASHERS[1].hash_one(file)]
 }
 
 impl ReadOnlyCatalog {
@@ -507,13 +484,9 @@ impl ReadOnlyCatalog {
         row_ids: &[u64],
     ) -> FileDirectory {
         let retry_failed = previous.retry_due();
-        let FileChanges {
-            selected,
-            removed,
-            file_bytes,
-        } = previous.changes_to(files, retry_failed);
+        let FileChanges { selected, removed } = previous.changes_to(files, retry_failed);
 
-        let mut directory = previous.advanced(scope, files, &removed, retry_failed, file_bytes);
+        let mut directory = previous.advanced(scope, files, &removed, retry_failed);
         for file in &removed {
             directory.forget(*file);
         }

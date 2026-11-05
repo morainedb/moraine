@@ -62,6 +62,9 @@ below the leading byte is moraine convention, opaque to SlateDB.
 | `inline` | Inlined data — reserved for RFC 0005 | Per RFC 0005 |
 | `index` | Equality-index entries (RFC 0016) | Live-only; insert + delete |
 | `schema_version` | `ducklake_schema_versions` rows | Insert + delete, and never expired with the snapshot that wrote one |
+| `changelog` | Recent commit changes | Sliding retained window |
+| `name` | Current schema/table names | Atomic with current entities |
+| `delete_target` | Current delete files by target data file | Atomic with current delete records |
 
 (Subspace declaration order — and therefore each subspace's discriminant
 byte — is fixed by the `Key` type and pinned by golden vectors; see Keys.)
@@ -98,12 +101,10 @@ bump that alters encoding) fails CI before it can reach a store.
   ids — schemas/tables/views/macros from the global `next_catalog_id`,
   files and column mappings from `next_file_id` (RFC 0018), columns from a
   per-table counter (RFC 0012).
-  Names live in values; name→id resolution runs against the in-memory
-  materialized snapshot for the compatibility API. Demand-loaded name
-  resolution requires a separate persistent index maintained atomically with
-  entity changes, including rename/drop and historical visibility. Specify
-  its encoding and migration here before introduction; an incomplete index
-  must never answer absence.
+  Names live in values; the compatibility API resolves them against its
+  materialized snapshot. Demand-loaded current-name lookup uses the persistent
+  directory below. Older formats use a scan until explicit migration completes;
+  an incomplete index never answers absence.
 - `history` keys append the version's `end_snapshot` as the final component,
   making ended versions of one entity distinct and time-ordered.
 - SlateDB iterates **forward only**; the layout depends on no descending
@@ -215,6 +216,53 @@ moraine ever pruned server-side (no such verb today, RFC 0003), the
 comparison would have to be **type-aware**, never lexicographic — for a
 numeric column `'9'` is not `> '10'`, and a naive compare silently drops
 correct rows.
+
+### Current-entity name entries
+
+The `name` subspace follows `changelog` at ordinal 8 (encoded discriminant
+`0x0a`). Its key is
+`(kind, parent_id, exact_name, entity_id)`: schema kind 0 uses parent 0; table
+kind 1 uses its schema ID. Names retain their exact UTF-8 spelling, encoded with
+storekey's string terminator. Values are empty. Appending the entity ID preserves
+row-faithful duplicate names; an exact-name lookup chooses the greatest matching
+ID, matching the previous ascending-directory scan, then validates the current
+entity. An ended entity has no name entry. Historical-name lookup remains a
+history operation.
+
+The same commit that changes a current schema or table deletes its old name
+entry and inserts its new one. Name changes, schema moves, and drops therefore
+cannot leave an independently published directory. Name probes admit storage
+blocks to Foyer and retain no decoded object cache. `SubspaceName::Name` reports
+the directory in census and compaction APIs.
+
+Format 11 introduces this directory. Earlier supported formats continue to use
+directory scans and do not write the new key tag. Explicit migration builds the
+complete directory before publishing format 11; an older binary then refuses
+the store rather than mutating entities without maintaining their entries.
+Formats 9 and 10 migrate directly to 11. At format 11, a nonempty
+`commit_log_batch_origin` marks a commit-log catalog; native catalogs have no
+origin. Migration preserves that origin, and adoption/demotion preserve the
+name-directory format.
+
+### Delete-file target directory
+
+Format 12 adds subspace ordinal 9 (encoded discriminant `0x0b`), `DeleteTarget { table_id, data_file_id,
+delete_file_id }`. All three components are big-endian `u64`; values are empty.
+A `(table_id, data_file_id)` prefix enumerates the current delete files targeting
+one data file. Readers point-read each referenced current delete record and
+validate its IDs and live lifecycle. No decoded objects are retained in this
+directory.
+
+Every batch that changes a current delete-file record removes its previous
+target entry and inserts its new live entry atomically. History records have no
+entries. The format-11-to-12 migration walks current delete records in bounded,
+resumable steps. Formats 9–11 remain readable through a streaming scan fallback;
+format 12 uses the directory for file planning and selected-file reads. Both
+native and commit-log stores use this layout and preserve their commit-log
+origin through migration.
+
+Selected-file reads on formats 9–11 scan the table's delete records once and
+filter against sorted, deduplicated file IDs, rather than rescanning for each ID.
 
 ### Atomicity invariant
 

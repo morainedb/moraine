@@ -320,7 +320,7 @@ impl TagTarget {
 }
 
 /// A live data file, as read from a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DataFileInfo {
     /// The file's id.
     pub id: DataFileId,

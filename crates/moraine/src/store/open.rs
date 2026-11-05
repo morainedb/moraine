@@ -396,17 +396,33 @@ impl<'a> StoreBuilder<'a> {
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
         }
-        if let Some(session) = &self.reader_session {
+        let wal: Arc<dyn slatedb::wal::WalReader> = if let Some(session) = &self.reader_session {
             let reader = session.reader();
-            let reader: Arc<dyn slatedb::wal::WalReader> = match &self.read_asked {
+            match &self.read_asked {
                 Some(asked) => Arc::new(crate::commit_log::asked::AskedReader::new(
                     reader,
                     Arc::clone(asked),
                 )),
                 None => reader,
-            };
-            builder = builder.with_wal_reader(reader);
-        }
+            }
+        } else {
+            let mut wal = slatedb::wal::SlateDbWalReaderBuilder::new()
+                .with_path(object_store::path::Path::from(self.path))
+                .with_object_store(Arc::clone(&self.object_store))
+                .with_options(slatedb::wal::SlateDbWalReaderOptions {
+                    max_buffered_bytes: 512 * 1024,
+                    max_fetch_tasks: 2,
+                    read_ahead_bytes: 256 * 1024,
+                });
+            if let Some(store) = &self.wal_object_store {
+                wal = wal.with_wal_object_store(Arc::clone(store));
+            }
+            Arc::new(wal.build()?)
+        };
+        builder = builder.with_wal_reader(Arc::new(super::reader_memory::AdmittedReader::new(
+            wal,
+            crate::MemoryReservation::reserve(0)?,
+        )));
 
         let reader = builder.build().await.map_err(Error::from)?;
         if let Some(preload) = self.cache_preload {

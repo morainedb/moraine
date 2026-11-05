@@ -2,7 +2,7 @@
 
 use std::{collections::VecDeque, future::Future};
 
-use futures::{StreamExt, stream::FuturesOrdered};
+use futures::{Stream, StreamExt, stream::FuturesOrdered};
 use tokio::sync::mpsc;
 
 use crate::error::Result;
@@ -13,7 +13,7 @@ use crate::error::Result;
 /// in-flight plan is polled on every wait, full window or not: one left
 /// unpolled would hold whatever it had acquired against the rest of the
 /// process.
-pub(super) async fn feed_window<L, P, T, E, U, S, R>(
+pub(super) async fn feed_stream<L, P, T, E, U, S, R>(
     mut launch: L,
     mut expand: E,
     mut spawn: S,
@@ -21,7 +21,7 @@ pub(super) async fn feed_window<L, P, T, E, U, S, R>(
     budget: usize,
 ) -> Result<()>
 where
-    L: FnMut() -> Option<P>,
+    L: Stream<Item = Result<P>> + Unpin,
     P: Future<Output = Result<T>>,
     E: FnMut(T) -> Vec<U>,
     S: FnMut(U) -> R,
@@ -32,17 +32,7 @@ where
     let mut exhausted = false;
 
     loop {
-        // The budget bounds launches, never polls; one plan always runs.
-        while !exhausted && (outstanding < budget || outstanding == 0) {
-            match launch() {
-                Some(plan) => {
-                    plans.push_back(plan);
-                    outstanding = outstanding.saturating_add(1);
-                }
-                None => exhausted = true,
-            }
-        }
-        if plans.is_empty() && planned.is_empty() {
+        if exhausted && plans.is_empty() && planned.is_empty() {
             return Ok(());
         }
 
@@ -71,8 +61,41 @@ where
                         .map(|(index, unit)| (unit, index.saturating_add(1) == count)),
                 );
             }
+            plan = launch.next(), if !exhausted && (outstanding < budget || outstanding == 0) => {
+                match plan {
+                    Some(plan) => {
+                        plans.push_back(plan?);
+                        outstanding = outstanding.saturating_add(1);
+                    }
+                    None => exhausted = true,
+                }
+            }
         }
     }
+}
+
+#[cfg(test)]
+async fn feed_window<L, P, T, E, U, S, R>(
+    launch: L,
+    expand: E,
+    spawn: S,
+    window: mpsc::Sender<R>,
+    budget: usize,
+) -> Result<()>
+where
+    L: FnMut() -> Option<P>,
+    P: Future<Output = Result<T>>,
+    E: FnMut(T) -> Vec<U>,
+    S: FnMut(U) -> R,
+{
+    feed_stream(
+        Box::pin(futures::stream::iter(std::iter::from_fn(launch).map(Ok))),
+        expand,
+        spawn,
+        window,
+        budget,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -231,5 +254,37 @@ mod tests {
         }
         feed.await.unwrap().unwrap();
         assert_eq!(arrived, vec![20]);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_next_source_still_polls_launched_plans() {
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let sources = futures::stream::unfold((0, completed), |(index, completed)| async move {
+            if index == 1 {
+                completed.notified().await;
+                return None;
+            }
+            let signal = completed.clone();
+            Some((
+                Ok(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    signal.notify_one();
+                    Ok::<_, Error>(7)
+                }),
+                (index + 1, completed),
+            ))
+        });
+        let (window, mut receiver) = mpsc::channel(1);
+        let feed = super::feed_stream(Box::pin(sources), |unit| vec![unit], |unit| unit, window, 2);
+        let consume = async {
+            assert_eq!(receiver.recv().await, Some(7));
+            assert_eq!(receiver.recv().await, None);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(feed, consume)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
     }
 }

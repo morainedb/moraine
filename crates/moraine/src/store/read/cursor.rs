@@ -66,6 +66,58 @@ impl OwnedEntityCursor {
         Ok(Self { handle, state })
     }
 
+    /// Reads one entity's current record and optional history range.
+    pub(crate) async fn open_entity(
+        handle: OwnedReadHandle,
+        entity: EntityKey,
+        versions: Versions,
+    ) -> Result<Self> {
+        let iterator = handle
+            .borrow()
+            .scan_prefix(Key::current(entity).encode(), .., ScanShape::Metadata)
+            .await?;
+        Ok(Self {
+            handle,
+            state: CursorState {
+                iterator,
+                history: (versions == Versions::LiveAndEnded)
+                    .then(|| history_entity_prefix(entity)),
+                historical: false,
+                shape: ScanShape::Metadata,
+                visited: 0,
+                latest_only: false,
+                previous_history_entity: None,
+            },
+        })
+    }
+
+    /// Scans only the ended versions of a temporal entity kind.
+    pub(crate) async fn open_ended(
+        handle: OwnedReadHandle,
+        kind: EntityRecordKind,
+    ) -> Result<Self> {
+        let entity = kind
+            .entity_kind()
+            .filter(|_| kind.is_versioned())
+            .ok_or_else(|| Error::Constraint("ended cursor requires a versioned entity".into()))?;
+        let iterator = handle
+            .borrow()
+            .scan_prefix(history_entity_kind_prefix(entity), .., ScanShape::Streaming)
+            .await?;
+        Ok(Self {
+            handle,
+            state: CursorState {
+                iterator,
+                history: None,
+                historical: true,
+                shape: ScanShape::Streaming,
+                visited: 0,
+                latest_only: false,
+                previous_history_entity: None,
+            },
+        })
+    }
+
     /// Emits current parents and only the newest ended version of absent
     /// parents.
     pub(crate) async fn open_latest(
@@ -86,6 +138,7 @@ impl OwnedEntityCursor {
 pub(crate) struct OwnedSnapshotCursor {
     handle: OwnedReadHandle,
     iterator: ScanIterator,
+    visited: usize,
 }
 
 impl OwnedSnapshotCursor {
@@ -98,7 +151,11 @@ impl OwnedSnapshotCursor {
                 ScanShape::Streaming,
             )
             .await?;
-        Ok(Self { handle, iterator })
+        Ok(Self {
+            handle,
+            iterator,
+            visited: 0,
+        })
     }
 
     pub(crate) async fn next(
@@ -109,6 +166,10 @@ impl OwnedSnapshotCursor {
             return Ok(None);
         };
         self.handle.borrow().validate()?;
+        self.visited = self.visited.wrapping_add(1);
+        if self.visited.is_multiple_of(1024) {
+            tokio::task::yield_now().await;
+        }
         let memory = MemoryReservation::reserve(
             (entry.key.len() as u64)
                 .saturating_add(entry.value.len() as u64)

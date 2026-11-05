@@ -63,6 +63,7 @@ mod index_upkeep;
 pub(crate) mod inline;
 mod memory;
 mod overlay;
+pub(crate) mod paging;
 mod rebase;
 use rebase::Rebase;
 
@@ -1150,16 +1151,24 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_view_column_tags(&self) -> Result<Vec<(u64, proto::ViewColumnTag)>> {
-        let rows = self
-            .visible_views()
-            .await?
-            .into_iter()
-            .flat_map(|view| {
-                view.column_tags
-                    .into_iter()
-                    .map(move |tag| (view.view_id, tag))
-            })
-            .collect();
+        let views = self.visible_views().await?;
+        let rows = crate::ffi_support::view_column_tag_rows_from(
+            views.iter().map(crate::ffi_support::ViewColumnTags::from),
+        )
+        .into_iter()
+        .map(|row| {
+            (
+                row.view_id,
+                proto::ViewColumnTag {
+                    column_name: row.column_name,
+                    key: row.key,
+                    value: row.value,
+                    begin_snapshot: row.begin_snapshot,
+                    end_snapshot: row.end_snapshot,
+                },
+            )
+        })
+        .collect();
         overlay::overlay_view_column_tags(&self.ops, rows)
     }
 
@@ -1689,7 +1698,7 @@ async fn stage_rows(
     // A maintenance batch stamps the head too, reusing the standing
     // snapshot id.
     writes.push(commit::head_stamp(result_id, base.batch_seq));
-    let staged_bytes = stage_batch(db_tx, &mut writes, inline_writes, entry_bytes)?;
+    let staged_bytes = stage_batch(db_tx, &mut writes, inline_writes, entry_bytes).await?;
     phases.stage = phase_started.elapsed();
 
     Ok(RowsStaged {
@@ -1888,14 +1897,14 @@ fn translate_batch(
 /// returning what the batch weighs (`entry_bytes` included, since index
 /// entries stage directly and never join `writes`). The caller has already
 /// stamped the head.
-fn stage_batch(
+async fn stage_batch(
     db_tx: &CommitSession,
     writes: &mut Vec<commit::StagedWrite>,
     inline_writes: Vec<commit::StagedWrite>,
     entry_bytes: u64,
 ) -> Result<StagedBytes> {
     writes.extend(inline_writes);
-    let mut staged = commit::stage_writes_on(db_tx, writes)?;
+    let mut staged = commit::stage_writes_on(db_tx, writes).await?;
     staged.0 = staged.0.saturating_add(entry_bytes);
     Ok(staged)
 }

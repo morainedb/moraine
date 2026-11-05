@@ -664,8 +664,10 @@ The cursor ABI visits at most 64 contributing parent records and emits at most
 64 output rows per page for entity metadata,
 partition columns and values, sort expressions, tags, variant statistics,
 macro implementations and parameters, name mappings, snapshot headers and
-changes, and column/view-column tags. Empty parents do not
-signal EOF or accumulate reservations across pages. A parent with more than
+changes, and column/view-column tags. A page also stops when its retained decode
+allowance reaches 1 MiB. One indivisible parent may cross that threshold and
+remains subject to working-memory admission; this is not a hard byte or RSS cap.
+Empty parents do not signal EOF or accumulate reservations across pages. A parent with more than
 64 children remains operation-owned while its children drain across pages. The
 C++ scan also caps each output batch at DuckDB's vector capacity. Each page owns its working
 memory through ABI conversion and uses its existing dump free function.
@@ -683,11 +685,35 @@ a backward request restarts its cursor. Sequential mutations traverse the
 metadata once more; arbitrary row order can cause repeated scans. Array-based
 providers retain their operation-owned rows for identity resolution.
 
-Schema-version projections, synthetic option rows, and staged metadata overlays
-still use result arrays. They must move to
-bounded cursors before every metadata operation can be independent of result
-size. Neither attachment nor transaction retains a decoded metadata-row cache.
+All 28 committed and staged metadata kinds use bounded output pages.
+Neither attachment nor transaction retains a decoded metadata-row cache.
 DuckDB's planning and result memory remains separate from the core cursor budget.
+
+A staged cursor freezes relevant authored operations at open. It streams committed
+parents through those edits, then emits surviving authored rows. The frozen plan
+is charged to working memory and shared with cursor forks. Forks restart at the
+same fixed read point and authored state, so later edits cannot change UPDATE or
+DELETE row identities. Table inserts inherit field-ID counters only from prior
+versions surviving at that operation. Embedded child projections retain only
+operation-sized owner maps, not committed parent directories. Tag scans suppress
+committed parents touched by staged operations and seek each touched parent's
+versions separately, retaining one surviving candidate. They select the
+current or newest ended version after lifecycle edits, then apply authored tag
+edits. Deleting the current parent can therefore expose an older version's tags
+without loading the column or view directory.
+
+Schema-version scans emit stored rows, then legacy snapshot-derived rows absent
+from the stored keyspace, then missing file floor rows. Two ordered file cursors
+reduce current and ended files to one minimum begin snapshot per table. A floor
+uses the first stored schema-version key; when legacy-only rows exist and that
+key does not cover the oldest file, the cursor scans snapshots for that table's
+earliest legacy row. This compatibility path trades repeated snapshot reads for
+bounded memory. No catalog-wide schema-version or file map is retained.
+
+Option scans emit fixed global facts as a bounded first page and stream stored
+options afterward. Stored global version, writer, encryption, and data-path
+entries are suppressed; table-scoped entries with those names remain visible.
+Row-ID replay includes the same fixed prefix.
 
 Index and row-position ABI calls load table-specific descriptor projections.
 Until persistent name indexes land, resolving their schema and table names

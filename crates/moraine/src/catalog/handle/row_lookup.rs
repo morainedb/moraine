@@ -11,10 +11,7 @@ use crate::{
     CacheIdentity,
     catalog::TableId,
     data_file::FileSummary,
-    store::{
-        inline::InlineChunkLocator,
-        proto::{DataFileValue, HeadValue},
-    },
+    store::{inline::InlineChunkLocator, proto::HeadValue},
 };
 
 mod directories;
@@ -137,7 +134,7 @@ struct FileDirectory {
     identity: CacheIdentity,
     data_prefix: String,
     table_prefix: String,
-    files: OrdMap<u64, Arc<DataFileValue>>,
+    files: OrdMap<u64, [u64; 2]>,
     /// Exact position maps, including dense files with permuted row order.
     summaries: OrdMap<u64, FileSummary>,
     ranges: files::DenseRanges,
@@ -157,8 +154,6 @@ struct FileDirectory {
     /// summarizes it then, so nothing is placed against a file whose
     /// bounds are unknown.
     deferred: OrdMap<u64, (u64, u64)>,
-    /// Estimated decoded size of `files`, carried across refreshes.
-    file_bytes: u64,
     bytes: u64,
 }
 

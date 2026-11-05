@@ -11,7 +11,7 @@ use slatedb::{
     config::{CheckpointOptions, CheckpointScope},
 };
 use tokio::{
-    sync::{Mutex, watch},
+    sync::{Mutex, oneshot, watch},
     time::Instant,
 };
 use uuid::Uuid;
@@ -30,7 +30,8 @@ pub(crate) struct CheckpointReader {
     reader: Arc<DbReader>,
     pub(crate) manifest: u64,
     expires: Option<Arc<SyncMutex<Instant>>>,
-    _stop: Option<watch::Sender<()>>,
+    stop: Option<watch::Sender<()>>,
+    released: Option<oneshot::Receiver<()>>,
 }
 
 impl CheckpointReader {
@@ -40,7 +41,7 @@ impl CheckpointReader {
             && Instant::now() >= *expires.lock().unwrap_or_else(PoisonError::into_inner)
         {
             return Err(slatedb::Error::unavailable(
-                "read checkpoint lease expired".to_owned(),
+                "read checkpoint lease expired; restart the transaction to acquire a new read scope".to_owned(),
             ));
         }
         Ok(&self.reader)
@@ -52,8 +53,25 @@ impl CheckpointReader {
             manifest: reader.manifest().id(),
             reader,
             expires: None,
-            _stop: None,
+            stop: None,
+            released: None,
         })
+    }
+
+    /// Releases an unshared reader before its replacement reserves replay
+    /// memory.
+    pub(crate) async fn retire(self) {
+        let Self {
+            reader,
+            stop,
+            released,
+            ..
+        } = self;
+        drop(reader);
+        drop(stop);
+        if let Some(released) = released {
+            let _ = released.await;
+        }
     }
 
     pub(crate) fn leased(
@@ -66,6 +84,7 @@ impl CheckpointReader {
         let reader = Arc::new(reader);
         let expires = Arc::new(SyncMutex::new(created + LEASE_LIFETIME));
         let (stop, mut stopped) = watch::channel(());
+        let (release, released) = oneshot::channel();
         let renewal_reader = reader.clone();
         let renewal_expires = expires.clone();
         tokio::spawn(async move {
@@ -98,13 +117,16 @@ impl CheckpointReader {
                 }
             }
             let _ = renewal_reader.close().await;
+            drop(renewal_reader);
+            let _ = release.send(());
             let _ = tokio::time::timeout(LEASE_TIMEOUT, admin.delete_checkpoint(checkpoint)).await;
         });
         Arc::new(Self {
             reader,
             manifest,
             expires: Some(expires),
-            _stop: Some(stop),
+            stop: Some(stop),
+            released: Some(released),
         })
     }
 }

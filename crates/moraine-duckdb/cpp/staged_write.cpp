@@ -103,7 +103,7 @@ protected:
 		auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
 		// Named, because every row this operator stages lands in `spec_`'s
 		// table: no other table's materialization goes stale for it.
-		return moraine_tx.StagedTxFor(spec_);
+		return moraine_tx.StagedTx();
 	}
 
 	// Resolves a row id against the scan's original read point. The returned

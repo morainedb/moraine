@@ -949,7 +949,7 @@ protected:
 	MoraineTxHandle *StagedTx(duckdb::ClientContext &client) const {
 		auto catalog_transaction = catalog_.GetCatalogTransaction(client);
 		auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
-		return moraine_tx.StagedTxForInline();
+		return moraine_tx.StagedTx();
 	}
 
 	// Physical rowids index the rows the source scan emitted, in order.

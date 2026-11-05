@@ -206,6 +206,7 @@ impl ReadOnlyCatalog {
 
     /// The ids among `requested` that are live inlined rows at `visible_at`
     /// (the head when `None`).
+    #[cfg(test)]
     pub(in crate::catalog::handle) async fn requested_inline_row_ids(
         &self,
         table: TableId,
@@ -228,6 +229,17 @@ impl ReadOnlyCatalog {
             .await;
         session.finish();
         outcome
+    }
+
+    /// Inline membership at the same read point as file candidate scans.
+    pub(in crate::catalog::handle) async fn requested_inline_row_ids_at(
+        &self,
+        handle: ReadHandle<'_>,
+        table: TableId,
+        requested: &[u64],
+    ) -> Result<HashSet<u64>> {
+        self.lookup_inline(handle, None, table, requested, None, live_row_ids)
+            .await
     }
 
     /// The requested rows live at `visible_at` (the head when `None`), with

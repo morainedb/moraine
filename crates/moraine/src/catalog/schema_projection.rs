@@ -96,10 +96,26 @@ impl CatalogSnapshot {
         table: TableId,
         file: &DataFileValue,
     ) -> Result<Vec<ReadColumn>> {
-        let columns = self.file_read_columns(table, Some(file))?;
-        if file.mapping_id.is_some() {
-            return Ok(columns);
+        if let Some(mapping_id) = file.mapping_id {
+            let bytes = handle
+                .get(
+                    crate::store::key::Key::current(crate::store::key::EntityKey::Mapping {
+                        table_id: table.get(),
+                        mapping_id,
+                    })
+                    .encode(),
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::Corruption(format!("no mapping {mapping_id} for table {table}"))
+                })?;
+            let _memory = crate::MemoryReservation::reserve(
+                (bytes.len() as u64).saturating_mul(4).saturating_add(256),
+            )?;
+            let mapping = crate::store::value::decode_value::<MappingValue>(&bytes)?;
+            return self.mapped_read_columns(table, Some(file), Some(&mapping));
         }
+        let columns = self.file_read_columns(table, Some(file))?;
         self.read_column_names_at(handle, table, file.begin_snapshot, columns, false)
             .await
     }

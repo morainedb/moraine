@@ -2,13 +2,11 @@
 //! fault-injection build so tests can drive the shipped planner.
 
 use futures::{FutureExt, future::BoxFuture};
-use slatedb::DbTransaction;
 
 use crate::{
     error::{Error, Result},
     store::{
         StagedBytes,
-        handle::ReadHandle,
         key::{EntityKey, Key},
         proto,
         read::{EntityRecord, scan_current_entities},
@@ -17,6 +15,7 @@ use crate::{
     transaction::{
         commit::{FORMAT_VERSION, MAX_FORMAT_VERSION},
         migration::{MigrationUnit, StepOutcome, StepProgress},
+        session::CommitSession,
     },
 };
 
@@ -30,7 +29,7 @@ pub(crate) const TARGET_SCOPE: u64 = 2;
 /// each to [`TARGET_SCOPE`], one record per batch, writing the new key
 /// before deleting the old.
 fn move_scope_step<'a>(
-    tx: &'a DbTransaction,
+    tx: &'a CommitSession,
     cursor: &'a [u8],
 ) -> BoxFuture<'a, Result<StepOutcome>> {
     async move {
@@ -48,7 +47,7 @@ fn move_scope_step<'a>(
         .encode();
         let encoded = value::encode_value(&value);
         staged.add(target.len(), encoded.len());
-        tx.put(target, encoded).map_err(Error::from)?;
+        tx.put(target, encoded)?;
 
         let source = Key::current(EntityKey::Option {
             scope_kind: SOURCE_SCOPE,
@@ -56,7 +55,7 @@ fn move_scope_step<'a>(
         })
         .encode();
         staged.add(source.len(), 0);
-        tx.delete(source).map_err(Error::from)?;
+        tx.delete(source)?;
 
         Ok(Some(StepProgress {
             cursor: scope_id.to_be_bytes().to_vec(),
@@ -79,10 +78,10 @@ fn decode_cursor(cursor: &[u8]) -> Result<Option<u64>> {
 
 /// The first record still under [`SOURCE_SCOPE`] past `start`.
 async fn next_source_record(
-    tx: &DbTransaction,
+    tx: &CommitSession,
     start: Option<u64>,
 ) -> Result<Option<(u64, proto::OptionScopeValue)>> {
-    Ok(scan_current_entities(ReadHandle::Tx(tx))
+    Ok(scan_current_entities(tx.handle())
         .await?
         .into_iter()
         .filter_map(|record| match record {
@@ -108,7 +107,7 @@ const MOVE_SCOPE: MigrationUnit = MigrationUnit {
 
 /// A step that walks nothing.
 fn no_work_step<'a>(
-    _tx: &'a DbTransaction,
+    _tx: &'a CommitSession,
     _cursor: &'a [u8],
 ) -> BoxFuture<'a, Result<StepOutcome>> {
     async move { Ok(None) }.boxed()

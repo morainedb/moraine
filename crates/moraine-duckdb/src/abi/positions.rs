@@ -127,13 +127,16 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
                 .map(|pair| (pair.value, moraine::DataFileId::new(pair.data_file_id)))
                 .collect();
 
+            let files: Vec<_> = pairs.iter().map(|(_, file)| *file).collect();
             let reads = handle_ref.catalog.reads();
             // SAFETY: caller contract for `probe` and `probe_ctx`.
             let view = unsafe {
                 handle_ref.block_on_cancellable(
                     probe,
                     probe_ctx,
-                    moraine::ffi_support::catalog_read::table_sources(reads, schema, table),
+                    moraine::ffi_support::catalog_read::table_sources_for(
+                        reads, schema, table, &files,
+                    ),
                 )
             }?;
             let table_id = resolve_table(&view, schema, table)?;

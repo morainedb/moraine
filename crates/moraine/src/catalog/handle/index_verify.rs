@@ -171,8 +171,9 @@ impl ReadOnlyCatalog {
     ) -> Result<IndexVerification> {
         let started = std::time::Instant::now();
         let session = self.begin_read().await?;
-        let snapshot = load_table(session.handle(), table, TableRead::Sources).await?;
-        super::index_build::require_data_store(&snapshot, table, data_store.is_some())?;
+        let snapshot = load_table(session.handle(), table, TableRead::Definition).await?;
+        super::index_build::require_data_store_at(session.handle(), table, data_store.is_some())
+            .await?;
 
         let info = snapshot
             .indexes_of(table)

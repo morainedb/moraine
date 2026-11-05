@@ -99,14 +99,15 @@ purpose; a stamped store refuses the wrong path anyway.
 
 ### The format stamp
 
-`FORMAT_WITH_COMMIT_LOG = 10` joins the structural format ladder of RFC
-0002. A store at that version keeps its commits in the log; the stamp is
-written by the library's migration when a store adopts the log, and never
-by this repository. `validate_format` refuses it before the newer-than-max
-check with a message naming the commit-log library, on every open path, so
-an older or provider-less binary never commits past the slots. The maximum
-format this binary understands stays at 9: this version does not *drive*
-format 10, it only recognizes it.
+Legacy structural format 10 marks a commit-log catalog. Format 11 adds the
+persistent name directory and uses `commit_log_batch_origin` to distinguish
+commit-log catalogs from native catalogs. Adoption sets that origin while
+preserving formats 11 and 12; demotion clears it while preserving their
+directories. Format 12 adds delete-file target lookup.
+A legacy format-9 catalog adopts as format 10 and explicitly migrates through 11 to 12.
+`validate_format` rejects unknown future formats first, then refuses a known
+commit-log format when its provider is absent. Migration preserves the origin
+and commits progress through the authoritative log (RFC 0015).
 
 ### Errors
 
@@ -170,7 +171,8 @@ and the race stay the library's.
    current is an L0 write rather than a WAL write. Rows the folder writes
    for itself outside a slot are durable only at that flush and must be
    re-derivable after a crash.
-3. On a format below 10, adopts: flushes, then races the format-10 stamp
+3. When the catalog has no adoption origin, adopts: flushes, then races the
+   adoption stamp (format 10 for legacy catalogs, otherwise the existing format)
    as the first slot and folds whichever stamp holds it. Slots take WAL
    ids counted from a **base** the plug fixes at adoption — just past the
    store's own WAL — because SlateDB's next WAL id may never move

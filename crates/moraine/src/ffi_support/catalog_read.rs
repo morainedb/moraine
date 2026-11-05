@@ -110,7 +110,7 @@ pub async fn index_table(
     } else {
         TableRead::Definition
     };
-    named_table(catalog, schema, table, selection).await
+    named_table(catalog, schema, table, selection, None).await
 }
 
 async fn named_table(
@@ -118,46 +118,33 @@ async fn named_table(
     schema: &str,
     table: &str,
     selection: crate::transaction::table_read::TableRead,
+    files: Option<&[crate::DataFileId]>,
 ) -> Result<CatalogSnapshot> {
-    use crate::transaction::table_read::load_table;
+    use crate::{
+        store::key::NameKind,
+        transaction::{names, table_read::load_table},
+    };
     let session = catalog.begin_read().await?;
     let result = read::consistent(session.handle(), || async {
         crate::transaction::commit::refuse_mid_migration(session.handle()).await?;
-        let mut schemas = EntityCursor::open(
-            session.handle(),
-            EntityRecordKind::Schema,
-            Versions::Live,
-            None,
-        )
-        .await?;
-        let mut schema_id = None;
-        while let Some((record, _memory)) = schemas.next().await? {
-            if let EntityRecord::Schema(value) = record
-                && value.schema_name == schema
-            {
-                schema_id = Some(value.schema_id);
-            }
+        let schema_id = names::lookup(session.handle(), NameKind::Schema, 0, schema)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("schema {schema}")))?;
+        let table_id = names::lookup(session.handle(), NameKind::Table, schema_id, table)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("table {schema}.{table}")))?;
+        let table = crate::TableId::new(table_id);
+        let mut view = load_table(session.handle(), table, selection).await?;
+        if let Some(files) = files {
+            crate::transaction::table_read::load_sources_for(
+                session.handle(),
+                &mut view,
+                table,
+                files,
+            )
+            .await?;
         }
-        let schema_id = schema_id.ok_or_else(|| Error::NotFound(format!("schema {schema}")))?;
-        let mut tables = EntityCursor::open(
-            session.handle(),
-            EntityRecordKind::Table,
-            Versions::Live,
-            None,
-        )
-        .await?;
-        let mut table_id = None;
-        while let Some((record, _memory)) = tables.next().await? {
-            if let EntityRecord::Table(value) = record
-                && value.schema_id == schema_id
-                && value.table_name == table
-            {
-                table_id = Some(value.table_id);
-            }
-        }
-        let table_id =
-            table_id.ok_or_else(|| Error::NotFound(format!("table {schema}.{table}")))?;
-        load_table(session.handle(), crate::TableId::new(table_id), selection).await
+        Ok(view)
     })
     .await;
     session.finish();
@@ -179,6 +166,30 @@ pub async fn table_sources(
         schema,
         table,
         crate::transaction::table_read::TableRead::Sources,
+        None,
     )
     .await
 }
+
+/// Loads descriptors and only the named files and their live delete files.
+///
+/// # Errors
+/// Returns an error when the table or a required record cannot be read.
+pub async fn table_sources_for(
+    catalog: &ReadOnlyCatalog,
+    schema: &str,
+    table: &str,
+    files: &[crate::DataFileId],
+) -> Result<CatalogSnapshot> {
+    named_table(
+        catalog,
+        schema,
+        table,
+        crate::transaction::table_read::TableRead::Definition,
+        Some(files),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests;

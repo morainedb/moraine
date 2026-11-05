@@ -34,14 +34,10 @@ using MetadataRowProvider = MetadataRows (*)(MoraineCatalogHandle *handle, Morai
 using MetadataScopedRowProvider = MetadataRows (*)(MoraineCatalogHandle *handle, uint64_t table_id,
                                                    MoraineInterruptProbe probe, void *probe_ctx);
 
-// `moraine_tx_stage`'s "not writable" `table_kind` sentinel (moraine_abi.h),
-// mirrored here so this spec and the staged-write Sink (staged_write.cpp)
-// share one source of truth.
+// Shared table-kind sentinel for read-only projections.
 constexpr int32_t kNotWritable = -1;
 
-// `moraine_tx_dump_*_of`'s "every version" `filter_snapshot` sentinel
-// (moraine_abi.h), mirrored here. Zero is a real snapshot id, so the
-// sentinel is the one value no snapshot can carry.
+// Every-version sentinel; zero is a valid snapshot ID.
 constexpr uint64_t kEveryVersion = UINT64_MAX;
 
 // Accept inline-registry INSERTs without staging them twice: the paired CREATE TABLE
@@ -78,9 +74,7 @@ struct MetadataTableSpec {
 	const char *name;
 	std::vector<MetadataColumnSpec> columns;
 	MetadataRowProvider provider;
-	// The readers a scan inside a write transaction goes through, so it
-	// observes the rows that transaction has staged: DuckLake's expiry and
-	// cleanup cascades re-read these tables after staging their own deletes.
+	// Readers that include the transaction's staged writes.
 	MetadataTxProviders tx;
 	// Staged ABI table kind, or a sentinel for read-only/no-op projections.
 	int32_t write_table_kind = kNotWritable;
@@ -91,16 +85,11 @@ struct MetadataTableSpec {
 	duckdb::idx_t end_snapshot_column = 0;
 	// Delete key columns in ABI decoder order. Empty rejects matching deletes.
 	std::vector<duckdb::idx_t> delete_key_columns;
-	// Whether an UPDATE with an arbitrary SET list overlays the row in
-	// place (the unversioned statistics kinds only). Distinct from
-	// `delete_key_columns`: reclamation gave most kinds a delete key, but
-	// overlay updates stay a statistics-table convention.
+	// Arbitrary SET lists update unversioned statistics rows in place.
 	bool overlay_updatable = false;
 	// Table ID column for scoped dumps, or -1 to materialize the whole kind.
 	int32_t scope_column = -1;
-	// Whether a scan of this kind may be narrowed to the versions live at
-	// a filter's snapshot, skipping the ended half. Set on every versioned
-	// kind the core exposes a live-bounded transactional dump for.
+	// Allows lifecycle filters to skip ended versions at the pinned head.
 	bool live_narrowable = false;
 	// Materializes one table's rows. Set exactly where `scope_column` is;
 	// without it a narrowable scan falls back to the whole kind.
@@ -108,6 +97,9 @@ struct MetadataTableSpec {
 	// Preserve field order: table specs use positional initializers.
 	MetadataScopedRowProvider scoped_provider = nullptr;
 	MetadataPageProvider page_provider = nullptr;
+	// A bounded prefix of synthetic rows, replayed with the same read handle.
+	MetadataRowProvider fixed_page_provider = nullptr;
+	bool staged_page_supported = false;
 };
 
 // Builds operation-owned rows, including the staged overlay when present.
@@ -181,37 +173,18 @@ void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry
 // by the synthesized `ducklake_*` tables (this file) and the dynamic
 // inline-table entries (inline_tables.cpp), which scan the same way.
 struct MetadataScanBindData : public duckdb::FunctionData {
-	// Shared, never copied: a scan emitting row ids registers this exact
-	// list with its transaction, and the staged-write Sink resolves each id
-	// back into it.
-	//
-	// Null when `spec` names a narrowable kind: that scan materializes in
-	// `InitGlobal` instead, because the filter deciding how much to build
-	// has not been pushed down yet at bind.
+	// Shared with row-ID resolution; null for scans deferred until InitGlobal.
 	std::shared_ptr<const MetadataRows> rows;
-	// The spec this scan reads and the catalog it reads through. Null for
-	// the inline-table entries, whose rows have no spec and whose Sinks
-	// resolve row ids their own way.
-	//
-	// A raw pointer, not `optional_ptr`: `InitGlobal` reads the bind data as
-	// const and must still reach a mutable catalog. Bind data outlives its
-	// bind (a prepared statement holds it across a DETACH), so `InitGlobal`
-	// re-resolves `catalog_name` and compares before dereferencing; the
-	// pointer is an identity, never a borrow.
+	// Null for inline tables. InitGlobal re-resolves catalog_name and checks
+	// pointer identity before dereferencing: PREPARE can outlive DETACH.
 	const MetadataTableSpec *spec = nullptr;
 	duckdb::Catalog *catalog = nullptr;
 	std::string catalog_name;
-	// The snapshot a `live_bound < end_snapshot OR end_snapshot IS NULL`
-	// filter pinned this scan to, set by `pushdown_complex_filter` before
-	// `InitGlobal` runs. Unset means the scan reads every version.
+	// Pushed lifecycle bound; unset reads every version.
 	duckdb::optional_idx live_bound;
-	// The `table_id` an equality filter pinned this scan to, set by
-	// `pushdown_complex_filter` before `InitGlobal` runs. Unset means the
-	// scan reads its kind whole.
+	// Pushed table-ID equality; unset scans the whole kind.
 	duckdb::optional_idx scope;
-	// The synthesized entry this scan reads, exposed through the table
-	// function's `get_bind_info` so `LogicalGet::GetTable()` resolves it:
-	// the binder's UPDATE/DELETE paths require a resolvable base table.
+	// Exposed through get_bind_info for UPDATE/DELETE base-table resolution.
 	duckdb::optional_ptr<duckdb::TableCatalogEntry> table_entry;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override;
