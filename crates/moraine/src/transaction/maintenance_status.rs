@@ -60,7 +60,7 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
             Some(value::encode_value(&status)),
         )];
         writes.push(commit::head_stamp(head, base.batch_seq));
-        let staged = commit::stage_writes_on(&session, &writes)?;
+        let staged = commit::stage_writes_on(&session, &writes).await?;
 
         let landed = commit::commit_batch(
             Arc::new(session),

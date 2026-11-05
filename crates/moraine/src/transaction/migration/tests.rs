@@ -143,7 +143,7 @@ async fn migrate_with(
 ) -> Result<MigrationReport> {
     install_migration(units);
     let db = open_migrator(object_store).await;
-    let outcome = run(&db).await;
+    let outcome = run(&db, None).await;
     db.close().await.unwrap();
     outcome
 }
@@ -364,8 +364,8 @@ async fn the_migrate_verb_is_a_noop_against_a_current_store() {
     .await
     .unwrap();
 
-    assert_eq!(report.from_format, MIN_FORMAT_VERSION);
-    assert_eq!(report.to_format, MIN_FORMAT_VERSION);
+    assert_eq!(report.from_format, MAX_FORMAT_VERSION);
+    assert_eq!(report.to_format, MAX_FORMAT_VERSION);
     assert!(report.units_run.is_empty());
     assert!(!report.resumed);
 }
@@ -401,11 +401,10 @@ async fn the_checkpoint_flag_takes_and_releases_one() {
 /// unambiguous chain with no gaps or repeated source versions.
 #[test]
 fn the_registry_and_the_readable_floor_agree() {
-    for pair in MIGRATIONS.windows(2) {
+    for source in [8, 9, 10] {
         assert_eq!(
-            pair[0].to_format, pair[1].from_format,
-            "{} and {} leave a gap the chain cannot cross",
-            pair[0].name, pair[1].name
+            chain_from(source).last().unwrap().to_format,
+            MAX_FORMAT_VERSION
         );
     }
 
@@ -433,12 +432,10 @@ fn the_registry_and_the_readable_floor_agree() {
         );
     }
 
-    let expected_floor = MIGRATIONS
-        .last()
-        .map_or(FORMAT_VERSION, |unit| unit.to_format);
+    let expected_floor = inline_tombstones::MIGRATION.to_format;
     assert_eq!(
         MIN_FORMAT_VERSION, expected_floor,
-        "the floor must sit at the newest rewritten layout: below it the keys are somewhere else"
+        "the floor must include the tombstone rewrite; older name layouts retain scan compatibility"
     );
 }
 
@@ -473,8 +470,8 @@ async fn raising_the_format_is_idempotent_and_never_implicit() {
     // A dry run answers "what format is this, and where would a raise
     // take it" without taking it.
     let probed = catalog.raise_format(true).await.unwrap();
-    assert_eq!(probed.from_format, MIN_FORMAT_VERSION);
-    assert_eq!(probed.to_format, additive_ceiling(MIN_FORMAT_VERSION));
+    assert_eq!(probed.from_format, MAX_FORMAT_VERSION);
+    assert_eq!(probed.to_format, additive_ceiling(MAX_FORMAT_VERSION));
     let still = catalog.raise_format(true).await.unwrap();
     assert_eq!(
         still, probed,
@@ -558,4 +555,90 @@ async fn a_mid_migration_store_never_reaches_the_raise() {
         matches!(refused, Error::Migration(_)),
         "expected the open to refuse a marked store, got {refused:?}"
     );
+}
+
+#[tokio::test]
+async fn name_directory_migration_backfills_multiple_batches() {
+    use crate::store::key::{NameKey, NameKind};
+    let store = Arc::new(InMemory::new());
+    let catalog = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+    let db = open_migrator(&store).await;
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
+    tx.put(
+        Key::Sys(SysKey::Format).encode(),
+        value::encode_value(&proto::FormatValue {
+            format_version: 9,
+            writer_version: "old".into(),
+            commit_log_batch_origin: None,
+        }),
+    )
+    .unwrap();
+    tx.delete(
+        Key::Name(NameKey {
+            kind: NameKind::Schema,
+            parent: 0,
+            name: "main".into(),
+            entity_id: 0,
+        })
+        .encode(),
+    )
+    .unwrap();
+    for table_id in 1..600 {
+        tx.put(
+            Key::current(EntityKey::Table { table_id }).encode(),
+            value::encode_value(&proto::TableValue {
+                table_id,
+                schema_id: 0,
+                table_name: format!("table_{table_id}"),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    }
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    inject_crash(Some(CrashPoint::AfterStep));
+    assert!(
+        Catalog::migrate(
+            store.clone(),
+            CatalogOptions::default(),
+            MigrationRequest::default()
+        )
+        .await
+        .is_err()
+    );
+    let report = Catalog::migrate(
+        store.clone(),
+        CatalogOptions::default(),
+        MigrationRequest::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.from_format, 9);
+    assert!(report.resumed);
+    assert_eq!(report.to_format, 11);
+    let catalog = Catalog::open(store, CatalogOptions::default())
+        .await
+        .unwrap();
+    for id in [1, 255, 256, 599] {
+        let table = crate::ffi_support::catalog_read::index_table(
+            &catalog,
+            "main",
+            &format!("table_{id}"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(table.tables.contains_key(&id));
+    }
+    catalog.close().await.unwrap();
 }

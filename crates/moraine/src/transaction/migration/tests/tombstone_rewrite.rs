@@ -115,8 +115,11 @@ async fn old_formats_migrate_to_versioned_inline_tombstones() {
         .await
         .unwrap();
         assert_eq!(report.from_format, format);
-        assert_eq!(report.to_format, 9);
-        assert_eq!(report.units_run, ["version-inline-tombstones"]);
+        assert_eq!(report.to_format, MAX_FORMAT_VERSION);
+        assert_eq!(
+            report.units_run,
+            ["version-inline-tombstones", "index-current-names"]
+        );
         assert_rewritten(&store, 3).await;
         let catalog = Catalog::open(store.clone(), CatalogOptions::default())
             .await
@@ -194,7 +197,7 @@ async fn interrupted_inline_tombstone_migration_resumes() {
         )
         .await
         .unwrap();
-        assert_eq!(report.to_format, 9);
+        assert_eq!(report.to_format, MAX_FORMAT_VERSION);
         assert_eq!(report.resumed, point != CrashPoint::AfterFinish);
         assert_rewritten(&store, 513).await;
     }

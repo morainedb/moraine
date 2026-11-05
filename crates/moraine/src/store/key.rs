@@ -16,7 +16,7 @@ use crate::{
 };
 
 mod names;
-pub(crate) use names::{NameKey, NameKind};
+pub(crate) use names::{NameKey, NameKind, name_prefix};
 
 /// Length in bytes of the encoded subspace prefix — one discriminant
 /// byte. The segment extractor and the prefix builders must agree on

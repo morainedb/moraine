@@ -108,9 +108,14 @@ older store unchanged. The stamp is therefore **lazy** — written the first
 time the feature is used, not on open — and there is **no migration**.
 
 A **rewriting** structural change alters where existing keys live or how they
-sort. Old keys must be read, re-encoded, and deleted. This is the only kind
-that needs the start/step/finish protocol below, and the only kind that makes
-an older store unreadable rather than merely older.
+sort. Old keys must be read, re-encoded, and deleted. This raises the readable
+floor when the binary no longer reads the old layout.
+
+A **directory backfill** adds derived entries for existing records. It also
+uses start/step/finish, because a partially built directory cannot answer absence
+correctly. The binary can retain a scan fallback for older formats, so this
+migration need not raise the readable floor. Format 11's exact-name directory
+is such a backfill.
 
 The practical consequence is that a binary reads a **range** of formats, not
 one: every format from the oldest it can still make sense of (its floor) up
@@ -124,7 +129,7 @@ structural version to the binary's:
 
 | Store vs. binary | Action |
 |---|---|
-| **Within the binary's range** (floor ≤ store ≤ newest it names) | Proceed normally. A store *below* the binary's newest is not migration-eligible: the intervening bumps were additive, so its keys are exactly where this binary looks for them. It is stamped forward lazily if and when it uses the newer feature, never rewritten on open. |
+| **Within the binary's range** (floor ≤ store ≤ newest it names) | Proceed normally. Older formats use their supported read paths. A directory backfill can be explicitly migrated while the format remains readable; opening never performs that migration. |
 | **Below the floor** | **Refuse to open.** Return the typed `Migration` error (RFC 0003) naming the store's version, the floor, and the verb that repairs it. A rewriting migration put this store's keys somewhere this binary does not look; it must be migrated up first. |
 | **Newer than the binary names** | **Refuse to open.** Return the typed `Migration` error (RFC 0003, per RFC 0002's meet-a-newer-format rule). Never guess, never downgrade, never write. |
 | **Absent** | The store is uninitialized. A read-write attach bootstraps it; a read-only attach refuses, having nothing committed to read. |
@@ -136,9 +141,17 @@ value encoding, lifted to the structural level.
 
 The first rewriting migration, `version-inline-tombstones` (8 → 9), moves
 single inline tombstones to immutable deletion-event keys (RFC 0005).
-The readable floor and fresh-store bootstrap are both 9. Opening an older
+The readable floor is 9; fresh stores bootstrap at 11 with name entries. Opening an older
 catalog refuses until the operator invokes `Catalog::migrate` or the
 unattached `moraine_migrate` SQL function.
+
+Format 11 backfills current schema and table names from formats 9 and 10.
+Each step visits at most 256 records and stops after approximately 1 MiB of
+name keys, retaining only one decoded source record at a time. The cursor is
+the last source key. Format 9 and 10 continue to scan names and write no name
+entries until explicit migration completes. Legacy format 10 denotes a
+commit-log catalog; from format 11, `commit_log_batch_origin` distinguishes
+commit-log from native catalogs. Adoption and demotion preserve format 11.
 
 ### Single-writer migration
 
@@ -152,13 +165,22 @@ accidental second catalog writer safe. Readers, meanwhile, must never observe
 a half-migrated store; the resume protocol below is structured so the only
 externally visible flip of `sys/format` is atomic and last.
 
-The start batch is additionally the **only writer of the marker key**:
-`migration::start` is the one code path that puts `sys/migration`, and any
+The start batch is the **only creator of the marker key**:
+`migration::start` creates `sys/migration`; steps advance its cursor, and any
 future writer must keep its rule — the marker lands in the same batch as a
 head move. Handles cache the marker's absence keyed on the head they
 observed it at (RFC 0009), so a marker written without moving the head
 would be invisible to every warm handle. The invariant is what that caching
 is sound against, not an incidental property of today's code — and every registered migration uses that start path.
+
+For a commit-log catalog, migration opens the writer with the provider's WAL
+session and submits every start, step, and finish through a commit session to
+an authoritative log slot. Every batch advances `head.batch_seq`; the finish
+preserves the adoption origin. Migration-specific writer acquisition permits
+an existing marker so crashes can resume. Each phase checks the format and
+expected durable cursor before staging; a lost slot requires reopening from
+that cursor. A native migration uses the same batch construction with SlateDB
+as the commit authority. No decoded catalog directory is retained.
 
 ### Crash-safe resumable migration
 
@@ -179,9 +201,7 @@ the start wins or loses cleanly rather than interleaving; a start that
 loses the race retries under the same bounded backoff a commit uses. It is
 also what warm handles rest on: a handle that observed the marker absent
 at a head may trust that observation for as long as the head stands,
-because no marker can appear without moving it (RFC 0009). A store with no
-head yet is pre-bootstrap and has nothing to anchor to; there the marker
-goes alone.
+because no marker can appear without moving it (RFC 0009). Migration requires an initialized catalog with a head stamp.
 
 **2. Step loop (many batches, each idempotent).** The migration walks its
 work in key order. Each step batch does two things, in this order:
@@ -275,9 +295,10 @@ v1→v2 then v2→v3, run in sequence, each with its own start/step/finish and i
 own cursor. There is no bespoke v1→v3 path to write or test; correctness of
 the composition follows from correctness of each link.
 
-The shipped registry contains `version-inline-tombstones` (8 → 9). For a
+The shipped registry contains `version-inline-tombstones` (8 → 9) and
+`index-current-names` (9 → 11 and 10 → 11). For a
 catalog at format 1 through 7 without an in-progress marker, the migration
-verb first advances the additive stamp to 8, then runs the rewrite. An
+verb first advances the additive stamp to 8, then runs the tombstone rewrite and name backfill. An
 interrupted unit resumes at its recorded format and cursor. The report keeps
 the original format as `from_format`, including when an additive advance
 preceded the rewrite.
@@ -289,7 +310,8 @@ cursor atomically. It leaves Arrow bodies and catalog snapshots unchanged.
 Deletion snapshots an older writer already overwrote cannot be recovered;
 migration preserves the surviving events, not history already lost.
 Future rewrites add a named unit, raise the readable floor, and pin the
-registry chain in tests.
+registry paths in tests. Directory backfills can preserve the readable floor
+when a legacy scan path remains available.
 
 There is **no automatic rollback**, by decision. Recovery from a failed
 migration is manual, resting on two mitigations already load-bearing elsewhere

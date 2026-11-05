@@ -956,7 +956,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             }
         )]
     );
-    assert_eq!(format.format_version, commit::MIN_FORMAT_VERSION);
+    assert_eq!(format.format_version, commit::MAX_FORMAT_VERSION);
     tx.rollback();
 }
 
@@ -4853,7 +4853,7 @@ async fn a_collapsing_deregistration_preserves_the_format_floor() {
         assert_eq!(schemas[0].1.same_as_version.is_some(), collapses);
         assert_eq!(
             format,
-            crate::transaction::commit::MIN_FORMAT_VERSION,
+            crate::transaction::commit::MAX_FORMAT_VERSION,
             "a schema reference must not lower the current format"
         );
     }

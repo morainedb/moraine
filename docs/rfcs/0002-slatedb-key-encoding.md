@@ -98,12 +98,10 @@ bump that alters encoding) fails CI before it can reach a store.
   ids — schemas/tables/views/macros from the global `next_catalog_id`,
   files and column mappings from `next_file_id` (RFC 0018), columns from a
   per-table counter (RFC 0012).
-  Names live in values; name→id resolution runs against the in-memory
-  materialized snapshot for the compatibility API. Demand-loaded name
-  resolution requires a separate persistent index maintained atomically with
-  entity changes, including rename/drop and historical visibility. Specify
-  its encoding and migration here before introduction; an incomplete index
-  must never answer absence.
+  Names live in values; the compatibility API resolves them against its
+  materialized snapshot. Demand-loaded current-name lookup uses the persistent
+  directory below. Older formats use a scan until explicit migration completes;
+  an incomplete index never answers absence.
 - `history` keys append the version's `end_snapshot` as the final component,
   making ended versions of one entity distinct and time-ordered.
 - SlateDB iterates **forward only**; the layout depends on no descending
@@ -237,6 +235,10 @@ Format 11 introduces this directory. Earlier supported formats continue to use
 directory scans and do not write the new key tag. Explicit migration builds the
 complete directory before publishing format 11; an older binary then refuses
 the store rather than mutating entities without maintaining their entries.
+Formats 9 and 10 migrate directly to 11. At format 11, a nonempty
+`commit_log_batch_origin` marks a commit-log catalog; native catalogs have no
+origin. Migration preserves that origin, and adoption/demotion preserve the
+name-directory format.
 
 ### Atomicity invariant
 

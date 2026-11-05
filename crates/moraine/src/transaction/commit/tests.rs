@@ -689,10 +689,7 @@ async fn create_index_persists_definition_and_entries_without_changing_format() 
         store::key::{IndexKind, index_index_prefix},
     };
     let (catalog, table) = catalog_with_two_column_table().await;
-    assert_eq!(
-        read_format_version(&catalog).await,
-        FORMAT_VERSION.max(MIN_FORMAT_VERSION)
-    );
+    assert_eq!(read_format_version(&catalog).await, MAX_FORMAT_VERSION);
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -720,7 +717,7 @@ async fn create_index_persists_definition_and_entries_without_changing_format() 
     assert_eq!(infos[0].columns, vec![ColumnId::new(1)]);
     assert!(infos[0].unique);
     assert_eq!(infos[0].state, IndexState::Ready);
-    assert_eq!(read_format_version(&catalog).await, MIN_FORMAT_VERSION);
+    assert_eq!(read_format_version(&catalog).await, MAX_FORMAT_VERSION);
 
     // Both backfill rows produced a stored entry.
     let tx = catalog.begin_write_tx().unwrap();
@@ -769,7 +766,7 @@ async fn deferred_index_is_non_unique_and_preserves_the_format() {
         snapshot.indexes_of(table)[0].maintenance,
         IndexMaintenance::Deferred
     );
-    assert_eq!(read_format_version(&catalog).await, MIN_FORMAT_VERSION);
+    assert_eq!(read_format_version(&catalog).await, MAX_FORMAT_VERSION);
 
     let error = catalog
         .commit(|tx| {
@@ -822,10 +819,7 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
             .indexes_of(table)
             .is_empty()
     );
-    assert_eq!(
-        read_format_version(&catalog).await,
-        FORMAT_VERSION.max(MIN_FORMAT_VERSION)
-    );
+    assert_eq!(read_format_version(&catalog).await, MAX_FORMAT_VERSION);
     catalog.close().await.unwrap();
 }
 
@@ -2615,7 +2609,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     assert_eq!(single_index, staged_index);
 
     // While building, lookups fail typed.
-    assert_eq!(read_format_version(&staged).await, MIN_FORMAT_VERSION);
+    assert_eq!(read_format_version(&staged).await, MAX_FORMAT_VERSION);
     assert!(matches!(
         staged
             .index_lookup(table_staged, staged_index, &[int_value(20)])
@@ -3661,7 +3655,7 @@ async fn drop_index_ends_definition_and_keeps_format() {
             .is_empty()
     );
     // Dropping the last index does not downgrade the stamp.
-    assert_eq!(read_format_version(&catalog).await, MIN_FORMAT_VERSION);
+    assert_eq!(read_format_version(&catalog).await, MAX_FORMAT_VERSION);
     catalog.close().await.unwrap();
 }
 

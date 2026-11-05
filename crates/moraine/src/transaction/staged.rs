@@ -1698,7 +1698,7 @@ async fn stage_rows(
     // A maintenance batch stamps the head too, reusing the standing
     // snapshot id.
     writes.push(commit::head_stamp(result_id, base.batch_seq));
-    let staged_bytes = stage_batch(db_tx, &mut writes, inline_writes, entry_bytes)?;
+    let staged_bytes = stage_batch(db_tx, &mut writes, inline_writes, entry_bytes).await?;
     phases.stage = phase_started.elapsed();
 
     Ok(RowsStaged {
@@ -1897,14 +1897,14 @@ fn translate_batch(
 /// returning what the batch weighs (`entry_bytes` included, since index
 /// entries stage directly and never join `writes`). The caller has already
 /// stamped the head.
-fn stage_batch(
+async fn stage_batch(
     db_tx: &CommitSession,
     writes: &mut Vec<commit::StagedWrite>,
     inline_writes: Vec<commit::StagedWrite>,
     entry_bytes: u64,
 ) -> Result<StagedBytes> {
     writes.extend(inline_writes);
-    let mut staged = commit::stage_writes_on(db_tx, writes)?;
+    let mut staged = commit::stage_writes_on(db_tx, writes).await?;
     staged.0 = staged.0.saturating_add(entry_bytes);
     Ok(staged)
 }

@@ -1238,7 +1238,10 @@ async fn a_demoted_lake_opens_without_its_provider() {
     let demoted = Box::pin(Catalog::demote(object_store.clone(), adopted.clone()))
         .await
         .unwrap();
-    assert_eq!(demoted.format, FORMAT_WITH_COMMIT_LOG - 1);
+    assert_eq!(
+        demoted.format,
+        crate::transaction::commit::MAX_FORMAT_VERSION
+    );
 
     // Again is a no-op, so a demote interrupted after the stamp can be rerun.
     let again = Box::pin(Catalog::demote(object_store.clone(), adopted.clone()))
@@ -1295,3 +1298,5 @@ async fn acknowledged_log_commits_are_visible_to_fixed_readers() {
     drop(scope);
     catalog.close().await.unwrap();
 }
+
+mod name_migration;

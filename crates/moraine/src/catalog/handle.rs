@@ -15,6 +15,7 @@ mod inline_scan;
 mod maintenance;
 #[cfg(test)]
 mod memory_fixture;
+mod migration_store;
 mod revision_memo;
 mod row_location;
 mod row_lookup;
@@ -62,9 +63,7 @@ use crate::{
         open::{self, StoreBuilder},
     },
     transaction::{
-        MigrationReport, Transaction, commit,
-        commit::{FORMAT_WITH_COMMIT_LOG, MAX_FORMAT_VERSION},
-        migration,
+        MigrationReport, Transaction, commit, commit::MIN_FORMAT_VERSION, migration,
         session::CommitSession,
     },
 };
@@ -1763,7 +1762,7 @@ impl Catalog {
             let head = base.snapshot_id;
             let mut batch = writes.clone();
             batch.push(commit::head_stamp(head, base.batch_seq));
-            let staged = commit::stage_writes_on(&session, &batch)?;
+            let staged = commit::stage_writes_on(&session, &batch).await?;
             let heads = commit::HeadTransition {
                 before: head,
                 after: head,
@@ -1862,7 +1861,7 @@ impl Catalog {
                     options.path
                 )));
             }
-            Some(format) if format.format_version < FORMAT_WITH_COMMIT_LOG => {
+            Some(format) if !commit::uses_commit_log(&format) => {
                 return Ok(Demoted {
                     folded: 0,
                     format: format.format_version,
@@ -1887,7 +1886,12 @@ impl Catalog {
                 "the store opened without a commit log to leave".to_string(),
             ));
         };
-        let (db, session, _format) = open_writer_db(Arc::clone(&object_store), &options).await?;
+        let (db, session, format) = open_writer_db(Arc::clone(&object_store), &options).await?;
+        let demoted_format = if format == commit::FORMAT_WITH_COMMIT_LOG {
+            MIN_FORMAT_VERSION
+        } else {
+            format
+        };
         let store = provider.holding(db.clone(), session, catalog_hooks(&object_store, &options));
 
         // The open replayed every slot; anything that landed since is a
@@ -1908,7 +1912,7 @@ impl Catalog {
         batch.put(
             crate::store::key::Key::Sys(crate::store::key::SysKey::Format).encode(),
             crate::store::value::encode_value(&crate::store::proto::FormatValue {
-                format_version: MAX_FORMAT_VERSION,
+                format_version: demoted_format,
                 writer_version: env!("CARGO_PKG_VERSION").to_string(),
                 commit_log_batch_origin: None,
             }),
@@ -1922,13 +1926,13 @@ impl Catalog {
         store.close().await?;
         info!(
             folded,
-            format = MAX_FORMAT_VERSION,
+            format = demoted_format,
             "demoted the lake off its commit log"
         );
 
         Ok(Demoted {
             folded,
-            format: MAX_FORMAT_VERSION,
+            format: demoted_format,
         })
     }
 
@@ -2142,31 +2146,7 @@ impl Catalog {
         options: CatalogOptions,
         request: MigrationRequest,
     ) -> Result<MigrationReport> {
-        let (db, _cache) = StoreBuilder::new(&options.path, object_store.clone())
-            .wal_object_store(wal_object_store(&options))
-            .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone())
-            .cache_identity(options.cache_identity)
-            .cache_size(options.cache_size)
-            .cache_memory(options.cache_memory)
-            .cache_auxiliary_percent(options.cache_auxiliary_percent)
-            .cache_preload(options.cache_preload)
-            .cache_puts(options.cache_puts)
-            .cache_compaction_puts(options.cache_compaction_puts)
-            .external_compaction(external_compaction(&options))
-            .open_writer()
-            .await?;
-
-        // A migration commits through the log, so it must be the log the
-        // catalog records: one opened elsewhere would rewrite keys from
-        // whatever the wrong log replayed.
-        if let Err(error) =
-            commit::verify_wal_store(&db, options.wal_store.as_ref().map(crate::WalStore::name))
-                .await
-        {
-            let _ = db.close().await;
-            return Err(error);
-        }
+        let (db, log) = migration_store::open(object_store.clone(), &options).await?;
 
         let checkpoint = if request.checkpoint {
             let taken = open::create_checkpoint(&db, None).await?;
@@ -2176,8 +2156,11 @@ impl Catalog {
             None
         };
 
-        let report = migration::run(&db).await;
-        let closed = db.close().await.map_err(Error::from);
+        let report = migration::run(&db, log.as_ref()).await;
+        let closed = match log {
+            Some(log) => log.store.close().await,
+            None => db.close().await.map_err(Error::from),
+        };
 
         // A failed migration keeps its checkpoint as the recovery point.
         let report = report.and_then(|report| closed.map(|()| report))?;

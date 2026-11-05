@@ -3,18 +3,18 @@
 use std::ops::Bound;
 
 use futures::{FutureExt, future::BoxFuture};
-use slatedb::DbTransaction;
 
 use super::{MigrationUnit, StepOutcome, StepProgress};
 use crate::{
     error::{Error, Result},
     store::{
         StagedBytes,
-        handle::{ReadHandle, ScanShape},
+        handle::ScanShape,
         key::{InlineKey, InlineOperation, InlineOperationKind, Key, inline_live_kind_prefix},
         proto::InlineInlineDeleteValue,
         value,
     },
+    transaction::session::CommitSession,
 };
 
 const TOMBSTONES_PER_STEP: usize = 256;
@@ -27,7 +27,7 @@ pub(super) const MIGRATION: MigrationUnit = MigrationUnit {
     step,
 };
 
-fn step<'a>(tx: &'a DbTransaction, cursor: &'a [u8]) -> BoxFuture<'a, Result<StepOutcome>> {
+fn step<'a>(tx: &'a CommitSession, cursor: &'a [u8]) -> BoxFuture<'a, Result<StepOutcome>> {
     async move {
         let prefix = inline_live_kind_prefix(InlineOperationKind::InlineDelete);
         let lower = if cursor.is_empty() {
@@ -48,7 +48,8 @@ fn step<'a>(tx: &'a DbTransaction, cursor: &'a [u8]) -> BoxFuture<'a, Result<Ste
             })?;
             Bound::Excluded(suffix.to_vec())
         };
-        let mut records = ReadHandle::Tx(tx)
+        let mut records = tx
+            .handle()
             .scan_prefix(
                 prefix,
                 (lower, Bound::<Vec<u8>>::Unbounded),
@@ -76,9 +77,9 @@ fn step<'a>(tx: &'a DbTransaction, cursor: &'a [u8]) -> BoxFuture<'a, Result<Ste
             })
             .encode();
             staged.add(target.len(), record.value.len());
-            tx.put(target, record.value).map_err(Error::from)?;
+            tx.put(target, record.value)?;
             staged.add(record.key.len(), 0);
-            tx.delete(record.key.clone()).map_err(Error::from)?;
+            tx.delete(record.key.clone())?;
             last = Some(record.key.to_vec());
         }
         Ok(last.map(|cursor| StepProgress { cursor, staged }))

@@ -9,10 +9,13 @@
 //! units, each running its own start, steps, and finish.
 
 use futures::future::BoxFuture;
-use slatedb::{Db, DbTransaction, IsolationLevel};
+use slatedb::{Db, IsolationLevel};
 use tracing::info;
 
+use super::session::CommitSession;
+
 mod inline_tombstones;
+mod names;
 
 use crate::{
     error::{Error, Result},
@@ -43,7 +46,7 @@ pub(crate) struct StepProgress {
 /// resuming at `cursor` (empty at the start of the walk). A step must be
 /// idempotent, must write new-format keys before deleting the old-format
 /// keys they supersede, and commits nothing itself.
-type StepFn = for<'a> fn(&'a DbTransaction, &'a [u8]) -> BoxFuture<'a, Result<StepOutcome>>;
+type StepFn = for<'a> fn(&'a CommitSession, &'a [u8]) -> BoxFuture<'a, Result<StepOutcome>>;
 
 /// One `v_n → v_{n+1}` structural rewrite.
 pub(crate) struct MigrationUnit {
@@ -58,7 +61,11 @@ pub(crate) struct MigrationUnit {
 }
 
 /// Every structural migration this binary ships, in ascending order.
-pub(crate) const MIGRATIONS: &[MigrationUnit] = &[inline_tombstones::MIGRATION];
+pub(crate) const MIGRATIONS: &[MigrationUnit] = &[
+    inline_tombstones::MIGRATION,
+    names::NATIVE,
+    names::COMMIT_LOG,
+];
 
 /// What one raise call did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,8 +110,8 @@ fn additive_ceiling(current: u64) -> u64 {
 }
 
 /// Raises `sys/format` to the additive ceiling without crossing a structural
-/// migration, refusing stores mid-migration. An attached catalog already
-/// requires format 9, the current ceiling, so this reports no change.
+/// migration, refusing stores mid-migration. Name directories require explicit
+/// backfill, so ordinary format raises stop before that migration.
 ///
 /// `dry_run` reports the result without writing; ordinary commits do not
 /// raise the format.
@@ -261,7 +268,7 @@ fn plan(format: u64, marker: Option<&proto::MigrationValue>) -> Result<Plan> {
 }
 
 /// Stages the marker recording `unit` and its progress.
-fn stage_marker(tx: &DbTransaction, unit: &MigrationUnit, cursor: &[u8]) -> Result<StagedBytes> {
+fn stage_marker(tx: &CommitSession, unit: &MigrationUnit, cursor: &[u8]) -> Result<StagedBytes> {
     let key = Key::Sys(SysKey::Migration).encode();
     let value = value::encode_value(&proto::MigrationValue {
         from_format: unit.from_format,
@@ -270,155 +277,158 @@ fn stage_marker(tx: &DbTransaction, unit: &MigrationUnit, cursor: &[u8]) -> Resu
     });
     let mut staged = StagedBytes::default();
     staged.add(key.len(), value.len());
-    tx.put(key, value).map_err(Error::from)?;
+    tx.put(key, value)?;
     Ok(staged)
 }
 
-/// The start batch: the marker exists after it, or it does not.
-///
-/// The marker rides a head stamp, so committers that cached the store's
-/// migration-free state at a head see that head move and read the marker
-/// again. That makes `sys/head` this batch's conflict anchor too, so a
-/// commit racing it wins or loses cleanly rather than interleaving.
-async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
+/// Commits progress and its head stamp through the store's commit authority.
+async fn land(
+    session: CommitSession,
+    mut staged: StagedBytes,
+    log: Option<&crate::commit_log::LogCommitter>,
+) -> Result<commit::Landed> {
+    let head = commit::read_head_value(session.handle()).await?;
+    let (key, value) = commit::head_stamp(head.snapshot_id, head.batch_seq);
+    let value = value.unwrap_or_default();
+    staged.add(key.len(), value.len());
+    session.put(key, value)?;
+    let projections = std::sync::RwLock::default();
+    commit::commit_batch(
+        std::sync::Arc::new(session),
+        commit::HeadTransition {
+            before: head.snapshot_id,
+            after: head.snapshot_id,
+        },
+        &[],
+        staged,
+        commit::Landing {
+            projections: &projections,
+            log,
+        },
+        &CommitDurability::OnFlushInterval,
+    )
+    .await
+}
+
+async fn check_progress(
+    session: &CommitSession,
+    unit: &MigrationUnit,
+    cursor: Option<&[u8]>,
+) -> Result<()> {
+    let format = read::read_format(session.handle()).await?;
+    let marker = read::read_migration(session.handle()).await?;
+    let same_marker = match (cursor, marker.as_ref()) {
+        (None, None) => true,
+        (Some(cursor), Some(marker)) => {
+            marker.from_format == unit.from_format
+                && marker.to_format == unit.to_format
+                && marker.cursor == cursor
+        }
+        _ => false,
+    };
+    if format.is_none_or(|format| format.format_version != unit.from_format) || !same_marker {
+        return Err(Error::Migration(
+            "migration progress changed; reopen to resume the durable cursor".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn start(
+    db: &Db,
+    unit: &MigrationUnit,
+    log: Option<&crate::commit_log::LogCommitter>,
+) -> Result<()> {
     for attempt in 0..MAX_COMMIT_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(commit::retry_backoff(attempt)).await;
         }
-
-        let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
-        let staged = match stage_start(&tx, unit).await {
-            Ok(staged) => staged,
-            Err(error) => {
-                tx.rollback();
-                return Err(error);
-            }
-        };
-
-        match commit_durable(
-            tx,
-            "migration start",
-            staged,
-            &CommitDurability::OnFlushInterval,
-        )
-        .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == slatedb::ErrorKind::Transaction => {
-                info!(attempt, "migration start lost the head race; retrying");
-            }
-            Err(error) => return Err(Error::from(error)),
+        let session =
+            CommitSession::folder(db.begin(IsolationLevel::Snapshot).map_err(Error::from)?);
+        check_progress(&session, unit, None).await?;
+        let staged = stage_marker(&session, unit, &[])?;
+        if matches!(
+            land(session, staged, log).await?,
+            commit::Landed::Committed(_)
+        ) {
+            return Ok(());
         }
     }
-
-    Err(Error::RetryBudgetExhausted(format!(
-        "migration start from format {} to {} spent {MAX_COMMIT_ATTEMPTS} attempts without \
-         settling; commits are landing faster than it can claim the head",
-        unit.from_format, unit.to_format
-    )))
+    Err(Error::RetryBudgetExhausted(
+        "migration start lost every head race".into(),
+    ))
 }
 
-/// Stages the start batch: the marker and the head stamp that carries it.
-async fn stage_start(tx: &DbTransaction, unit: &MigrationUnit) -> Result<StagedBytes> {
-    let mut staged = stage_marker(tx, unit, &[])?;
-    // A store with no head is pre-bootstrap and has nothing to anchor to.
-    if let Some(head) = read::read_head(ReadHandle::Tx(tx)).await? {
-        let (key, value) = commit::head_stamp(head.snapshot_id, head.batch_seq);
-        let value = value.unwrap_or_default();
-        staged.add(key.len(), value.len());
-        tx.put(key, value).map_err(Error::from)?;
-    }
-
-    Ok(staged)
-}
-
-/// The finish batch: the format flip and the marker clear, together.
-async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
-    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
-
+async fn finish(
+    db: &Db,
+    unit: &MigrationUnit,
+    cursor: &[u8],
+    log: Option<&crate::commit_log::LogCommitter>,
+) -> Result<()> {
+    let session = CommitSession::folder(db.begin(IsolationLevel::Snapshot).map_err(Error::from)?);
+    check_progress(&session, unit, Some(cursor)).await?;
+    let old = read::read_format(session.handle())
+        .await?
+        .ok_or_else(|| Error::Corruption("migration lost its format stamp".into()))?;
     let format = Key::Sys(SysKey::Format).encode();
     let stamp = value::encode_value(&proto::FormatValue {
         format_version: unit.to_format,
         writer_version: env!("CARGO_PKG_VERSION").to_string(),
-        commit_log_batch_origin: None,
+        commit_log_batch_origin: old.commit_log_batch_origin,
     });
     let marker = Key::Sys(SysKey::Migration).encode();
     let mut staged = StagedBytes::default();
     staged.add(format.len(), stamp.len());
     staged.add(marker.len(), 0);
-    if let Err(error) = tx.put(format, stamp).and_then(|()| tx.delete(marker)) {
-        tx.rollback();
-        return Err(Error::from(error));
-    }
-
-    commit_durable(
-        tx,
-        "migration finish",
-        staged,
-        &CommitDurability::OnFlushInterval,
-    )
-    .await
-    .map_err(Error::from)?;
-    Ok(())
+    session.put(format, stamp)?;
+    session.delete(marker)?;
+    require_landed(land(session, staged, log).await?)
 }
 
-/// Walks one unit to completion: start (unless resuming), then step batches
-/// until the walk is done, then finish.
-async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Result<()> {
+fn require_landed(landed: commit::Landed) -> Result<()> {
+    match landed {
+        commit::Landed::Committed(_) => Ok(()),
+        commit::Landed::LostRace => Err(Error::Migration(
+            "migration lost a head race; reopen to resume the durable cursor".into(),
+        )),
+    }
+}
+
+/// Advances only after each rewrite and its cursor land in one commit.
+async fn run_unit(
+    db: &Db,
+    unit: &MigrationUnit,
+    resume: Option<Vec<u8>>,
+    log: Option<&crate::commit_log::LogCommitter>,
+) -> Result<()> {
     let mut cursor = if let Some(cursor) = resume {
         cursor
     } else {
-        start(db, unit).await?;
+        start(db, unit, log).await?;
         crash_seam(CrashPoint::AfterStart)?;
         Vec::new()
     };
-
     loop {
-        let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
-
-        let outcome = match (unit.step)(&tx, &cursor).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tx.rollback();
-                return Err(error);
-            }
-        };
-
+        let session =
+            CommitSession::folder(db.begin(IsolationLevel::Snapshot).map_err(Error::from)?);
+        check_progress(&session, unit, Some(&cursor)).await?;
         let Some(StepProgress {
             cursor: next,
             staged: rewritten,
-        }) = outcome
+        }) = (unit.step)(&session, &cursor).await?
         else {
-            tx.rollback();
+            session.rollback();
             break;
         };
-
-        // The cursor advances in the same batch as the rewrite it records.
-        let mut staged = match stage_marker(&tx, unit, &next) {
-            Ok(staged) => staged,
-            Err(error) => {
-                tx.rollback();
-                return Err(error);
-            }
-        };
+        let mut staged = stage_marker(&session, unit, &next)?;
         staged.0 = staged.0.saturating_add(rewritten.0);
-        commit_durable(
-            tx,
-            "migration step",
-            staged,
-            &CommitDurability::OnFlushInterval,
-        )
-        .await
-        .map_err(Error::from)?;
+        require_landed(land(session, staged, log).await?)?;
         crash_seam(CrashPoint::AfterStep)?;
-
         cursor = next;
     }
-
     crash_seam(CrashPoint::BeforeFinish)?;
-    finish(db, unit).await?;
+    finish(db, unit, &cursor, log).await?;
     crash_seam(CrashPoint::AfterFinish)?;
-
     Ok(())
 }
 
@@ -426,7 +436,10 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
 /// migration if the marker says one is in flight. A store already at the
 /// newest format is left untouched and reported as such. Epoch fencing on
 /// the writer means exactly one migrator runs.
-pub(crate) async fn run(db: &Db) -> Result<MigrationReport> {
+pub(crate) async fn run(
+    db: &Db,
+    log: Option<&crate::commit_log::LogCommitter>,
+) -> Result<MigrationReport> {
     let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
     let (format, marker) = futures::join!(
         read::read_format(ReadHandle::Tx(&tx)),
@@ -475,7 +488,7 @@ pub(crate) async fn run(db: &Db) -> Result<MigrationReport> {
             "migrating the store format"
         );
 
-        run_unit(db, unit, resume.take()).await?;
+        run_unit(db, unit, resume.take(), log).await?;
 
         units_run.push(unit.name.to_string());
         to_format = unit.to_format;

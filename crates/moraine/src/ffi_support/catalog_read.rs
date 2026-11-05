@@ -119,44 +119,19 @@ async fn named_table(
     table: &str,
     selection: crate::transaction::table_read::TableRead,
 ) -> Result<CatalogSnapshot> {
-    use crate::transaction::table_read::load_table;
+    use crate::{
+        store::key::NameKind,
+        transaction::{names, table_read::load_table},
+    };
     let session = catalog.begin_read().await?;
     let result = read::consistent(session.handle(), || async {
         crate::transaction::commit::refuse_mid_migration(session.handle()).await?;
-        let mut schemas = EntityCursor::open(
-            session.handle(),
-            EntityRecordKind::Schema,
-            Versions::Live,
-            None,
-        )
-        .await?;
-        let mut schema_id = None;
-        while let Some((record, _memory)) = schemas.next().await? {
-            if let EntityRecord::Schema(value) = record
-                && value.schema_name == schema
-            {
-                schema_id = Some(value.schema_id);
-            }
-        }
-        let schema_id = schema_id.ok_or_else(|| Error::NotFound(format!("schema {schema}")))?;
-        let mut tables = EntityCursor::open(
-            session.handle(),
-            EntityRecordKind::Table,
-            Versions::Live,
-            None,
-        )
-        .await?;
-        let mut table_id = None;
-        while let Some((record, _memory)) = tables.next().await? {
-            if let EntityRecord::Table(value) = record
-                && value.schema_id == schema_id
-                && value.table_name == table
-            {
-                table_id = Some(value.table_id);
-            }
-        }
-        let table_id =
-            table_id.ok_or_else(|| Error::NotFound(format!("table {schema}.{table}")))?;
+        let schema_id = names::lookup(session.handle(), NameKind::Schema, 0, schema)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("schema {schema}")))?;
+        let table_id = names::lookup(session.handle(), NameKind::Table, schema_id, table)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("table {schema}.{table}")))?;
         load_table(session.handle(), crate::TableId::new(table_id), selection).await
     })
     .await;
@@ -182,3 +157,6 @@ pub async fn table_sources(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests;

@@ -85,7 +85,7 @@ counter implies for a batch prepared against a current head; a stale head
 names a taken slot and loses.
 
 `adopted` and `adopt` serve the open path alone: a read-write open on a
-format below the log's flushes, then adopts with the format stamp, and
+catalog not yet on the log flushes, then adopts with the format stamp, and
 folds whichever stamp won — the library's, now. `fold_tail` folds what has
 landed past the store's cursor into a held store, or refreshes a followed
 reader, and returns how many slots that was; demoting uses it to fold the

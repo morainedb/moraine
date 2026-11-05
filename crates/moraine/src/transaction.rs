@@ -6,6 +6,7 @@ pub(crate) mod index_maintenance;
 pub(crate) mod inline;
 pub(crate) mod maintenance_status;
 pub(crate) mod migration;
+pub(crate) mod names;
 pub(crate) mod operations;
 pub(crate) mod session;
 pub(crate) mod staged;
