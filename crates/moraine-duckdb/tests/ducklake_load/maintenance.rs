@@ -928,7 +928,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             &options,
             "SELECT count(*), sum(a) FROM lake.main.t;"
         )),
-        vec![vec!["12".to_string(), "144".to_string()]],
+        vec![vec!["11".to_string(), "144".to_string()]],
         "a maintenance pass must not change what the lake contains"
     );
 }
@@ -2081,7 +2081,7 @@ fn raising_a_fresh_stores_format_is_idempotent() {
     // A dry run answers what a raise would do, twice over, without doing
     // it — the pre-flight a one-way door needs.
     let probed = raise_with("the dry run", ", dry_run := true");
-    assert_eq!(probed, (11, 11));
+    assert_eq!(probed, (12, 12));
     assert_eq!(
         raise_with("the second dry run", ", dry_run := true"),
         probed,

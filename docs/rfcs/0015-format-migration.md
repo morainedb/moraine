@@ -158,6 +158,10 @@ with at most 256 records or approximately 1 MiB of staged keys per step. Its
 cursor is the last current delete-file key. As with the name migration, the
 marker blocks ordinary opens until the directory and format stamp agree.
 Legacy formats 9 and 10 reach 12 through the name-directory migration to 11.
+After a successful native migration, the writer flushes and publishes the
+completed checkpoint before closing. Fixed read-only scopes can acquire the
+migrated version without reopening a normal writer. Commit-log migrations
+retain the provider's acknowledged-publication contract.
 
 ### Single-writer migration
 

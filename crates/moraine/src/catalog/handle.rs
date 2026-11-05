@@ -2157,9 +2157,24 @@ impl Catalog {
         };
 
         let report = migration::run(&db, log.as_ref()).await;
-        let closed = match log {
-            Some(log) => log.store.close().await,
-            None => db.close().await.map_err(Error::from),
+        let closed = if let Some(log) = log {
+            log.store.close().await
+        } else {
+            let publication = if report.is_ok() {
+                crate::store::checkpoint::Publisher::new(
+                    db.clone(),
+                    StoreBuilder::new(&options.path, object_store.clone())
+                        .wal_object_store(wal_object_store(&options))
+                        .admin(),
+                )
+                .flushed()
+                .await
+                .map_err(Error::from)
+            } else {
+                Ok(())
+            };
+            let closed = db.close().await.map_err(Error::from);
+            publication.and(closed)
         };
 
         // A failed migration keeps its checkpoint as the recovery point.

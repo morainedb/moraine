@@ -119,6 +119,23 @@ async fn legacy_targets_scan_and_migration_resumes_between_batches() {
     .unwrap();
     assert!(report.resumed);
     assert_eq!((report.from_format, report.to_format), (11, 12));
+    let reader = Catalog::open_read_only(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let scope = reader.index_read_scope().await.unwrap().unwrap();
+    let read = scope.reads().begin_read().await.unwrap();
+    assert_eq!(
+        read::read_format(read.handle())
+            .await
+            .unwrap()
+            .unwrap()
+            .format_version,
+        12,
+        "read-only scopes must acquire the migrated version without reopening a writer"
+    );
+    read.finish();
+    drop(scope);
+    reader.close().await.unwrap();
     let catalog = Catalog::open(store, CatalogOptions::default())
         .await
         .unwrap();

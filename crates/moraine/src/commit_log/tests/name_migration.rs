@@ -197,6 +197,22 @@ async fn delete_target_migration_resumes_through_log_slots() {
     .unwrap();
     assert!(report.resumed);
     assert_eq!((report.from_format, report.to_format), (11, 12));
+    let reader = Catalog::open_read_only(objects.clone(), options.clone())
+        .await
+        .unwrap();
+    let scope = reader.index_read_scope().await.unwrap().unwrap();
+    let read = scope.reads().begin_read().await.unwrap();
+    assert_eq!(
+        read::read_format(read.handle())
+            .await
+            .unwrap()
+            .unwrap()
+            .format_version,
+        12
+    );
+    read.finish();
+    drop(scope);
+    reader.close().await.unwrap();
     let catalog = Catalog::open(objects, options).await.unwrap();
     let read = catalog.begin_read().await.unwrap();
     let after = read::read_format(read.handle()).await.unwrap().unwrap();
