@@ -44,6 +44,9 @@ use crate::{
     },
 };
 
+#[doc(hidden)]
+pub mod metadata_export;
+
 /// The pinned store revision; an adapter must pair it with its attachment
 /// identity.
 #[must_use]

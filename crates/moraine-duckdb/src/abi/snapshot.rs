@@ -5,6 +5,8 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
+use moraine::ffi_support::metadata_export::MetadataExport;
+
 use super::{free_array, free_c_string, guard, snapshot_list, to_c_string};
 use crate::{
     error::{AbiError, MoraineError, codes},
@@ -112,21 +114,28 @@ pub unsafe extern "C" fn moraine_snapshot_schemas(
 ) -> i32 {
     // SAFETY: caller contract for the pointers.
     unsafe {
-        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
-            let owned: Vec<(u64, CString)> = snapshot
-                .schemas()
-                .into_iter()
-                .map(|s| Ok((s.id.get(), to_c_string(s.name)?)))
-                .collect::<Result<_, AbiError>>()?;
+        snapshot_list::<MoraineSchemaDesc, (u64, CString)>(
+            snapshot,
+            MetadataExport::Schemas,
+            out_items,
+            out_len,
+            err,
+            |snapshot| {
+                let owned: Vec<(u64, CString)> = snapshot
+                    .schemas()
+                    .into_iter()
+                    .map(|s| Ok((s.id.get(), to_c_string(s.name)?)))
+                    .collect::<Result<_, AbiError>>()?;
 
-            Ok(owned
-                .into_iter()
-                .map(|(id, name)| MoraineSchemaDesc {
-                    id,
-                    name: name.into_raw(),
-                })
-                .collect())
-        })
+                Ok(owned
+                    .into_iter()
+                    .map(|(id, name)| MoraineSchemaDesc {
+                        id,
+                        name: name.into_raw(),
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
@@ -176,22 +185,29 @@ pub unsafe extern "C" fn moraine_snapshot_tables_in(
 ) -> i32 {
     // SAFETY: caller contract for the pointers.
     unsafe {
-        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
-            let owned: Vec<(u64, u64, CString)> = snapshot
-                .tables_in(moraine::SchemaId::new(schema_id))
-                .into_iter()
-                .map(|t| Ok((t.id.get(), t.schema_id.get(), to_c_string(t.name)?)))
-                .collect::<Result<_, AbiError>>()?;
+        snapshot_list::<MoraineTableDesc, (u64, u64, CString)>(
+            snapshot,
+            MetadataExport::TablesIn(schema_id),
+            out_items,
+            out_len,
+            err,
+            |snapshot| {
+                let owned: Vec<(u64, u64, CString)> = snapshot
+                    .tables_in(moraine::SchemaId::new(schema_id))
+                    .into_iter()
+                    .map(|t| Ok((t.id.get(), t.schema_id.get(), to_c_string(t.name)?)))
+                    .collect::<Result<_, AbiError>>()?;
 
-            Ok(owned
-                .into_iter()
-                .map(|(id, schema_id, name)| MoraineTableDesc {
-                    id,
-                    schema_id,
-                    name: name.into_raw(),
-                })
-                .collect())
-        })
+                Ok(owned
+                    .into_iter()
+                    .map(|(id, schema_id, name)| MoraineTableDesc {
+                        id,
+                        schema_id,
+                        name: name.into_raw(),
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
@@ -249,34 +265,41 @@ pub unsafe extern "C" fn moraine_snapshot_columns_of(
 ) -> i32 {
     // SAFETY: caller contract for the pointers.
     unsafe {
-        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
-            let owned: Vec<(u64, CString, CString, bool, Option<u64>)> = snapshot
-                .columns_of(moraine::TableId::new(table_id))
-                .into_iter()
-                .map(|c| {
-                    Ok((
-                        c.id.get(),
-                        to_c_string(c.name)?,
-                        to_c_string(c.column_type)?,
-                        c.nulls_allowed,
-                        c.parent_column.map(moraine::ColumnId::get),
-                    ))
-                })
-                .collect::<Result<_, AbiError>>()?;
-            Ok(owned
-                .into_iter()
-                .map(
-                    |(id, name, sql_type, nulls_allowed, parent)| MoraineColumnDesc {
-                        id,
-                        name: name.into_raw(),
-                        sql_type: sql_type.into_raw(),
-                        nulls_allowed,
-                        has_parent_column: parent.is_some(),
-                        parent_column: parent.unwrap_or(0),
-                    },
-                )
-                .collect())
-        })
+        snapshot_list::<MoraineColumnDesc, (u64, CString, CString, bool, Option<u64>)>(
+            snapshot,
+            MetadataExport::ColumnsOf(table_id),
+            out_items,
+            out_len,
+            err,
+            |snapshot| {
+                let owned: Vec<(u64, CString, CString, bool, Option<u64>)> = snapshot
+                    .columns_of(moraine::TableId::new(table_id))
+                    .into_iter()
+                    .map(|c| {
+                        Ok((
+                            c.id.get(),
+                            to_c_string(c.name)?,
+                            to_c_string(c.column_type)?,
+                            c.nulls_allowed,
+                            c.parent_column.map(moraine::ColumnId::get),
+                        ))
+                    })
+                    .collect::<Result<_, AbiError>>()?;
+                Ok(owned
+                    .into_iter()
+                    .map(
+                        |(id, name, sql_type, nulls_allowed, parent)| MoraineColumnDesc {
+                            id,
+                            name: name.into_raw(),
+                            sql_type: sql_type.into_raw(),
+                            nulls_allowed,
+                            has_parent_column: parent.is_some(),
+                            parent_column: parent.unwrap_or(0),
+                        },
+                    )
+                    .collect())
+            },
+        )
     }
 }
 
@@ -338,31 +361,38 @@ pub unsafe extern "C" fn moraine_snapshot_views_in(
 ) -> i32 {
     // SAFETY: caller contract for the pointers.
     unsafe {
-        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
-            let owned: Vec<(u64, u64, CString, CString, CString)> = snapshot
-                .views_in(moraine::SchemaId::new(schema_id))
-                .into_iter()
-                .map(|v| {
-                    Ok((
-                        v.id.get(),
-                        v.schema_id.get(),
-                        to_c_string(v.name)?,
-                        to_c_string(v.dialect)?,
-                        to_c_string(v.sql)?,
-                    ))
-                })
-                .collect::<Result<_, AbiError>>()?;
-            Ok(owned
-                .into_iter()
-                .map(|(id, schema_id, name, dialect, sql)| MoraineViewDesc {
-                    id,
-                    schema_id,
-                    name: name.into_raw(),
-                    dialect: dialect.into_raw(),
-                    sql: sql.into_raw(),
-                })
-                .collect())
-        })
+        snapshot_list::<MoraineViewDesc, (u64, u64, CString, CString, CString)>(
+            snapshot,
+            MetadataExport::ViewsIn(schema_id),
+            out_items,
+            out_len,
+            err,
+            |snapshot| {
+                let owned: Vec<(u64, u64, CString, CString, CString)> = snapshot
+                    .views_in(moraine::SchemaId::new(schema_id))
+                    .into_iter()
+                    .map(|v| {
+                        Ok((
+                            v.id.get(),
+                            v.schema_id.get(),
+                            to_c_string(v.name)?,
+                            to_c_string(v.dialect)?,
+                            to_c_string(v.sql)?,
+                        ))
+                    })
+                    .collect::<Result<_, AbiError>>()?;
+                Ok(owned
+                    .into_iter()
+                    .map(|(id, schema_id, name, dialect, sql)| MoraineViewDesc {
+                        id,
+                        schema_id,
+                        name: name.into_raw(),
+                        dialect: dialect.into_raw(),
+                        sql: sql.into_raw(),
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
@@ -465,3 +495,6 @@ pub unsafe extern "C" fn moraine_snapshot_id(
         Err(code) => code,
     }
 }
+
+#[cfg(test)]
+mod tests;

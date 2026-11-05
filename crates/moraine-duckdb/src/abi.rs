@@ -202,8 +202,9 @@ pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: imp
 ///
 /// Every pointer must be valid per the ABI contract; `err`, if non-null, must
 /// be writable.
-unsafe fn snapshot_list<Row>(
+unsafe fn snapshot_list<Row, Conversion>(
     snapshot: *mut MoraineSnapshotHandle,
+    selection: moraine::ffi_support::metadata_export::MetadataExport,
     out_items: *mut *mut Row,
     out_len: *mut usize,
     err: *mut MoraineError,
@@ -218,7 +219,8 @@ unsafe fn snapshot_list<Row>(
         }
         // SAFETY: caller contract for `snapshot`.
         let snapshot = unsafe { &(*snapshot).snapshot };
-        let memory = snapshot.reserve_copy()?;
+        let memory =
+            selection.reserve_export(snapshot, size_of::<Row>(), size_of::<Conversion>())?;
         Ok((produce(snapshot)?, memory))
     };
 
