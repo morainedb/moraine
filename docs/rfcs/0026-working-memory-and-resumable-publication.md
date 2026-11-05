@@ -47,7 +47,11 @@ visible records into its view. Store scan buffers and retained record-set keys
 hold reservations through decoding and projection ownership.
 
 `CatalogSnapshot::reserve_copy()` lets a caller admit metadata copies before
-materializing them. Snapshot C exports use it. Catalog dump conversion reserves
+materializing them. Snapshot C exports instead estimate only the selected
+descriptors, copied strings (including NUL terminators and column defaults),
+conversion vectors, and column-sorting scratch. They reserve before allocating
+and retain the allowance until the paired free call, independently of the
+resident snapshot's reservation. Catalog dump conversion reserves
 row headers and string bytes. Index, inline, checkpoint, and maintenance arrays
 also retain their allowances, and the paired C free function releases that
 reservation. Exported IPC bytes retain admission through their paired free or
