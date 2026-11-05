@@ -14,7 +14,7 @@ async fn exact_name_lookup_does_not_decode_unrelated_tables() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             tx.create_table(
                 schema,
@@ -56,7 +56,7 @@ async fn name_entries_follow_create_rename_and_drop_atomically() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             tx.create_table(
                 schema,
@@ -90,7 +90,7 @@ async fn name_entries_follow_create_rename_and_drop_atomically() {
     assert!(read.handle().get(key("before")).await.unwrap().is_some());
     read.finish();
     catalog
-        .commit(|tx| tx.rename_table(crate::TableId::new(row.table_id), "after"))
+        .commit_materialized(|tx| tx.rename_table(crate::TableId::new(row.table_id), "after"))
         .await
         .unwrap();
     let read = catalog.begin_read().await.unwrap();
@@ -104,7 +104,7 @@ async fn name_entries_follow_create_rename_and_drop_atomically() {
     );
     assert!(index_table(&catalog, "main", "after", false).await.is_ok());
     catalog
-        .commit(|tx| tx.drop_table(crate::TableId::new(row.table_id)))
+        .commit_materialized(|tx| tx.drop_table(crate::TableId::new(row.table_id)))
         .await
         .unwrap();
     let read = catalog.begin_read().await.unwrap();
@@ -168,7 +168,7 @@ async fn positioning_sources_do_not_decode_unrelated_records() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             tx.create_table(
                 schema,

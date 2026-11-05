@@ -27,7 +27,7 @@ async fn maintenance_status_is_bounded_and_survives_a_read_only_reopen() {
     let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
         .await
         .unwrap();
-    let head = writer.snapshot().await.unwrap().current_snapshot().id;
+    let head = writer.read_scope().await.unwrap().current_snapshot().id;
 
     for number in 0..18 {
         writer.record_maintenance_pass(pass(number)).await.unwrap();
@@ -38,7 +38,7 @@ async fn maintenance_status_is_bounded_and_survives_a_read_only_reopen() {
     assert_eq!(status.first().unwrap().steps[0].detail, "pass 17");
     assert_eq!(status.last().unwrap().steps[0].detail, "pass 2");
     assert_eq!(
-        writer.snapshot().await.unwrap().current_snapshot().id,
+        writer.read_scope().await.unwrap().current_snapshot().id,
         head,
         "status must not mint a DuckLake snapshot"
     );
@@ -48,6 +48,9 @@ async fn maintenance_status_is_bounded_and_survives_a_read_only_reopen() {
         .await
         .unwrap();
     assert_eq!(reader.maintenance_status().await.unwrap(), status);
-    assert_eq!(reader.snapshot().await.unwrap().current_snapshot().id, head);
+    assert_eq!(
+        reader.read_scope().await.unwrap().current_snapshot().id,
+        head
+    );
     reader.close().await.unwrap();
 }

@@ -111,8 +111,8 @@ impl IndexShape {
 /// Dereferences to [`CatalogSnapshot`]; reads observe the transaction's
 /// own staged mutations. Nothing touches the store until the closure
 /// returns.
-pub struct Transaction {
-    state: CatalogSnapshot,
+pub(crate) struct Transaction {
+    pub(crate) state: CatalogSnapshot,
     ops: Vec<Operation>,
     index_entries: Vec<StagedIndexEntry>,
     inline_ops: Vec<InlineStage>,

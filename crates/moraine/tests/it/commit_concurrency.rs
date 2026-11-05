@@ -11,19 +11,19 @@ async fn disjoint_table_ddl_both_succeed() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |tx| tx.add_column(a, &col("a1")).map(|_| ()))
+        c1.commit(async move |tx| tx.add_column(a, &col("a1")).await.map(|_| ()))
             .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |tx| tx.add_column(b, &col("b1")).map(|_| ()))
+        c2.commit(async move |tx| tx.add_column(b, &col("b1")).await.map(|_| ()))
             .await
     });
     t1.await.unwrap().unwrap();
     t2.await.unwrap().unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
-    assert_eq!(head.columns_of(a).len(), 2);
-    assert_eq!(head.columns_of(b).len(), 2);
+    let head = catalog.read_scope().await.unwrap();
+    assert_eq!(head.columns_of(a).await.unwrap().len(), 2);
+    assert_eq!(head.columns_of(b).await.unwrap().len(), 2);
     catalog.close().await.unwrap();
 }
 
@@ -42,14 +42,14 @@ async fn same_table_ddl_races_serialize_or_conflict() {
         let t1 = tokio::spawn({
             let n1 = n1.clone();
             async move {
-                c1.commit(move |tx| tx.add_column(a, &col(&n1)).map(|_| ()))
+                c1.commit(async move |tx| tx.add_column(a, &col(&n1)).await.map(|_| ()))
                     .await
             }
         });
         let t2 = tokio::spawn({
             let n2 = n2.clone();
             async move {
-                c2.commit(move |tx| tx.add_column(a, &col(&n2)).map(|_| ()))
+                c2.commit(async move |tx| tx.add_column(a, &col(&n2)).await.map(|_| ()))
                     .await
             }
         });
@@ -63,9 +63,14 @@ async fn same_table_ddl_races_serialize_or_conflict() {
             }
         }
     }
-    let head = catalog.snapshot().await.unwrap();
-    let names: std::collections::HashSet<String> =
-        head.columns_of(a).into_iter().map(|c| c.name).collect();
+    let head = catalog.read_scope().await.unwrap();
+    let names: std::collections::HashSet<String> = head
+        .columns_of(a)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     for name in &added {
         assert!(
             names.contains(name),
@@ -86,11 +91,11 @@ async fn same_name_create_race_yields_one_table() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |tx| tx.create_table(s, "orders", &[col("x")]).map(|_| ()))
+        c1.commit(async move |tx| tx.create_table(s, "orders", &[col("x")]).await.map(|_| ()))
             .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |tx| tx.create_table(s, "orders", &[col("x")]).map(|_| ()))
+        c2.commit(async move |tx| tx.create_table(s, "orders", &[col("x")]).await.map(|_| ()))
             .await
     });
     let results = [t1.await.unwrap(), t2.await.unwrap()];
@@ -102,9 +107,11 @@ async fn same_name_create_race_yields_one_table() {
             .any(|r| matches!(r, Err(Error::AlreadyExists(_) | Error::CommitConflict(_))))
     );
     // Exactly one live table named "orders" either way.
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     let orders: Vec<_> = head
         .tables_in(s)
+        .await
+        .unwrap()
         .into_iter()
         .filter(|t| t.name == "orders")
         .collect();
@@ -120,7 +127,7 @@ async fn counters_never_regress_or_collide_under_concurrency() {
         let c = catalog.clone();
         let name = format!("t{i}");
         handles.push(tokio::spawn(async move {
-            c.commit(move |tx| tx.create_table(s, &name, &[col("x")]).map(|_| ()))
+            c.commit(async move |tx| tx.create_table(s, &name, &[col("x")]).await.map(|_| ()))
                 .await
         }));
     }
@@ -128,8 +135,14 @@ async fn counters_never_regress_or_collide_under_concurrency() {
         h.await.unwrap().unwrap();
     }
 
-    let head = catalog.snapshot().await.unwrap();
-    let mut ids: Vec<u64> = head.tables_in(s).iter().map(|t| t.id.get()).collect();
+    let head = catalog.read_scope().await.unwrap();
+    let mut ids: Vec<u64> = head
+        .tables_in(s)
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.id.get())
+        .collect();
     ids.sort_unstable();
     let before = ids.len();
     ids.dedup();
@@ -144,18 +157,26 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |tx| tx.register_data_file(a, datafile(100), &[]).map(|_| ()))
-            .await
+        c1.commit(async move |tx| {
+            tx.register_data_file(a, datafile(100), &[])
+                .await
+                .map(|_| ())
+        })
+        .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |tx| tx.register_data_file(a, datafile(50), &[]).map(|_| ()))
-            .await
+        c2.commit(async move |tx| {
+            tx.register_data_file(a, datafile(50), &[])
+                .await
+                .map(|_| ())
+        })
+        .await
     });
     t1.await.unwrap().unwrap();
     t2.await.unwrap().unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
-    let files = head.data_files_of(a);
+    let head = catalog.read_scope().await.unwrap();
+    let files = head.data_files_of(a).await.unwrap();
     assert_eq!(files.len(), 2);
     let mut starts: Vec<(u64, u64)> = files
         .iter()
@@ -171,7 +192,7 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
     // Dense, disjoint ranges regardless of which commit won the race.
     assert_eq!(starts[0].0, 0);
     assert_eq!(starts[1].0, starts[0].1);
-    assert_eq!(head.table_stats(a).unwrap().next_row_id, 150);
+    assert_eq!(head.table_stats(a).await.unwrap().unwrap().next_row_id, 150);
     catalog.close().await.unwrap();
 }
 
@@ -191,16 +212,22 @@ async fn same_table_deletes_of_different_files_both_land() {
     let (catalog, _s, a, _b) = seeded().await;
     // Two data files to delete from, registered up front.
     catalog
-        .commit(move |tx| {
-            tx.register_data_file(a, datafile(100), &[])?;
-            tx.register_data_file(a, datafile(50), &[])?;
+        .commit(async move |tx| {
+            tx.register_data_file(a, datafile(100), &[]).await?;
+            tx.register_data_file(a, datafile(50), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
-    let mut ids: Vec<_> = head.data_files_of(a).iter().map(|f| f.id).collect();
+    let head = catalog.read_scope().await.unwrap();
+    let mut ids: Vec<_> = head
+        .data_files_of(a)
+        .await
+        .unwrap()
+        .iter()
+        .map(|f| f.id)
+        .collect();
     ids.sort_unstable();
     let (first, second) = (ids[0], ids[1]);
 
@@ -218,15 +245,17 @@ async fn same_table_deletes_of_different_files_both_land() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |tx| {
+        c1.commit(async move |tx| {
             tx.register_delete_file(a, delete_over(first), &[])
+                .await
                 .map(|_| ())
         })
         .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |tx| {
+        c2.commit(async move |tx| {
             tx.register_delete_file(a, delete_over(second), &[])
+                .await
                 .map(|_| ())
         })
         .await
@@ -234,9 +263,9 @@ async fn same_table_deletes_of_different_files_both_land() {
     t1.await.unwrap().unwrap();
     t2.await.unwrap().unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     assert_eq!(
-        head.delete_files_of(a).len(),
+        head.delete_files_of(a).await.unwrap().len(),
         2,
         "deletes of different files must both land, not conflict"
     );
@@ -249,10 +278,14 @@ async fn append_vs_drop_is_a_real_error() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |tx| tx.register_data_file(a, datafile(10), &[]).map(|_| ()))
-            .await
+        c1.commit(async move |tx| {
+            tx.register_data_file(a, datafile(10), &[])
+                .await
+                .map(|_| ())
+        })
+        .await
     });
-    let t2 = tokio::spawn(async move { c2.commit(move |tx| tx.drop_table(a)).await });
+    let t2 = tokio::spawn(async move { c2.commit(async move |tx| tx.drop_table(a).await).await });
     let r1 = t1.await.unwrap();
     let r2 = t2.await.unwrap();
 
@@ -266,14 +299,19 @@ async fn append_vs_drop_is_a_real_error() {
     }
 
     // Whatever the outcome mix, the head must be consistent with it.
-    let head = catalog.snapshot().await.unwrap();
-    let live = head.tables_in(s).into_iter().any(|t| t.id == a);
+    let head = catalog.read_scope().await.unwrap();
+    let live = head
+        .tables_in(s)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|t| t.id == a);
     if r2.is_ok() {
         assert!(!live, "drop committed, so the table must be gone");
     } else {
         assert!(live, "drop failed, so the table must survive");
         if r1.is_ok() {
-            assert_eq!(head.data_files_of(a).len(), 1);
+            assert_eq!(head.data_files_of(a).await.unwrap().len(), 1);
         }
     }
     catalog.close().await.unwrap();
@@ -291,10 +329,11 @@ async fn option_set_vs_drop_leaves_no_orphaned_option() {
         let c1 = catalog.clone();
         let c2 = catalog.clone();
         let t1 = tokio::spawn(async move {
-            c1.commit(move |tx| tx.set_option(OptionScope::Table(a), "k", "v"))
+            c1.commit(async move |tx| tx.set_option(OptionScope::Table(a), "k", "v").await)
                 .await
         });
-        let t2 = tokio::spawn(async move { c2.commit(move |tx| tx.drop_table(a)).await });
+        let t2 =
+            tokio::spawn(async move { c2.commit(async move |tx| tx.drop_table(a).await).await });
         let set = t1.await.unwrap();
         let dropped = t2.await.unwrap();
 
@@ -305,11 +344,16 @@ async fn option_set_vs_drop_leaves_no_orphaned_option() {
             }
         }
 
-        let head = catalog.snapshot().await.unwrap();
-        let live = head.tables_in(s).into_iter().any(|t| t.id == a);
+        let head = catalog.read_scope().await.unwrap();
+        let live = head
+            .tables_in(s)
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|t| t.id == a);
         if !live {
             assert_eq!(
-                head.option(OptionScope::Table(a), "k"),
+                head.option(OptionScope::Table(a), "k").await.unwrap(),
                 None,
                 "dropped table kept an orphaned option record"
             );

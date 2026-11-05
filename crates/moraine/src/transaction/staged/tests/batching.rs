@@ -115,7 +115,7 @@ async fn concurrent_appends_to_disjoint_tables_both_land() {
         "each mints a snapshot of its own, consecutively"
     );
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert_eq!(head.snapshot.snapshot_id, 3);
     assert_eq!(
         head.snapshot.next_file_id, 3,
@@ -156,8 +156,8 @@ async fn concurrent_appends_to_one_table_rebase_row_ids_and_stats() {
     second.commit().await.unwrap();
 
     let (concurrent, sequential) = (
-        concurrent.snapshot().await.unwrap(),
-        sequential.snapshot().await.unwrap(),
+        concurrent.materialized().await.unwrap(),
+        sequential.materialized().await.unwrap(),
     );
     assert_eq!(concurrent.snapshot.snapshot_id, 3);
     assert_eq!(concurrent.data_files.get(&1), sequential.data_files.get(&1));
@@ -191,7 +191,7 @@ async fn an_append_begun_before_a_landed_append_rebases_onto_it() {
     assert_eq!(landed.commit().await.unwrap().get(), 2);
 
     assert_eq!(early.commit().await.unwrap().get(), 3);
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let starts: Vec<Option<u64>> = head.data_files[&1]
         .values()
         .map(|file| file.row_id_start)
@@ -252,7 +252,10 @@ async fn conflicting_members_decline_the_batch_rather_than_aborting_it() {
         matches!(loser, Error::CommitConflict(_)) && loser.to_string().contains("conflict"),
         "{loser}"
     );
-    assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 3);
+    assert_eq!(
+        catalog.materialized().await.unwrap().snapshot.snapshot_id,
+        3
+    );
 }
 
 /// Two more inlined rows for table 1, appended after the two `head`
@@ -292,7 +295,7 @@ async fn concurrent_inline_inserts_into_an_indexed_table_rebase_their_entries() 
     };
 
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
-    let head = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+    let head = catalog.materialized().await.unwrap().snapshot.snapshot_id;
 
     // The first insert registers the inline table's schema and commits
     // alone; the members below ride the batch.
@@ -345,7 +348,7 @@ async fn concurrent_inline_inserts_into_an_indexed_table_rebase_their_entries() 
         "the loser's rows moved past the winner's"
     );
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 6);
-    let stats = catalog.snapshot().await.unwrap().table_stats[&1].clone();
+    let stats = catalog.materialized().await.unwrap().table_stats[&1].clone();
     assert_eq!((stats.record_count, stats.next_row_id), (6, 6));
 }
 
@@ -359,7 +362,7 @@ async fn an_inline_insert_begun_before_a_landed_one_rebases_its_entries() {
     };
 
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
-    let head = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+    let head = catalog.materialized().await.unwrap().snapshot.snapshot_id;
     seed_inline_rows(&catalog, head + 1).await;
     let head = head + 1;
 
@@ -390,7 +393,7 @@ async fn an_inline_insert_begun_before_a_landed_one_rebases_its_entries() {
         assert_eq!(lookup(value).await, [row_id], "value {value}");
     }
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 6);
-    let stats = catalog.snapshot().await.unwrap().table_stats[&1].clone();
+    let stats = catalog.materialized().await.unwrap().table_stats[&1].clone();
     assert_eq!((stats.record_count, stats.next_row_id), (6, 6));
 }
 
@@ -463,7 +466,7 @@ async fn a_burst_of_sixty_four_members_all_land() {
     tx.commit().await.unwrap();
 
     for round in 0..3u64 {
-        let head = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+        let head = catalog.materialized().await.unwrap().snapshot.snapshot_id;
         let mut members = Vec::new();
         for table_id in 1..=WRITERS {
             let mut tx = begin(&catalog);
@@ -500,7 +503,7 @@ async fn a_burst_of_sixty_four_members_all_land() {
             assert!(matches!(err, Error::CommitConflict(_)), "{err}");
         }
     }
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(head.snapshot.snapshot_id > 3 * WRITERS);
 }
 
@@ -511,7 +514,7 @@ async fn a_burst_of_sixty_four_members_all_land() {
 #[tokio::test]
 async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_opened_at() {
     let catalog = catalog_with_two_tables().await;
-    let read = catalog.snapshot().await.unwrap();
+    let read = catalog.materialized().await.unwrap();
     assert_eq!(read.snapshot.snapshot_id, 1);
 
     let mut other = begin(&catalog);
@@ -524,7 +527,7 @@ async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_open
             .unwrap();
     stage_append(&mut tx, 1, 1, 1, 0);
     assert_eq!(tx.commit().await.unwrap().get(), 3);
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert_eq!(head.snapshot.next_file_id, 3);
     assert!(
         head.data_files[&1].contains_key(&2),
@@ -539,7 +542,10 @@ async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_open
         late.commit().await.unwrap_err(),
         Error::CommitConflict(_)
     ));
-    assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 3);
+    assert_eq!(
+        catalog.materialized().await.unwrap().snapshot.snapshot_id,
+        3
+    );
 }
 
 /// A head-preserving commit derives nothing from the head, so a race it
@@ -571,7 +577,7 @@ async fn a_head_preserving_commit_re_drives_its_own_lost_race() {
         2,
         "head-preserving: it lands on the head it finds"
     );
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert_eq!(head.scheduled_deletions().len(), 1);
     assert!(
         head.data_files[&1].contains_key(&1),
@@ -672,7 +678,7 @@ async fn coalesced_log_appends_rebase_against_pending_members() {
     .await
     .unwrap();
     seed_two_tables(&catalog).await;
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut first = crate::ffi_support::staged::staged_begin_scoped(
         &catalog,
         None,
@@ -692,7 +698,7 @@ async fn coalesced_log_appends_rebase_against_pending_members() {
     let (first, second) = tokio::join!(first.commit(), second.commit());
     first.unwrap();
     second.unwrap();
-    let view = catalog.snapshot().await.unwrap();
+    let view = catalog.materialized().await.unwrap();
     assert_eq!(view.snapshot.snapshot_id, 3);
     assert_eq!(view.data_files[&1].len(), 2);
     assert_eq!(view.table_stats[&1].next_row_id, 20);

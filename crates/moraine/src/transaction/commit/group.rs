@@ -15,7 +15,7 @@ use tokio::{
 
 use super::{
     CommitDurability, HeadTransition, Landed, Prepared, StagedWrite, Submission, await_submitted,
-    fold, head_view_for, prepare_and_stage, submit_batch,
+    fold, prepare_and_stage, submit_batch,
 };
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, Store, projection::ProjectionCache},
@@ -76,6 +76,7 @@ pub(crate) struct Batch {
     pub(crate) db_tx: Arc<CommitSession>,
     /// The head view the batch opened at.
     base: Arc<CatalogSnapshot>,
+    #[cfg(test)]
     complete_base: bool,
     /// `base` folded forward through the members staged so far; `None`
     /// until a second member needs it.
@@ -123,6 +124,7 @@ pub(crate) trait StageOnto {
     ) -> Result<Staging>;
 }
 
+#[cfg(test)]
 impl<F> StageOnto for [F]
 where
     F: Fn(&mut Transaction) -> Result<()>,
@@ -138,6 +140,7 @@ where
     }
 }
 
+#[cfg(test)]
 impl<F, const N: usize> StageOnto for [F; N]
 where
     F: Fn(&mut Transaction) -> Result<()>,
@@ -152,14 +155,13 @@ where
     }
 }
 
-/// A closure whose premises are restricted to one table operation.
-pub(crate) struct TableMember<F> {
-    pub(crate) table: crate::TableId,
-    pub(crate) selection: crate::transaction::table_read::TableRead,
+/// A closure whose premises are restricted to one operation.
+pub(crate) struct ScopedMember<'a, F> {
+    pub(crate) selection: crate::transaction::scoped::CommitRead<'a>,
     pub(crate) mutate: F,
 }
 
-impl<F> StageOnto for TableMember<F>
+impl<F> StageOnto for ScopedMember<'_, F>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
@@ -169,12 +171,7 @@ where
         _db: &Store,
         projections: &std::sync::RwLock<ProjectionCache>,
     ) -> Result<Staging> {
-        let mut view = crate::transaction::table_read::load_table(
-            batch.db_tx.handle(),
-            self.table,
-            self.selection,
-        )
-        .await?;
+        let mut view = self.selection.load(batch.db_tx.handle()).await?;
         batch.apply_pending(&mut view)?;
         batch.count_member();
         let prepared = prepare_and_stage(&batch.db_tx, projections, &self.mutate, &view).await?;
@@ -198,7 +195,134 @@ where
     }
 }
 
+/// A demand-loaded public commit callback.
+pub(crate) struct DemandMember<F>(pub(crate) F);
+
+impl<F> StageOnto for DemandMember<F>
+where
+    F: AsyncFn(&mut crate::transaction::demand::Transaction) -> Result<()>,
+{
+    async fn stage_onto(
+        &self,
+        batch: &mut Batch,
+        _db: &Store,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging> {
+        batch.stage_demand(&self.0, projections).await
+    }
+}
+
+pub(crate) struct DemandGroup<'a>(pub(crate) &'a [crate::CommitMember<'a>]);
+
+impl StageOnto for DemandGroup<'_> {
+    async fn stage_onto(
+        &self,
+        batch: &mut Batch,
+        _db: &Store,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging> {
+        let mut ids = Vec::new();
+        let mut ours = Vec::new();
+        for member in self.0 {
+            let (mut transaction, observed) = batch.begin_demand().await?;
+            let result = member(&mut transaction).await;
+            match batch
+                .finish_demand(transaction, observed, result, projections)
+                .await?
+            {
+                Staging::Staged {
+                    ids: more_ids,
+                    ours: more_changes,
+                } => {
+                    ids.extend(more_ids);
+                    ours.extend(more_changes);
+                }
+                Staging::Declined(error) => return Ok(Staging::Declined(error)),
+            }
+        }
+        Ok(Staging::Staged { ids, ours })
+    }
+}
+
 impl Batch {
+    async fn stage_demand<F>(
+        &mut self,
+        callback: &F,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging>
+    where
+        F: AsyncFn(&mut crate::transaction::demand::Transaction) -> Result<()>,
+    {
+        let (mut transaction, observed) = self.begin_demand().await?;
+        let result = callback(&mut transaction).await;
+        self.finish_demand(transaction, observed, result, projections)
+            .await
+    }
+
+    async fn begin_demand(
+        &mut self,
+    ) -> Result<(
+        crate::transaction::demand::Transaction,
+        crate::store::proto::HeadValue,
+    )> {
+        self.count_member();
+        self.refold()?;
+        let transaction = crate::transaction::demand::Transaction::new(
+            self.db_tx.clone(),
+            self.premise().clone(),
+            &self.writes,
+        )?;
+        let observed = super::read_head_value(self.db_tx.handle()).await?;
+        if !self.db_tx.is_folder()
+            && (observed.snapshot_id != self.head_before
+                || observed.batch_seq != self.sequence_before)
+        {
+            return Err(Error::CommitConflict(
+                "catalog moved before loading mutation dependencies".into(),
+            ));
+        }
+        Ok((transaction, observed))
+    }
+
+    async fn finish_demand(
+        &mut self,
+        transaction: crate::transaction::demand::Transaction,
+        observed: crate::store::proto::HeadValue,
+        result: Result<()>,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging> {
+        if super::read_head_value(self.db_tx.handle()).await? != observed {
+            return Err(Error::CommitConflict(
+                "catalog moved while loading mutation dependencies".into(),
+            ));
+        }
+        result?;
+        let prepared = super::finish_and_stage(
+            &self.db_tx,
+            projections,
+            transaction.inner.into_parts(),
+            &transaction.base,
+        )
+        .await?;
+        let (id, ours) = match prepared {
+            Prepared::Nothing { head } => (head, Vec::new()),
+            Prepared::Staged {
+                ours,
+                commits,
+                writes,
+                staged_bytes,
+            } => {
+                let changes = vec![(*ours).clone()];
+                self.admit_member(commits, *ours, writes, staged_bytes);
+                (commits, changes)
+            }
+        };
+        Ok(Staging::Staged {
+            ids: vec![SnapshotId::new(id)],
+            ours,
+        })
+    }
+
     async fn open(db: &Store, _projections: &std::sync::RwLock<ProjectionCache>) -> Result<Self> {
         let db_tx = db.begin_commit_session()?;
         let base = match crate::transaction::staged::dependencies::header(db_tx.handle()).await {
@@ -214,6 +338,7 @@ impl Batch {
         Ok(Self {
             db_tx: Arc::new(db_tx),
             base,
+            #[cfg(test)]
             complete_base: false,
             premise: None,
             folded: 0,
@@ -282,6 +407,7 @@ impl Batch {
 
     /// Runs every member's closure in turn and stages the result. An error
     /// leaves the batch poisoned: the caller must discard it.
+    #[cfg(test)]
     async fn stage<F>(
         &mut self,
         members: &[F],
@@ -291,7 +417,7 @@ impl Batch {
         F: Fn(&mut Transaction) -> Result<()>,
     {
         if !self.complete_base {
-            self.base = head_view_for(self.db_tx.handle(), projections).await?;
+            self.base = super::head_view_for(self.db_tx.handle(), projections).await?;
             Arc::make_mut(&mut self.base).batch_seq = self.sequence_before;
             self.complete_base = true;
             self.premise = None;

@@ -2013,6 +2013,7 @@ dependencies = [
  "futures",
  "moraine",
  "object_store",
+ "parquet",
  "tokio",
  "tracing",
  "tracing-subscriber",

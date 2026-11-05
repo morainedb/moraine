@@ -459,10 +459,12 @@ mod tests {
                 .await
                 .expect("test setup: open catalog");
             catalog
-                .commit(|tx| {
-                    let schema = tx.create_schema("s")?;
-                    tx.create_view(schema, "clean", "duckdb", "select 1")?;
-                    tx.create_view(schema, "poisoned", "duckdb", "select 1 as a\0b")?;
+                .commit(async |tx| {
+                    let schema = tx.create_schema("s").await?;
+                    tx.create_view(schema, "clean", "duckdb", "select 1")
+                        .await?;
+                    tx.create_view(schema, "poisoned", "duckdb", "select 1 as a\0b")
+                        .await?;
                     Ok(())
                 })
                 .await

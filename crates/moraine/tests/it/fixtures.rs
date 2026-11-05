@@ -53,18 +53,18 @@ pub async fn open_memory() -> Catalog {
 pub async fn seeded() -> (Catalog, SchemaId, TableId, TableId) {
     let catalog = open_memory().await;
     catalog
-        .commit(|tx| {
-            let s = tx.create_schema("s")?;
-            tx.create_table(s, "a", &[col("x")])?;
-            tx.create_table(s, "b", &[col("x")])?;
+        .commit(async |tx| {
+            let s = tx.create_schema("s").await?;
+            tx.create_table(s, "a", &[col("x")]).await?;
+            tx.create_table(s, "b", &[col("x")]).await?;
             Ok(())
         })
         .await
         .unwrap();
-    let snapshot = catalog.snapshot().await.unwrap();
-    let s = snapshot.schema_by_name("s").unwrap().id;
-    let a = snapshot.table_by_name(s, "a").unwrap().id;
-    let b = snapshot.table_by_name(s, "b").unwrap().id;
+    let snapshot = catalog.read_scope().await.unwrap();
+    let s = snapshot.schema_by_name("s").await.unwrap().unwrap().id;
+    let a = snapshot.table_by_name(s, "a").await.unwrap().unwrap().id;
+    let b = snapshot.table_by_name(s, "b").await.unwrap().unwrap().id;
     (catalog, s, a, b)
 }
 

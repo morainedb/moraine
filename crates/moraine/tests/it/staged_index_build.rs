@@ -132,9 +132,14 @@ async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, DataStore) {
 
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "orders", &[col("a")]).await?;
             tx.register_data_file(
                 table,
                 moraine::DataFile {
@@ -143,7 +148,8 @@ async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, DataStore) {
                     ..datafile(rows)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             created.set(Some(table));
             Ok(())
         })
@@ -177,7 +183,7 @@ fn by_entries(entries: usize) -> BuildStep {
 #[allow(clippy::unwrap_used)]
 async fn head(catalog: &Catalog) -> u64 {
     catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .current_snapshot()
@@ -189,7 +195,7 @@ async fn head(catalog: &Catalog) -> u64 {
 #[allow(clippy::unwrap_used)]
 async fn schema_version(catalog: &Catalog) -> u64 {
     catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .current_snapshot()
@@ -226,10 +232,12 @@ async fn staged_build_spans_steps_and_finishes_ready() {
         .unwrap();
 
     let info = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .indexes_of(table)
+        .await
+        .unwrap()
         .remove(0);
     assert_eq!(info.state, IndexState::Ready, "the build flipped ready");
     assert_eq!(info.id, index);
@@ -378,8 +386,8 @@ async fn interrupted_staged_build_resumes_from_its_cursor() {
     // building — the state a cancelled or crashed driver leaves behind.
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let id = tx.create_index_staged(table, &def(true))?;
+        .commit(async |tx| {
+            let id = tx.create_index_staged(table, &def(true)).await?;
             index.set(Some(id));
             Ok(())
         })
@@ -387,7 +395,7 @@ async fn interrupted_staged_build_resumes_from_its_cursor() {
         .unwrap();
     let index = index.get().unwrap();
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.build_index_step(
                 index,
                 &[
@@ -402,15 +410,18 @@ async fn interrupted_staged_build_resumes_from_its_cursor() {
                 ],
                 false,
             )
+            .await
             .map(|_| ())
         })
         .await
         .unwrap();
     let building = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .indexes_of(table)
+        .await
+        .unwrap()
         .remove(0);
     assert_eq!(building.state, IndexState::Building);
     assert_eq!(building.build_cursor, Some(1), "the cursor persisted");
@@ -424,10 +435,12 @@ async fn interrupted_staged_build_resumes_from_its_cursor() {
     assert_eq!(resumed, index, "resumed the same definition");
 
     let info = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .indexes_of(table)
+        .await
+        .unwrap()
         .remove(0);
     assert_eq!(info.state, IndexState::Ready);
     for value in 0..7 {
@@ -460,10 +473,12 @@ async fn duplicate_in_backfill_fails_the_build_and_drops_the_definition() {
     assert!(matches!(err, Error::Constraint(_)), "{err}");
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .indexes_of(table)
+            .await
+            .unwrap()
             .is_empty(),
         "the failed build left no definition behind"
     );
@@ -493,7 +508,7 @@ async fn resuming_with_a_different_definition_is_refused() {
     use moraine::{ColumnOrder, Direction, NullOrder};
     let (catalog, table, data) = table_with_file((0..7).collect()).await;
     catalog
-        .commit(|tx| tx.create_index_staged(table, &def(true)).map(|_| ()))
+        .commit(async |tx| tx.create_index_staged(table, &def(true)).await.map(|_| ()))
         .await
         .unwrap();
 
@@ -676,11 +691,16 @@ async fn table_with_grouped_files(
 
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "orders", &[col("a")]).await?;
             for file in &registrations {
-                tx.register_data_file(table, file.clone(), &[])?;
+                tx.register_data_file(table, file.clone(), &[]).await?;
             }
             created.set(Some(table));
             Ok(())
@@ -780,8 +800,8 @@ async fn cancelled_build_resumes_inside_a_row_group() {
     ));
     let checkpoint = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let snapshot = catalog.snapshot().await.unwrap();
-            if let Some(index) = snapshot.index_by_name(table, "by_a")
+            let snapshot = catalog.read_scope().await.unwrap();
+            if let Some(index) = snapshot.index_by_name(table, "by_a").await.unwrap()
                 && index
                     .build_position_cursor
                     .is_some_and(|position| position % 1_000 != 999)

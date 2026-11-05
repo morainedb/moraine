@@ -103,6 +103,9 @@ async fn staging_memory_failure_releases_rows_and_prevents_commit() {
             .is_err()
     );
     assert!(tx.commit().await.is_err());
-    assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 0);
+    assert_eq!(
+        catalog.materialized().await.unwrap().snapshot.snapshot_id,
+        0
+    );
     catalog.close().await.unwrap();
 }

@@ -19,14 +19,22 @@ fn key(expression: &str, direction: &str) -> SortKeyDef {
 async fn a_spec_reads_back_with_its_keys_in_declared_order() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("year(x)", "DESC"), key("x", "ASC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("year(x)", "DESC"), key("x", "ASC")])
+                .await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let spec = catalog.snapshot().await.unwrap().sorting_of(table).unwrap();
+    let spec = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .sorting_of(table)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         spec.keys,
         vec![key("year(x)", "DESC"), key("x", "ASC")],
@@ -39,10 +47,12 @@ async fn an_unsorted_table_has_no_spec() {
     let (catalog, _, table, _) = seeded().await;
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .sorting_of(table)
+            .await
+            .unwrap()
             .is_none()
     );
 }
@@ -53,33 +63,37 @@ async fn an_unsorted_table_has_no_spec() {
 async fn resorting_leaves_the_old_spec_readable_by_time_travel() {
     let (catalog, _, table, _) = seeded().await;
     let first = catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("x", "ASC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("x", "ASC")]).await?;
             Ok(())
         })
         .await
         .unwrap();
     let second = catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("x", "DESC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("x", "DESC")]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
     let spec_then = catalog
-        .snapshot_at(first)
+        .read_scope_at(first)
         .await
         .unwrap()
         .sorting_of(table)
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(spec_then.keys, vec![key("x", "ASC")]);
 
     let spec_now = catalog
-        .snapshot_at(second)
+        .read_scope_at(second)
         .await
         .unwrap()
         .sorting_of(table)
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(spec_now.keys, vec![key("x", "DESC")]);
     assert_ne!(spec_then.id, spec_now.id, "a new spec gets a fresh id");
@@ -91,31 +105,35 @@ async fn resorting_leaves_the_old_spec_readable_by_time_travel() {
 async fn clearing_unsorts_the_table_but_keeps_the_past() {
     let (catalog, _, table, _) = seeded().await;
     let sorted = catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("x", "ASC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("x", "ASC")]).await?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(move |tx| tx.clear_sorting(table))
+        .commit(async move |tx| tx.clear_sorting(table).await)
         .await
         .unwrap();
 
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .sorting_of(table)
+            .await
+            .unwrap()
             .is_none()
     );
     assert!(
         catalog
-            .snapshot_at(sorted)
+            .read_scope_at(sorted)
             .await
             .unwrap()
             .sorting_of(table)
+            .await
+            .unwrap()
             .is_some()
     );
 }
@@ -124,7 +142,7 @@ async fn clearing_unsorts_the_table_but_keeps_the_past() {
 async fn clearing_an_unsorted_table_is_not_found() {
     let (catalog, _, table, _) = seeded().await;
     let err = catalog
-        .commit(move |tx| tx.clear_sorting(table))
+        .commit(async move |tx| tx.clear_sorting(table).await)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "{err}");
@@ -135,8 +153,8 @@ async fn an_empty_spec_is_refused_and_an_absent_table_is_not_found() {
     let (catalog, _, table, _) = seeded().await;
 
     let empty = catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[]).await?;
             Ok(())
         })
         .await
@@ -144,8 +162,9 @@ async fn an_empty_spec_is_refused_and_an_absent_table_is_not_found() {
     assert!(matches!(empty, Error::Constraint(_)), "{empty}");
 
     let absent_table = catalog
-        .commit(|tx| {
-            tx.set_sorting(TableId::new(9999), &[key("x", "ASC")])?;
+        .commit(async |tx| {
+            tx.set_sorting(TableId::new(9999), &[key("x", "ASC")])
+                .await?;
             Ok(())
         })
         .await
@@ -160,14 +179,22 @@ async fn an_empty_spec_is_refused_and_an_absent_table_is_not_found() {
 async fn an_expression_naming_no_live_column_is_stored_verbatim() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("nonexistent_column + 1", "ASC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("nonexistent_column + 1", "ASC")])
+                .await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let spec = catalog.snapshot().await.unwrap().sorting_of(table).unwrap();
+    let spec = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .sorting_of(table)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(spec.keys[0].expression, "nonexistent_column + 1");
 }
 
@@ -175,23 +202,25 @@ async fn an_expression_naming_no_live_column_is_stored_verbatim() {
 async fn dropping_the_table_drops_its_spec() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("x", "ASC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("x", "ASC")]).await?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(move |tx| tx.drop_table(table))
+        .commit(async move |tx| tx.drop_table(table).await)
         .await
         .unwrap();
 
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .sorting_of(table)
+            .await
+            .unwrap()
             .is_none()
     );
 }
@@ -203,24 +232,24 @@ async fn dropping_the_table_drops_its_spec() {
 async fn setting_a_spec_leaves_the_schema_version_alone() {
     let (catalog, _, table, _) = seeded().await;
     let before = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .current_snapshot()
         .schema_version;
 
     catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("x", "ASC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("x", "ASC")]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let after = catalog.snapshot().await.unwrap();
+    let after = catalog.read_scope().await.unwrap();
     assert_eq!(after.current_snapshot().schema_version, before);
     assert!(
-        after.sorting_of(table).is_some(),
+        after.sorting_of(table).await.unwrap().is_some(),
         "the spec landed all the same"
     );
 }
@@ -232,8 +261,9 @@ async fn setting_a_spec_leaves_the_schema_version_alone() {
 async fn a_verb_written_spec_serves_through_the_ducklake_projections() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(move |tx| {
-            tx.set_sorting(table, &[key("year(x)", "DESC"), key("x", "ASC")])?;
+        .commit(async move |tx| {
+            tx.set_sorting(table, &[key("year(x)", "DESC"), key("x", "ASC")])
+                .await?;
             Ok(())
         })
         .await

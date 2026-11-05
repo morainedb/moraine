@@ -29,7 +29,7 @@ async fn table_with_one_deleted_row(catalog: &Catalog, data: &InMemory) -> Table
     let (delete_size, delete_footer) = parquet(data, "delete.parquet", "pos", vec![1]).await;
     let table = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.set_option(OptionScope::Global, "data_path", "/lake/")?;
             let schema = tx.schema_by_name("main").unwrap().id;
             let id = tx.create_table(
@@ -88,7 +88,7 @@ async fn an_index_built_from_the_rows_verifies_clean() {
         .unwrap();
     let table = table_with_one_deleted_row(&catalog, &data).await;
     let store = DataStore::new(Arc::new(data));
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     let def = IndexDef {
         name: "by_a".into(),
         columns: vec![column],
@@ -125,7 +125,7 @@ async fn indexed_table_with_uniqueness(
         .unwrap();
     let table = table_with_one_deleted_row(&catalog, &data).await;
     let store = DataStore::new(Arc::new(data));
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     let def = IndexDef {
         name: "by_a".into(),
         columns: vec![column],
@@ -136,7 +136,7 @@ async fn indexed_table_with_uniqueness(
         .await
         .unwrap();
     let info = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .index_by_name(table, "by_a")
@@ -270,7 +270,7 @@ async fn a_building_index_is_refused() {
         .unwrap();
     let table = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             table.set(Some(tx.create_table(
                 schema,
@@ -286,7 +286,7 @@ async fn a_building_index_is_refused() {
         .await
         .unwrap();
     let table = table.get().unwrap();
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     let def = IndexDef {
         name: "by_a".into(),
         columns: vec![column],
@@ -348,7 +348,7 @@ async fn apply_inline_steps(steps: Vec<Step>) -> (Catalog, TableId, Vec<i64>) {
         .unwrap();
     let table = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             table.set(Some(tx.create_table(
                 schema,
@@ -365,7 +365,7 @@ async fn apply_inline_steps(steps: Vec<Step>) -> (Catalog, TableId, Vec<i64>) {
         .await
         .unwrap();
     let table = table.get().unwrap();
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     let index = catalog
         .create_index_staged(
             table,
@@ -413,7 +413,7 @@ async fn apply_inline_steps(steps: Vec<Step>) -> (Catalog, TableId, Vec<i64>) {
                     })
                     .collect();
                 catalog
-                    .commit(|tx| {
+                    .commit_materialized(|tx| {
                         tx.inline_insert(table, &chunk(fresh.clone()), &entries)
                             .map(|_| ())
                     })
@@ -436,7 +436,7 @@ async fn apply_inline_steps(steps: Vec<Step>) -> (Catalog, TableId, Vec<i64>) {
                     values: vec![Some(integer(value))],
                 }];
                 catalog
-                    .commit(|tx| tx.inline_delete(table, row_id, &removals))
+                    .commit_materialized(|tx| tx.inline_delete(table, row_id, &removals))
                     .await
                     .unwrap();
                 live.remove(position);
@@ -511,7 +511,7 @@ async fn null_entries_on_a_unique_index_are_not_reported_missing() {
         .unwrap();
     let table = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.set_option(OptionScope::Global, "data_path", "/lake/")?;
             let schema = tx.schema_by_name("main").unwrap().id;
             let id = tx.create_table(
@@ -546,7 +546,7 @@ async fn null_entries_on_a_unique_index_are_not_reported_missing() {
         .unwrap();
     let table = table.get().unwrap();
     let store = DataStore::new(Arc::new(data));
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     catalog
         .create_index_staged(
             table,
@@ -584,7 +584,7 @@ async fn a_read_only_catalog_can_verify() {
         .unwrap();
     let table = table_with_one_deleted_row(&catalog, &data).await;
     let store = DataStore::new(Arc::new(data));
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     catalog
         .create_index_staged(
             table,
@@ -625,7 +625,7 @@ async fn certifying_records_only_a_clean_pass() {
     );
 
     let at = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .current_snapshot()
@@ -644,11 +644,11 @@ async fn certifying_records_only_a_clean_pass() {
     assert_eq!(read_report.certified_at, report.certified_at);
     assert_eq!(
         read_report.verified_at,
-        Some(catalog.snapshot().await.unwrap().current_snapshot().id)
+        Some(catalog.materialized().await.unwrap().current_snapshot().id)
     );
     assert_eq!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .index_by_name(table, "by_a")
@@ -673,7 +673,7 @@ async fn certifying_records_only_a_clean_pass() {
     assert_eq!(report.dead, 1);
     assert_eq!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .index_by_name(table, "by_a")
@@ -698,7 +698,7 @@ async fn a_certificate_survives_dml_and_not_a_rebuild() {
         let catalog = catalog.clone();
         async move {
             catalog
-                .snapshot()
+                .materialized()
                 .await
                 .unwrap()
                 .index_by_name(table, "by_a")
@@ -711,7 +711,7 @@ async fn a_certificate_survives_dml_and_not_a_rebuild() {
     // An inlined insert maintains the index at commit, so the certificate
     // stands.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let index = tx.index_by_name(table, "by_a").unwrap().id;
             tx.inline_insert(
                 table,
@@ -730,13 +730,13 @@ async fn a_certificate_survives_dml_and_not_a_rebuild() {
 
     // Dropping and recreating the index is a different entry set.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let index = tx.index_by_name(table, "by_a").unwrap().id;
             tx.drop_index(index)
         })
         .await
         .unwrap();
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     catalog
         .create_index_staged(
             table,
@@ -765,13 +765,13 @@ async fn a_replaced_definition_rejects_stale_verification() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.drop_index(info.id)?;
             Ok(())
         })
         .await
         .unwrap();
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     catalog
         .create_index_staged(
             table,
@@ -788,13 +788,13 @@ async fn a_replaced_definition_rejects_stale_verification() {
         .await
         .unwrap();
     let replacement = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .index_by_name(table, "by_a")
         .unwrap();
     let result = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.record_index_verification(
                 replacement.id,
                 report.definition.unwrap(),
@@ -808,7 +808,7 @@ async fn a_replaced_definition_rejects_stale_verification() {
     );
     assert_eq!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .index_by_name(table, "by_a")
@@ -827,7 +827,7 @@ async fn poisoned_indexes_reject_certificates() {
         .verify_index(table, "by_a", Some(store), "/lake/")
         .await
         .unwrap();
-    let mut snapshot = (*catalog.snapshot().await.unwrap()).clone();
+    let mut snapshot = (*catalog.materialized().await.unwrap()).clone();
     std::sync::Arc::make_mut(
         snapshot
             .indexes
@@ -838,7 +838,7 @@ async fn poisoned_indexes_reject_certificates() {
     )
     .poisoned = Some(true);
     let next = snapshot.current_snapshot().id.get() + 1;
-    let mut tx = crate::transaction::Transaction::new(snapshot, next);
+    let mut tx = crate::transaction::verbs::Transaction::new(snapshot, next);
     let result =
         tx.record_index_verification(info.id, report.definition.unwrap(), report.verified_at);
     assert!(
@@ -847,7 +847,7 @@ async fn poisoned_indexes_reject_certificates() {
     );
     assert_eq!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .index_by_name(table, "by_a")

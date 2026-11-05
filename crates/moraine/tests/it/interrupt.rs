@@ -42,7 +42,7 @@ async fn gated() -> (Catalog, Arc<GatedStore>) {
         .await
         .unwrap();
     seeder
-        .commit(|tx| tx.create_schema("seed").map(|_| ()))
+        .commit(async |tx| tx.create_schema("seed").await.map(|_| ()))
         .await
         .unwrap();
     seeder.close().await.unwrap();
@@ -57,7 +57,7 @@ async fn gated() -> (Catalog, Arc<GatedStore>) {
 #[allow(clippy::unwrap_used)]
 async fn head(catalog: &Catalog) -> u64 {
     catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .current_snapshot()
@@ -97,7 +97,7 @@ async fn a_commit_behind_a_parked_flush_submits_and_lands_after_it() {
     // One batch in flight, parked at the gate. Its own caller is dropped;
     // the write survives that (the case below is about exactly this).
     {
-        let holder = catalog.commit(|tx| tx.create_schema("holder").map(|_| ()));
+        let holder = catalog.commit(async |tx| tx.create_schema("holder").await.map(|_| ()));
         tokio::pin!(holder);
         tokio::select! {
             () = store.arrival() => {}
@@ -108,7 +108,7 @@ async fn a_commit_behind_a_parked_flush_submits_and_lands_after_it() {
     // The commit behind it submits at once and waits only on a flush; its
     // caller is dropped while that flush is still owed.
     {
-        let behind = catalog.commit(|tx| tx.create_schema("behind").map(|_| ()));
+        let behind = catalog.commit(async |tx| tx.create_schema("behind").await.map(|_| ()));
         tokio::pin!(behind);
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -120,21 +120,22 @@ async fn a_commit_behind_a_parked_flush_submits_and_lands_after_it() {
     store.open_gate();
     await_head(&catalog, head_before + 2).await;
 
-    let view = catalog.snapshot().await.unwrap();
+    let view = catalog.read_scope().await.unwrap();
     assert!(
-        view.schema_by_name("holder").is_some(),
+        view.schema_by_name("holder").await.unwrap().is_some(),
         "the batch in flight was supposed to land"
     );
     assert!(
-        view.schema_by_name("behind").is_some(),
+        view.schema_by_name("behind").await.unwrap().is_some(),
         "the batch submitted behind it was supposed to land"
     );
     let first = catalog
-        .snapshot_at(SnapshotId::new(head_before + 1))
+        .read_scope_at(SnapshotId::new(head_before + 1))
         .await
         .unwrap();
     assert!(
-        first.schema_by_name("holder").is_some() && first.schema_by_name("behind").is_none(),
+        first.schema_by_name("holder").await.unwrap().is_some()
+            && first.schema_by_name("behind").await.unwrap().is_none(),
         "the parked batch must land first and whole"
     );
 }
@@ -155,7 +156,7 @@ async fn an_interrupt_during_the_write_returns_at_once_and_the_write_still_lands
 
     store.gate_wal_writes();
     let interrupted = {
-        let commit = catalog.commit(|tx| tx.create_schema("shielded").map(|_| ()));
+        let commit = catalog.commit(async |tx| tx.create_schema("shielded").await.map(|_| ()));
         tokio::pin!(commit);
         tokio::select! {
             () = store.arrival() => true,
@@ -176,17 +177,17 @@ async fn an_interrupt_during_the_write_returns_at_once_and_the_write_still_lands
     store.open_gate();
     await_head(&catalog, head_before + 1).await;
 
-    let view = catalog.snapshot().await.unwrap();
+    let view = catalog.read_scope().await.unwrap();
     assert!(
-        view.schema_by_name("shielded").is_some(),
+        view.schema_by_name("shielded").await.unwrap().is_some(),
         "the shielded write landed without its schema"
     );
     let minted = catalog
-        .snapshot_at(SnapshotId::new(head_before + 1))
+        .read_scope_at(SnapshotId::new(head_before + 1))
         .await
         .unwrap();
     assert!(
-        minted.schema_by_name("shielded").is_some(),
+        minted.schema_by_name("shielded").await.unwrap().is_some(),
         "the minted snapshot is torn: it advanced head without its own writes"
     );
 }
@@ -201,8 +202,13 @@ async fn a_staged_commit_interrupted_during_its_write_still_lands() {
     let (catalog, store) = gated().await;
     let head_before = head(&catalog).await;
     let next = head_before + 1;
-    let view = catalog.snapshot().await.unwrap();
-    let next_catalog_id = view.schemas().last().map_or(1, |s| s.id.get() + 1);
+    let view = catalog.read_scope().await.unwrap();
+    let next_catalog_id = view
+        .schemas()
+        .await
+        .unwrap()
+        .last()
+        .map_or(1, |s| s.id.get() + 1);
 
     let mut tx = staged_begin(&catalog, None, String::new(), None).unwrap();
     tx.stage(RowOperation::Insert {
@@ -256,10 +262,12 @@ async fn a_staged_commit_interrupted_during_its_write_still_lands() {
     await_head(&catalog, next).await;
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("staged")
+            .await
+            .unwrap()
             .is_some(),
         "the staged path's shielded write landed without its schema"
     );
@@ -281,7 +289,7 @@ async fn an_interrupted_read_releases_its_snapshot_and_writes_nothing() {
 
     store.gate_wal_writes();
     {
-        let holder = catalog.commit(|tx| tx.create_schema("holder").map(|_| ()));
+        let holder = catalog.commit(async |tx| tx.create_schema("holder").await.map(|_| ()));
         tokio::pin!(holder);
         tokio::select! {
             () = store.arrival() => {}
@@ -294,7 +302,7 @@ async fn an_interrupted_read_releases_its_snapshot_and_writes_nothing() {
     // mid-materialization or not at all — either way it must leave no
     // trace.
     {
-        let read = catalog.snapshot_at(SnapshotId::new(head_before));
+        let read = catalog.read_scope_at(SnapshotId::new(head_before));
         tokio::pin!(read);
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
@@ -314,12 +322,12 @@ async fn an_interrupted_read_releases_its_snapshot_and_writes_nothing() {
     await_head(&catalog, head_before + 1).await;
 
     catalog
-        .commit(|tx| tx.create_schema("after").map(|_| ()))
+        .commit(async |tx| tx.create_schema("after").await.map(|_| ()))
         .await
         .unwrap();
-    let view = catalog.snapshot().await.unwrap();
+    let view = catalog.read_scope().await.unwrap();
     assert!(
-        view.schema_by_name("after").is_some(),
+        view.schema_by_name("after").await.unwrap().is_some(),
         "the handle was left unusable by a cancelled read"
     );
     assert_eq!(

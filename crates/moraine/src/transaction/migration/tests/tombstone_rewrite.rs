@@ -130,7 +130,7 @@ async fn old_formats_migrate_to_versioned_inline_tombstones() {
             .unwrap();
         assert_eq!(
             catalog
-                .snapshot()
+                .materialized()
                 .await
                 .unwrap()
                 .current_snapshot()

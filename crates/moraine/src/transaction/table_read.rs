@@ -1,13 +1,13 @@
 //! Operation-owned table descriptors for index work and file reads.
 
 use crate::{
-    Catalog, CatalogSnapshot, Error, ReadOnlyCatalog, Result, SnapshotId, TableId, Transaction,
+    Catalog, CatalogSnapshot, Error, ReadOnlyCatalog, Result, SnapshotId, TableId,
     store::{
         handle::ReadHandle,
         key::{EntityKey, Key},
         read::{self, EntityCursor, EntityRecord, EntityRecordKind, Versions},
     },
-    transaction::commit,
+    transaction::{commit, verbs::Transaction},
 };
 
 #[cfg(test)]
@@ -25,13 +25,17 @@ pub(crate) enum TableRead {
     IndexCreation,
 }
 
-fn retain(view: &mut CatalogSnapshot, record: EntityRecord) -> Result<()> {
+pub(crate) fn retain(view: &mut CatalogSnapshot, record: EntityRecord) -> Result<()> {
     view.admit(record.estimated_bytes().saturating_add(80))?;
     view.put_record(record);
     Ok(())
 }
 
-async fn point(handle: ReadHandle<'_>, view: &mut CatalogSnapshot, key: EntityKey) -> Result<()> {
+pub(crate) async fn point(
+    handle: ReadHandle<'_>,
+    view: &mut CatalogSnapshot,
+    key: EntityKey,
+) -> Result<()> {
     let key = Key::current(key);
     if let Some(value) = handle.get(key.encode()).await? {
         retain(view, read::decode_current_record(key, &value)?)?;
@@ -192,14 +196,7 @@ impl Catalog {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        let member = commit::TableMember {
-            table,
-            selection,
-            mutate,
-        };
-        let ids = commit::commit_cycle(&self.store(), &member, self.commits()).await?;
-        ids.first()
-            .copied()
-            .ok_or_else(|| Error::Corruption("table commit returned no snapshot".into()))
+        self.commit_scoped(super::scoped::CommitRead::Table(table, selection), mutate)
+            .await
     }
 }

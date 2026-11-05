@@ -7,16 +7,18 @@ use arrow::{
     datatypes::{DataType, Field, Int64Type, Schema, UInt64Type},
 };
 use moraine::{
-    Catalog, CatalogSnapshot, DataFile, DataFileId, DataStore, DeleteFile, Error, InlineChunk,
-    TableId,
+    Catalog, DataFile, DataFileId, DataStore, DeleteFile, Error, InlineChunk, ReadScope, TableId,
 };
 use object_store::memory::InMemory;
 
 use crate::fixtures::{col, datafile, open_memory, row_id_field, write_parquet};
 
-fn all_columns(snapshot: &CatalogSnapshot, table: TableId) -> Vec<String> {
+#[allow(clippy::unwrap_used)]
+async fn all_columns(snapshot: &ReadScope, table: TableId) -> Vec<String> {
     snapshot
         .columns_of(table)
+        .await
+        .unwrap()
         .iter()
         .filter(|column| column.parent_column.is_none())
         .map(|column| column.name.clone())
@@ -264,12 +266,18 @@ async fn table_with(catalog: &Catalog, columns: &[&str], files: Vec<DataFile>) -
     let created = std::cell::Cell::new(None);
     let defs: Vec<_> = columns.iter().map(|name| col(name)).collect();
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            tx.set_option(moraine::OptionScope::Global, "data_path", "")?;
-            let table = tx.create_table(schema, "orders", &defs)?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            tx.set_option(moraine::OptionScope::Global, "data_path", "")
+                .await?;
+            let table = tx.create_table(schema, "orders", &defs).await?;
             for file in files.clone() {
-                tx.register_data_file(table, file, &[])?;
+                tx.register_data_file(table, file, &[]).await?;
             }
             created.set(Some(table));
             Ok(())
@@ -281,12 +289,19 @@ async fn table_with(catalog: &Catalog, columns: &[&str], files: Vec<DataFile>) -
 
 #[allow(clippy::unwrap_used)]
 async fn only_file(catalog: &Catalog, table: TableId) -> DataFileId {
-    catalog.snapshot().await.unwrap().data_files_of(table)[0].id
+    catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap()[0]
+        .id
 }
 
 #[allow(clippy::unwrap_used)]
-async fn head(catalog: &Catalog) -> Arc<CatalogSnapshot> {
-    catalog.snapshot().await.unwrap()
+async fn head(catalog: &Catalog) -> ReadScope {
+    catalog.read_scope().await.unwrap()
 }
 
 #[tokio::test]
@@ -320,7 +335,7 @@ async fn file_rows_come_back_with_the_current_columns_and_their_ids() {
                 "",
                 table,
                 &[(2, Some(file)), (1, Some(file)), (1, Some(file))],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -467,7 +482,7 @@ async fn a_file_with_embedded_ids_is_read_at_its_exact_positions() {
                 "",
                 table,
                 &[(9, Some(file)), (12, Some(file))],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -508,7 +523,7 @@ async fn rows_deleted_at_the_snapshot_are_omitted() {
     let (delete_size, delete_footer) =
         write_parquet(&data, "main/orders/delete.parquet", &delete_batch(&[1])).await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.register_delete_file(
                 table,
                 DeleteFile {
@@ -523,6 +538,7 @@ async fn rows_deleted_at_the_snapshot_are_omitted() {
                 },
                 &[],
             )
+            .await
             .map(|_| ())
         })
         .await
@@ -537,7 +553,7 @@ async fn rows_deleted_at_the_snapshot_are_omitted() {
                 "",
                 table,
                 &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -580,7 +596,7 @@ async fn repeated_summary_positions_read_only_the_live_version() {
     let (delete_size, delete_footer) =
         write_parquet(&data, "main/orders/delete.parquet", &delete_batch(&[0])).await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.register_delete_file(
                 table,
                 DeleteFile {
@@ -595,6 +611,7 @@ async fn repeated_summary_positions_read_only_the_live_version() {
                 },
                 &[],
             )
+            .await
             .map(|_| ())
         })
         .await
@@ -610,7 +627,7 @@ async fn repeated_summary_positions_read_only_the_live_version() {
                 "",
                 table,
                 &[(5, Some(file))],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -643,8 +660,9 @@ async fn inlined_rows_decode_from_their_chunk() {
     let catalog = open_memory().await;
     let table = table_with(&catalog, &["a"], vec![]).await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.inline_insert(table, &inline_chunk(&[7, 8, 9]), &[])
+                .await
                 .map(|_| ())
         })
         .await
@@ -659,7 +677,7 @@ async fn inlined_rows_decode_from_their_chunk() {
                 "",
                 table,
                 &[(1, None), (2, None)],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -675,14 +693,15 @@ async fn an_inlined_row_deleted_at_the_snapshot_is_refused() {
     let catalog = open_memory().await;
     let table = table_with(&catalog, &["a"], vec![]).await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.inline_insert(table, &inline_chunk(&[7, 8]), &[])
+                .await
                 .map(|_| ())
         })
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.inline_delete(table, 1, &[]))
+        .commit(async |tx| tx.inline_delete(table, 1, &[]).await)
         .await
         .unwrap();
 
@@ -695,7 +714,7 @@ async fn an_inlined_row_deleted_at_the_snapshot_is_refused() {
                 "",
                 table,
                 &[(1, None)],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -738,7 +757,7 @@ async fn a_column_added_after_a_file_was_written_reads_as_null() {
     .await;
     let file = only_file(&catalog, table).await;
     catalog
-        .commit(|tx| tx.add_column(table, &col("b")).map(|_| ()))
+        .commit(async |tx| tx.add_column(table, &col("b")).await.map(|_| ()))
         .await
         .unwrap();
 
@@ -751,7 +770,7 @@ async fn a_column_added_after_a_file_was_written_reads_as_null() {
                 "",
                 table,
                 &[(1, Some(file))],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -792,7 +811,7 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
     let (delete_size, delete_footer) =
         write_parquet(&data, "main/orders/delete.parquet", &delete_batch(&[0])).await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.register_delete_file(
                 table,
                 DeleteFile {
@@ -807,6 +826,7 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
                 },
                 &[],
             )
+            .await
             .map(|_| ())
         })
         .await
@@ -820,7 +840,7 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
                 "",
                 table,
                 &[(0, Some(file))],
-                &all_columns(&pinned, table),
+                &all_columns(&pinned, table).await,
             )
             .await,
     )
@@ -835,7 +855,7 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
                 "",
                 table,
                 &[(0, Some(file))],
-                &all_columns(&current, table),
+                &all_columns(&current, table).await,
             )
             .await,
     )
@@ -886,7 +906,7 @@ async fn a_file_the_snapshot_does_not_hold_is_refused() {
     )
     .await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.register_data_file(
                 table,
                 DataFile {
@@ -896,15 +916,18 @@ async fn a_file_the_snapshot_does_not_hold_is_refused() {
                 },
                 &[],
             )
+            .await
             .map(|_| ())
         })
         .await
         .unwrap();
     let later = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .data_files_of(table)
+        .await
+        .unwrap()
         .into_iter()
         .find(|file| file.record_count == 2)
         .unwrap()
@@ -918,7 +941,7 @@ async fn a_file_the_snapshot_does_not_hold_is_refused() {
                 "",
                 table,
                 &[(3, Some(later))],
-                &all_columns(&pinned, table),
+                &all_columns(&pinned, table).await,
             )
             .await,
     )
@@ -963,7 +986,7 @@ async fn a_candidate_the_named_file_does_not_hold_is_omitted() {
                 "",
                 table,
                 &[(7, Some(file))],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )
@@ -1004,7 +1027,7 @@ async fn a_position_a_replacement_delete_file_deletes_later_is_still_served() {
     )
     .await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.register_delete_file(
                 table,
                 DeleteFile {
@@ -1019,6 +1042,7 @@ async fn a_position_a_replacement_delete_file_deletes_later_is_still_served() {
                 },
                 &[],
             )
+            .await
             .map(|_| ())
         })
         .await
@@ -1033,7 +1057,7 @@ async fn a_position_a_replacement_delete_file_deletes_later_is_still_served() {
                 "",
                 table,
                 &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
-                &all_columns(&snapshot, table),
+                &all_columns(&snapshot, table).await,
             )
             .await,
     )

@@ -7,6 +7,9 @@ use bytes::Bytes;
 use prost::Message as _;
 use tracing::debug;
 
+#[cfg(any(test, feature = "fault-injection"))]
+use crate::store::key::current_entity_kind_prefix;
+
 mod cursor;
 pub(crate) mod schema_versions;
 pub(crate) use cursor::{EntityCursor, OwnedEntityCursor, OwnedSnapshotCursor};
@@ -17,8 +20,8 @@ use crate::{
         handle::{ReadHandle, ScanShape},
         key::{
             CurrentKey, EntityKey, EntityKind, HistoryKey, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
-            TableScopedKind, current_entity_kind_prefix, current_table_prefix,
-            history_entity_kind_prefix, history_table_prefix, subspace_prefix,
+            TableScopedKind, current_table_prefix, history_entity_kind_prefix,
+            history_table_prefix, subspace_prefix,
         },
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
@@ -310,6 +313,7 @@ async fn scan_decode_split<T>(
 /// As [`scan_decode`] over a whole subspace, splitting the data-scaled
 /// kinds (`kind_prefix` names each one's prefix). `extract` also receives
 /// the encoded key.
+#[cfg(any(test, feature = "fault-injection"))]
 async fn scan_decode_subspace<T>(
     handle: ReadHandle<'_>,
     subspace: Subspace,
@@ -511,6 +515,7 @@ pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(
 /// One half of the shared record set: a subspace's records keyed by their
 /// encoded store keys, so iteration follows scan order and a committed
 /// write folds in by key.
+#[cfg(test)]
 pub(crate) type RecordSet = imbl::OrdMap<Bytes, Arc<EntityRecord>>;
 
 /// Decodes the record at a `current` key.
@@ -541,6 +546,7 @@ pub(crate) fn decode_history_record(key: Key, bytes: &[u8]) -> Result<EntityReco
 }
 
 /// Visits decoded records without retaining an intermediate scan result.
+#[cfg(test)]
 pub(crate) async fn visit_entity_records(
     handle: ReadHandle<'_>,
     historical: bool,
@@ -596,6 +602,7 @@ pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<
 }
 
 /// As [`scan_current_entities`], keyed for the shared record set.
+#[cfg(test)]
 pub(crate) async fn scan_current_records(handle: ReadHandle<'_>) -> Result<RecordSet> {
     let records = scan_decode_subspace(
         handle,

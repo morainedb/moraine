@@ -16,7 +16,7 @@ async fn indexed_inline_commit_benchmark() {
     let rows = benchmark_setting("MORAINE_INLINE_ROWS", 32_768);
     let (catalog, index) = catalog_with_indexed_inline_table(false).await;
     let head = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .current_snapshot()

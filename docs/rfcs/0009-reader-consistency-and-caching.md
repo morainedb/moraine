@@ -11,9 +11,9 @@ metadata result arrays between operations. Native DuckDB catalog entries and
 bounded row-lookup results have their own ownership and limits.
 
 Writers use SlateDB snapshots; independent reader transactions share fixed
-checkpoint readers at writer-published durable boundaries. Explicit
-`CatalogSnapshot` calls remain a materializing compatibility API, with all
-returned memory owned by the caller.
+checkpoint readers at writer-published durable boundaries. Current and
+historical metadata APIs return demand-loaded scopes; eager whole-catalog
+entry points are removed. Streaming cursors retain only a bounded store page.
 
 ## Goals
 
@@ -34,9 +34,10 @@ protocol in RFC 0004, and data-file reclamation in RFC 0007.
 
 Writer read scopes retain `DbSnapshot` without loading catalog entities.
 Independent readers retain fixed checkpoint readers across calls, using
-SlateDB's existing APIs without a dependency patch. Legacy unscoped
-materializations still verify their read boundary; scopes never silently
-downgrade isolation.
+SlateDB's existing APIs without a dependency patch. New scope acquisition
+checks the following reader for migration before pinning its checkpoint. An
+already pinned scope keeps its revision. Scopes never silently downgrade
+isolation.
 
 #### Reader scopes using existing checkpoint APIs
 
@@ -163,18 +164,13 @@ operation returns `RetryBudgetExhausted`; it must not fall back to an
 unguarded scan. Writer-backed isolated transactions run the operation once.
 This boundary covers a single call, not several independent API calls.
 
-### Explicit materialization
+### Current and historical read scopes
 
-`snapshot()` and `snapshot_at()` materialize a caller-owned `CatalogSnapshot`.
-Writer reads use an isolated store read point. An unscoped following reader
-validates the complete head stamp before and after the materialization and
-retries a changed pass. A pinned reader uses its checkpoint throughout.
-
-The catalog handle retains neither the resulting snapshot nor the decoded
-records used to construct it. Repeated calls decode again through Foyer.
-Concurrent explicit materializations therefore require independent working
-memory. Callers that need several reads at one revision should hold a read
-scope and use point reads or cursors.
+`read_scope()` and `read_scope_at()` return fixed, demand-loaded views.
+`ReadScope` and its cursors retain their store revision and checkpoint lease;
+lookups decode only requested records. Unversioned metadata is fixed by the
+same scope, including during time travel. Eager `snapshot()` and `snapshot_at()`
+entry points are removed. Complete materializations are unit-test oracles only.
 
 The changelog remains a compatible stored record. Ordinary demand-loaded
 reads do not replay it to maintain decoded catalog maps.
@@ -405,9 +401,9 @@ ordering, admission, and error semantics changes that have to be maintained
 twice for no saving: moving `Bytes` is constant-time, and a decoder that does
 not retain it can borrow it locally.
 
-### Materialized compatibility views
+### Collected operation results
 
-A compatibility materialization may collect the requested record set under
+An explicit collection accessor may collect its requested record set under
 working-memory admission. The set is local to that call and is never installed
 on the catalog handle. Exhausting the allowance returns a typed error; it does
 not authorize an unbounded allocation.

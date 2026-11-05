@@ -118,7 +118,7 @@ fn edit_parents(tx: &mut StagedTransaction) {
 async fn parent_tag_pages_select_surviving_versions_and_freeze_edits() {
     let catalog = open().await;
     seed_tag_versions(&catalog).await;
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
         .with_read_scope(scope.reads().clone());
     edit_parents(&mut tx);

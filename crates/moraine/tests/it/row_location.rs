@@ -40,11 +40,16 @@ fn dense_batch(values: &[i64]) -> RecordBatch {
 async fn table_with(catalog: &Catalog, files: Vec<DataFile>) -> TableId {
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "orders", &[col("a")]).await?;
             for file in files.clone() {
-                tx.register_data_file(table, file, &[])?;
+                tx.register_data_file(table, file, &[]).await?;
             }
             created.set(Some(table));
             Ok(())
@@ -91,7 +96,13 @@ async fn a_dense_file_answers_from_its_recorded_range() {
         .await
         .unwrap();
 
-    let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
+    let file = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap()[0]
         .id
         .get();
     assert_eq!(files_for(&located, 0), vec![Some(file)]);
@@ -129,7 +140,13 @@ async fn a_file_whose_embedded_ids_hold_gaps_is_read_exactly() {
         .await
         .unwrap();
 
-    let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
+    let file = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap()[0]
         .id
         .get();
     assert_eq!(files_for(&located, 5), vec![Some(file)]);
@@ -177,9 +194,11 @@ async fn one_row_id_in_two_current_files_returns_both() {
         .await
         .unwrap();
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.read_scope().await.unwrap();
     let mut ids: Vec<Option<u64>> = snapshot
         .data_files_of(table)
+        .await
+        .unwrap()
         .iter()
         .map(|file| Some(file.id.get()))
         .collect();
@@ -202,7 +221,13 @@ async fn an_unreadable_file_leaves_every_requested_row_a_candidate() {
         .await
         .unwrap();
 
-    let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
+    let file = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap()[0]
         .id
         .get();
     // Degrading broadens: both rows stay candidates for the file it could
@@ -217,9 +242,14 @@ async fn an_inlined_row_locates_with_no_file() {
     let catalog = open_memory().await;
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "orders", &[col("a")]).await?;
             tx.inline_insert(
                 table,
                 &InlineChunk {
@@ -229,7 +259,8 @@ async fn an_inlined_row_locates_with_no_file() {
                     row_count: 2,
                 },
                 &[],
-            )?;
+            )
+            .await?;
             created.set(Some(table));
             Ok(())
         })
@@ -307,7 +338,13 @@ async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
         .locate_row_ids(Some(store), "", table, vec![9, 11])
         .await
         .unwrap();
-    let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
+    let file = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap()[0]
         .id
         .get();
     assert_eq!(files_for(&located, 9), vec![Some(file)]);
@@ -372,7 +409,7 @@ async fn publishing_selected_tables_respects_the_snapshot_cutoff() {
     let data = Arc::new(InMemory::new());
     let store = DataStore::new(data.clone());
     let table = table_with(&catalog, vec![datafile(3)]).await;
-    let since = catalog.commit(|_| Ok(())).await.unwrap();
+    let since = catalog.commit(async |_| Ok(())).await.unwrap();
     let (file_size_bytes, footer_size) = write(
         &data,
         "main/orders/data-2.parquet",
@@ -380,7 +417,7 @@ async fn publishing_selected_tables_respects_the_snapshot_cutoff() {
     )
     .await;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.register_data_file(
                 table,
                 DataFile {
@@ -389,10 +426,11 @@ async fn publishing_selected_tables_respects_the_snapshot_cutoff() {
                     ..datafile(2)
                 },
                 &[],
-            )?;
-            let main = tx.schema_by_name("main").unwrap().id;
-            let other = tx.create_table(main, "other", &[col("a")])?;
-            tx.register_data_file(other, datafile(9), &[])?;
+            )
+            .await?;
+            let main = tx.schema_by_name("main").await.unwrap().unwrap().id;
+            let other = tx.create_table(main, "other", &[col("a")]).await?;
+            tx.register_data_file(other, datafile(9), &[]).await?;
             Ok(())
         })
         .await
@@ -449,9 +487,14 @@ async fn warming_every_table_reaches_tables_outside_the_first_schema() {
     )
     .await;
     catalog
-        .commit(|tx| {
-            let main = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let orders = tx.create_table(main, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let main = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let orders = tx.create_table(main, "orders", &[col("a")]).await?;
             tx.register_data_file(
                 orders,
                 DataFile {
@@ -460,10 +503,11 @@ async fn warming_every_table_reaches_tables_outside_the_first_schema() {
                     ..datafile(3)
                 },
                 &[],
-            )?;
+            )
+            .await?;
 
-            let analytics = tx.create_schema("analytics")?;
-            let events = tx.create_table(analytics, "events", &[col("a")])?;
+            let analytics = tx.create_schema("analytics").await?;
+            let events = tx.create_table(analytics, "events", &[col("a")]).await?;
             tx.register_data_file(
                 events,
                 DataFile {
@@ -472,7 +516,8 @@ async fn warming_every_table_reaches_tables_outside_the_first_schema() {
                     ..datafile(2)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -498,15 +543,20 @@ async fn warming_every_table_carries_on_past_a_table_it_cannot_read() {
     )
     .await;
     catalog
-        .commit(|tx| {
-            let main = tx.schema_by_name("main").expect("bootstrap schema").id;
+        .commit(async |tx| {
+            let main = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
             // Registered but never written: unreadable, and ordered before
             // the table that must still be warmed.
-            let orders = tx.create_table(main, "orders", &[col("a")])?;
-            tx.register_data_file(orders, datafile(3), &[])?;
+            let orders = tx.create_table(main, "orders", &[col("a")]).await?;
+            tx.register_data_file(orders, datafile(3), &[]).await?;
 
-            let analytics = tx.create_schema("analytics")?;
-            let events = tx.create_table(analytics, "events", &[col("a")])?;
+            let analytics = tx.create_schema("analytics").await?;
+            let events = tx.create_table(analytics, "events", &[col("a")]).await?;
             tx.register_data_file(
                 events,
                 DataFile {
@@ -515,7 +565,8 @@ async fn warming_every_table_carries_on_past_a_table_it_cannot_read() {
                     ..datafile(2)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -577,9 +628,14 @@ async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_or
     .await;
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "orders", &[col("a")]).await?;
             tx.inline_insert(
                 table,
                 &InlineChunk {
@@ -589,7 +645,8 @@ async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_or
                     row_count: 3,
                 },
                 &[],
-            )?;
+            )
+            .await?;
             tx.register_data_file(
                 table,
                 DataFile {
@@ -598,14 +655,21 @@ async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_or
                     ..datafile(3)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             created.set(Some(table));
             Ok(())
         })
         .await
         .unwrap();
     let table = created.get().unwrap();
-    let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
+    let file = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap()[0]
         .id
         .get();
 
@@ -701,10 +765,16 @@ mod locate_row_positions {
 
         let created = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                tx.set_option(moraine::OptionScope::Global, "data_path", "")?;
-                let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-                let table = tx.create_table(schema, "orders", &[col("a")])?;
+            .commit(async |tx| {
+                tx.set_option(moraine::OptionScope::Global, "data_path", "")
+                    .await?;
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap schema")
+                    .id;
+                let table = tx.create_table(schema, "orders", &[col("a")]).await?;
                 tx.register_data_file(
                     table,
                     DataFile {
@@ -713,7 +783,8 @@ mod locate_row_positions {
                         ..datafile(3)
                     },
                     &[],
-                )?;
+                )
+                .await?;
                 tx.register_data_file(
                     table,
                     DataFile {
@@ -722,15 +793,16 @@ mod locate_row_positions {
                         ..datafile(5)
                     },
                     &[],
-                )?;
+                )
+                .await?;
                 created.set(Some(table));
                 Ok(())
             })
             .await
             .unwrap();
         let table = created.get().unwrap();
-        let snapshot = catalog.snapshot().await.unwrap();
-        let files = snapshot.data_files_of(table);
+        let snapshot = catalog.read_scope().await.unwrap();
+        let files = snapshot.data_files_of(table).await.unwrap();
         let dense_id = files
             .iter()
             .find(|file| file.record_count == 3)
@@ -799,13 +871,9 @@ mod locate_row_positions {
         let store = DataStore::new(data.clone());
         let (table, dense_id, _) = fixture(&catalog, &data).await;
 
-        let scope = catalog
-            .index_read_scope()
-            .await
-            .unwrap()
-            .expect("a writer holds the store, so the scope pins a revision");
+        let scope = catalog.index_read_scope().await.unwrap();
         let reads = scope.reads();
-        let snapshot = reads.snapshot().await.unwrap();
+        let snapshot = reads.read_scope().await.unwrap();
         let pairs = [(1, dense_id), (2, dense_id)];
 
         // Resolve the pairs for the first time.
@@ -848,7 +916,7 @@ mod locate_row_positions {
 
         catalog
             .locate_row_positions_at(
-                &catalog.snapshot().await.unwrap(),
+                &catalog.read_scope().await.unwrap(),
                 &store,
                 "",
                 table,
@@ -882,7 +950,7 @@ mod locate_row_positions {
         // rewrite file's last embedded id (position 4).
         let located = catalog
             .locate_row_positions_at(
-                &catalog.snapshot().await.unwrap(),
+                &catalog.read_scope().await.unwrap(),
                 &store,
                 "",
                 table,
@@ -917,7 +985,7 @@ mod locate_row_positions {
         // Row 1 actually lives in the dense file, not the rewrite file.
         let result = catalog
             .locate_row_positions_at(
-                &catalog.snapshot().await.unwrap(),
+                &catalog.read_scope().await.unwrap(),
                 &store,
                 "",
                 table,
@@ -941,7 +1009,7 @@ mod locate_row_positions {
 
         let result = catalog
             .locate_row_positions_at(
-                &catalog.snapshot().await.unwrap(),
+                &catalog.read_scope().await.unwrap(),
                 &store,
                 "",
                 table,
@@ -965,7 +1033,7 @@ mod locate_row_positions {
 
         let located = catalog
             .locate_row_positions_at(
-                &catalog.snapshot().await.unwrap(),
+                &catalog.read_scope().await.unwrap(),
                 &store,
                 "",
                 table,
@@ -991,7 +1059,7 @@ mod locate_row_positions {
         let (delete_size, delete_footer) =
             write(&data, "main/orders/delete-1.parquet", &pos_batch(&[0])).await;
         catalog
-            .commit(|tx| {
+            .commit(async |tx| {
                 tx.register_delete_file(
                     table,
                     DeleteFile {
@@ -1005,7 +1073,8 @@ mod locate_row_positions {
                         encryption_key: None,
                     },
                     &[],
-                )?;
+                )
+                .await?;
                 Ok(())
             })
             .await
@@ -1013,7 +1082,7 @@ mod locate_row_positions {
 
         let located = catalog
             .locate_row_positions_at(
-                &catalog.snapshot().await.unwrap(),
+                &catalog.read_scope().await.unwrap(),
                 &store,
                 "",
                 table,

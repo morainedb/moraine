@@ -153,8 +153,9 @@ impl ReadOnlyCatalog {
     /// ```no_run
     /// # async fn example(catalog: &moraine::Catalog, table: moraine::TableId,
     /// # column: moraine::ColumnId) -> moraine::Result<()> {
-    /// if let Some(scope) = catalog.index_read_scope().await? {
-    ///     let snapshot = scope.reads().snapshot().await?;
+    /// let scope = catalog.index_read_scope().await?;
+    /// {
+    ///     let snapshot = scope.reads().read_scope().await?;
     ///     let predicate = moraine::IndexPredicate {
     ///         column,
     ///         comparison: moraine::IndexComparison::IsNull,
@@ -169,7 +170,8 @@ impl ReadOnlyCatalog {
     ///
     /// # Errors
     /// Returns lookup errors when a selected index cannot be read.
-    pub async fn index_predicate_rows(
+    #[doc(hidden)]
+    pub async fn index_predicate_rows_projected(
         &self,
         snapshot: &CatalogSnapshot,
         table: TableId,

@@ -221,28 +221,30 @@ fn seed(dir: &Path) {
             .await
             .expect("test setup: open catalog");
         catalog
-            .commit(|tx| {
-                let schema = tx.create_schema("sales")?;
-                let table = tx.create_table(
-                    schema,
-                    "orders",
-                    &[
-                        ColumnDef {
-                            name: "id".into(),
-                            column_type: "BIGINT".into(),
-                            nulls_allowed: false,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                        ColumnDef {
-                            name: "amount".into(),
-                            column_type: "DOUBLE".into(),
-                            nulls_allowed: true,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                )?;
+            .commit(async |tx| {
+                let schema = tx.create_schema("sales").await?;
+                let table = tx
+                    .create_table(
+                        schema,
+                        "orders",
+                        &[
+                            ColumnDef {
+                                name: "id".into(),
+                                column_type: "BIGINT".into(),
+                                nulls_allowed: false,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                            ColumnDef {
+                                name: "amount".into(),
+                                column_type: "DOUBLE".into(),
+                                nulls_allowed: true,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                        ],
+                    )
+                    .await?;
                 tx.register_data_file(
                     table,
                     DataFile {
@@ -257,8 +259,10 @@ fn seed(dir: &Path) {
                         column_stats: vec![],
                     },
                     &[],
-                )?;
-                tx.create_view(schema, "orders_v", "duckdb", "select * from orders")?;
+                )
+                .await?;
+                tx.create_view(schema, "orders_v", "duckdb", "select * from orders")
+                    .await?;
                 Ok(())
             })
             .await
@@ -285,28 +289,30 @@ fn seed_composite(dir: &Path) {
             .await
             .expect("test setup: open catalog");
         catalog
-            .commit(|tx| {
-                let schema = tx.create_schema("sales")?;
-                let table = tx.create_table(
-                    schema,
-                    "t",
-                    &[
-                        ColumnDef {
-                            name: "a".into(),
-                            column_type: "BIGINT".into(),
-                            nulls_allowed: false,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                        ColumnDef {
-                            name: "b".into(),
-                            column_type: "VARCHAR".into(),
-                            nulls_allowed: false,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                )?;
+            .commit(async |tx| {
+                let schema = tx.create_schema("sales").await?;
+                let table = tx
+                    .create_table(
+                        schema,
+                        "t",
+                        &[
+                            ColumnDef {
+                                name: "a".into(),
+                                column_type: "BIGINT".into(),
+                                nulls_allowed: false,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                            ColumnDef {
+                                name: "b".into(),
+                                column_type: "VARCHAR".into(),
+                                nulls_allowed: false,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                        ],
+                    )
+                    .await?;
                 tx.register_data_file(
                     table,
                     DataFile {
@@ -321,7 +327,8 @@ fn seed_composite(dir: &Path) {
                         column_stats: vec![],
                     },
                     &[],
-                )?;
+                )
+                .await?;
                 let a = |v: i128| {
                     Some(IndexKeyValue::Int {
                         value: v,
@@ -350,7 +357,8 @@ fn seed_composite(dir: &Path) {
                             values: vec![a(7), b("x")],
                         },
                     ],
-                )?;
+                )
+                .await?;
                 Ok(())
             })
             .await
@@ -1545,7 +1553,7 @@ fn attach_snapshot_and_list_round_trip() {
     let mut err = MoraineError::default();
     // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
     let code = unsafe {
-        moraine_snapshot(
+        moraine_snapshot_scoped(
             handle,
             &raw mut snapshot,
             None,
@@ -1671,8 +1679,10 @@ fn scoped_snapshot_and_schema_listing_do_not_retain_a_catalog_view() {
                 .unwrap();
             let sql = format!("SELECT 1 /*{}*/", "x".repeat(2 * 1024 * 1024));
             catalog
-                .commit(|transaction| {
-                    transaction.create_view(moraine::SchemaId::new(0), "large", "duckdb", &sql)?;
+                .commit(async |transaction| {
+                    transaction
+                        .create_view(moraine::SchemaId::new(0), "large", "duckdb", &sql)
+                        .await?;
                     Ok(())
                 })
                 .await
@@ -1756,12 +1766,14 @@ fn embedded_nul_in_catalog_data_reports_corruption() {
             .await
             .expect("test setup: open catalog");
         catalog
-            .commit(|tx| {
-                let schema = tx.create_schema("s")?;
+            .commit(async |tx| {
+                let schema = tx.create_schema("s").await?;
                 // Two views: the clean one converts first (ordered by
                 // id) and must drop cleanly when the second fails.
-                tx.create_view(schema, "clean", "duckdb", "select 1")?;
-                tx.create_view(schema, "poisoned", "duckdb", "select 1 as a\0b")?;
+                tx.create_view(schema, "clean", "duckdb", "select 1")
+                    .await?;
+                tx.create_view(schema, "poisoned", "duckdb", "select 1 as a\0b")
+                    .await?;
                 Ok(())
             })
             .await
@@ -1773,8 +1785,9 @@ fn embedded_nul_in_catalog_data_reports_corruption() {
     let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
     let mut err = MoraineError::default();
     // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
-    let code =
-        unsafe { moraine_snapshot(handle, &raw mut snap, None, ptr::null_mut(), &raw mut err) };
+    let code = unsafe {
+        moraine_snapshot_scoped(handle, &raw mut snap, None, ptr::null_mut(), &raw mut err)
+    };
     assert_eq!(code, codes::OK);
 
     let mut views: *mut MoraineViewDesc = ptr::null_mut();
@@ -1974,7 +1987,7 @@ fn snapshot_on_null_handle_reports_invalid_argument() {
     // SAFETY: a null `handle` is exactly the input this test exercises;
     // `snapshot`/`err` are valid, writable local slots.
     let code = unsafe {
-        moraine_snapshot(
+        moraine_snapshot_scoped(
             ptr::null_mut(),
             &raw mut snapshot,
             None,
@@ -2173,7 +2186,7 @@ fn cancellation_after_durability_reports_an_unknown_commit_outcome() {
                 catalog
                     .catalog
                     .writer()?
-                    .commit(|tx| tx.create_schema("landed").map(|_| ()))
+                    .commit(async |tx| tx.create_schema("landed").await.map(|_| ()))
                     .await?;
                 interrupted.store(true, Ordering::SeqCst);
                 std::future::pending::<Result<(), moraine::Error>>().await
@@ -2183,9 +2196,16 @@ fn cancellation_after_durability_reports_an_unknown_commit_outcome() {
     assert_eq!(result.unwrap_err().code, codes::COMMIT_OUTCOME_UNKNOWN);
     assert!(
         catalog
-            .block_on(catalog.catalog.reads().snapshot())
+            .block_on(async {
+                catalog
+                    .catalog
+                    .reads()
+                    .read_scope()
+                    .await?
+                    .schema_by_name("landed")
+                    .await
+            })
             .unwrap()
-            .schema_by_name("landed")
             .is_some()
     );
     // SAFETY: consumed exactly once.
@@ -2236,9 +2256,17 @@ fn snapshot_id_of(handle: *mut MoraineCatalogHandle) -> u64 {
     // SAFETY: `handle` is attached for the duration of the caller.
     let handle_ref = unsafe { &*handle };
     handle_ref
-        .block_on(handle_ref.catalog.reads().snapshot())
+        .block_on(async {
+            Ok::<_, moraine::Error>(
+                handle_ref
+                    .catalog
+                    .reads()
+                    .read_scope()
+                    .await?
+                    .current_snapshot(),
+            )
+        })
         .expect("read head")
-        .current_snapshot()
         .id
         .get()
 }
@@ -2258,7 +2286,7 @@ fn probe_cancels_snapshot_then_quiet_probe_succeeds() {
     // SAFETY: `handle` is attached; `snapshot`/`err` are valid local
     // slots; `probe_always` accepts a null context.
     let code = unsafe {
-        moraine_snapshot(
+        moraine_snapshot_scoped(
             handle,
             &raw mut snapshot,
             Some(probe_always),
@@ -2276,7 +2304,7 @@ fn probe_cancels_snapshot_then_quiet_probe_succeeds() {
     let mut err2 = MoraineError::default();
     // SAFETY: same contracts; `probe_never` accepts a null context.
     let code2 = unsafe {
-        moraine_snapshot(
+        moraine_snapshot_scoped(
             handle,
             &raw mut snap2,
             Some(probe_never),
@@ -2668,7 +2696,7 @@ fn a_second_attach_outlives_the_cache_builders_runtime() {
     let mut err = MoraineError::default();
     // SAFETY: `second` is attached; the out-params are valid slots.
     let code = unsafe {
-        moraine_snapshot(
+        moraine_snapshot_scoped(
             second,
             &raw mut snapshot,
             None,

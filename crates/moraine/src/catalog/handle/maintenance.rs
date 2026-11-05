@@ -334,7 +334,7 @@ impl ReadOnlyCatalog {
     /// # use object_store::memory::InMemory;
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+    /// catalog.commit(async |tx| tx.create_schema("sales").await.map(|_| ())).await?;
     ///
     /// let census = catalog.store_census(CensusRequest::default()).await?;
     /// // Physical figures count what has been written out, so a store whose
@@ -579,10 +579,7 @@ impl Catalog {
     }
 
     pub(super) async fn index_head(&self) -> Result<crate::CatalogSnapshot> {
-        let scope = self
-            .index_read_scope()
-            .await?
-            .ok_or_else(|| Error::Constraint("maintenance requires a fixed read scope".into()))?;
+        let scope = self.index_read_scope().await?;
         let session = scope.reads().begin_read().await?;
         let mut view = crate::transaction::staged::dependencies::header(session.handle()).await?;
         let mut records = session
@@ -839,10 +836,7 @@ impl Catalog {
     /// Every table id the catalog still records, live or in history — the
     /// tables a read at a resolvable snapshot can name.
     async fn recorded_tables(&self) -> Result<HashSet<u64>> {
-        let scope = self
-            .index_read_scope()
-            .await?
-            .ok_or_else(|| Error::Constraint("maintenance requires a fixed read scope".into()))?;
+        let scope = self.index_read_scope().await?;
         let session = scope.reads().begin_read().await?;
         let mut seen = HashSet::new();
         let mut current = session
@@ -934,10 +928,7 @@ impl Catalog {
         batch_size: usize,
         pace: Duration,
     ) -> Result<u64> {
-        let scope = self
-            .index_read_scope()
-            .await?
-            .ok_or_else(|| Error::Constraint("maintenance requires a fixed read scope".into()))?;
+        let scope = self.index_read_scope().await?;
         let session = scope.reads().begin_read().await?;
         let handle = session.handle();
         let mut stats = handle
@@ -1186,7 +1177,7 @@ mod tests {
             .unwrap();
         let table = Cell::new(None);
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.create_schema("s")?;
                 table.set(Some(tx.create_table(
                     schema,
@@ -1204,7 +1195,7 @@ mod tests {
             .await
             .unwrap();
         let table = table.get().unwrap();
-        let before = catalog.snapshot().await.unwrap();
+        let before = catalog.materialized().await.unwrap();
 
         for unique in [false, true] {
             let index = Cell::new(None);
@@ -1213,7 +1204,7 @@ mod tests {
                 width: IntWidth::I64,
             };
             catalog
-                .commit(|tx| {
+                .commit_materialized(|tx| {
                     index.set(Some(tx.create_index(
                         table,
                         &IndexDef {

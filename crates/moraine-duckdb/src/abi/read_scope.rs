@@ -8,12 +8,13 @@ use crate::{
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle},
 };
 
-/// Opens a transaction snapshot with a pinned index/inline read surface when
-/// supported. Readers without pinned revisions receive an ordinary snapshot
-/// instead.
+/// Opens a transaction snapshot with a fixed catalog, index, and inline read
+/// surface.
 ///
 /// # Safety
-/// Same pointer and cancellation contract as [`super::moraine_snapshot`].
+/// `handle` must be attached and `out` writable. A non-null `probe` must be
+/// safe to call with `probe_ctx` from any thread during this call. A non-null
+/// `err` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_snapshot_scoped(
     handle: *mut MoraineCatalogHandle,
@@ -30,18 +31,15 @@ pub unsafe extern "C" fn moraine_snapshot_scoped(
         let handle = unsafe { &*handle };
         let open = async {
             let scope = handle.catalog.reads().index_read_scope().await?;
-            let snapshot = if let Some(scope) = scope {
+            let snapshot = {
                 let head = moraine::ffi_support::head_stamp(scope.reads())
                     .await?
                     .ok_or_else(|| moraine::Error::Corruption("catalog has no head".to_owned()))?;
                 MoraineSnapshotHandle {
-                    snapshot: None,
                     stamp: (head.snapshot_id, head.batch_seq),
-                    read_identity: Some(scope.identity().clone()),
-                    read_alias: Some(Box::new(handle.read_alias(scope.reads().clone()))),
+                    read_identity: scope.identity().clone(),
+                    read_alias: Box::new(handle.read_alias(scope.reads().clone())),
                 }
-            } else {
-                MoraineSnapshotHandle::new(handle.catalog.reads().snapshot().await?)
             };
             // The boxed alias address stays stable for the snapshot's lifetime.
             Ok::<_, moraine::Error>(Box::new(snapshot))
@@ -72,7 +70,7 @@ pub unsafe extern "C" fn moraine_snapshot_read_handle(
 ) -> *mut MoraineCatalogHandle {
     // SAFETY: caller guarantees a live snapshot when non-null.
     unsafe { snapshot.as_ref() }
-        .and_then(|snapshot| snapshot.read_alias.as_deref())
+        .map(|snapshot| snapshot.read_alias.as_ref())
         .map_or(ptr::null_mut(), |handle| ptr::from_ref(handle).cast_mut())
 }
 
@@ -91,9 +89,7 @@ pub unsafe extern "C" fn moraine_snapshot_read_revision(
     else {
         return false;
     };
-    let Some(identity) = &snapshot.read_identity else {
-        return false;
-    };
+    let identity = &snapshot.read_identity;
     *out = moraine::ffi_support::index_read_revision(identity);
     true
 }

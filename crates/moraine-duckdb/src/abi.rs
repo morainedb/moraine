@@ -6,8 +6,8 @@
 //!
 //! Two owned, opaque handle types cross the boundary as raw pointers:
 //! [`MoraineCatalogHandle`] (one tokio runtime plus one open [`Catalog`]
-//! per `ATTACH`) and [`MoraineSnapshotHandle`] (one materialized
-//! [`CatalogSnapshot`] per `moraine_snapshot` call). Listing calls return
+//! per `ATTACH`) and [`MoraineSnapshotHandle`] (one fixed read scope per
+//! `moraine_snapshot_scoped` call). Listing calls return
 //! heap-allocated arrays of C descriptor structs; each has a paired
 //! `_free` function that must be called exactly once.
 //!
@@ -16,7 +16,6 @@
 //! not outlive its owning scoped snapshot.
 //!
 //! [`Catalog`]: moraine::Catalog
-//! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
 mod attach;
 mod fault;
@@ -59,31 +58,6 @@ use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineSnapshotHandle},
 };
-
-/// The view a read resolves against: `snapshot`'s when non-null, else the
-/// catalog head read through `handle`.
-///
-/// # Safety
-///
-/// `snapshot`, if non-null, must point to a live [`MoraineSnapshotHandle`];
-/// `probe`/`probe_ctx` must satisfy the interrupt-probe contract.
-pub(crate) unsafe fn pinned_or_head(
-    handle: &MoraineCatalogHandle,
-    snapshot: *mut MoraineSnapshotHandle,
-    probe: crate::runtime::MoraineInterruptProbe,
-    probe_ctx: *mut std::ffi::c_void,
-) -> Result<std::sync::Arc<moraine::CatalogSnapshot>, AbiError> {
-    if snapshot.is_null() {
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        return unsafe {
-            handle.block_on_cancellable(probe, probe_ctx, handle.catalog.reads().snapshot())
-        };
-    }
-    // SAFETY: caller contract for `snapshot`.
-    let snapshot = unsafe { &*snapshot };
-    // SAFETY: caller contract for the cancellation callback and context.
-    unsafe { handle.block_on_cancellable(probe, probe_ctx, snapshot.materialize()) }
-}
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
 /// results into a `(code, message)` pair written to `err`.

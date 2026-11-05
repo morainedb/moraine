@@ -32,7 +32,7 @@ async fn table_with_one_deleted_row(catalog: &Catalog, data: &InMemory) -> (u64,
     let (size, footer) = parquet(data, "data.parquet", "a", vec![10, 20, 30]).await;
     let (delete_size, delete_footer) = parquet(data, "delete.parquet", "pos", vec![1]).await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.set_option(OptionScope::Global, "data_path", "/lake/")?;
             let schema = tx.schema_by_name("main").unwrap().id;
             let table = tx.create_table(
@@ -132,7 +132,7 @@ async fn a_small_selection_fans_out_across_row_groups() {
     let data = Arc::new(InMemory::new());
     let (size, footer) = grouped_parquet(&data, "data.parquet", "a", ROWS, GROUP_ROWS).await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.set_option(OptionScope::Global, "data_path", "/lake/")?;
             let schema = tx.schema_by_name("main").unwrap().id;
             let table = tx.create_table(
@@ -164,7 +164,7 @@ async fn a_small_selection_fans_out_across_row_groups() {
         .await
         .unwrap();
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     let schema = snapshot.schema_by_name("main").unwrap().id;
     let table = snapshot.table_by_name(schema, "t").unwrap().id;
     let file = snapshot.data_files_of(table)[0].id;
@@ -178,7 +178,7 @@ async fn a_small_selection_fans_out_across_row_groups() {
 
     for (parallelism, fans_out) in [(1, false), (2, true)] {
         let mut scan = catalog
-            .scan_rows_at(
+            .scan_rows_at_projected(
                 &snapshot,
                 Some(store.clone()),
                 "",
@@ -219,7 +219,7 @@ async fn scan_positions_do_not_materialize_unfiltered_deletes() {
         .unwrap();
     let data = Arc::new(InMemory::new());
     let (delete_size, delete_footer) = table_with_one_deleted_row(&catalog, &data).await;
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     let schema = snapshot.schema_by_name("main").unwrap().id;
     let table = snapshot.table_by_name(schema, "t").unwrap().id;
     let file = snapshot.data_files_of(table)[0].id;
@@ -227,7 +227,7 @@ async fn scan_positions_do_not_materialize_unfiltered_deletes() {
     let pairs = [(0, Some(file)), (1, Some(file)), (2, Some(file))];
 
     let scan = catalog
-        .scan_rows_at(
+        .scan_rows_at_projected(
             &snapshot,
             Some(store.clone()),
             "",
@@ -256,8 +256,8 @@ async fn scan_positions_do_not_materialize_unfiltered_deletes() {
     );
 
     let located = catalog
-        .locate_row_positions_at(
-            &catalog.snapshot().await.unwrap(),
+        .locate_row_positions_at_projected(
+            &catalog.materialized().await.unwrap(),
             &store,
             "",
             table,
@@ -278,7 +278,7 @@ async fn excluded_positions_are_omitted_like_deletions() {
         .unwrap();
     let data = Arc::new(InMemory::new());
     table_with_one_deleted_row(&catalog, &data).await;
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     let schema = snapshot.schema_by_name("main").unwrap().id;
     let table = snapshot.table_by_name(schema, "t").unwrap().id;
     let file = snapshot.data_files_of(table)[0].id;
@@ -290,7 +290,7 @@ async fn excluded_positions_are_omitted_like_deletions() {
     }];
 
     let scan = catalog
-        .scan_rows_at_excluding(
+        .scan_rows_at_excluding_projected(
             &snapshot,
             Some(store.clone()),
             "",
@@ -304,7 +304,7 @@ async fn excluded_positions_are_omitted_like_deletions() {
     assert_eq!(first_column_values(scan).await, vec![10]);
 
     let scan = catalog
-        .scan_rows_at(&snapshot, Some(store), "", table, &pairs, &["a".into()])
+        .scan_rows_at_projected(&snapshot, Some(store), "", table, &pairs, &["a".into()])
         .await
         .unwrap();
     assert_eq!(first_column_values(scan).await, vec![10, 30]);

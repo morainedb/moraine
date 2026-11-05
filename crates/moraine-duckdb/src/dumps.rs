@@ -145,53 +145,57 @@ pub(crate) mod test_support {
                 .await
                 .expect("test setup: open catalog");
             catalog
-                .commit(|tx| {
-                    let schema = tx.create_schema("sales")?;
-                    let table = tx.create_table(
-                        schema,
-                        "orders",
-                        &[
-                            ColumnDef {
-                                name: "id".into(),
-                                column_type: "BIGINT".into(),
-                                nulls_allowed: false,
-                                default_value: None,
-                                children: Vec::new(),
+                .commit(async |tx| {
+                    let schema = tx.create_schema("sales").await?;
+                    let table = tx
+                        .create_table(
+                            schema,
+                            "orders",
+                            &[
+                                ColumnDef {
+                                    name: "id".into(),
+                                    column_type: "BIGINT".into(),
+                                    nulls_allowed: false,
+                                    default_value: None,
+                                    children: Vec::new(),
+                                },
+                                ColumnDef {
+                                    name: "amount".into(),
+                                    column_type: "DOUBLE".into(),
+                                    nulls_allowed: true,
+                                    default_value: None,
+                                    children: Vec::new(),
+                                },
+                            ],
+                        )
+                        .await?;
+                    let column = tx.columns_of(table).await.unwrap()[0].id;
+                    let file = tx
+                        .register_data_file(
+                            table,
+                            DataFile {
+                                path: "orders/data-1.parquet".into(),
+                                path_is_relative: true,
+                                file_format: "parquet".into(),
+                                record_count: 10,
+                                file_size_bytes: 1024,
+                                footer_size: 64,
+                                encryption_key: Some("a2V5LWRhdGE=".into()),
+                                partition_values: vec![],
+                                column_stats: vec![FileColumnStats {
+                                    column_id: column,
+                                    column_size_bytes: 100,
+                                    value_count: Some(10),
+                                    null_count: Some(0),
+                                    min_value: Some("1".into()),
+                                    max_value: Some("10".into()),
+                                    contains_nan: None,
+                                    extra_stats: None,
+                                }],
                             },
-                            ColumnDef {
-                                name: "amount".into(),
-                                column_type: "DOUBLE".into(),
-                                nulls_allowed: true,
-                                default_value: None,
-                                children: Vec::new(),
-                            },
-                        ],
-                    )?;
-                    let column = tx.columns_of(table)[0].id;
-                    let file = tx.register_data_file(
-                        table,
-                        DataFile {
-                            path: "orders/data-1.parquet".into(),
-                            path_is_relative: true,
-                            file_format: "parquet".into(),
-                            record_count: 10,
-                            file_size_bytes: 1024,
-                            footer_size: 64,
-                            encryption_key: Some("a2V5LWRhdGE=".into()),
-                            partition_values: vec![],
-                            column_stats: vec![FileColumnStats {
-                                column_id: column,
-                                column_size_bytes: 100,
-                                value_count: Some(10),
-                                null_count: Some(0),
-                                min_value: Some("1".into()),
-                                max_value: Some("10".into()),
-                                contains_nan: None,
-                                extra_stats: None,
-                            }],
-                        },
-                        &[],
-                    )?;
+                            &[],
+                        )
+                        .await?;
                     tx.register_delete_file(
                         table,
                         DeleteFile {
@@ -205,7 +209,8 @@ pub(crate) mod test_support {
                             encryption_key: Some("a2V5LWRlbA==".into()),
                         },
                         &[],
-                    )?;
+                    )
+                    .await?;
                     tx.update_column_stats(
                         table,
                         column,
@@ -216,23 +221,30 @@ pub(crate) mod test_support {
                             max_value: Some("10".into()),
                             extra_stats: None,
                         },
-                    )?;
-                    tx.create_view(schema, "orders_v", "duckdb", "select * from orders")?;
+                    )
+                    .await?;
+                    tx.create_view(schema, "orders_v", "duckdb", "select * from orders")
+                        .await?;
                     Ok(())
                 })
                 .await
                 .expect("test setup: commit fixtures");
 
-            catalog
-                .commit(|tx| {
-                    let table = tx.tables_in(tx.schemas()[1].id)[0].id;
-                    tx.rename_table(table, "orders2")
-                })
-                .await
-                .expect("test setup: rename table");
+            rename_orders(&catalog).await;
 
             catalog.close().await.expect("test setup: close catalog");
         });
+    }
+
+    async fn rename_orders(catalog: &moraine::Catalog) {
+        catalog
+            .commit(async |tx| {
+                let schema = tx.schemas().await?[1].id;
+                let table = tx.tables_in(schema).await.unwrap()[0].id;
+                tx.rename_table(table, "orders2").await
+            })
+            .await
+            .expect("test setup: rename table");
     }
 
     /// Seeds a schema + table, then tags both the table and its first
@@ -254,8 +266,8 @@ pub(crate) mod test_support {
                 .await
                 .expect("test setup: open catalog");
             catalog
-                .commit(|tx| {
-                    let schema = tx.create_schema("sales")?;
+                .commit(async |tx| {
+                    let schema = tx.create_schema("sales").await?;
                     tx.create_table(
                         schema,
                         "orders",
@@ -266,7 +278,8 @@ pub(crate) mod test_support {
                             default_value: None,
                             children: Vec::new(),
                         }],
-                    )?;
+                    )
+                    .await?;
                     Ok(())
                 })
                 .await

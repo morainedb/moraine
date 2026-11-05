@@ -9,6 +9,7 @@ pub(crate) mod index_policy;
 pub(crate) mod inline;
 pub(crate) mod projection;
 mod schema_projection;
+pub use crate::transaction::read_scope::{CatalogCursor, ReadScope};
 mod snapshot;
 mod store_paths;
 #[cfg(test)]

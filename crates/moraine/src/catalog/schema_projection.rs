@@ -267,7 +267,7 @@ mod tests {
             .unwrap();
         let table = Cell::new(None);
         let written = catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.create_schema("s")?;
                 table.set(Some(tx.create_table(
                     schema,
@@ -286,10 +286,10 @@ mod tests {
             .unwrap();
         let table = table.get().unwrap();
         catalog
-            .commit(|tx| tx.rename_column(table, ColumnId::new(1), "renamed"))
+            .commit_materialized(|tx| tx.rename_column(table, ColumnId::new(1), "renamed"))
             .await
             .unwrap();
-        let snapshot = catalog.snapshot().await.unwrap();
+        let snapshot = catalog.materialized().await.unwrap();
 
         // An unrelated table's history must never be decoded by this read.
         let tx = catalog.begin_write_tx().unwrap();

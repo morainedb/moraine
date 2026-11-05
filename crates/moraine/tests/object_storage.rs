@@ -138,15 +138,15 @@ async fn bootstrap_commit_and_reopen_on_s3() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     catalog.close().await.unwrap();
 
     // Reopen: state persisted through the real endpoint.
     let catalog = Catalog::open(store, options_at("reopen")).await.unwrap();
-    let head = catalog.snapshot().await.unwrap();
-    assert!(head.schema_by_name("sales").is_some());
+    let head = catalog.read_scope().await.unwrap();
+    assert!(head.schema_by_name("sales").await.unwrap().is_some());
     catalog.close().await.unwrap();
 }
 
@@ -158,7 +158,7 @@ async fn read_only_catalog_reads_s3_state() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("analytics").map(|_| ()))
+        .commit(async |tx| tx.create_schema("analytics").await.map(|_| ()))
         .await
         .unwrap();
     catalog.close().await.unwrap();
@@ -166,8 +166,8 @@ async fn read_only_catalog_reads_s3_state() {
     let reader = Catalog::open_read_only(store, options_at("reader"))
         .await
         .unwrap();
-    let head = reader.snapshot().await.unwrap();
-    assert!(head.schema_by_name("analytics").is_some());
+    let head = reader.read_scope().await.unwrap();
+    assert!(head.schema_by_name("analytics").await.unwrap().is_some());
     reader.close().await.unwrap();
 }
 
@@ -198,13 +198,17 @@ async fn seed_attach_measurement(
         let columns = columns.clone();
         let created = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                created.set(Some(tx.create_table(
-                    schema,
-                    &format!("t{table}"),
-                    &columns,
-                )?));
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                created.set(Some(
+                    tx.create_table(schema, &format!("t{table}"), &columns)
+                        .await?,
+                ));
                 Ok(())
             })
             .await
@@ -222,9 +226,10 @@ async fn seed_attach_measurement(
             .unwrap();
         let table_ids = table_ids.clone();
         catalog
-            .commit(move |tx| {
+            .commit(async move |tx| {
                 for &table in &table_ids {
-                    tx.update_table_stats(table, 100 + round as u64, 4_096)?;
+                    tx.update_table_stats(table, 100 + round as u64, 4_096)
+                        .await?;
                 }
                 Ok(())
             })
@@ -252,7 +257,7 @@ async fn measure_fresh_attaches(
         opens.push(open_start.elapsed());
 
         let view_start = Instant::now();
-        let view = reader.snapshot().await.unwrap();
+        let view = reader.read_scope().await.unwrap();
         views.push(view_start.elapsed());
         totals.push(total_start.elapsed());
         std::hint::black_box(&view);
@@ -477,8 +482,13 @@ async fn measure_commit_latency_against_the_endpoint() {
         for i in 0..COMMITS {
             let start = Instant::now();
             catalog
-                .commit(move |tx| {
-                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                .commit(async move |tx| {
+                    let schema = tx
+                        .schema_by_name("main")
+                        .await
+                        .unwrap()
+                        .expect("bootstrap")
+                        .id;
                     tx.create_table(
                         schema,
                         &format!("t{i}"),
@@ -489,7 +499,8 @@ async fn measure_commit_latency_against_the_endpoint() {
                             default_value: None,
                             children: Vec::new(),
                         }],
-                    )?;
+                    )
+                    .await?;
                     Ok(())
                 })
                 .await
@@ -597,8 +608,8 @@ async fn seed_index_lookup_measurement(
 
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("bench")?;
+        .commit(async |tx| {
+            let schema = tx.create_schema("bench").await?;
             let columns: Vec<ColumnDef> = ["a", "b", "c"]
                 .iter()
                 .map(|name| ColumnDef {
@@ -609,25 +620,29 @@ async fn seed_index_lookup_measurement(
                     children: Vec::new(),
                 })
                 .collect();
-            let table = tx.create_table(schema, "lookups", &columns)?;
-            let unique = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_a".into(),
-                    columns: vec![ColumnId::new(1)],
-                    unique: true,
-                },
-                &[],
-            )?;
-            let non_unique = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_b".into(),
-                    columns: vec![ColumnId::new(2)],
-                    unique: false,
-                },
-                &[],
-            )?;
+            let table = tx.create_table(schema, "lookups", &columns).await?;
+            let unique = tx
+                .create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[],
+                )
+                .await?;
+            let non_unique = tx
+                .create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_b".into(),
+                        columns: vec![ColumnId::new(2)],
+                        unique: false,
+                    },
+                    &[],
+                )
+                .await?;
             created.set(Some(IndexLookupFixture {
                 table,
                 unique,
@@ -650,7 +665,7 @@ async fn seed_index_lookup_measurement(
             let entries = index_lookup_entries(&fixture, file);
             let table = fixture.table;
             catalog
-                .commit(move |tx| {
+                .commit(async move |tx| {
                     tx.register_data_file(
                         table,
                         DataFile {
@@ -665,7 +680,8 @@ async fn seed_index_lookup_measurement(
                             column_stats: Vec::new(),
                         },
                         &entries,
-                    )?;
+                    )
+                    .await?;
                     Ok(())
                 })
                 .await
@@ -1055,19 +1071,21 @@ async fn seed_located_lookup_measurement(
 
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("bench")?;
-            let table = tx.create_table(
-                schema,
-                "located",
-                &[ColumnDef {
-                    name: "a".into(),
-                    column_type: "BIGINT".into(),
-                    nulls_allowed: false,
-                    default_value: None,
-                    children: Vec::new(),
-                }],
-            )?;
+        .commit(async |tx| {
+            let schema = tx.create_schema("bench").await?;
+            let table = tx
+                .create_table(
+                    schema,
+                    "located",
+                    &[ColumnDef {
+                        name: "a".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: false,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .await?;
             created.set(Some(table));
             Ok(())
         })
@@ -1103,9 +1121,9 @@ async fn seed_located_lookup_measurement(
         .await;
 
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             for file in files.clone() {
-                tx.register_data_file(table, file, &[])?;
+                tx.register_data_file(table, file, &[]).await?;
             }
             Ok(())
         })
@@ -1212,7 +1230,13 @@ async fn measure_located_lookup_latency_against_the_endpoint() {
     let census_reader = Catalog::open_read_only(store.clone(), options.clone())
         .await
         .unwrap();
-    let mut files = census_reader.snapshot().await.unwrap().data_files_of(table);
+    let mut files = census_reader
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap();
     files.sort_by_key(|file| file.id);
     let dense_starts: Vec<u64> = files
         .iter()

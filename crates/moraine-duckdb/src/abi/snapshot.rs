@@ -1,7 +1,7 @@
 //! Snapshot handles and catalog descriptor arrays.
 
 use std::{
-    ffi::{CString, c_char, c_void},
+    ffi::{CString, c_char},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -10,65 +10,10 @@ use moraine::ffi_support::catalog_read::SnapshotProjection;
 use super::{free_array, free_c_string, guard, snapshot_list, to_c_string};
 use crate::{
     error::{AbiError, MoraineError, codes},
-    runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle},
+    runtime::MoraineSnapshotHandle,
 };
 
-/// Materializes the catalog's current snapshot and writes the resulting
-/// handle to `*out`.
-///
-/// Cancellable: races the core read against `probe` (polled
-/// immediately, then ~100 ms; a null `probe` disables polling). If a
-/// cancellation wins, returns [`codes::INTERRUPTED`] and `*out` is left
-/// unwritten.
-///
-/// # Safety
-///
-/// `handle` must be a pointer previously returned by
-/// [`super::moraine_attach_with_wal_store`] and not yet detached. `out` must be
-/// a valid, writable `*mut *mut MoraineSnapshotHandle`. `probe`, if non-null,
-/// must be safe to call with `probe_ctx` from any thread. `err`, if non-null,
-/// must be a valid, writable [`MoraineError`]. All for the duration of this
-/// call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_snapshot(
-    handle: *mut MoraineCatalogHandle,
-    out: *mut *mut MoraineSnapshotHandle,
-    probe: MoraineInterruptProbe,
-    probe_ctx: *mut c_void,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<Box<MoraineSnapshotHandle>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out.is_null() {
-            return Err(AbiError::invalid_argument("`out` is null"));
-        }
-        // SAFETY: `handle` validity is this function's own safety contract.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
-        }?;
-        Ok(Box::new(MoraineSnapshotHandle::new(snapshot)))
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(handle) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe {
-                *out = Box::into_raw(handle);
-            }
-            codes::OK
-        }
-        Err(code) => code,
-    }
-}
-
-/// Frees a snapshot handle returned by [`moraine_snapshot`] or
-/// [`super::moraine_snapshot_scoped`].
+/// Frees a snapshot handle returned by [`super::moraine_snapshot_scoped`].
 /// A null `snapshot` is a no-op.
 ///
 /// # Safety
@@ -102,8 +47,8 @@ pub struct MoraineSchemaDesc {
 /// # Safety
 ///
 /// `snapshot` must be a pointer previously returned by
-/// [`moraine_snapshot`]. `out_items`/`out_len` must be valid, writable
-/// pointers. `err`, if non-null, must be a valid, writable
+/// [`super::moraine_snapshot_scoped`]. `out_items`/`out_len` must be valid,
+/// writable pointers. `err`, if non-null, must be a valid, writable
 /// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_snapshot_schemas(

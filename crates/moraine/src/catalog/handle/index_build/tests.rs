@@ -50,7 +50,7 @@ async fn fixture(chunks: &[InlineChunk]) -> (Catalog, TableId, IndexDef) {
         .unwrap();
     let table = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let id = tx.create_table(
                 schema,
@@ -71,7 +71,7 @@ async fn fixture(chunks: &[InlineChunk]) -> (Catalog, TableId, IndexDef) {
         .await
         .unwrap();
     let table = table.get().unwrap();
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
     let def = IndexDef {
         name: "by_a".into(),
         columns: vec![column],
@@ -89,7 +89,7 @@ async fn inline_steps_commit_before_later_chunks_are_decoded() {
         .begin_staged_index(table, &def, &[], IndexMaintenance::Synchronous, false)
         .await
         .unwrap();
-    let before = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let before = catalog.materialized().await.unwrap().current_snapshot().id;
     let result = catalog
         .drive_staged_build(
             table,
@@ -105,7 +105,7 @@ async fn inline_steps_commit_before_later_chunks_are_decoded() {
         .await;
     assert!(matches!(result, Err(Error::Corruption(_))), "{result:?}");
     assert!(
-        catalog.snapshot().await.unwrap().current_snapshot().id > before,
+        catalog.materialized().await.unwrap().current_snapshot().id > before,
         "inline derivation decoded a later chunk before committing its first step"
     );
     catalog.close().await.unwrap();
@@ -130,7 +130,7 @@ async fn inline_resume_skips_completed_chunks_without_a_row_watermark() {
     first.schema_version = 1;
     let (catalog, table, def) = fixture(&[first, chunk(vec![30, 40])]).await;
     let begin = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .current_snapshot()
@@ -149,7 +149,7 @@ async fn inline_resume_skips_completed_chunks_without_a_row_watermark() {
         ..Default::default()
     };
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_source_step(
                 index,
                 &[
@@ -172,7 +172,7 @@ async fn inline_resume_skips_completed_chunks_without_a_row_watermark() {
         .unwrap();
     assert_eq!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .index_by_name(table, &def.name)
@@ -232,14 +232,14 @@ async fn inline_resume_skips_completed_chunks_without_a_row_watermark() {
 async fn inline_resume_inside_a_chunk_excludes_tombstones() {
     let (catalog, table, def) = fixture(&[chunk(vec![10, 20, 30, 40])]).await;
     let begin = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .current_snapshot()
         .id
         .get();
     catalog
-        .commit(|tx| tx.inline_delete(table, 2, &[]))
+        .commit_materialized(|tx| tx.inline_delete(table, 2, &[]))
         .await
         .unwrap();
     let index = catalog
@@ -252,7 +252,7 @@ async fn inline_resume_inside_a_chunk_excludes_tombstones() {
         ..Default::default()
     };
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_source_step(
                 index,
                 &[IndexEntry {
@@ -323,7 +323,7 @@ async fn cancelled_inline_build_resumes_its_committed_checkpoint() {
     ));
     let checkpoint = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let snapshot = catalog.snapshot().await.unwrap();
+            let snapshot = catalog.materialized().await.unwrap();
             if let Some(index) = snapshot.index_by_name(table, &def.name)
                 && snapshot.indexes[&table.get()][&index.id.get()]
                     .build_inline_cursor
@@ -375,7 +375,7 @@ async fn cancelled_inline_build_resumes_its_committed_checkpoint() {
 async fn resumed_build_still_detects_a_duplicate_of_a_committed_row() {
     let (catalog, table, def) = fixture(&[chunk(vec![10, 20, 10])]).await;
     let begin = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .current_snapshot()
@@ -391,7 +391,7 @@ async fn resumed_build_still_detects_a_duplicate_of_a_committed_row() {
         ..Default::default()
     };
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_source_step(
                 index,
                 &[IndexEntry {
@@ -473,7 +473,7 @@ async fn inline_steps_commit_before_file_inventory_is_decoded() {
         .begin_staged_index(table, &def, &[], IndexMaintenance::Synchronous, true)
         .await
         .unwrap();
-    let before = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let before = catalog.materialized().await.unwrap().current_snapshot().id;
     let write = catalog.begin_write_tx().unwrap();
     write
         .put(

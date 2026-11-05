@@ -6,8 +6,6 @@ use std::sync::Arc;
 use imbl::{HashMap, OrdMap, OrdSet};
 use prost::Message as _;
 
-#[cfg(test)]
-use crate::store::read::EntityRecordKind;
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
@@ -25,7 +23,7 @@ use crate::{
             SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
             ViewValue,
         },
-        read::EntityRecord,
+        read::{EntityRecord, EntityRecordKind},
     },
 };
 
@@ -273,6 +271,7 @@ impl CatalogSnapshot {
     /// not history); with `at: Some(s)` a record is included iff
     /// `begin_snapshot <= s` and it had not ended by `s` (`current` records
     /// never have; `history` records carry their end).
+    #[cfg(test)]
     pub(crate) fn try_build_from<'a>(
         snapshot: SnapshotValue,
         current: impl IntoIterator<Item = &'a EntityRecord>,
@@ -324,7 +323,6 @@ impl CatalogSnapshot {
 
     /// The live records of `kind`, in store key order: what a live scan of
     /// the kind returns at this view's head.
-    #[cfg(test)]
     pub(crate) fn live_records(&self, kind: EntityRecordKind) -> Vec<EntityRecord> {
         fn flat<V: Clone>(
             rows: &OrdMap<u64, V>,

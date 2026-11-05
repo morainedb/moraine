@@ -41,9 +41,9 @@ async fn a_census_names_the_subspaces_the_catalog_wrote() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
-            let sales = tx.create_schema("sales")?;
-            tx.create_table(sales, "orders", &[col("id")])?;
+        .commit(async |tx| {
+            let sales = tx.create_schema("sales").await?;
+            tx.create_table(sales, "orders", &[col("id")]).await?;
             Ok(())
         })
         .await
@@ -77,10 +77,10 @@ async fn the_scanning_leg_counts_live_keys() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
-            let sales = tx.create_schema("sales")?;
-            tx.create_table(sales, "orders", &[col("id")])?;
-            tx.create_table(sales, "returns", &[col("id")])?;
+        .commit(async |tx| {
+            let sales = tx.create_schema("sales").await?;
+            tx.create_table(sales, "orders", &[col("id")]).await?;
+            tx.create_table(sales, "returns", &[col("id")]).await?;
             Ok(())
         })
         .await
@@ -115,7 +115,7 @@ async fn a_read_only_catalog_measures_but_does_not_merge() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
 
@@ -173,7 +173,7 @@ async fn a_store_with_nothing_to_merge_reports_skipped() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
 
@@ -203,7 +203,7 @@ async fn a_targeted_merge_reports_only_its_subspace() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
 
@@ -232,15 +232,15 @@ async fn a_merge_leaves_the_catalog_untouched() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
-            let sales = tx.create_schema("sales")?;
-            tx.create_table(sales, "orders", &[col("id")])?;
+        .commit(async |tx| {
+            let sales = tx.create_schema("sales").await?;
+            tx.create_table(sales, "orders", &[col("id")]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let before = catalog.snapshot().await.unwrap();
+    let before = catalog.read_scope().await.unwrap();
     catalog
         .compact_store(merge_request(
             CompactionTarget::WholeStore,
@@ -248,13 +248,16 @@ async fn a_merge_leaves_the_catalog_untouched() {
         ))
         .await
         .unwrap();
-    let after = catalog.snapshot().await.unwrap();
+    let after = catalog.read_scope().await.unwrap();
 
     assert_eq!(
         before.current_snapshot().id,
         after.current_snapshot().id,
         "a merge minted a snapshot"
     );
-    assert_eq!(before.schemas().len(), after.schemas().len());
-    assert!(after.schema_by_name("sales").is_some());
+    assert_eq!(
+        before.schemas().await.unwrap().len(),
+        after.schemas().await.unwrap().len()
+    );
+    assert!(after.schema_by_name("sales").await.unwrap().is_some());
 }

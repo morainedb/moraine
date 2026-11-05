@@ -159,39 +159,19 @@ unsafe fn create_index_in_one_commit(
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
 ) -> Result<(), AbiError> {
-    let reads = handle.catalog.reads();
-    let scoped = async {
-        match data_store {
-            Some(store) => {
-                reads
-                    .scoped_backfill_entries(store, &handle.data_prefix, table_id, &def.columns)
-                    .await
-            }
-            None => Ok(Vec::new()),
-        }
-    };
-    let inline = reads.inline_backfill_entries(table_id, &def.columns);
-    // SAFETY: caller contract for `probe`/`probe_ctx`.
-    let (mut backfill, inline) = unsafe {
-        handle.block_on_cancellable(probe, probe_ctx, async { tokio::try_join!(scoped, inline) })
-    }?;
-    backfill.extend(inline);
-
     // SAFETY: caller contract for `probe`/`probe_ctx`.
     unsafe {
         handle.block_on_commit(
             probe,
             probe_ctx,
-            handle.catalog.writer()?.commit(|tx| {
-                tx.create_index_ordered_with_maintenance(
-                    table_id,
-                    def,
-                    orders,
-                    maintenance,
-                    &backfill,
-                )?;
-                Ok(())
-            }),
+            handle.catalog.writer()?.create_index(
+                table_id,
+                def,
+                orders,
+                maintenance,
+                data_store,
+                &handle.data_prefix,
+            ),
         )
     }?;
     Ok(())
@@ -402,21 +382,10 @@ pub unsafe extern "C" fn moraine_index_drop(
             handle_ref.block_on_commit(
                 probe,
                 probe_ctx,
-                handle_ref.catalog.writer()?.commit(|tx| {
-                    let Some(schema) = tx.schema_by_name(schema) else {
-                        return if if_exists {
-                            Ok(())
-                        } else {
-                            Err(moraine::Error::NotFound(format!("schema {schema}")))
-                        };
-                    };
-                    let index = tx.index_by_schema_name(schema.id, name)?;
-                    match index {
-                        Some(index) => tx.drop_index(index.id),
-                        None if if_exists => Ok(()),
-                        None => Err(moraine::Error::NotFound(format!("index {name}"))),
-                    }
-                }),
+                handle_ref
+                    .catalog
+                    .writer()?
+                    .drop_index(schema, name, if_exists),
             )
         }?;
         Ok(())

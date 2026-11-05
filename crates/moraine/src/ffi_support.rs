@@ -1292,7 +1292,7 @@ mod tests {
             .unwrap();
 
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.create_schema("sales")?;
                 let table = tx.create_table(
                     schema,
@@ -1371,7 +1371,7 @@ mod tests {
             .unwrap();
 
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let table = tx.tables_in(tx.schemas()[1].id)[0].id;
                 tx.rename_table(table, "orders2")
             })
@@ -1394,7 +1394,7 @@ mod tests {
         assert_eq!(first, repeat, "the stamp moved with no commit");
 
         catalog
-            .commit(|tx| tx.create_schema("more").map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema("more").map(|_| ()))
             .await
             .unwrap();
         let minted = head_stamp(&catalog).await.unwrap().unwrap();
@@ -1403,7 +1403,7 @@ mod tests {
 
         // Reuses the snapshot id; only the batch count says the store moved.
         catalog
-            .commit(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
+            .commit_materialized(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
             .await
             .unwrap();
         let reused = head_stamp(&catalog).await.unwrap().unwrap();
@@ -1446,7 +1446,7 @@ mod tests {
         let warmed = catalog.full_entity_scans();
 
         let ended_at = catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 tx.create_schema("more")?;
                 tx.drop_table(crate::catalog::TableId::new(orders))
             })
@@ -1486,21 +1486,21 @@ mod tests {
             ..CatalogOptions::default()
         };
         let reader = Catalog::open_read_only(store, options).await.unwrap();
-        reader.snapshot().await.unwrap();
+        reader.materialized().await.unwrap();
         dump_table_stats(&reader).await.unwrap();
         let warmed = reader.full_entity_scans();
 
         let minted = writer
-            .commit(|tx| tx.create_schema("more").map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema("more").map(|_| ()))
             .await
             .unwrap();
         for _ in 0..200 {
-            if reader.snapshot().await.unwrap().snapshot.snapshot_id >= minted.get() {
+            if reader.materialized().await.unwrap().snapshot.snapshot_id >= minted.get() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let view = reader.snapshot().await.unwrap();
+        let view = reader.materialized().await.unwrap();
         assert_eq!(
             view.snapshot.snapshot_id,
             minted.get(),
@@ -1530,15 +1530,15 @@ mod tests {
         use crate::store::read::{EntityRecordKind, Versions, scan_entity_kind};
 
         let catalog = seed().await;
-        let schema = catalog.snapshot().await.unwrap().schemas()[0].id;
+        let schema = catalog.materialized().await.unwrap().schemas()[0].id;
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 tx.set_option(crate::catalog::OptionScope::Global, "answer", "42")?;
                 tx.set_tag(crate::catalog::TagTarget::Schema(schema), "owner", "sales")
             })
             .await
             .unwrap();
-        let view = catalog.snapshot().await.unwrap();
+        let view = catalog.materialized().await.unwrap();
         let session = catalog.begin_read().await.unwrap();
 
         for kind in [
@@ -1647,17 +1647,17 @@ mod tests {
             ..CatalogOptions::default()
         };
         let catalog = Catalog::open_read_only(store, options).await.unwrap();
-        catalog.snapshot().await.unwrap();
+        catalog.materialized().await.unwrap();
 
         plant_migration_marker(&writer).await;
         for _ in 0..100 {
-            if catalog.snapshot().await.is_err() {
+            if catalog.materialized().await.is_err() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        assert!(refuses(&catalog.snapshot().await), "snapshot");
+        assert!(refuses(&catalog.materialized().await), "snapshot");
         assert!(refuses(&dump_schemas(&catalog).await), "dump_schemas");
         assert!(refuses(&dump_mappings(&catalog).await), "dump_mappings");
         assert!(
@@ -1695,7 +1695,7 @@ mod tests {
     async fn expire_snapshots_below_head(catalog: &Catalog, records: bool) {
         use crate::transaction::staged::{Cell, RowOperation, TableKind};
 
-        let head = catalog.snapshot().await.unwrap().current_snapshot().id;
+        let head = catalog.materialized().await.unwrap().current_snapshot().id;
         let mut tx = staged::staged_begin(catalog, None, String::new(), None).unwrap();
         for snapshot in dump_snapshots(catalog).await.unwrap() {
             if snapshot.snapshot_id == head.get() {
@@ -1890,7 +1890,7 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.create_schema("s")?;
                 tx.create_macro(
                     schema,
@@ -1933,11 +1933,11 @@ mod tests {
             .await
             .unwrap();
 
-        let head = catalog.snapshot().await.unwrap();
+        let head = catalog.materialized().await.unwrap();
         let schema = head.schema_by_name("s").unwrap();
         let created = head.macro_by_name(schema.id, "add").unwrap();
         catalog
-            .commit(move |tx| tx.drop_macro(created.id))
+            .commit_materialized(move |tx| tx.drop_macro(created.id))
             .await
             .unwrap();
 
@@ -2008,7 +2008,7 @@ mod tests {
         // A second table, so one table's rows are a strict subset and the
         // offset has something to skip.
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.schemas()[0].id;
                 let table = tx.create_table(
                     schema,
@@ -2092,7 +2092,7 @@ mod tests {
         // A second table, and an ended version on each, so neither half of
         // the record set is a single table's run.
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.schemas()[1].id;
                 let table = tx.create_table(
                     schema,
@@ -2127,7 +2127,7 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.schemas()[1].id;
                 let table = tx.tables_in(schema)[1].id;
                 let file = tx.data_files_of(table)[0].id;
@@ -2169,7 +2169,7 @@ mod tests {
         // A second table with its own deletions, so neither table's run is
         // the whole dump.
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.schemas()[1].id;
                 let table = tx.create_table(
                     schema,

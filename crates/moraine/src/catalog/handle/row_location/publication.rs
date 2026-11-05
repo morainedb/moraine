@@ -149,9 +149,7 @@ impl RowSummaryProgress {
             return Ok(true);
         }
         if self.handle.is_none() {
-            let scope = catalog.index_read_scope().await?.ok_or_else(|| {
-                Error::Constraint("publication requires a fixed read scope".into())
-            })?;
+            let scope = catalog.index_read_scope().await?;
             self.handle = Some(scope.reads().owned_read_handle());
         }
         let handle = self

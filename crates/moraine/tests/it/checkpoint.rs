@@ -29,12 +29,12 @@ async fn seeded_with_checkpoint() -> (Arc<FreezingStore>, String) {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     let checkpoint = catalog.create_checkpoint(None).await.unwrap();
     catalog
-        .commit(|tx| tx.create_schema("ops").map(|_| ()))
+        .commit(async |tx| tx.create_schema("ops").await.map(|_| ()))
         .await
         .unwrap();
     catalog.close().await.unwrap();
@@ -52,10 +52,10 @@ async fn a_pinned_reader_serves_the_checkpoint_and_not_later_commits() {
     let pinned = Catalog::open_read_only(store.clone(), pinned_to(&checkpoint))
         .await
         .unwrap();
-    let view = pinned.snapshot().await.unwrap();
-    assert!(view.schema_by_name("sales").is_some());
+    let view = pinned.read_scope().await.unwrap();
+    assert!(view.schema_by_name("sales").await.unwrap().is_some());
     assert!(
-        view.schema_by_name("ops").is_none(),
+        view.schema_by_name("ops").await.unwrap().is_none(),
         "a commit after the checkpoint must not be visible through it"
     );
     pinned.close().await.unwrap();
@@ -63,8 +63,8 @@ async fn a_pinned_reader_serves_the_checkpoint_and_not_later_commits() {
     let latest = Catalog::open_read_only(store, CatalogOptions::default())
         .await
         .unwrap();
-    let view = latest.snapshot().await.unwrap();
-    assert!(view.schema_by_name("ops").is_some());
+    let view = latest.read_scope().await.unwrap();
+    assert!(view.schema_by_name("ops").await.unwrap().is_some());
     latest.close().await.unwrap();
 }
 
@@ -82,10 +82,12 @@ async fn a_pinned_reader_opens_against_a_store_that_refuses_writes() {
         .unwrap();
     assert!(
         pinned
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some()
     );
     pinned.close().await.unwrap();
@@ -214,10 +216,12 @@ async fn a_read_only_catalog_reads_the_cut_it_is_pinned_to() {
         .unwrap();
     assert!(
         reader
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some()
     );
     reader.close().await.unwrap();
@@ -234,7 +238,7 @@ async fn a_listed_checkpoint_reports_its_manifest_and_lifetime() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     let held = catalog.create_checkpoint(None).await.unwrap();

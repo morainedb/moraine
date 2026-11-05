@@ -129,21 +129,24 @@ async fn seed(
     }
     let table = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             let schema = tx
                 .schema_by_name("main")
+                .await?
                 .ok_or_else(|| moraine::Error::NotFound("main".into()))?
                 .id;
-            let id = tx.create_table(
-                schema,
-                "lookup",
-                &[ColumnDef {
-                    name: "a".into(),
-                    column_type: "BIGINT".into(),
-                    nulls_allowed: true,
-                    ..Default::default()
-                }],
-            )?;
+            let id = tx
+                .create_table(
+                    schema,
+                    "lookup",
+                    &[ColumnDef {
+                        name: "a".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        ..Default::default()
+                    }],
+                )
+                .await?;
             table.set(Some(id));
             for source in 0..count {
                 if mode == "files" {
@@ -161,7 +164,8 @@ async fn seed(
                             column_stats: Vec::new(),
                         },
                         &[],
-                    )?;
+                    )
+                    .await?;
                 } else {
                     tx.inline_insert(
                         id,
@@ -172,7 +176,8 @@ async fn seed(
                             arrow_body: vec![0; 1024],
                         },
                         &[],
-                    )?;
+                    )
+                    .await?;
                 }
             }
             Ok(())

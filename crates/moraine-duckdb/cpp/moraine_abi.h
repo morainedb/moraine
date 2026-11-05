@@ -96,11 +96,11 @@ typedef struct MoraineMetadataCursor MoraineMetadataCursor;
 // An execution-owned cursor, including its pinned read surface and runtime.
 typedef struct MoraineRowScan MoraineRowScan;
 
-// A pinned read scope or an explicitly materialized compatibility view.
+// A pinned catalog read scope.
 //
 // Opaque to C — only ever seen as a `MoraineSnapshotHandle*` obtained
-// from [`moraine_snapshot`](crate::abi::moraine_snapshot) and released
-// via [`moraine_snapshot_free`](crate::abi::moraine_snapshot_free).
+// from [`moraine_snapshot_scoped`](crate::abi::moraine_snapshot_scoped) and
+// released via [`moraine_snapshot_free`](crate::abi::moraine_snapshot_free).
 typedef struct MoraineSnapshotHandle MoraineSnapshotHandle;
 
 // A staged-row transaction, opaque to C. Owns one [`StagedTransaction`]
@@ -1504,7 +1504,7 @@ int32_t moraine_attach_with_wal_store(const char *path,
 // Free a non-null result exactly once with [`moraine_string_free`].
 //
 // Cancellable via `probe`/`probe_ctx`, exactly as
-// [`super::moraine_snapshot`].
+// [`super::moraine_snapshot_scoped`].
 //
 // # Safety
 //
@@ -1627,7 +1627,7 @@ void moraine_string_free(char *ptr);
 // before the flag existed reads as not encrypted.
 //
 // Cancellable via `probe`/`probe_ctx`, exactly as
-// [`super::moraine_snapshot`].
+// [`super::moraine_snapshot_scoped`].
 //
 // # Safety
 //
@@ -2216,12 +2216,13 @@ int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
 // matching call, not yet freed.
 void moraine_locate_row_positions_free_files(struct MoraineLocatedFile *items, size_t len);
 
-// Opens a transaction snapshot with a pinned index/inline read surface when
-// supported. Readers without pinned revisions receive an ordinary snapshot
-// instead.
+// Opens a transaction snapshot with a fixed catalog, index, and inline read
+// surface.
 //
 // # Safety
-// Same pointer and cancellation contract as [`super::moraine_snapshot`].
+// `handle` must be attached and `out` writable. A non-null `probe` must be
+// safe to call with `probe_ctx` from any thread during this call. A non-null
+// `err` must be writable.
 int32_t moraine_snapshot_scoped(struct MoraineCatalogHandle *handle,
                                 struct MoraineSnapshotHandle **out,
                                 MoraineInterruptProbe probe,
@@ -2323,30 +2324,7 @@ uint64_t moraine_row_scan_files_read(const struct MoraineRowScan *scan);
 // `moraine_row_scan_open`.
 void moraine_row_scan_free(struct MoraineRowScan *scan);
 
-// Materializes the catalog's current snapshot and writes the resulting
-// handle to `*out`.
-//
-// Cancellable: races the core read against `probe` (polled
-// immediately, then ~100 ms; a null `probe` disables polling). If a
-// cancellation wins, returns [`codes::INTERRUPTED`] and `*out` is left
-// unwritten.
-//
-// # Safety
-//
-// `handle` must be a pointer previously returned by
-// [`super::moraine_attach_with_wal_store`] and not yet detached. `out` must be
-// a valid, writable `*mut *mut MoraineSnapshotHandle`. `probe`, if non-null,
-// must be safe to call with `probe_ctx` from any thread. `err`, if non-null,
-// must be a valid, writable [`MoraineError`]. All for the duration of this
-// call.
-int32_t moraine_snapshot(struct MoraineCatalogHandle *handle,
-                         struct MoraineSnapshotHandle **out,
-                         MoraineInterruptProbe probe,
-                         void *probe_ctx,
-                         struct MoraineError *err);
-
-// Frees a snapshot handle returned by [`moraine_snapshot`] or
-// [`super::moraine_snapshot_scoped`].
+// Frees a snapshot handle returned by [`super::moraine_snapshot_scoped`].
 // A null `snapshot` is a no-op.
 //
 // # Safety
@@ -2360,8 +2338,8 @@ void moraine_snapshot_free(struct MoraineSnapshotHandle *snapshot);
 // # Safety
 //
 // `snapshot` must be a pointer previously returned by
-// [`moraine_snapshot`]. `out_items`/`out_len` must be valid, writable
-// pointers. `err`, if non-null, must be a valid, writable
+// [`super::moraine_snapshot_scoped`]. `out_items`/`out_len` must be valid,
+// writable pointers. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
 int32_t moraine_snapshot_schemas(struct MoraineSnapshotHandle *snapshot,
                                  struct MoraineSchemaDesc **out_items,

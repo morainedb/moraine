@@ -271,14 +271,14 @@ async fn a_migrated_store_still_time_travels() {
         .await
         .unwrap();
     let first = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_schema("sales")?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_schema("ops")?;
             Ok(())
         })
@@ -296,7 +296,7 @@ async fn a_migrated_store_still_time_travels() {
     let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
         .await
         .unwrap();
-    let past = catalog.snapshot_at(first).await.unwrap();
+    let past = catalog.materialized_at(first).await.unwrap();
     catalog.close().await.unwrap();
 
     let mut names: Vec<String> = past
@@ -393,7 +393,7 @@ async fn the_checkpoint_flag_takes_and_releases_one() {
     let catalog = Catalog::open(object_store, CatalogOptions::default())
         .await
         .unwrap();
-    assert_eq!(catalog.snapshot().await.unwrap().schemas().len(), 1);
+    assert_eq!(catalog.materialized().await.unwrap().schemas().len(), 1);
     catalog.close().await.unwrap();
 }
 

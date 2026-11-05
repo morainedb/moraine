@@ -15,6 +15,9 @@ use slatedb::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::store::read::RecordSet;
+
 mod pacer;
 
 pub(crate) use pacer::FlushPacer;
@@ -38,9 +41,7 @@ use crate::{
         handle::ReadHandle,
         key::{EntityKey, Key, SysKey},
         open::StoreBuilder,
-        proto,
-        read::{self, RecordSet},
-        value,
+        proto, read, value,
     },
     telemetry::{STALL_INTERVAL, reporting_phase},
     transaction::{
@@ -850,6 +851,7 @@ async fn resolve_below(
 /// Materializes a catalog view through an open transaction. `at: None`
 /// reads the head (`current` only); `at: Some(s)` also scans `history` to
 /// reconstruct the entities live at `s`.
+#[cfg(test)]
 pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
     match at {
         None => Ok(materialize_capturing(tx).await?.0),
@@ -881,6 +883,7 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
 
 /// As [`materialize`] at head, also handing back the scanned `current`
 /// records from the same consistent cut.
+#[cfg(test)]
 pub(crate) async fn materialize_capturing(
     tx: ReadHandle<'_>,
 ) -> Result<(CatalogSnapshot, Arc<RecordSet>)> {
@@ -1084,7 +1087,9 @@ mod group;
 use diff::diff_options;
 pub(crate) use diff::{Touched, diff_touched, diff_writes};
 use group::Outcome;
-pub(crate) use group::{Batch, Coalescer, StageOnto, Staging, TableMember};
+pub(crate) use group::{
+    Batch, Coalescer, DemandGroup, DemandMember, ScopedMember, StageOnto, Staging,
+};
 
 /// What a batch's durable write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1159,6 +1164,7 @@ where
 }
 
 /// Explicitly materializes the compatibility verb API's commit premises.
+#[cfg(test)]
 pub(crate) async fn head_view_for(
     handle: ReadHandle<'_>,
     projections: &std::sync::RwLock<ProjectionCache>,
@@ -1249,6 +1255,17 @@ where
     state.admit(0)?;
     let mut tx = Transaction::new(state, new_id);
     f(&mut tx)?;
+    finish_and_stage(db_tx, projections, tx.into_parts(), base).await
+}
+
+async fn finish_and_stage(
+    db_tx: &Arc<CommitSession>,
+    projections: &std::sync::RwLock<ProjectionCache>,
+    parts: TransactionParts,
+    base: &CatalogSnapshot,
+) -> Result<Prepared> {
+    let head = base.snapshot.snapshot_id;
+    let new_id = head + 1;
     let TransactionParts {
         operations,
         index_entries,
@@ -1256,7 +1273,7 @@ where
         mut state,
         next_catalog_id,
         next_file_id,
-    } = tx.into_parts();
+    } = parts;
     let growth = state
         .estimated_bytes()
         .saturating_sub(base.estimated_bytes());

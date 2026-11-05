@@ -18,14 +18,18 @@ async fn seeded() -> (Catalog, TableId) {
 #[tokio::test]
 async fn registration_is_data_only_and_visible() {
     let (catalog, t) = seeded().await;
-    let before = catalog.snapshot().await.unwrap().current_snapshot();
+    let before = catalog.read_scope().await.unwrap().current_snapshot();
 
     catalog
-        .commit(move |tx| tx.register_data_file(t, datafile(100), &[]).map(|_| ()))
+        .commit(async move |tx| {
+            tx.register_data_file(t, datafile(100), &[])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     // Data-only commits mint a snapshot but carry the schema version.
     assert_eq!(head.current_snapshot().id.get(), before.id.get() + 1);
     assert_eq!(
@@ -33,11 +37,11 @@ async fn registration_is_data_only_and_visible() {
         before.schema_version
     );
 
-    let files = head.data_files_of(t);
+    let files = head.data_files_of(t).await.unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].record_count, 100);
     assert_eq!(files[0].row_id_start, Some(0));
-    assert_eq!(head.table_stats(t).unwrap().next_row_id, 100);
+    assert_eq!(head.table_stats(t).await.unwrap().unwrap().next_row_id, 100);
     catalog.close().await.unwrap();
 }
 
@@ -45,30 +49,48 @@ async fn registration_is_data_only_and_visible() {
 async fn expiry_time_travels_and_row_ids_stay_dense() {
     let (catalog, t) = seeded().await;
     catalog
-        .commit(move |tx| tx.register_data_file(t, datafile(100), &[]).map(|_| ()))
+        .commit(async move |tx| {
+            tx.register_data_file(t, datafile(100), &[])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap();
-    let registered = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let registered = catalog.read_scope().await.unwrap().current_snapshot().id;
 
-    let file_id = catalog.snapshot().await.unwrap().data_files_of(t)[0].id;
+    let file_id = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(t)
+        .await
+        .unwrap()[0]
+        .id;
     catalog
-        .commit(move |tx| tx.expire_data_file(t, file_id))
+        .commit(async move |tx| tx.expire_data_file(t, file_id).await)
         .await
         .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
-    assert!(head.data_files_of(t).is_empty());
+    let head = catalog.read_scope().await.unwrap();
+    assert!(head.data_files_of(t).await.unwrap().is_empty());
     // The expired file is still visible at its snapshot.
-    let past = catalog.snapshot_at(registered).await.unwrap();
-    assert_eq!(past.data_files_of(t).len(), 1);
+    let past = catalog.read_scope_at(registered).await.unwrap();
+    assert_eq!(past.data_files_of(t).await.unwrap().len(), 1);
 
     // A later registration allocates above the expired rows.
     catalog
-        .commit(move |tx| tx.register_data_file(t, datafile(10), &[]).map(|_| ()))
+        .commit(async move |tx| {
+            tx.register_data_file(t, datafile(10), &[])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap();
-    let head = catalog.snapshot().await.unwrap();
-    assert_eq!(head.data_files_of(t)[0].row_id_start, Some(100));
+    let head = catalog.read_scope().await.unwrap();
+    assert_eq!(
+        head.data_files_of(t).await.unwrap()[0].row_id_start,
+        Some(100)
+    );
     catalog.close().await.unwrap();
 }
 
@@ -77,15 +99,17 @@ async fn encryption_keys_round_trip_verbatim() {
     let (catalog, t) = seeded().await;
 
     catalog
-        .commit(move |tx| {
-            let file = tx.register_data_file(
-                t,
-                DataFile {
-                    encryption_key: Some("ZGF0YS1rZXk=".into()),
-                    ..datafile(10)
-                },
-                &[],
-            )?;
+        .commit(async move |tx| {
+            let file = tx
+                .register_data_file(
+                    t,
+                    DataFile {
+                        encryption_key: Some("ZGF0YS1rZXk=".into()),
+                        ..datafile(10)
+                    },
+                    &[],
+                )
+                .await?;
             tx.register_delete_file(
                 t,
                 DeleteFile {
@@ -99,19 +123,24 @@ async fn encryption_keys_round_trip_verbatim() {
                     encryption_key: Some("ZGVsZXRlLWtleQ==".into()),
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     assert_eq!(
-        head.data_files_of(t)[0].encryption_key.as_deref(),
+        head.data_files_of(t).await.unwrap()[0]
+            .encryption_key
+            .as_deref(),
         Some("ZGF0YS1rZXk=")
     );
     assert_eq!(
-        head.delete_files_of(t)[0].encryption_key.as_deref(),
+        head.delete_files_of(t).await.unwrap()[0]
+            .encryption_key
+            .as_deref(),
         Some("ZGVsZXRlLWtleQ==")
     );
     catalog.close().await.unwrap();
@@ -121,8 +150,8 @@ async fn encryption_keys_round_trip_verbatim() {
 async fn delete_files_cascade_with_their_data_file() {
     let (catalog, t) = seeded().await;
     catalog
-        .commit(move |tx| {
-            let f = tx.register_data_file(t, datafile(100), &[])?;
+        .commit(async move |tx| {
+            let f = tx.register_data_file(t, datafile(100), &[]).await?;
             tx.register_delete_file(
                 t,
                 DeleteFile {
@@ -136,25 +165,26 @@ async fn delete_files_cascade_with_their_data_file() {
                     encryption_key: None,
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
         .unwrap();
-    let head = catalog.snapshot().await.unwrap();
-    assert_eq!(head.delete_files_of(t).len(), 1);
-    let file_id = head.data_files_of(t)[0].id;
+    let head = catalog.read_scope().await.unwrap();
+    assert_eq!(head.delete_files_of(t).await.unwrap().len(), 1);
+    let file_id = head.data_files_of(t).await.unwrap()[0].id;
 
     catalog
-        .commit(move |tx| tx.expire_data_file(t, file_id))
+        .commit(async move |tx| tx.expire_data_file(t, file_id).await)
         .await
         .unwrap();
-    let head = catalog.snapshot().await.unwrap();
-    assert!(head.delete_files_of(t).is_empty());
+    let head = catalog.read_scope().await.unwrap();
+    assert!(head.delete_files_of(t).await.unwrap().is_empty());
 
     // Registering a delete file against a missing data file fails.
     let err = catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.register_delete_file(
                 t,
                 DeleteFile {
@@ -169,6 +199,7 @@ async fn delete_files_cascade_with_their_data_file() {
                 },
                 &[],
             )
+            .await
             .map(|_| ())
         })
         .await
@@ -181,7 +212,7 @@ async fn delete_files_cascade_with_their_data_file() {
 async fn column_stats_round_trip_verbatim() {
     let (catalog, t) = seeded().await;
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.register_data_file(
                 t,
                 DataFile {
@@ -198,7 +229,8 @@ async fn column_stats_round_trip_verbatim() {
                     ..datafile(100)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             tx.update_column_stats(
                 t,
                 ColumnId::new(1),
@@ -210,21 +242,26 @@ async fn column_stats_round_trip_verbatim() {
                     extra_stats: None,
                 },
             )
+            .await
         })
         .await
         .unwrap();
-    let head = catalog.snapshot().await.unwrap();
-    let stats = head.column_stats(t, ColumnId::new(1)).unwrap();
+    let head = catalog.read_scope().await.unwrap();
+    let stats = head
+        .column_stats(t, ColumnId::new(1))
+        .await
+        .unwrap()
+        .unwrap();
     // '9' > '10' lexicographically — stored verbatim, never compared.
     assert_eq!(stats.min_value.as_deref(), Some("9"));
     assert_eq!(stats.max_value.as_deref(), Some("10"));
     // Stats-only commits mint a snapshot too.
     let before = head.current_snapshot().id;
     catalog
-        .commit(move |tx| tx.update_table_stats(t, 100, 1000))
+        .commit(async move |tx| tx.update_table_stats(t, 100, 1000).await)
         .await
         .unwrap();
-    let after = catalog.snapshot().await.unwrap().current_snapshot();
+    let after = catalog.read_scope().await.unwrap().current_snapshot();
     assert_eq!(after.id.get(), before.get() + 1);
     catalog.close().await.unwrap();
 }
@@ -234,8 +271,8 @@ async fn expired_delete_files_vanish_at_head_but_time_travel_sees_them() {
     let (catalog, t) = seeded().await;
 
     catalog
-        .commit(move |tx| {
-            let file = tx.register_data_file(t, datafile(10), &[])?;
+        .commit(async move |tx| {
+            let file = tx.register_data_file(t, datafile(10), &[]).await?;
             tx.register_delete_file(
                 t,
                 DeleteFile {
@@ -249,28 +286,33 @@ async fn expired_delete_files_vanish_at_head_but_time_travel_sees_them() {
                     encryption_key: None,
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
         .unwrap();
-    let registered = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let registered = catalog.read_scope().await.unwrap().current_snapshot().id;
 
     catalog
-        .commit(move |tx| {
-            let delete_file = tx.delete_files_of(t)[0].id;
-            tx.expire_delete_file(t, delete_file)
+        .commit(async move |tx| {
+            let delete_file = tx.delete_files_of(t).await.unwrap()[0].id;
+            tx.expire_delete_file(t, delete_file).await
         })
         .await
         .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
-    assert!(head.delete_files_of(t).is_empty());
-    assert_eq!(head.data_files_of(t).len(), 1, "the data file survives");
+    let head = catalog.read_scope().await.unwrap();
+    assert!(head.delete_files_of(t).await.unwrap().is_empty());
+    assert_eq!(
+        head.data_files_of(t).await.unwrap().len(),
+        1,
+        "the data file survives"
+    );
 
     // The expiry is versioned: time travel still serves the delete file.
-    let past = catalog.snapshot_at(registered).await.unwrap();
-    assert_eq!(past.delete_files_of(t).len(), 1);
+    let past = catalog.read_scope_at(registered).await.unwrap();
+    assert_eq!(past.delete_files_of(t).await.unwrap().len(), 1);
     catalog.close().await.unwrap();
 }
 
@@ -288,7 +330,7 @@ async fn expiry_keeps_file_column_stats_the_past_still_resolves() {
 
     let (catalog, t) = seeded().await;
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.register_data_file(
                 t,
                 DataFile {
@@ -306,23 +348,33 @@ async fn expiry_keeps_file_column_stats_the_past_still_resolves() {
                 },
                 &[],
             )
+            .await
             .map(|_| ())
         })
         .await
         .unwrap();
-    let registered = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let registered = catalog.read_scope().await.unwrap().current_snapshot().id;
 
-    let file_id = catalog.snapshot().await.unwrap().data_files_of(t)[0].id;
+    let file_id = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(t)
+        .await
+        .unwrap()[0]
+        .id;
     catalog
-        .commit(move |tx| tx.expire_data_file(t, file_id))
+        .commit(async move |tx| tx.expire_data_file(t, file_id).await)
         .await
         .unwrap();
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .data_files_of(t)
+            .await
+            .unwrap()
             .is_empty()
     );
 
@@ -336,10 +388,12 @@ async fn expiry_keeps_file_column_stats_the_past_still_resolves() {
     );
     assert_eq!(
         catalog
-            .snapshot_at(registered)
+            .read_scope_at(registered)
             .await
             .unwrap()
             .data_files_of(t)
+            .await
+            .unwrap()
             .len(),
         1
     );
@@ -354,7 +408,11 @@ async fn file_column_stats_sweep_is_bounded_and_idempotent() {
 
     let (catalog, t) = seeded().await;
     catalog
-        .commit(move |tx| tx.register_data_file(t, datafile(100), &[]).map(|_| ()))
+        .commit(async move |tx| {
+            tx.register_data_file(t, datafile(100), &[])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap();
 

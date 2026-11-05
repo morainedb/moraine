@@ -44,14 +44,10 @@ async fn acknowledged_slots_are_available_in_fixed_read_scopes() {
         .unwrap();
     let reader = Catalog::open_read_only(objects, options).await.unwrap();
     writer
-        .commit(|tx| tx.set_option(crate::OptionScope::Global, "probe", "first"))
+        .commit_materialized(|tx| tx.set_option(crate::OptionScope::Global, "probe", "first"))
         .await
         .unwrap();
-    let first = reader
-        .index_read_scope()
-        .await
-        .unwrap()
-        .expect("fixed scope");
+    let first = reader.index_read_scope().await.unwrap();
     assert_eq!(
         crate::ffi_support::catalog_read::global_option(first.reads(), "probe")
             .await
@@ -60,14 +56,10 @@ async fn acknowledged_slots_are_available_in_fixed_read_scopes() {
         Some("first")
     );
     writer
-        .commit(|tx| tx.set_option(crate::OptionScope::Global, "probe", "second"))
+        .commit_materialized(|tx| tx.set_option(crate::OptionScope::Global, "probe", "second"))
         .await
         .unwrap();
-    let second = reader
-        .index_read_scope()
-        .await
-        .unwrap()
-        .expect("new fixed scope");
+    let second = reader.index_read_scope().await.unwrap();
     assert_ne!(first.identity(), second.identity());
     assert_eq!(
         crate::ffi_support::catalog_read::global_option(first.reads(), "probe")
@@ -202,7 +194,13 @@ async fn a_tailing_read_only_open_is_served_the_logs_slots() {
         "the tailing reader replayed the slot"
     );
     assert_eq!(
-        reader.snapshot().await.unwrap().current_snapshot().id.get(),
+        reader
+            .materialized()
+            .await
+            .unwrap()
+            .current_snapshot()
+            .id
+            .get(),
         0
     );
     reader.close().await.unwrap();
@@ -240,7 +238,7 @@ async fn a_committer_adopts_the_log_and_commits_through_it() {
     );
 
     committer
-        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("s").map(|_| ()))
         .await
         .unwrap();
     let slots = provider.log.slots();
@@ -268,7 +266,7 @@ async fn a_committer_adopts_the_log_and_commits_through_it() {
     .unwrap();
     assert!(
         reader
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("s")
@@ -304,7 +302,7 @@ async fn a_lost_race_is_served_the_winner_before_the_retry_lands() {
         .land_unseen(2, peer_slot(&provider, 2, b"\xffpeer", b"landed"));
 
     committer
-        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("s").map(|_| ()))
         .await
         .unwrap();
     assert_eq!(
@@ -351,7 +349,7 @@ async fn two_committers_commit_through_one_log() {
     .await
     .unwrap();
     first
-        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
 
@@ -369,7 +367,7 @@ async fn two_committers_commit_through_one_log() {
     .await
     .unwrap();
     second
-        .commit(|tx| tx.create_schema("b").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("b").map(|_| ()))
         .await
         .unwrap();
     assert_eq!(
@@ -377,7 +375,7 @@ async fn two_committers_commit_through_one_log() {
         vec![1, 2, 3],
         "the second committer's batch is the third slot"
     );
-    let seen = second.snapshot().await.unwrap();
+    let seen = second.materialized().await.unwrap();
     assert!(
         seen.schema_by_name("a").is_some(),
         "the first committer's commit, served"
@@ -387,7 +385,7 @@ async fn two_committers_commit_through_one_log() {
     // The first is served slot 3 as it reads, and lands after it.
     assert!(
         first
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("b")
@@ -395,7 +393,7 @@ async fn two_committers_commit_through_one_log() {
         "a read is served the peer's slot"
     );
     first
-        .commit(|tx| tx.create_schema("c").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("c").map(|_| ()))
         .await
         .unwrap();
     assert_eq!(sequences(&provider), vec![1, 2, 3, 4]);
@@ -407,7 +405,7 @@ async fn two_committers_commit_through_one_log() {
 
     // And the second is served the first's slot in turn: a read asks, and
     // the listing it causes serves the slot.
-    second.snapshot().await.unwrap();
+    second.materialized().await.unwrap();
     assert!(
         second_provider
             .await_served(4, std::time::Duration::from_secs(5))
@@ -415,7 +413,7 @@ async fn two_committers_commit_through_one_log() {
     );
     assert!(
         second
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("c")
@@ -445,7 +443,7 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
     .await
     .unwrap();
     adopter
-        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
     adopter.close().await.unwrap();
@@ -471,7 +469,7 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
     committer_provider.report_served(3);
 
     let outcome = committer
-        .commit(|tx| tx.create_schema("b").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("b").map(|_| ()))
         .await;
     assert!(
         outcome.is_ok(),
@@ -508,7 +506,7 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
     .unwrap();
     for name in ["a", "b"] {
         committer
-            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema(name).map(|_| ()))
             .await
             .unwrap();
     }
@@ -527,7 +525,7 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
     }
     for name in ["c", "d"] {
         committer
-            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema(name).map(|_| ()))
             .await
             .unwrap();
     }
@@ -544,7 +542,7 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
     .unwrap();
     assert!(
         folded_only
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("d")
@@ -578,11 +576,16 @@ async fn a_handles_own_rows_land_as_head_preserving_slots() {
     .await
     .unwrap();
     committer
-        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
     let before = provider.log.slots().len();
-    let head_before = committer.snapshot().await.unwrap().current_snapshot().id;
+    let head_before = committer
+        .materialized()
+        .await
+        .unwrap()
+        .current_snapshot()
+        .id;
 
     committer
         .commit_own_rows(vec![(b"\xffown".to_vec(), Some(b"row".to_vec()))])
@@ -605,7 +608,12 @@ async fn a_handles_own_rows_land_as_head_preserving_slots() {
         "the slot carries the rows"
     );
     assert_eq!(
-        committer.snapshot().await.unwrap().current_snapshot().id,
+        committer
+            .materialized()
+            .await
+            .unwrap()
+            .current_snapshot()
+            .id,
         head_before
     );
     committer.close().await.unwrap();
@@ -628,7 +636,7 @@ async fn a_holder_folds_a_loss_and_applies_its_win() {
         .await
         .unwrap();
     committer
-        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
     committer.close().await.unwrap();
@@ -817,19 +825,19 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
     let idle = Catalog::open(object_store.clone(), options(idle_provider.clone()))
         .await
         .unwrap();
-    idle.snapshot().await.unwrap();
+    idle.materialized().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let listings = idle_provider.polls();
 
     let peer = Catalog::open(object_store, options(Arc::new(provider.sharing())))
         .await
         .unwrap();
-    peer.commit(|tx| tx.create_schema("landed").map(|_| ()))
+    peer.commit_materialized(|tx| tx.create_schema("landed").map(|_| ()))
         .await
         .unwrap();
 
     assert!(
-        idle.snapshot()
+        idle.materialized()
             .await
             .unwrap()
             .schema_by_name("landed")
@@ -886,7 +894,7 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     );
 
     committer
-        .commit(|tx| tx.create_schema("b").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("b").map(|_| ()))
         .await
         .unwrap();
     assert!(
@@ -895,7 +903,7 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     );
     assert!(
         committer
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("b")
@@ -940,7 +948,7 @@ async fn the_taker_folds_the_tail_without_a_live_catalog() {
     let before = replay_point(object_store.clone()).await;
     for name in ["a", "b", "c"] {
         committer
-            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema(name).map(|_| ()))
             .await
             .unwrap();
     }
@@ -978,7 +986,7 @@ async fn the_taker_folds_the_tail_without_a_live_catalog() {
     .unwrap();
     assert!(
         folded_only
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("c")
@@ -1039,7 +1047,7 @@ async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
         .await
         .unwrap();
     first
-        .commit(|tx| tx.create_schema("from_first").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("from_first").map(|_| ()))
         .await
         .unwrap();
 
@@ -1048,7 +1056,7 @@ async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
         .unwrap();
     assert!(
         second
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("from_first")
@@ -1056,14 +1064,14 @@ async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
         "the second committer opens on what the first committed"
     );
     second
-        .commit(|tx| tx.create_schema("from_second").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("from_second").map(|_| ()))
         .await
         .unwrap();
 
     // The first read after a peer's commit, with no idling in between.
     assert!(
         first
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("from_second")
@@ -1100,7 +1108,7 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
     // slot 8 are folded by whichever committer lands them.
     for index in 0..3 {
         committer
-            .commit(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
             .await
             .unwrap();
     }
@@ -1108,14 +1116,14 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
     let after_four = replay_point(object_store.clone()).await;
     for index in 3..6 {
         committer
-            .commit(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
             .await
             .unwrap();
     }
     assert_eq!(provider.folded_sequence(), 7, "slots 5..7 are published");
     assert_eq!(replay_point(object_store.clone()).await, after_four);
     committer
-        .commit(|tx| tx.create_schema("s6").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("s6").map(|_| ()))
         .await
         .unwrap();
     assert_eq!(
@@ -1139,7 +1147,7 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
     .unwrap();
     assert!(
         folded_only
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .schema_by_name("s6")
@@ -1188,11 +1196,11 @@ async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
     );
 
     committer
-        .commit(|tx| tx.create_schema("landed").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("landed").map(|_| ()))
         .await
         .unwrap();
     // A read asks; the tick it asked for lists, and the slot is served.
-    reader.snapshot().await.unwrap();
+    reader.materialized().await.unwrap();
     assert!(
         reader_provider
             .await_served(2, std::time::Duration::from_secs(5))
@@ -1223,7 +1231,7 @@ async fn a_demoted_lake_opens_without_its_provider() {
         .unwrap();
     for name in ["a", "b"] {
         committer
-            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .commit_materialized(|tx| tx.create_schema(name).map(|_| ()))
             .await
             .unwrap();
     }
@@ -1253,7 +1261,7 @@ async fn a_demoted_lake_opens_without_its_provider() {
     let plain = Catalog::open(object_store.clone(), options_at("lake"))
         .await
         .unwrap();
-    let snapshot = plain.snapshot().await.unwrap();
+    let snapshot = plain.materialized().await.unwrap();
     assert!(snapshot.schema_by_name("a").is_some());
     assert!(snapshot.schema_by_name("b").is_some());
     plain.close().await.unwrap();
@@ -1288,11 +1296,11 @@ async fn acknowledged_log_commits_are_visible_to_fixed_readers() {
     .await
     .unwrap();
     catalog
-        .commit(|transaction| transaction.create_schema("published").map(|_| ()))
+        .commit_materialized(|transaction| transaction.create_schema("published").map(|_| ()))
         .await
         .unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
-    let snapshot = scope.reads().snapshot().await.unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
+    let snapshot = scope.reads().materialized().await.unwrap();
     assert!(snapshot.schema_by_name("published").is_some());
     drop(snapshot);
     drop(scope);

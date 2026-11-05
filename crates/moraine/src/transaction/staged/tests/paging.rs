@@ -16,7 +16,7 @@ async fn paged_staged_files_match_the_overlay_and_freeze_authored_rows() {
         snapshot_changes_row(1, "inserted_into_table:1"),
     ));
     setup.commit().await.unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
         .with_read_scope(scope.reads().clone());
     tx.stage(insert_row(TableKind::DataFile, data_file_row(200, 1, 2)));
@@ -74,7 +74,7 @@ async fn paged_stats_replace_and_delete_without_retaining_the_directory() {
             .unwrap();
     }
     catalog.commit_write_tx(write).await.unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
         .with_read_scope(scope.reads().clone());
     tx.stage(insert_row(
@@ -141,7 +141,7 @@ async fn paged_table_inserts_inherit_only_surviving_counters() {
     }
     catalog.commit_write_tx(write).await.unwrap();
     for delete_current in [false, true] {
-        let scope = catalog.index_read_scope().await.unwrap().unwrap();
+        let scope = catalog.index_read_scope().await.unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
             .with_read_scope(scope.reads().clone());
         tx.stage(RowOperation::UpdateSetEnd {
@@ -202,7 +202,7 @@ async fn container_pages_merge_existing_and_new_scopes_once() {
             .unwrap();
     }
     catalog.commit_write_tx(write).await.unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
         .with_read_scope(scope.reads().clone());
     for id in [0, 200] {
@@ -283,7 +283,7 @@ async fn snapshot_pages_skip_deleted_runs_without_ending_the_scan() {
             .unwrap();
     }
     catalog.commit_write_tx(write).await.unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
         .with_read_scope(scope.reads().clone());
     for id in 0..130 {
@@ -332,7 +332,7 @@ async fn snapshot_pages_skip_deleted_runs_without_ending_the_scan() {
 async fn child_pages_merge_parent_edits_and_authored_rows() {
     let catalog = open().await;
     seed_table(&catalog).await;
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
         .with_read_scope(scope.reads().clone());
     for id in 10..140 {
@@ -433,7 +433,7 @@ async fn schema_version_pages_apply_deletes_inserts_and_file_floors() {
         )
         .unwrap();
     catalog.commit_write_tx(write).await.unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
         .with_read_scope(scope.reads().clone());
     tx.stage(RowOperation::Delete {

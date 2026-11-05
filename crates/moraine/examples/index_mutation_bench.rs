@@ -65,27 +65,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = Catalog::open(Arc::new(InMemory::new()), options).await?;
     let ids = Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("s")?;
-            let table = tx.create_table(
-                schema,
-                "t",
-                &[ColumnDef {
-                    name: "a".into(),
-                    column_type: "BIGINT".into(),
-                    ..ColumnDef::default()
-                }],
-            )?;
-            let index = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_a".into(),
-                    columns: vec![tx.columns_of(table)[0].id],
-                    unique: true,
-                },
-                &[],
-            )?;
-            tx.register_data_file(table, file(0, existing), &entries(index, 0, existing))?;
+        .commit(async |tx| {
+            let schema = tx.create_schema("s").await?;
+            let table = tx
+                .create_table(
+                    schema,
+                    "t",
+                    &[ColumnDef {
+                        name: "a".into(),
+                        column_type: "BIGINT".into(),
+                        ..ColumnDef::default()
+                    }],
+                )
+                .await?;
+            let column = tx.columns_of(table).await?[0].id;
+            let index = tx
+                .create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![column],
+                        unique: true,
+                    },
+                    &[],
+                )
+                .await?;
+            tx.register_data_file(table, file(0, existing), &entries(index, 0, existing))
+                .await?;
             ids.set(Some((table, index)));
             Ok(())
         })
@@ -105,8 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started_cpu = ProcessTime::now();
         let started = Instant::now();
         catalog
-            .commit(|tx| {
+            .commit(async |tx| {
                 tx.register_data_file(table, file.clone(), &entries)
+                    .await
                     .map(|_| ())
             })
             .await?;

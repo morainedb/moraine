@@ -16,6 +16,7 @@ mod maintenance;
 #[cfg(test)]
 mod memory_fixture;
 mod migration_store;
+mod mutations;
 mod revision_memo;
 mod row_location;
 mod row_lookup;
@@ -45,10 +46,11 @@ use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+#[cfg(test)]
+use crate::CatalogSnapshot;
 use crate::{
     catalog::{
-        CatalogSnapshot, RecentRow, SnapshotId, StoreCheckpoint, TableId, Timestamp,
-        projection::ProjectionCache,
+        RecentRow, SnapshotId, StoreCheckpoint, TableId, Timestamp, projection::ProjectionCache,
     },
     commit_log::LogCommitter,
     data_file,
@@ -89,17 +91,22 @@ pub struct MigrationRequest {
 /// needs.
 #[derive(Debug, Default)]
 struct ReadTally {
+    #[cfg(test)]
     materializations: AtomicU64,
+    #[cfg(test)]
     refreshes: AtomicU64,
+    #[cfg(test)]
     cache_hits: AtomicU64,
     head_reads: AtomicU64,
     /// Read transactions opened on the writer.
     read_transactions: AtomicU64,
+    #[cfg(test)]
     materialize_micros: AtomicU64,
     #[cfg(test)]
     current_scans: AtomicU64,
 }
 
+#[cfg(test)]
 impl ReadTally {
     /// Records a full rebuild and reports it, with the running totals that
     /// make one attach's behaviour legible in a log.
@@ -819,7 +826,13 @@ fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
 
 /// One member of a [`Catalog::commit_group`] batch: a closure authoring
 /// one logical commit.
-pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
+pub type CommitMember<'a> = &'a (
+        dyn for<'tx> Fn(
+    &'tx mut Transaction,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<()>> + Send + 'tx>,
+> + Sync
+    );
 
 /// Ceilings for the per-revision memos beside the probe cache: located
 /// candidates are a few tens of bytes per row; a deletion ledger can run to
@@ -848,7 +861,7 @@ const MEMO_ENTRIES: usize = 4096;
 /// # writer.close().await?;
 /// let reader = Catalog::open_read_only(object_store, CatalogOptions::default()).await?;
 /// // There is no `commit` on a read-only handle, so this does not build.
-/// reader.commit(|tx| tx.create_schema("nope").map(|_| ())).await?;
+/// reader.commit(async |tx| tx.create_schema("nope").await.map(|_| ())).await?;
 /// # Ok::<(), moraine::Error>(()) }).unwrap();
 /// ```
 ///
@@ -861,10 +874,10 @@ const MEMO_ENTRIES: usize = 4096;
 /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 /// # let object_store = Arc::new(InMemory::new());
 /// # let writer = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
-/// # writer.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+/// writer.commit(async |tx| tx.create_schema("sales").await.map(|_| ())).await?;
 /// # writer.close().await?;
 /// let reader = Catalog::open_read_only(object_store, CatalogOptions::default()).await?;
-/// assert!(reader.snapshot().await?.schema_by_name("sales").is_some());
+/// assert!(reader.read_scope().await?.schema_by_name("sales").await?.is_some());
 /// # Ok::<(), moraine::Error>(()) }).unwrap();
 /// ```
 #[derive(Clone)]
@@ -1135,7 +1148,8 @@ impl ReadOnlyCatalog {
     /// # Errors
     ///
     /// Returns an error if the store cannot be read.
-    pub async fn snapshot(&self) -> Result<Arc<CatalogSnapshot>> {
+    #[cfg(test)]
+    pub(crate) async fn materialized(&self) -> Result<Arc<CatalogSnapshot>> {
         self.view(None).await
     }
 
@@ -1145,14 +1159,18 @@ impl ReadOnlyCatalog {
     ///
     /// Returns [`Error::NotFound`] if `snapshot` is beyond the head, or
     /// another error if the store cannot be read.
-    pub async fn snapshot_at(&self, snapshot: SnapshotId) -> Result<Arc<CatalogSnapshot>> {
+    #[cfg(test)]
+    pub(crate) async fn materialized_at(
+        &self,
+        snapshot: SnapshotId,
+    ) -> Result<Arc<CatalogSnapshot>> {
         self.view(Some(snapshot.get())).await
     }
 
     /// A table's inlined rows live at the latest committed snapshot, in
     /// row-id order, each carrying the Arrow IPC bytes it decodes from.
     ///
-    /// These rows are not part of a [`CatalogSnapshot`]: they are served
+    /// These rows are not part of a [`crate::ReadScope`]: they are served
     /// from the `inline` subspace on demand, one range scan per call. Rows
     /// of one chunk share one body and rows of one schema version share one
     /// schema.
@@ -1172,8 +1190,8 @@ impl ReadOnlyCatalog {
     /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
     /// # let created = std::cell::Cell::new(None);
     /// catalog
-    ///     .commit(|tx| {
-    ///         let main = tx.schema_by_name("main").expect("bootstrap schema").id;
+    ///     .commit(async |tx| {
+    ///         let main = tx.schema_by_name("main").await?.expect("bootstrap schema").id;
     ///         let orders = tx.create_table(
     ///             main,
     ///             "orders",
@@ -1184,7 +1202,7 @@ impl ReadOnlyCatalog {
     ///                 default_value: None,
     ///                 children: Vec::new(),
     ///             }],
-    ///         )?;
+    ///         ).await?;
     ///         // The Arrow bytes are the caller's to produce; moraine stores
     ///         // and returns them verbatim.
     ///         tx.inline_insert(
@@ -1196,7 +1214,7 @@ impl ReadOnlyCatalog {
     ///                 row_count: 2,
     ///             },
     ///             &[],
-    ///         )?;
+    ///         ).await?;
     /// #       created.set(Some(orders));
     ///         Ok(())
     ///     })
@@ -1224,7 +1242,7 @@ impl ReadOnlyCatalog {
     ///
     /// Only rows still inlined are found: past snapshots of flushed rows
     /// read from the backdated data file
-    /// [`CatalogSnapshot::data_files_of`] serves, never from here.
+    /// [`crate::ReadScope::data_files_of`] serves, never from here.
     ///
     /// # Errors
     ///
@@ -1259,6 +1277,7 @@ impl ReadOnlyCatalog {
     }
 
     /// Materializes a caller-owned view at one store read point.
+    #[cfg(test)]
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
         let session = self.begin_read().await?;
         let started = Instant::now();
@@ -1287,7 +1306,7 @@ impl ReadOnlyCatalog {
 
     /// Opens a read session at the current head — a read-write transaction or
     /// the read-only reader — the same isolation
-    /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
+    /// [`snapshot`](Self::read_scope)/[`snapshot_at`](Self::read_scope_at) use.
     /// Every read of the store opens its session here, so this is where a
     /// store mid-structural-migration is refused. The check is keyed on
     /// the head: a migration start moves it, so a head already observed
@@ -1441,10 +1460,8 @@ impl Catalog {
         &self,
         dry_run: bool,
     ) -> Result<crate::transaction::migration::CatalogVersionRaise> {
-        let from = self
-            .snapshot()
+        let from = crate::ffi_support::catalog_read::global_option(self, "version")
             .await?
-            .option(crate::catalog::OptionScope::Global, "version")
             .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
         let to = crate::catalog::MAX_CATALOG_VERSION.to_owned();
 
@@ -1461,23 +1478,26 @@ impl Catalog {
         }
 
         let target = to.clone();
-        self.commit(move |tx| {
-            // Re-read inside the commit. Recording the version is
-            // last-write-wins, so a check made against the snapshot above
-            // could be overtaken between that read and this write; this is
-            // the one that holds the never-lower invariant.
-            let recorded = tx
-                .catalog_version()
-                .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
-            if !crate::catalog::serves_catalog_version(&recorded) {
-                return Err(Error::Migration(format!(
-                    "store records catalog version {recorded}, which this build does not serve"
-                )));
-            }
+        self.commit_scoped(
+            crate::transaction::scoped::CommitRead::Options(crate::OptionScope::Global),
+            move |tx| {
+                // Re-read inside the commit. Recording the version is
+                // last-write-wins, so a check made against the snapshot above
+                // could be overtaken between that read and this write; this is
+                // the one that holds the never-lower invariant.
+                let recorded = tx
+                    .catalog_version()
+                    .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
+                if !crate::catalog::serves_catalog_version(&recorded) {
+                    return Err(Error::Migration(format!(
+                        "store records catalog version {recorded}, which this build does not serve"
+                    )));
+                }
 
-            tx.set_catalog_version(&target);
-            Ok(())
-        })
+                tx.set_catalog_version(&target);
+                Ok(())
+            },
+        )
         .await?;
         Ok(crate::transaction::migration::CatalogVersionRaise { from, to })
     }
@@ -1507,7 +1527,7 @@ impl Catalog {
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
     /// // Bootstrap mints the default `main` schema.
-    /// assert_eq!(catalog.snapshot().await?.schemas().len(), 1);
+    /// assert_eq!(catalog.read_scope().await?.schemas().await?.len(), 1);
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
@@ -1964,18 +1984,18 @@ impl Catalog {
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let object_store = Arc::new(InMemory::new());
     /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
-    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+    /// catalog.commit(async |tx| tx.create_schema("sales").await.map(|_| ())).await?;
     /// let checkpoint = catalog.create_checkpoint(None).await?;
     ///
     /// // A commit after the checkpoint is not in it.
-    /// catalog.commit(|tx| tx.create_schema("ops").map(|_| ())).await?;
+    /// catalog.commit(async |tx| tx.create_schema("ops").await.map(|_| ())).await?;
     ///
     /// let mut options = CatalogOptions::default();
     /// options.checkpoint = Some(checkpoint);
     /// let reader = Catalog::open_read_only(object_store, options).await?;
-    /// let view = reader.snapshot().await?;
-    /// assert!(view.schema_by_name("sales").is_some());
-    /// assert!(view.schema_by_name("ops").is_none());
+    /// let view = reader.read_scope().await?;
+    /// assert!(view.schema_by_name("sales").await?.is_some());
+    /// assert!(view.schema_by_name("ops").await?.is_none());
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open_read_only(
@@ -2422,8 +2442,8 @@ impl Catalog {
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
     /// let snapshot = catalog
-    ///     .commit(|tx| {
-    ///         let sales = tx.create_schema("sales")?;
+    ///     .commit(async |tx| {
+    ///         let sales = tx.create_schema("sales").await?;
     ///         tx.create_table(
     ///             sales,
     ///             "orders",
@@ -2434,17 +2454,18 @@ impl Catalog {
     ///                 default_value: None,
     ///                 children: Vec::new(),
     ///             }],
-    ///         )?;
+    ///         ).await?;
     ///         Ok(())
     ///     })
     ///     .await?;
     /// // `main` plus the newly created `sales` schema.
-    /// assert_eq!(catalog.snapshot_at(snapshot).await?.schemas().len(), 2);
+    /// assert_eq!(catalog.read_scope_at(snapshot).await?.schemas().await?.len(), 2);
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
-    pub async fn commit<F>(&self, f: F) -> Result<SnapshotId>
+    #[cfg(test)]
+    pub(crate) async fn commit_materialized<F>(&self, f: F) -> Result<SnapshotId>
     where
-        F: Fn(&mut Transaction) -> Result<()>,
+        F: Fn(&mut crate::transaction::verbs::Transaction) -> Result<()>,
     {
         let ids =
             commit::commit_cycle(&self.store, std::slice::from_ref(&f), &self.commits).await?;
@@ -2452,51 +2473,34 @@ impl Catalog {
             Error::Corruption("a commit of one member reported no snapshot".to_string())
         })
     }
+}
 
-    /// Commits several mutations as one batch, made durable by one flush.
-    ///
-    /// Each closure is its own logical commit with its own snapshot — a
-    /// group batches commits, it does not merge them — so the returned ids
-    /// are one per member, in member order, and time travel resolves each
-    /// separately. Members run in the order given, and each stages against
-    /// the state the members before it left, so a group never conflicts
-    /// with itself. Where [`Catalog::commit`] costs one durable flush per
-    /// mutation, a group costs one for all of them.
-    ///
-    /// The batch is the unit of durability: a crash leaves every member
-    /// committed or none of them, and a member that fails aborts the whole
-    /// group, including members that already staged. Closures may be re-run
-    /// as a group after a lost race with a concurrent commit, so the purity
-    /// requirement of [`Catalog::commit`] applies to every member.
+impl Catalog {
+    /// Commits an atomic mutation, loading metadata on demand.
+    /// The callback may run again after a concurrent commit and must not
+    /// perform external side effects.
     ///
     /// # Errors
+    /// Returns a callback error, commit conflict, or store error.
+    pub async fn commit<F>(&self, callback: F) -> Result<SnapshotId>
+    where
+        F: AsyncFn(&mut Transaction) -> Result<()>,
+    {
+        let ids = commit::commit_cycle(&self.store, &commit::DemandMember(callback), &self.commits)
+            .await?;
+        ids.first()
+            .copied()
+            .ok_or_else(|| Error::Corruption("commit returned no snapshot".into()))
+    }
+
+    /// Commits callbacks as one atomic group with one snapshot per member.
+    /// Callbacks may be retried together and must not perform external side
+    /// effects.
     ///
-    /// Returns whatever error any member returns (the whole group is
-    /// aborted), or the errors [`Catalog::commit`] documents — a conflict
-    /// or an exhausted retry budget applies to the group as a whole.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions, Transaction};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// let ids = catalog
-    ///     .commit_group(&[
-    ///         &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
-    ///         &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
-    ///     ])
-    ///     .await?;
-    ///
-    /// // Two snapshots, one flush.
-    /// assert_eq!(ids.len(), 2);
-    /// assert_eq!(ids[1].get(), ids[0].get() + 1);
-    /// assert!(catalog.snapshot_at(ids[0]).await?.schema_by_name("ops").is_none());
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
+    /// # Errors
+    /// Any callback error aborts the group. Store and conflict errors
+    /// propagate.
     pub async fn commit_group(&self, members: &[CommitMember<'_>]) -> Result<Vec<SnapshotId>> {
-        commit::commit_cycle(&self.store, members, &self.commits).await
+        commit::commit_cycle(&self.store, &commit::DemandGroup(members), &self.commits).await
     }
 }

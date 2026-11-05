@@ -148,7 +148,7 @@ impl ReadOnlyCatalog {
     /// # store: moraine::DataStore, table: moraine::TableId, file: moraine::DataFileId)
     /// # -> Result<(), moraine::Error> {
     /// let mut scan = catalog
-    ///     .scan_rows_at(
+    ///     .scan_rows_at_projected(
     ///         snapshot,
     ///         Some(store),
     ///         "",
@@ -160,7 +160,7 @@ impl ReadOnlyCatalog {
     /// while let Some(batch) = scan.next_record_batch().await? {
     ///     // Consume this projected batch before requesting the next one.
     ///     assert!(batch.num_rows() > 0);
-    /// }
+    /// # }
     /// # Ok(())
     /// # }
     /// ```
@@ -170,7 +170,8 @@ impl ReadOnlyCatalog {
     /// files or inline rows. Partially visible historical files return
     /// [`Error::Unsupported`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn scan_rows_at(
+    #[doc(hidden)]
+    pub async fn scan_rows_at_projected(
         &self,
         snapshot: &CatalogSnapshot,
         data_store: Option<DataStore>,
@@ -179,7 +180,7 @@ impl ReadOnlyCatalog {
         pairs: &[(u64, Option<DataFileId>)],
         columns: &[String],
     ) -> Result<LocatedRowScan> {
-        self.scan_rows_at_excluding(
+        self.scan_rows_at_excluding_projected(
             snapshot,
             data_store,
             data_prefix,
@@ -199,7 +200,8 @@ impl ReadOnlyCatalog {
     ///
     /// As [`Self::scan_rows_at`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn scan_rows_at_excluding(
+    #[doc(hidden)]
+    pub async fn scan_rows_at_excluding_projected(
         &self,
         snapshot: &CatalogSnapshot,
         data_store: Option<DataStore>,

@@ -262,11 +262,15 @@ existing semantics. Cold small mutations must not load unrelated catalog
 metadata. A partial operation view must never be installed as a complete
 catalog snapshot.
 
-The materialized closure API below remains a compatibility path; migrating
-the extension's staged-row commits must remove its full-view dependency too.
+Public asynchronous verb callbacks begin with only the head and counters.
+Each operation loads its dependency keys or ranges, keeping loaded-key identity
+so subsequent dependency reads cannot overwrite staged changes. Original and
+staged projections grow together; absent point reads are also remembered.
+Pending group writes are folded before the next callback starts. A commit-log
+reader's head is checked before and after the callback, and a move refuses the
+attempt. Eager verb preparation exists only as a unit-test reference.
 
-
-Verb transactions clone the structurally shared `CatalogSnapshot` maps.
+Verb transactions clone only their operation-owned `CatalogSnapshot` maps.
 Mutations copy affected tree paths; untouched maps and nested subtrees remain
 shared with the premise and held readers. Group formation and folding use the
 same representation, so each member avoids copying unrelated catalog rows.
@@ -297,8 +301,8 @@ These indexes and shared nodes are derived memory state, with no new on-disk
 encoding or migration. Commit conflict detection and WAL durability are unchanged.
 
 For a warm premise, a fixed metadata mutation pays for changed tree paths and
-its own encoded writes, rather than unrelated tables or files. Cold
-materialization, external refresh, explicit whole-table operations, large
+its own encoded writes, rather than unrelated tables or files. Explicit
+whole-table operations, large
 individual records, and projection readers retaining a copy-on-write dump are
 outside this bound. The release benchmark in
 `crates/moraine/examples/verb_commit_bench.rs` varies unrelated tables and files
@@ -316,8 +320,7 @@ ends, inlined writes) and lands them atomically:
    the `tstat` records for any tables this commit inserts rows into — all
    **through the transaction handle**, so the premise view and the
    conflict-detection window share one start sequence and no commit can
-   land unseen between them (RFC 0009, "Commit attempts materialize
-   through the transaction").
+   land unseen between them.
 2. **Allocate ids** locally by bumping in-memory copies of the counters:
    `next_catalog_id`/`next_file_id` from the snapshot record, `next_row_id`
    from each touched table's `tstat`. No store writes yet.
@@ -542,7 +545,7 @@ needs to understand what SQL produced the mutations.
 
 **What a benign-race retry re-runs (verb path).** A retry is a full re-run
 of the commit cycle, exactly as RFC 0003 specifies for `commit`: re-read a
-fresh `CatalogSnapshot` at the new head, **re-run the caller's closure**
+fresh demand-loaded premise at the new head, **re-run the caller's closure**
 against it, re-allocate ids from the advanced counters, re-stage, re-commit.
 The closure re-run is load-bearing, not an implementation nicety: it is
 what re-resolves names and re-validates logical premises against the state

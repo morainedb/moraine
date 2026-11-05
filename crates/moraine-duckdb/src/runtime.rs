@@ -344,51 +344,23 @@ where
 /// the half-built store's background tasks.
 pub(crate) const CANCELLED_ATTACH_SHUTDOWN: Duration = Duration::from_secs(5);
 
-/// A pinned read scope or an explicitly materialized compatibility view.
+/// A pinned catalog read scope.
 ///
 /// Opaque to C — only ever seen as a `MoraineSnapshotHandle*` obtained
-/// from [`moraine_snapshot`](crate::abi::moraine_snapshot) and released
-/// via [`moraine_snapshot_free`](crate::abi::moraine_snapshot_free).
+/// from [`moraine_snapshot_scoped`](crate::abi::moraine_snapshot_scoped) and
+/// released via [`moraine_snapshot_free`](crate::abi::moraine_snapshot_free).
 pub struct MoraineSnapshotHandle {
-    pub(crate) snapshot: Option<Arc<CatalogSnapshot>>,
     pub(crate) stamp: (u64, u64),
-    pub(crate) read_alias: Option<Box<MoraineCatalogHandle>>,
-    pub(crate) read_identity: Option<moraine::IndexReadIdentity>,
+    pub(crate) read_alias: Box<MoraineCatalogHandle>,
+    pub(crate) read_identity: moraine::IndexReadIdentity,
 }
 
 impl MoraineSnapshotHandle {
-    pub(crate) fn new(snapshot: Arc<CatalogSnapshot>) -> Self {
-        let stamp = moraine::ffi_support::snapshot_stamp(&snapshot);
-        Self {
-            snapshot: Some(snapshot),
-            stamp: (stamp.snapshot_id, stamp.batch_seq),
-            read_alias: None,
-            read_identity: None,
-        }
-    }
-
-    pub(crate) async fn materialize(&self) -> moraine::Result<Arc<CatalogSnapshot>> {
-        if let Some(snapshot) = &self.snapshot {
-            return Ok(Arc::clone(snapshot));
-        }
-        let alias = self
-            .read_alias
-            .as_ref()
-            .ok_or_else(|| moraine::Error::Corruption("snapshot has no read scope".to_owned()))?;
-        alias.catalog.reads().snapshot().await
-    }
-
     pub(crate) fn project(
         &self,
         projection: moraine::ffi_support::catalog_read::SnapshotProjection,
     ) -> Result<Arc<CatalogSnapshot>, AbiError> {
-        if let Some(snapshot) = &self.snapshot {
-            return Ok(Arc::clone(snapshot));
-        }
-        let alias = self
-            .read_alias
-            .as_ref()
-            .ok_or_else(|| AbiError::invalid_argument("snapshot has no read scope"))?;
+        let alias = &self.read_alias;
         // SAFETY: no callback or context is supplied; the deadline still applies.
         unsafe {
             alias.block_on_cancellable(

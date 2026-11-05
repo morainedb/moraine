@@ -3,6 +3,7 @@
 use std::{
     ffi::{c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
 };
 
 use arrow::{
@@ -114,9 +115,8 @@ pub unsafe extern "C" fn moraine_row_scan_open(
         // `positions_len` positions, for the duration of this call.
         let excluded = unsafe { owned_exclusions(excluded, excluded_len) }?;
         // SAFETY: caller supplies live handles and valid strings and arrays.
-        let (handle, schema, table, pairs, columns) = unsafe {
+        let (schema, table, pairs, columns) = unsafe {
             (
-                &*handle,
                 borrow_str(schema, "schema")?,
                 borrow_str(table, "table")?,
                 if pairs_len == 0 {
@@ -148,11 +148,21 @@ pub unsafe extern "C" fn moraine_row_scan_open(
                 )
             })
             .collect();
-        // SAFETY: caller supplies the pinned snapshot and cancellation pointers.
-        let view = unsafe { super::pinned_or_head(handle, snapshot, probe, probe_ctx) }?;
-        let table = resolve_table(&view, schema, table)?;
+        // SAFETY: caller supplies a live snapshot for this call.
+        let snapshot = unsafe { &*snapshot };
+        let handle = snapshot.read_alias.as_ref();
         let reads = handle.catalog.reads();
-        let open = reads.scan_rows_at_excluding(
+        let files: Vec<_> = pairs.iter().filter_map(|(_, file)| *file).collect();
+        // SAFETY: caller supplies valid cancellation pointers.
+        let view = Arc::new(unsafe {
+            handle.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::catalog_read::table_sources_for(reads, schema, table, &files),
+            )
+        }?);
+        let table = resolve_table(&view, schema, table)?;
+        let open = reads.scan_rows_at_excluding_projected(
             &view,
             handle.data_store.clone(),
             &handle.data_prefix,

@@ -27,8 +27,8 @@ fn parameter(name: &str) -> MacroParameterDef {
 async fn macros_commit_version_and_time_travel() {
     let catalog = open_memory().await;
     let created = catalog
-        .commit(|tx| {
-            let s = tx.create_schema("s")?;
+        .commit(async |tx| {
+            let s = tx.create_schema("s").await?;
             tx.create_macro(
                 s,
                 "add",
@@ -36,22 +36,23 @@ async fn macros_commit_version_and_time_travel() {
                     scalar_impl("(a + 1)", vec![parameter("a")]),
                     scalar_impl("(a + b)", vec![parameter("a"), parameter("b")]),
                 ],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
-    let s = head.schema_by_name("s").unwrap();
-    let m = head.macro_by_name(s.id, "add").unwrap();
+    let head = catalog.read_scope().await.unwrap();
+    let s = head.schema_by_name("s").await.unwrap().unwrap();
+    let m = head.macro_by_name(s.id, "add").await.unwrap().unwrap();
     assert_eq!(m.implementations.len(), 2);
     assert_eq!(m.implementations[1].parameters[1].name, "b");
 
     // Macros have their own namespace: a table named "add" coexists.
     catalog
-        .commit(move |tx| {
-            tx.create_table(s.id, "add", &[col("a")])?;
+        .commit(async move |tx| {
+            tx.create_table(s.id, "add", &[col("a")]).await?;
             Ok(())
         })
         .await
@@ -60,26 +61,36 @@ async fn macros_commit_version_and_time_travel() {
     // Replacement is drop + create under a fresh id.
     let m_id = m.id;
     catalog
-        .commit(move |tx| {
-            tx.drop_macro(m_id)?;
-            tx.create_macro(s.id, "add", &[scalar_impl("(a + 2)", vec![parameter("a")])])?;
+        .commit(async move |tx| {
+            tx.drop_macro(m_id).await?;
+            tx.create_macro(s.id, "add", &[scalar_impl("(a + 2)", vec![parameter("a")])])
+                .await?;
             Ok(())
         })
         .await
         .unwrap();
-    let head = catalog.snapshot().await.unwrap();
-    let replacement = head.macro_by_name(s.id, "add").unwrap();
+    let head = catalog.read_scope().await.unwrap();
+    let replacement = head.macro_by_name(s.id, "add").await.unwrap().unwrap();
     assert_ne!(replacement.id, m_id);
     assert_eq!(replacement.implementations[0].sql, "(a + 2)");
 
     // The pre-replacement definition is visible at the old snapshot.
-    let past = catalog.snapshot_at(created).await.unwrap();
-    assert_eq!(past.macro_by_id(m_id).unwrap().implementations.len(), 2);
+    let past = catalog.read_scope_at(created).await.unwrap();
+    assert_eq!(
+        past.macro_by_id(m_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .implementations
+            .len(),
+        2
+    );
 
     // Live-name collision among macros is rejected.
     let err = catalog
-        .commit(move |tx| {
-            tx.create_macro(s.id, "add", &[scalar_impl("1", vec![])])?;
+        .commit(async move |tx| {
+            tx.create_macro(s.id, "add", &[scalar_impl("1", vec![])])
+                .await?;
             Ok(())
         })
         .await
@@ -91,17 +102,17 @@ async fn macros_commit_version_and_time_travel() {
 async fn drop_schema_rejects_live_macros() {
     let catalog = open_memory().await;
     catalog
-        .commit(|tx| {
-            let s = tx.create_schema("s")?;
-            tx.create_macro(s, "m", &[scalar_impl("1", vec![])])?;
+        .commit(async |tx| {
+            let s = tx.create_schema("s").await?;
+            tx.create_macro(s, "m", &[scalar_impl("1", vec![])]).await?;
             Ok(())
         })
         .await
         .unwrap();
-    let head = catalog.snapshot().await.unwrap();
-    let s = head.schema_by_name("s").unwrap();
+    let head = catalog.read_scope().await.unwrap();
+    let s = head.schema_by_name("s").await.unwrap().unwrap();
     let err = catalog
-        .commit(move |tx| tx.drop_schema(s.id))
+        .commit(async move |tx| tx.drop_schema(s.id).await)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Constraint(_)));
