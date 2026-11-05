@@ -195,7 +195,9 @@ impl MetadataCursor {
         let Some(overlay) = &self.overlay else {
             return Ok(None);
         };
-        let row = overlay.inserted(self.inserted)?;
+        let row = overlay
+            .next_inserted(self.inserted, self.scope.owned_read_handle())
+            .await?;
         self.inserted += usize::from(row.is_some());
         Ok(row)
     }

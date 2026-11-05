@@ -474,3 +474,5 @@ async fn schema_version_pages_apply_deletes_inserts_and_file_floors() {
     tx.rollback();
     catalog.close().await.unwrap();
 }
+
+mod parent_tags;

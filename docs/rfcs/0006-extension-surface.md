@@ -683,8 +683,7 @@ a backward request restarts its cursor. Sequential mutations traverse the
 metadata once more; arbitrary row order can cause repeated scans. Array-based
 providers retain their operation-owned rows for identity resolution.
 
-All 28 committed metadata kinds and 26 staged kinds use bounded output pages.
-Staged column-tag and view-column-tag projections still use result arrays.
+All 28 committed and staged metadata kinds use bounded output pages.
 Neither attachment nor transaction retains a decoded metadata-row cache.
 DuckDB's planning and result memory remains separate from the core cursor budget.
 
@@ -694,7 +693,12 @@ is charged to working memory and shared with cursor forks. Forks restart at the
 same fixed read point and authored state, so later edits cannot change UPDATE or
 DELETE row identities. Table inserts inherit field-ID counters only from prior
 versions surviving at that operation. Embedded child projections retain only
-operation-sized owner maps, not committed parent directories.
+operation-sized owner maps, not committed parent directories. Tag scans suppress
+committed parents touched by staged operations and seek each touched parent's
+versions separately, retaining one surviving candidate. They select the
+current or newest ended version after lifecycle edits, then apply authored tag
+edits. Deleting the current parent can therefore expose an older version's tags
+without loading the column or view directory.
 
 Schema-version scans emit stored rows, then legacy snapshot-derived rows absent
 from the stored keyspace, then missing file floor rows. Two ordered file cursors

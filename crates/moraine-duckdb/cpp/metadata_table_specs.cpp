@@ -1307,6 +1307,8 @@ std::vector<MetadataTableSpec> MetadataTableSpecsImpl() {
 		case 19:
 		case 20:
 		case 23:
+		case 18:
+		case 26:
 			spec.staged_page_supported = true;
 			break;
 		default:

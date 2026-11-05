@@ -17,6 +17,7 @@ use crate::{
 
 mod children;
 mod containers;
+mod parent_tags;
 pub(crate) mod schema_versions;
 mod tables;
 
@@ -27,6 +28,7 @@ pub(crate) struct Overlay {
 }
 
 enum Rows {
+    ParentTags(parent_tags::Parents),
     Containers(containers::Containers),
     Snapshots(HashSet<u64>),
     SchemaVersions(schema_versions::Changes),
@@ -122,6 +124,9 @@ impl Rows {
         handle: crate::store::handle::OwnedReadHandle,
     ) -> Result<Self> {
         Ok(match table {
+            TableKind::ColumnTag | TableKind::ViewColumnTag => {
+                Rows::ParentTags(parent_tags::Parents::new(table, operations)?)
+            }
             TableKind::SchemaVersions => {
                 Rows::SchemaVersions(schema_versions::Changes::new(operations)?)
             }
@@ -225,10 +230,11 @@ impl Overlay {
     ) -> Result<Arc<Self>> {
         let requested_table = table;
         let table = children::parent(table);
-        let operation_table = if table == TableKind::SnapshotChanges {
-            TableKind::Snapshot
-        } else {
-            table
+        let operation_table = match table {
+            TableKind::SnapshotChanges => TableKind::Snapshot,
+            TableKind::ColumnTag => TableKind::Column,
+            TableKind::ViewColumnTag => TableKind::View,
+            _ => table,
         };
         let bytes = operations
             .iter()
@@ -253,6 +259,7 @@ impl Overlay {
 
     pub(crate) fn apply(&self, record: EntityRecord) -> Result<Option<EntityRecord>> {
         match (&self.rows, record) {
+            (Rows::ParentTags(rows), record) => rows.apply(record),
             (Rows::SchemaVersions(changes), EntityRecord::File(row)) => changes
                 .files
                 .apply(row)
@@ -321,6 +328,17 @@ impl Overlay {
         }
     }
 
+    pub(crate) async fn next_inserted(
+        &self,
+        index: usize,
+        handle: crate::store::handle::OwnedReadHandle,
+    ) -> Result<Option<(EntityRecord, MemoryReservation)>> {
+        match &self.rows {
+            Rows::ParentTags(rows) => rows.replacement(index, handle).await,
+            _ => self.inserted(index),
+        }
+    }
+
     pub(crate) fn inserted(
         &self,
         index: usize,
@@ -342,7 +360,7 @@ impl Overlay {
         }
         match &self.rows {
             Rows::Containers(rows) => rows.inserted(index),
-            Rows::Snapshots(_) | Rows::SchemaVersions(_) => Ok(None),
+            Rows::ParentTags(_) | Rows::Snapshots(_) | Rows::SchemaVersions(_) => Ok(None),
             Rows::Tables(rows) => export(rows.inserted.get(index), EntityRecord::Table),
             Rows::Files(rows) => export(rows.inserted.get(index), EntityRecord::File),
             Rows::DeleteFiles(rows) => export(rows.inserted.get(index), EntityRecord::DeleteFile),

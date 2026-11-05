@@ -1151,16 +1151,24 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_view_column_tags(&self) -> Result<Vec<(u64, proto::ViewColumnTag)>> {
-        let rows = self
-            .visible_views()
-            .await?
-            .into_iter()
-            .flat_map(|view| {
-                view.column_tags
-                    .into_iter()
-                    .map(move |tag| (view.view_id, tag))
-            })
-            .collect();
+        let views = self.visible_views().await?;
+        let rows = crate::ffi_support::view_column_tag_rows_from(
+            views.iter().map(crate::ffi_support::ViewColumnTags::from),
+        )
+        .into_iter()
+        .map(|row| {
+            (
+                row.view_id,
+                proto::ViewColumnTag {
+                    column_name: row.column_name,
+                    key: row.key,
+                    value: row.value,
+                    begin_snapshot: row.begin_snapshot,
+                    end_snapshot: row.end_snapshot,
+                },
+            )
+        })
+        .collect();
         overlay::overlay_view_column_tags(&self.ops, rows)
     }
 
