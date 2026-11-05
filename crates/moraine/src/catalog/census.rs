@@ -32,6 +32,8 @@ pub enum SubspaceName {
     Changelog,
     /// Persistent current-entity name entries.
     Name,
+    /// Current delete files ordered by target data file.
+    DeleteTarget,
     /// A segment whose prefix names no subspace this build knows. The raw
     /// prefix is carried verbatim; empty means the unsegmented root tree,
     /// which a store moraine wrote never has.
@@ -57,6 +59,7 @@ impl SubspaceName {
             Self::SchemaVersion => Some(Subspace::SchemaVersion),
             Self::Changelog => Some(Subspace::Changelog),
             Self::Name => Some(Subspace::Name),
+            Self::DeleteTarget => Some(Subspace::DeleteTarget),
             Self::Unknown(_) => None,
         }
     }
@@ -74,6 +77,7 @@ impl From<Subspace> for SubspaceName {
             Subspace::SchemaVersion => Self::SchemaVersion,
             Subspace::Changelog => Self::Changelog,
             Subspace::Name => Self::Name,
+            Subspace::DeleteTarget => Self::DeleteTarget,
         }
     }
 }
@@ -90,6 +94,7 @@ impl fmt::Display for SubspaceName {
             Self::SchemaVersion => f.write_str("schema_version"),
             Self::Changelog => f.write_str("changelog"),
             Self::Name => f.write_str("name"),
+            Self::DeleteTarget => f.write_str("delete_target"),
             Self::Unknown(prefix) => {
                 f.write_str("unknown(")?;
                 for byte in prefix {

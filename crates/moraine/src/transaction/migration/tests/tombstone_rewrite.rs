@@ -118,7 +118,11 @@ async fn old_formats_migrate_to_versioned_inline_tombstones() {
         assert_eq!(report.to_format, MAX_FORMAT_VERSION);
         assert_eq!(
             report.units_run,
-            ["version-inline-tombstones", "index-current-names"]
+            [
+                "version-inline-tombstones",
+                "index-current-names",
+                "index-delete-file-targets"
+            ]
         );
         assert_rewritten(&store, 3).await;
         let catalog = Catalog::open(store.clone(), CatalogOptions::default())

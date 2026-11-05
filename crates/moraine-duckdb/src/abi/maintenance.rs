@@ -1168,7 +1168,7 @@ fn parse_subspace(name: &str) -> Result<moraine::SubspaceName, AbiError> {
 }
 
 /// The subspaces a merge target may name.
-pub(super) const KNOWN_SUBSPACES: [moraine::SubspaceName; 9] = [
+pub(super) const KNOWN_SUBSPACES: [moraine::SubspaceName; 10] = [
     moraine::SubspaceName::System,
     moraine::SubspaceName::Snapshot,
     moraine::SubspaceName::Current,
@@ -1178,6 +1178,7 @@ pub(super) const KNOWN_SUBSPACES: [moraine::SubspaceName; 9] = [
     moraine::SubspaceName::SchemaVersion,
     moraine::SubspaceName::Changelog,
     moraine::SubspaceName::Name,
+    moraine::SubspaceName::DeleteTarget,
 ];
 
 /// Deletes published row summaries whose data file is gone, reporting what

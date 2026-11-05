@@ -463,3 +463,52 @@ async fn index_lifecycle_avoids_unrelated_catalog_records() {
     assert_eq!(entries.len(), 2);
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn inline_steps_commit_before_file_inventory_is_decoded() {
+    use crate::store::key::{EntityKey, Key};
+
+    let (catalog, table, def) = fixture(&[chunk(vec![10, 20, 30])]).await;
+    let index = catalog
+        .begin_staged_index(table, &def, &[], IndexMaintenance::Synchronous, true)
+        .await
+        .unwrap();
+    let before = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let write = catalog.begin_write_tx().unwrap();
+    write
+        .put(
+            Key::current(EntityKey::File {
+                table_id: table.get(),
+                data_file_id: 999,
+            })
+            .encode(),
+            b"invalid later file",
+        )
+        .unwrap();
+    catalog.commit_write_tx(write).await.unwrap();
+    let result = catalog
+        .drive_staged_build(
+            table,
+            &def,
+            index,
+            Some(DataStore::new(Arc::new(InMemory::new()))),
+            "",
+            BuildStep {
+                entries: 1,
+                bytes: 1024,
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Corruption(_))), "{result:?}");
+    assert!(
+        catalog
+            .table_snapshot(table, TableRead::Definition)
+            .await
+            .unwrap()
+            .current_snapshot()
+            .id
+            > before,
+        "file inventory was decoded before earlier inline steps could commit"
+    );
+    catalog.close().await.unwrap();
+}

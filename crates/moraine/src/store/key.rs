@@ -15,7 +15,9 @@ use crate::{
     store::index_encoding::CanonicalKey,
 };
 
+mod delete_targets;
 mod names;
+pub(crate) use delete_targets::delete_target_prefix;
 pub(crate) use names::{NameKey, NameKind, name_prefix};
 
 /// Length in bytes of the encoded subspace prefix — one discriminant
@@ -66,6 +68,15 @@ pub(crate) enum Key {
     },
     /// Exact-name entries for current metadata entities.
     Name(NameKey),
+    /// Current delete files ordered by their target data file.
+    DeleteTarget {
+        /// Owning table.
+        table_id: u64,
+        /// Target data file.
+        data_file_id: u64,
+        /// Referenced current delete-file record.
+        delete_file_id: u64,
+    },
 }
 
 /// An equality-index entry key. The unique kind keys on the value alone,
@@ -544,12 +555,14 @@ pub(crate) enum Subspace {
     Changelog,
     /// Persistent current-entity names.
     Name,
+    /// Current delete files ordered by target.
+    DeleteTarget,
 }
 
 impl Subspace {
     /// Every subspace, in discriminant order. A census walks this, so a
     /// subspace added to [`Key`] and left out here goes unreported.
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::System,
         Self::Snapshot,
         Self::Current,
@@ -559,6 +572,7 @@ impl Subspace {
         Self::SchemaVersion,
         Self::Changelog,
         Self::Name,
+        Self::DeleteTarget,
     ];
 
     /// The subspace whose keys carry exactly `prefix`, or `None` for a
@@ -589,6 +603,11 @@ impl Subspace {
                 begin_snapshot: 0,
             },
             Self::Changelog => Key::Changelog { snapshot_id: 0 },
+            Self::DeleteTarget => Key::DeleteTarget {
+                table_id: 0,
+                data_file_id: 0,
+                delete_file_id: 0,
+            },
             Self::Name => Key::Name(NameKey {
                 kind: NameKind::Schema,
                 parent: 0,

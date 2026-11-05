@@ -63,9 +63,11 @@ pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
 pub(crate) const FORMAT_WITH_COMMIT_LOG: u64 = 10;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_NAMES;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_DELETE_TARGETS;
 /// Current schemas and tables have an atomic exact-name directory.
 pub(crate) const FORMAT_WITH_NAMES: u64 = 11;
+/// Current delete files have an atomic target-data-file directory.
+pub(crate) const FORMAT_WITH_DELETE_TARGETS: u64 = 12;
 /// The lowest format this binary reads directly; a store below it must be
 /// migrated up first. Rises only when a format rewrites the keyspace.
 pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;
@@ -1349,6 +1351,9 @@ pub(crate) async fn stage_writes_on(
     writes: &[StagedWrite],
 ) -> Result<StagedBytes> {
     let mut staged = super::names::stage(session, writes).await?;
+    staged.0 = staged
+        .0
+        .saturating_add(super::file_targets::stage(session, writes).await?.0);
     for (key, write) in writes {
         staged.add(key.len(), write.as_ref().map_or(0, Vec::len));
         match write {

@@ -196,6 +196,53 @@ fn positioned_rows(
     Ok(positions)
 }
 
+/// Emits distinct candidates in request order, with sorted file IDs.
+fn candidate_rows(
+    row_ids: &[u64],
+    mut placements: HashMap<u64, Vec<DataFileId>>,
+    inlined: &HashSet<u64>,
+) -> Vec<FileRowCandidate> {
+    // Emit in the caller's order; locating must not reorder.
+    let mut seen = HashSet::new();
+    row_ids
+        .iter()
+        .copied()
+        .filter(|row_id| seen.insert(*row_id))
+        .flat_map(|row_id| {
+            // A live inlined row, and a row located nowhere at all, are
+            // both reported without a file rather than
+            // dropped.
+            let inline_placements =
+                if inlined.contains(&row_id) || !placements.contains_key(&row_id) {
+                    Some(FileRowCandidate {
+                        row_id,
+                        data_file_id: None,
+                    })
+                } else {
+                    None
+                };
+
+            let file_placements = if let Some(files) = placements.get_mut(&row_id) {
+                // Summaries resolve concurrently, so this arrives in
+                // completion order; candidates must not vary run to run.
+                files.sort_unstable();
+                files.dedup();
+                files
+                    .iter()
+                    .map(|data_file_id| FileRowCandidate {
+                        row_id,
+                        data_file_id: Some(*data_file_id),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            file_placements.into_iter().chain(inline_placements)
+        })
+        .collect::<Vec<_>>()
+}
+
 /// What one publishing pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowSummaryPublish {
@@ -307,9 +354,13 @@ impl ReadOnlyCatalog {
         }
 
         let started = Instant::now();
-        let snapshot = self
-            .table_snapshot(table, super::table_read::TableRead::Sources)
-            .await?;
+        let session = self.begin_read().await?;
+        let snapshot = super::table_read::load_table(
+            session.handle(),
+            table,
+            super::table_read::TableRead::Definition,
+        )
+        .await?;
         let snapshot_ms = milliseconds(started.elapsed());
 
         // The two halves run concurrently, so their elapsed times overlap
@@ -320,7 +371,14 @@ impl ReadOnlyCatalog {
                 return Ok((HashMap::<u64, Vec<DataFileId>>::new(), 0));
             };
             let placements = self
-                .locate_files(store, data_prefix, &snapshot, table, &row_ids)
+                .locate_file_pages(
+                    session.handle(),
+                    store,
+                    data_prefix,
+                    &snapshot,
+                    table,
+                    &row_ids,
+                )
                 .await?;
             Ok::<_, Error>((placements, milliseconds(started.elapsed())))
         };
@@ -330,51 +388,16 @@ impl ReadOnlyCatalog {
         // ids are needed, so the bodies stay unread.
         let inlined = async {
             let started = Instant::now();
-            let rows = self.requested_inline_row_ids(table, &row_ids, None).await?;
+            let rows = self
+                .requested_inline_row_ids_at(session.handle(), table, &row_ids)
+                .await?;
             Ok::<_, Error>((rows, milliseconds(started.elapsed())))
         };
-        let ((mut placements, files_ms), (inlined, inline_ms)) =
+        let ((placements, files_ms), (inlined, inline_ms)) =
             futures::try_join!(file_placements, inlined)?;
+        session.finish();
 
-        // Emit in the caller's order; locating must not reorder.
-        let mut seen = HashSet::new();
-        let located = row_ids
-            .iter()
-            .copied()
-            .filter(|row_id| seen.insert(*row_id))
-            .flat_map(|row_id| {
-                // A live inlined row, and a row located nowhere at all, are
-                // both reported without a file rather than
-                // dropped.
-                let inline_placements =
-                    if inlined.contains(&row_id) || !placements.contains_key(&row_id) {
-                        Some(FileRowCandidate {
-                            row_id,
-                            data_file_id: None,
-                        })
-                    } else {
-                        None
-                    };
-
-                let file_placements = if let Some(files) = placements.get_mut(&row_id) {
-                    // Summaries resolve concurrently, so this arrives in
-                    // completion order; candidates must not vary run to run.
-                    files.sort_unstable();
-                    files.dedup();
-                    files
-                        .iter()
-                        .map(|data_file_id| FileRowCandidate {
-                            row_id,
-                            data_file_id: Some(*data_file_id),
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                file_placements.into_iter().chain(inline_placements)
-            })
-            .collect::<Vec<_>>();
+        let located = candidate_rows(&row_ids, placements, &inlined);
 
         // The other half of an index read's bind: the lookup returns row ids,
         // this turns them into file candidates. `files_ms` is the summary

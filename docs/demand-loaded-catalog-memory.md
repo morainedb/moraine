@@ -133,3 +133,20 @@ These measurements preserve WAL-fresh publication. There is no forced SST flush
 per commit. WAL replay remains non-evictable inside SlateDB; SST-backed reads use
 Foyer. The adapter admits retained replay after one upstream batch is decoded,
 so that transient batch and native allocator overhead remain outside the bound.
+
+## File inventories
+
+Internal backfill and index verification now stream current data-file records.
+Format 12 maintains an atomic `(table, data file, delete file)` directory, so
+planning reads only delete records for the file being planned. Migration from
+11 backfills this directory in batches of 256 records; legacy reads remain
+supported but use repeated streaming delete scans until migrated.
+
+Row candidate lookup reads at most 128 file descriptors per page and ends a
+page when its decode allowance reaches 1 MiB, with one record permitted to
+cross that threshold. A 300-file regression verifies candidates across three
+pages and bounds the retained directory to one page. Retained data summaries
+carry 128-bit source signatures, not decoded catalog file records. These are
+structural bounds, not measured RSS savings. Uncached lookups now pay for a
+streaming file-metadata scan; storage blocks and immutable file summaries can
+still be served from their existing caches.

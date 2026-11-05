@@ -107,8 +107,7 @@ pub(crate) async fn load_table(
     .await
 }
 
-/// Reads requested files and streams delete records, retaining only their
-/// targets.
+/// Reads requested files and their registered delete records.
 pub(crate) async fn load_sources_for(
     handle: ReadHandle<'_>,
     view: &mut CatalogSnapshot,
@@ -130,19 +129,11 @@ pub(crate) async fn load_sources_for(
         )
         .await?;
     }
-    if !files.is_empty() {
-        let mut cursor = EntityCursor::open(
-            handle,
-            EntityRecordKind::DeleteFile,
-            Versions::Live,
-            Some(table.get()),
-        )
-        .await?;
-        while let Some((record, _memory)) = cursor.next().await? {
-            if matches!(&record, EntityRecord::DeleteFile(row) if files.binary_search(&crate::DataFileId::new(row.data_file_id)).is_ok())
-            {
-                retain(view, record)?;
-            }
+    for file in files {
+        let mut cursor =
+            super::file_targets::DeleteCursor::open(handle, table.get(), file.get()).await?;
+        while let Some((row, _memory)) = cursor.next().await? {
+            retain(view, EntityRecord::DeleteFile(row))?;
         }
     }
     Ok(())

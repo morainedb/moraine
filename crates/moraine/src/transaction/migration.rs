@@ -14,6 +14,7 @@ use tracing::info;
 
 use super::session::CommitSession;
 
+mod delete_targets;
 mod inline_tombstones;
 mod names;
 
@@ -65,6 +66,7 @@ pub(crate) const MIGRATIONS: &[MigrationUnit] = &[
     inline_tombstones::MIGRATION,
     names::NATIVE,
     names::COMMIT_LOG,
+    delete_targets::MIGRATION,
 ];
 
 /// What one raise call did.

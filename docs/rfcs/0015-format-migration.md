@@ -151,7 +151,13 @@ name keys, retaining only one decoded source record at a time. The cursor is
 the last source key. Format 9 and 10 continue to scan names and write no name
 entries until explicit migration completes. Legacy format 10 denotes a
 commit-log catalog; from format 11, `commit_log_batch_origin` distinguishes
-commit-log from native catalogs. Adoption and demotion preserve format 11.
+commit-log from native catalogs. Adoption and demotion preserve formats 11 and 12.
+
+The format-11-to-12 unit backfills the current delete-file target directory,
+with at most 256 records or approximately 1 MiB of staged keys per step. Its
+cursor is the last current delete-file key. As with the name migration, the
+marker blocks ordinary opens until the directory and format stamp agree.
+Legacy formats 9 and 10 reach 12 through the name-directory migration to 11.
 
 ### Single-writer migration
 

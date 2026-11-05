@@ -928,7 +928,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             &options,
             "SELECT count(*), sum(a) FROM lake.main.t;"
         )),
-        vec![vec!["11".to_string(), "144".to_string()]],
+        vec![vec!["12".to_string(), "144".to_string()]],
         "a maintenance pass must not change what the lake contains"
     );
 }

@@ -625,7 +625,7 @@ async fn name_directory_migration_backfills_multiple_batches() {
     .unwrap();
     assert_eq!(report.from_format, 9);
     assert!(report.resumed);
-    assert_eq!(report.to_format, 11);
+    assert_eq!(report.to_format, MAX_FORMAT_VERSION);
     let catalog = Catalog::open(store, CatalogOptions::default())
         .await
         .unwrap();

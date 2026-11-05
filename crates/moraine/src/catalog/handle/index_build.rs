@@ -1,6 +1,6 @@
 //! Resumable, bounded staged index construction.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use futures::TryStreamExt;
 use tokio::sync::mpsc;
@@ -22,7 +22,8 @@ use crate::{
         index_encoding::{Direction, IndexKeyValue, NullOrder, encode_ordered_index_entry},
         index_entries::scan_index_entries,
         key::IndexKind,
-        proto::{DataFileValue, DeleteFileValue, InlineBuildCursorValue},
+        proto::{DataFileValue, InlineBuildCursorValue},
+        read::{EntityCursor, EntityRecord, EntityRecordKind, Versions},
     },
     telemetry::reporting_phase,
     transaction::EncodedIndexEntry,
@@ -714,8 +715,8 @@ impl Catalog {
             );
             let derivation_started = Instant::now();
             let session = self.begin_read().await?;
-            let snapshot = load_table(session.handle(), table, TableRead::Sources).await?;
-            require_data_store(&snapshot, table, data_store.is_some())?;
+            let snapshot = load_table(session.handle(), table, TableRead::Definition).await?;
+            require_data_store_at(session.handle(), table, data_store.is_some()).await?;
             let source = backfill::BackfillSource {
                 snapshot: &snapshot,
                 table,
@@ -901,44 +902,54 @@ impl ReadOnlyCatalog {
             resolve_data_path(data_prefix, &table_prefix, path, is_relative)
         };
         let metrics = self.data_read_metrics();
-        let deletions_by_file = deletions_by_file(snapshot, table);
-
-        let mut remaining = snapshot
-            .data_files
-            .get(&table.get())
-            .into_iter()
-            .flat_map(|files| files.values())
-            .filter(|file| file_cursor.is_none_or(|cursor| file.data_file_id >= cursor))
-            .filter_map(|file| {
+        let records = EntityCursor::open(
+            handle,
+            EntityRecordKind::File,
+            Versions::Live,
+            Some(table.get()),
+        )
+        .await?;
+        let remaining = futures::stream::try_unfold(records, move |mut cursor| async move {
+            while let Some((record, memory)) = cursor.next().await? {
+                let EntityRecord::File(file) = record else {
+                    continue;
+                };
+                if file_cursor.is_some_and(|cursor| file.data_file_id < cursor) {
+                    continue;
+                }
                 let start = if file_cursor == Some(file.data_file_id) {
                     position_cursor.map_or(0, |position| position.saturating_add(1))
                 } else {
                     0
                 };
-                (start < file.record_count).then_some((file, start))
-            });
-        // Planning runs ahead of the unit window under one launch budget,
-        // and the feeder closes the window after the last unit, which is
-        // what ends the consumer.
+                if start < file.record_count {
+                    return Ok(Some(((file, start, memory), cursor)));
+                }
+            }
+            Ok(None)
+        });
+        let resolve = &resolve;
+        let object_store = &object_store;
+        let plans = remaining.map_ok(|(file, start, memory)| {
+            let metrics = Arc::clone(&metrics);
+            async move {
+                let _memory = memory;
+                plan_file(
+                    snapshot,
+                    table,
+                    handle,
+                    object_store,
+                    metrics,
+                    resolve,
+                    &file,
+                    start,
+                )
+                .await
+            }
+        });
         let (running, mut ready) = mpsc::channel::<RunningUnit>(UNIT_CONCURRENCY);
-        let feed = feeder::feed_window(
-            || {
-                remaining.next().map(|(file, start)| {
-                    plan_file(
-                        snapshot,
-                        table,
-                        handle,
-                        &object_store,
-                        Arc::clone(&metrics),
-                        &resolve,
-                        deletions_by_file
-                            .get(&file.data_file_id)
-                            .map_or(&[][..], Vec::as_slice),
-                        file,
-                        start,
-                    )
-                })
-            },
+        let feed = feeder::feed_stream(
+            Box::pin(plans),
             |plan| plan.units(&projection),
             Unit::spawn,
             running,
@@ -1004,26 +1015,6 @@ async fn establish_filter(
     Ok(())
 }
 
-/// A table's delete files, grouped by the data file each one targets.
-fn deletions_by_file(
-    snapshot: &CatalogSnapshot,
-    table: TableId,
-) -> HashMap<u64, Vec<&DeleteFileValue>> {
-    let mut by_file: HashMap<u64, Vec<&DeleteFileValue>> = HashMap::new();
-    for deletion in snapshot
-        .delete_files
-        .get(&table.get())
-        .into_iter()
-        .flat_map(|files| files.values())
-    {
-        by_file
-            .entry(deletion.data_file_id)
-            .or_default()
-            .push(deletion);
-    }
-    by_file
-}
-
 /// Resolves one file's read columns, dead positions, and row-group sizes.
 #[allow(clippy::too_many_arguments)]
 async fn plan_file(
@@ -1033,7 +1024,6 @@ async fn plan_file(
     object_store: &DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
     resolve: &impl Fn(&str, bool) -> Result<object_store::path::Path>,
-    deletions: &[&DeleteFileValue],
     file: &DataFileValue,
     start: u64,
 ) -> Result<FilePlan> {
@@ -1048,33 +1038,9 @@ async fn plan_file(
     .single_touch();
 
     let columns = snapshot.file_read_columns_at(handle, table, file);
-    let inline_dead =
-        crate::store::inline::stream::file_delete_positions(handle, table.get(), file_id);
-    let file_dead = async {
-        let mut dead = Vec::new();
-        for deletion in deletions {
-            dead.extend(
-                data_file::delete_file_positions(
-                    data_file::ParquetFile::new(
-                        object_store.clone(),
-                        resolve(&deletion.path, deletion.path_is_relative)?,
-                        deletion.file_size_bytes,
-                        deletion.footer_size,
-                    )
-                    .with_metrics(Arc::clone(&metrics)),
-                )
-                .await?,
-            );
-        }
-        Ok(dead)
-    };
-    let (columns, mut dead, file_dead, group_rows) = futures::try_join!(
-        columns,
-        inline_dead,
-        file_dead,
-        data_file::row_group_row_counts(&parquet)
-    )?;
-    dead.extend(file_dead);
+    let dead = backfill::dead_positions(handle, table, file_id, object_store, metrics, resolve);
+    let (columns, dead, group_rows) =
+        futures::try_join!(columns, dead, data_file::row_group_row_counts(&parquet))?;
 
     Ok(FilePlan {
         file: parquet.with_columns(columns),
@@ -1084,6 +1050,29 @@ async fn plan_file(
         group_rows,
         start,
     })
+}
+
+/// Probes file presence without retaining the table's file inventory.
+pub(super) async fn require_data_store_at(
+    handle: crate::store::handle::ReadHandle<'_>,
+    table: TableId,
+    has_data_store: bool,
+) -> Result<()> {
+    if !has_data_store {
+        let mut files = EntityCursor::open(
+            handle,
+            EntityRecordKind::File,
+            Versions::Live,
+            Some(table.get()),
+        )
+        .await?;
+        if files.next().await?.is_some() {
+            return Err(Error::Constraint(format!(
+                "staged index build for table {table} requires a data-path store"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A build must be able to read every registered file before it can publish.

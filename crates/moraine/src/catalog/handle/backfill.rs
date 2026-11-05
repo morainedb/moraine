@@ -14,13 +14,16 @@ use super::{
     table_read::{TableRead, load_table},
 };
 use crate::{
-    catalog::{
-        ColumnId, DataFileInfo, DeleteFileInfo, FileIndexEntry, IndexEntry, IndexId, TableId,
-        resolve_data_path,
-    },
+    catalog::{ColumnId, FileIndexEntry, IndexEntry, IndexId, TableId, resolve_data_path},
     data_file::{self, DataStore},
     error::{Error, Result},
-    store::{handle::ReadHandle, inline as store_inline, key::InlineOperation},
+    store::{
+        handle::ReadHandle,
+        inline as store_inline,
+        key::InlineOperation,
+        read::{EntityCursor, EntityRecord, EntityRecordKind, Versions},
+    },
+    transaction::file_targets::DeleteCursor,
 };
 
 #[derive(Clone, Copy)]
@@ -30,38 +33,53 @@ pub(super) struct BackfillSource<'a> {
     pub(super) handle: ReadHandle<'a>,
 }
 
-async fn collect_immediate_backfill<'a>(
-    files: impl Iterator<Item = DataFileInfo> + 'a,
+async fn collect_immediate_backfill(
     object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
     positions: &[usize],
-    source: BackfillSource<'a>,
+    source: BackfillSource<'_>,
     resolve: impl Fn(&str, bool) -> Result<Path>,
-    killed_positions: &'a HashMap<u64, HashSet<u64>>,
 ) -> Result<Vec<IndexEntry>> {
-    // Each future drains its file completely, so the one buffer below is the
-    // whole read window; a second stage would hold a window of its own.
-    stream::iter(files)
-        .map(move |file| {
+    let cursor = EntityCursor::open(
+        source.handle,
+        EntityRecordKind::File,
+        Versions::Live,
+        Some(source.table.get()),
+    )
+    .await?;
+    let files = stream::try_unfold(cursor, |mut cursor| async move {
+        while let Some((record, memory)) = cursor.next().await? {
+            if let EntityRecord::File(file) = record {
+                return Ok(Some(((file, memory), cursor)));
+            }
+        }
+        Ok(None)
+    });
+    let resolve = &resolve;
+    files
+        .map_ok(|(file, memory)| {
             let object_store = object_store.clone();
             let metrics = Arc::clone(&metrics);
-            let path = resolve(&file.path, file.path_is_relative);
-            let dead_positions = killed_positions.get(&file.id.get());
             async move {
-                let recorded = source
-                    .snapshot
-                    .data_files
-                    .get(&source.table.get())
-                    .and_then(|files| files.get(&file.id.get()))
-                    .ok_or_else(|| Error::NotFound(format!("data file {}", file.id)))?;
+                let _memory = memory;
                 let columns = source
                     .snapshot
-                    .file_read_columns_at(source.handle, source.table, recorded)
+                    .file_read_columns_at(source.handle, source.table, &file)
                     .await?;
+                let dead = dead_positions(
+                    source.handle,
+                    source.table,
+                    file.data_file_id,
+                    &object_store,
+                    Arc::clone(&metrics),
+                    resolve,
+                )
+                .await?;
+                let dead: data_file::RowPositions = dead.into_iter().collect();
                 data_file::scoped_read_entry_batches(
                     data_file::ParquetFile::new(
                         object_store,
-                        path?,
+                        resolve(&file.path, file.path_is_relative)?,
                         file.file_size_bytes,
                         file.footer_size,
                     )
@@ -75,21 +93,22 @@ async fn collect_immediate_backfill<'a>(
                     },
                 )
                 .await?
-                .try_fold(Vec::new(), move |mut entries, batch| async move {
-                    entries.extend(batch.into_iter().filter_map(|entry| {
-                        let dead = dead_positions
-                            .is_some_and(|positions| positions.contains(&entry.ordinal));
-                        (!dead).then_some(IndexEntry {
-                            row_id: entry.row_id,
-                            values: entry.values,
-                        })
-                    }));
-                    Ok(entries)
+                .try_fold(Vec::new(), move |mut entries, batch| {
+                    let dead = dead.clone();
+                    async move {
+                        entries.extend(batch.into_iter().filter_map(|entry| {
+                            (!dead.contains(entry.ordinal)).then_some(IndexEntry {
+                                row_id: entry.row_id,
+                                values: entry.values,
+                            })
+                        }));
+                        Ok(entries)
+                    }
                 })
                 .await
             }
         })
-        .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
+        .try_buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
         .try_fold(Vec::new(), |mut entries, file_entries| async move {
             entries.extend(file_entries);
             Ok(entries)
@@ -97,37 +116,39 @@ async fn collect_immediate_backfill<'a>(
         .await
 }
 
-pub(super) async fn collect_inline_delete_positions(
-    session_handle: ReadHandle<'_>,
-    table_id: u64,
-) -> Result<HashMap<u64, HashSet<u64>>> {
-    let killed = store_inline::scan_inline_file_deletes(session_handle, table_id)
-        .await?
-        .into_iter()
-        .fold(
-            HashMap::<u64, HashSet<u64>>::new(),
-            |mut killed, (data_file_id, row_id, _)| {
-                killed.entry(data_file_id).or_default().insert(row_id);
-                killed
-            },
-        );
-
-    Ok(killed)
-}
-
-/// Folds inline file-deletes into the delete-file positions of the same
-/// target. Both name a physical position within their file, so one map
-/// serves both.
-pub(super) fn merge_killed_positions(
-    killed_positions: &mut HashMap<u64, HashSet<u64>>,
-    inline_killed: HashMap<u64, HashSet<u64>>,
-) {
-    for (data_file_id, positions) in inline_killed {
-        killed_positions
-            .entry(data_file_id)
-            .or_default()
-            .extend(positions);
-    }
+/// Reads only deletion records targeting this file, at the derivation read
+/// point.
+pub(super) async fn dead_positions(
+    handle: ReadHandle<'_>,
+    table: TableId,
+    file: u64,
+    object_store: &DataStore,
+    metrics: Arc<data_file::ScopedReadMetrics>,
+    resolve: &impl Fn(&str, bool) -> Result<Path>,
+) -> Result<HashSet<u64>> {
+    let inline = store_inline::stream::file_delete_positions(handle, table.get(), file);
+    let external = async {
+        let mut cursor = DeleteCursor::open(handle, table.get(), file).await?;
+        let mut positions = Vec::new();
+        while let Some((deletion, _memory)) = cursor.next().await? {
+            positions.extend(
+                data_file::delete_file_positions(
+                    data_file::ParquetFile::new(
+                        object_store.clone(),
+                        resolve(&deletion.path, deletion.path_is_relative)?,
+                        deletion.file_size_bytes,
+                        deletion.footer_size,
+                    )
+                    .with_metrics(Arc::clone(&metrics)),
+                )
+                .await?,
+            );
+        }
+        Ok::<_, Error>(positions)
+    };
+    let (mut positions, external) = futures::try_join!(inline, external)?;
+    positions.extend(external);
+    Ok(positions)
 }
 
 /// The recorded inline schema of each distinct version in `schema_versions`,
@@ -156,41 +177,6 @@ pub(super) async fn read_inline_schemas(
     )
     .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
     .try_collect()
-    .await
-}
-
-pub(super) async fn collect_delete_positions<'a>(
-    files: impl Iterator<Item = DeleteFileInfo> + 'a,
-    object_store: DataStore,
-    metrics: Arc<data_file::ScopedReadMetrics>,
-    resolve: &'a impl Fn(&str, bool) -> Result<Path>,
-) -> Result<HashMap<u64, HashSet<u64>>> {
-    stream::iter(files.map(|file| {
-        let path = resolve(&file.path, file.path_is_relative);
-        let object_store = object_store.clone();
-        let metrics = Arc::clone(&metrics);
-        async move {
-            let positions = data_file::delete_file_positions(
-                data_file::ParquetFile::new(
-                    object_store,
-                    path?,
-                    file.file_size_bytes,
-                    file.footer_size,
-                )
-                .with_metrics(metrics),
-            )
-            .await?;
-            Ok::<_, Error>((file.data_file_id.get(), positions))
-        }
-    }))
-    .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-    .try_fold(
-        HashMap::<u64, HashSet<u64>>::new(),
-        |mut killed, (data_file_id, positions)| async move {
-            killed.entry(data_file_id).or_default().extend(positions);
-            Ok(killed)
-        },
-    )
     .await
 }
 
@@ -268,7 +254,7 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<IndexEntry>> {
         let session = self.begin_read().await?;
 
-        let snapshot = load_table(session.handle(), table, TableRead::Sources).await?;
+        let snapshot = load_table(session.handle(), table, TableRead::Definition).await?;
         let positions = snapshot.column_positions(table, columns)?;
 
         let table_prefix = snapshot.table_data_prefix(table)?;
@@ -276,22 +262,9 @@ impl ReadOnlyCatalog {
             resolve_data_path(data_prefix, &table_prefix, path, is_relative)
         };
 
-        // Entries are live-only. Both kinds of deletion name a physical
-        // position within their target file, so they fold into one map.
-        let inline_deletes = collect_inline_delete_positions(session.handle(), table.get());
         let metrics = self.data_read_metrics();
-        let delete_files = collect_delete_positions(
-            snapshot.delete_files_of(table).into_iter(),
-            object_store.clone(),
-            Arc::clone(&metrics),
-            &resolve,
-        );
-        let (inline_killed, mut killed_positions) =
-            futures::try_join!(inline_deletes, delete_files)?;
-        merge_killed_positions(&mut killed_positions, inline_killed);
 
         let outcome = collect_immediate_backfill(
-            snapshot.data_files_of(table).into_iter(),
             object_store,
             metrics,
             &positions,
@@ -301,7 +274,6 @@ impl ReadOnlyCatalog {
                 handle: session.handle(),
             },
             resolve,
-            &killed_positions,
         )
         .await;
         session.finish();

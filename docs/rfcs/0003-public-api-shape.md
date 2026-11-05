@@ -172,9 +172,37 @@ operations should use fixed read scopes and demand-loaded projections.
 
 `ffi_support::catalog_read::table_sources_for` resolves an exact schema/table
 name and point-reads only the requested current data-file IDs at one read point.
-It streams that table's delete-file records and retains only records targeting
-those files. Committed file-name mappings are fetched by mapping ID when a file
+At format 12 it seeks the delete-target directory and point-reads only the
+matching current delete records. Legacy formats stream the table's delete
+records and retain only the requested targets. Committed file-name mappings are fetched by mapping ID when a file
 is read; source projections do not retain the table's mapping directory.
+
+Staged-row translation resolves an operation-owned dependency projection:
+point reads for authored entity identities; the affected tables' descriptors,
+columns, index definitions and table statistics; referenced file mappings;
+and a scan of each affected table's delete-file directory retaining only
+records targeting referenced files. These partial projections are never
+installed as complete catalog snapshots. Rebase retains the caller's fixed
+authored read scope until its dependencies are resolved. The explicit public verb
+closure API still requires a complete working snapshot. Internal index build and
+certification commits instead declare their table dependencies and fold pending
+batch writes into that operation-owned projection.
+
+Internal immediate/staged backfills and index verification stream current file
+records and resolve delete files per target at the same fixed read point. Their
+file-plan concurrency bounds retained descriptors. Explicit backfill `Vec`
+results and verification's entry set remain proportional to the requested
+result, not an additional catalog inventory.
+
+`locate_row_ids` reads file descriptors in pages of at most 128 records, stopping
+a page after its decode allowance reaches 1 MiB (one oversized record can cross
+that threshold). It resolves row-ID statistics only for those files and uses
+the same read point for inline membership. Retained data summaries store
+process-local 128-bit source signatures instead of decoded file records;
+`DataFileInfo` implements `Hash` for this validation. The file directory holds
+only the last page. Large tables therefore require a streaming metadata pass
+on each uncached row lookup; Foyer serves storage blocks, and the data cache
+continues to serve immutable file summaries.
 
 Accessors (all in-memory, name→id resolved internally):
 
@@ -527,14 +555,3 @@ Per RFC 0001:
   semantics rather than in the extension contract, which was unresolved when
   this was written. The bet paid: the contract settled (RFC 0005) without
   moving a verb, and the surface was legible throughout.
-
-Staged-row translation resolves an operation-owned dependency projection:
-point reads for authored entity identities; the affected tables' descriptors,
-columns, index definitions and table statistics; referenced file mappings;
-and a scan of each affected table's delete-file directory retaining only
-records targeting referenced files. These partial projections are never
-installed as complete catalog snapshots. Rebase retains the caller's fixed
-authored read scope until its dependencies are resolved. The explicit public verb
-closure API still requires a complete working snapshot. Internal index build and
-certification commits instead declare their table dependencies and fold pending
-batch writes into that operation-owned projection.

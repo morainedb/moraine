@@ -102,8 +102,9 @@ purpose; a stamped store refuses the wrong path anyway.
 Legacy structural format 10 marks a commit-log catalog. Format 11 adds the
 persistent name directory and uses `commit_log_batch_origin` to distinguish
 commit-log catalogs from native catalogs. Adoption sets that origin while
-preserving format 11; demotion clears it while preserving the name directory.
-A legacy format-9 catalog adopts as format 10 and explicitly migrates to 11.
+preserving formats 11 and 12; demotion clears it while preserving their
+directories. Format 12 adds delete-file target lookup.
+A legacy format-9 catalog adopts as format 10 and explicitly migrates through 11 to 12.
 `validate_format` rejects unknown future formats first, then refuses a known
 commit-log format when its provider is absent. Migration preserves the origin
 and commits progress through the authoritative log (RFC 0015).

@@ -162,7 +162,7 @@ async fn name_maintenance_preserves_exact_spelling_and_duplicate_order() {
 }
 
 #[tokio::test]
-async fn positioning_sources_do_not_decode_other_files_or_mappings() {
+async fn positioning_sources_do_not_decode_unrelated_records() {
     use crate::store::{proto, value};
     let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
@@ -215,6 +215,13 @@ async fn positioning_sources_do_not_decode_other_files_or_mappings() {
                 data_file_id: 999,
             }),
             b"corrupt unrelated file".to_vec(),
+        ),
+        (
+            Key::current(EntityKey::DeleteFile {
+                table_id,
+                delete_file_id: 999,
+            }),
+            b"corrupt unrelated deletion".to_vec(),
         ),
         (
             Key::current(EntityKey::Mapping {
