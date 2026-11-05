@@ -216,6 +216,28 @@ comparison would have to be **type-aware**, never lexicographic — for a
 numeric column `'9'` is not `> '10'`, and a naive compare silently drops
 correct rows.
 
+### Current-entity name entries
+
+The `name` subspace follows `changelog` at tag 8. Its key is
+`(kind, parent_id, exact_name, entity_id)`: schema kind 0 uses parent 0; table
+kind 1 uses its schema ID. Names retain their exact UTF-8 spelling, encoded with
+storekey's string terminator. Values are empty. Appending the entity ID preserves
+row-faithful duplicate names; an exact-name lookup chooses the greatest matching
+ID, matching the previous ascending-directory scan, then validates the current
+entity. An ended entity has no name entry. Historical-name lookup remains a
+history operation.
+
+The same commit that changes a current schema or table deletes its old name
+entry and inserts its new one. Name changes, schema moves, and drops therefore
+cannot leave an independently published directory. Name probes admit storage
+blocks to Foyer and retain no decoded object cache. `SubspaceName::Name` reports
+the directory in census and compaction APIs.
+
+Format 11 introduces this directory. Earlier supported formats continue to use
+directory scans and do not write the new key tag. Explicit migration builds the
+complete directory before publishing format 11; an older binary then refuses
+the store rather than mutating entities without maintaining their entries.
+
 ### Atomicity invariant
 
 One DuckLake catalog commit — snapshot record, head-pointer update, every

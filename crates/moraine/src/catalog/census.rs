@@ -30,6 +30,8 @@ pub enum SubspaceName {
     SchemaVersion,
     /// Per-commit changelogs a reader replays to refresh.
     Changelog,
+    /// Persistent current-entity name entries.
+    Name,
     /// A segment whose prefix names no subspace this build knows. The raw
     /// prefix is carried verbatim; empty means the unsegmented root tree,
     /// which a store moraine wrote never has.
@@ -54,6 +56,7 @@ impl SubspaceName {
             Self::Index => Some(Subspace::Index),
             Self::SchemaVersion => Some(Subspace::SchemaVersion),
             Self::Changelog => Some(Subspace::Changelog),
+            Self::Name => Some(Subspace::Name),
             Self::Unknown(_) => None,
         }
     }
@@ -70,6 +73,7 @@ impl From<Subspace> for SubspaceName {
             Subspace::Index => Self::Index,
             Subspace::SchemaVersion => Self::SchemaVersion,
             Subspace::Changelog => Self::Changelog,
+            Subspace::Name => Self::Name,
         }
     }
 }
@@ -85,6 +89,7 @@ impl fmt::Display for SubspaceName {
             Self::Index => f.write_str("index"),
             Self::SchemaVersion => f.write_str("schema_version"),
             Self::Changelog => f.write_str("changelog"),
+            Self::Name => f.write_str("name"),
             Self::Unknown(prefix) => {
                 f.write_str("unknown(")?;
                 for byte in prefix {
