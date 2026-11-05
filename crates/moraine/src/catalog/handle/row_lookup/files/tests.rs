@@ -80,7 +80,7 @@ async fn dense_file(data: &InMemory, ordinal: u64, rows: u64) -> DataFile {
 async fn table_with(catalog: &Catalog, files: Vec<DataFile>) -> (TableId, Vec<DataFileId>) {
     let created = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let table = tx.create_table(
                 schema,
@@ -169,7 +169,7 @@ async fn retained_summaries_preserve_positions_and_validate_the_source() {
     let directory = super::super::lookup(&warm.catalog.row_lookups.files, warm.table).unwrap();
     let file = warm
         .catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .data_files_of(warm.table)
@@ -244,7 +244,7 @@ async fn retained_permuted_summaries_survive_auxiliary_eviction() {
         .unwrap();
     let directory = super::super::lookup(&catalog.row_lookups.files, table).unwrap();
     let file = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .data_files_of(table)
@@ -293,7 +293,7 @@ async fn a_registered_file_is_the_only_one_a_warm_directory_summarizes() {
     let file = dense_file(&warm.data, 4, 3).await;
     let table = warm.table;
     warm.catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             added.set(Some(tx.register_data_file(table, file.clone(), &[])?));
             Ok(())
         })
@@ -314,7 +314,7 @@ async fn an_expired_file_leaves_a_warm_directory_without_a_rebuild() {
     let warm = warm_table().await;
     let (table, expired) = (warm.table, warm.ids[2]);
     warm.catalog
-        .commit(|tx| tx.expire_data_file(table, expired))
+        .commit_materialized(|tx| tx.expire_data_file(table, expired))
         .await
         .unwrap();
 
@@ -464,7 +464,7 @@ async fn overlapping_summary_spans_only_probe_files_covering_the_requested_rows(
         assert_eq!(catalog.row_lookups.summarized_files(), 64);
     }
     catalog
-        .commit(|tx| tx.expire_data_file(table, ids[0]))
+        .commit_materialized(|tx| tx.expire_data_file(table, ids[0]))
         .await
         .unwrap();
     let found = catalog
@@ -573,7 +573,7 @@ async fn warm_table_with_unreadable_file() -> (WarmTable, DataFileId, u64) {
     let table = warm.table;
     let added = Cell::new(None);
     warm.catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             added.set(Some(tx.register_data_file(table, missing_file(9), &[])?));
             Ok(())
         })
@@ -641,7 +641,7 @@ async fn a_new_file_is_summarized_without_retrying_a_failing_one() {
     let table = warm.table;
     let file = dense_file(&warm.data, 5, 3).await;
     warm.catalog
-        .commit(|tx| tx.register_data_file(table, file.clone(), &[]).map(|_| ()))
+        .commit_materialized(|tx| tx.register_data_file(table, file.clone(), &[]).map(|_| ()))
         .await
         .unwrap();
 
@@ -661,7 +661,7 @@ async fn registering_files_does_not_restart_the_failed_summary_wait() {
     for ordinal in 0..FIRST_RETRY_SKIP {
         let file = dense_file(&warm.data, 100 + u64::from(ordinal), 3).await;
         warm.catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 tx.register_data_file(warm.table, file.clone(), &[])
                     .map(|_| ())
             })
@@ -686,7 +686,7 @@ async fn a_transient_summary_failure_recovers() {
     warm.data.delete(&path).await.unwrap();
     let added = Cell::new(None);
     warm.catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             added.set(Some(tx.register_data_file(
                 warm.table,
                 file.clone(),

@@ -118,8 +118,10 @@ impl Model {
 /// The catalog's rebuild at `snapshot`, in the model's shape.
 #[allow(clippy::unwrap_used)]
 async fn rebuilt_at(catalog: &Catalog, snapshot: SnapshotId, table: TableId) -> Vec<ModelColumn> {
-    let view = catalog.snapshot_at(snapshot).await.unwrap();
+    let view = catalog.read_scope_at(snapshot).await.unwrap();
     view.columns_of(table)
+        .await
+        .unwrap()
         .into_iter()
         .map(|column| {
             assert!(
@@ -164,7 +166,7 @@ async fn apply_op(
                 children: Vec::new(),
             };
             let landed = catalog
-                .commit(|tx| tx.add_column(table, &def).map(|_| ()))
+                .commit(async |tx| tx.add_column(table, &def).await.map(|_| ()))
                 .await
                 .unwrap();
             model.columns.push(ModelColumn {
@@ -180,7 +182,7 @@ async fn apply_op(
             let at = model.select(which).filter(|_| model.columns.len() > 1)?;
             let column = ColumnId::new(model.columns[at].id);
             let landed = catalog
-                .commit(|tx| tx.drop_column(table, column))
+                .commit(async |tx| tx.drop_column(table, column).await)
                 .await
                 .unwrap();
             model.columns.remove(at);
@@ -191,7 +193,7 @@ async fn apply_op(
             let column = ColumnId::new(model.columns[at].id);
             let name = format!("r{index}");
             let landed = catalog
-                .commit(|tx| tx.rename_column(table, column, &name))
+                .commit(async |tx| tx.rename_column(table, column, &name).await)
                 .await
                 .unwrap();
             model.columns[at].name = name;
@@ -212,7 +214,7 @@ async fn apply_op(
             let column = ColumnId::new(model.columns[at].id);
             let promoted = widened.clone();
             let landed = catalog
-                .commit(|tx| {
+                .commit(async |tx| {
                     tx.alter_column(
                         table,
                         column,
@@ -222,6 +224,7 @@ async fn apply_op(
                             default_value: None,
                         },
                     )
+                    .await
                 })
                 .await
                 .unwrap();
@@ -251,9 +254,9 @@ async fn replay_and_compare(ops: &[ColumnOp]) {
         .collect();
     let created = std::cell::Cell::new(None);
     let snapshot = catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("s")?;
-            created.set(Some(tx.create_table(schema, "t", &initial)?));
+        .commit(async |tx| {
+            let schema = tx.create_schema("s").await?;
+            created.set(Some(tx.create_table(schema, "t", &initial).await?));
             Ok(())
         })
         .await

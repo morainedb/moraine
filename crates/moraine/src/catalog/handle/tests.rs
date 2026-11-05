@@ -17,6 +17,56 @@ async fn open() -> Catalog {
         .unwrap()
 }
 
+#[tokio::test]
+async fn catalog_version_updates_do_not_read_unrelated_entities() {
+    use crate::store::key::EntityKey;
+
+    let catalog = open().await;
+    let write = catalog.begin_write_tx().unwrap();
+    write
+        .put(
+            Key::current(EntityKey::Table { table_id: 999 }).encode(),
+            b"unrelated invalid record",
+        )
+        .unwrap();
+    write
+        .put(
+            Key::current(EntityKey::Option {
+                scope_kind: 0,
+                scope_id: 0,
+            })
+            .encode(),
+            value::encode_value(&proto::OptionScopeValue {
+                options: [
+                    ("version".into(), crate::CATALOG_VERSION.into()),
+                    ("keep".into(), "value".into()),
+                ]
+                .into(),
+            }),
+        )
+        .unwrap();
+    catalog.commit_write_tx(write).await.unwrap();
+    let dry = catalog.raise_catalog_version(true).await.unwrap();
+    assert_eq!(dry.from, crate::CATALOG_VERSION);
+    let raised = catalog.raise_catalog_version(false).await.unwrap();
+    assert_eq!(raised.to, crate::MAX_CATALOG_VERSION);
+    let read = catalog.begin_read().await.unwrap();
+    let options = crate::store::read::read_global_options(read.handle())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        options.options.get("keep").map(String::as_str),
+        Some("value")
+    );
+    assert_eq!(
+        options.options.get("version").map(String::as_str),
+        Some(crate::MAX_CATALOG_VERSION)
+    );
+    read.finish();
+    catalog.close().await.unwrap();
+}
+
 fn snapshot_row(id: u64) -> Vec<Cell> {
     vec![
         Cell::U64(id),
@@ -310,7 +360,7 @@ async fn index_queries_observe_later_commits_without_retaining_views() {
     let catalog = open().await;
     let ids = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let table = tx.create_table(
                 schema,
@@ -378,8 +428,11 @@ async fn index_queries_observe_later_commits_without_retaining_views() {
     let transaction = catalog.begin_write_tx().unwrap();
     transaction.delete(&corrupt_key).unwrap();
     catalog.commit_write_tx(transaction).await.unwrap();
-    let held = catalog.snapshot().await.unwrap();
-    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    let held = catalog.materialized().await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(index))
+        .await
+        .unwrap();
     assert!(held.index_by_id(table, index).is_some());
     assert!(matches!(
         catalog.index_lookup_many(table, index, &[]).await,
@@ -396,10 +449,10 @@ async fn a_late_read_view_cannot_replace_a_committed_view() {
     let old = catalog.load_head_view(session.handle()).await.unwrap();
 
     catalog
-        .commit(|tx| tx.create_schema("new").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("new").map(|_| ()))
         .await
         .unwrap();
-    let committed = catalog.snapshot().await.unwrap();
+    let committed = catalog.materialized().await.unwrap();
     let late = catalog.head_view(session.handle(), epoch).await.unwrap();
     session.finish();
 
@@ -408,7 +461,7 @@ async fn a_late_read_view_cannot_replace_a_committed_view() {
     assert!(committed.schema_by_name("new").is_some());
     assert_eq!(
         committed.current_snapshot().id,
-        catalog.snapshot().await.unwrap().current_snapshot().id
+        catalog.materialized().await.unwrap().current_snapshot().id
     );
     catalog.close().await.unwrap();
 }
@@ -600,16 +653,16 @@ async fn requested_inline_rows_follow_updates_and_wider_chunks() {
 async fn forgetting_the_head_view_resolves_it_from_the_store_again() {
     let catalog = open().await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_schema("forgettable")?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let installed = catalog.snapshot().await.unwrap();
+    let installed = catalog.materialized().await.unwrap();
     catalog.forget_head_view();
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(
         snapshot.current_snapshot().id,
         installed.current_snapshot().id,
@@ -624,7 +677,7 @@ async fn forgetting_the_head_view_resolves_it_from_the_store_again() {
 async fn raising_refuses_a_catalog_version_this_build_does_not_serve() {
     let catalog = open().await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.set_catalog_version("1.2");
             Ok(())
         })
@@ -641,7 +694,7 @@ async fn raising_refuses_a_catalog_version_this_build_does_not_serve() {
     assert!(catalog.raise_catalog_version(true).await.is_err());
     assert_eq!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .option(crate::catalog::OptionScope::Global, "version")
@@ -683,7 +736,7 @@ async fn external_compaction_starts_no_coordinator() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("sales").map(|_| ()))
         .await
         .unwrap();
     catalog.close().await.unwrap();
@@ -728,7 +781,7 @@ async fn a_provider_can_declare_external_compaction() {
 async fn concurrent_snapshots_are_independent_and_agree() {
     let catalog = open().await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             for id in 0..1000 {
                 tx.create_schema(&format!("schema_{id}"))?;
             }
@@ -744,7 +797,7 @@ async fn concurrent_snapshots_are_independent_and_agree() {
         let barrier = barrier.clone();
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            catalog.snapshot().await.unwrap()
+            catalog.materialized().await.unwrap()
         }));
     }
     let snapshots = futures::future::join_all(tasks).await;
@@ -762,13 +815,13 @@ async fn concurrent_snapshots_are_independent_and_agree() {
 #[tokio::test]
 async fn decoded_snapshots_are_owned_only_by_the_caller() {
     let catalog = open().await;
-    let view = catalog.snapshot().await.unwrap();
+    let view = catalog.materialized().await.unwrap();
     let weak = Arc::downgrade(&view);
     drop(view);
     assert!(weak.upgrade().is_none());
     assert_eq!(catalog.memory_tally().projection_bytes, 0);
     catalog
-        .commit(|tx| tx.create_schema("uncached").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("uncached").map(|_| ()))
         .await
         .unwrap();
     assert_eq!(catalog.memory_tally().projection_bytes, 0);

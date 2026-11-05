@@ -77,18 +77,20 @@ impl ReadOnlyCatalog {
     ///
     /// ```
     /// # async fn example(catalog: &moraine::Catalog) -> moraine::Result<()> {
-    /// if let Some(scope) = catalog.index_read_scope().await? {
-    ///     let view = scope.reads().snapshot().await?;
-    ///     assert!(view.schema_by_name("main").is_some());
+    /// let scope = catalog.index_read_scope().await?;
+    /// {
+    ///     let view = scope.reads().read_scope().await?;
+    ///     assert!(view.schema_by_name("main").await?.is_some());
     ///     // Further reads through scope.reads() observe this same revision.
     /// }
     /// # Ok(()) }
     /// ```
-    pub async fn index_read_scope(&self) -> Result<Option<IndexReadScope>> {
+    pub async fn index_read_scope(&self) -> Result<IndexReadScope> {
         self.refuse_if_closed()?;
         let (handle, revision) = if let Some(pinned) = &self.pinned {
             (pinned.handle.clone(), pinned.revision)
         } else if let Some(scopes) = &self.reader_scopes {
+            self.begin_read().await?.finish();
             let reader = scopes.acquire().await?;
             let revision = reader.manifest;
             (OwnedReadHandle::Checkpoint(reader), revision)
@@ -102,7 +104,7 @@ impl ReadOnlyCatalog {
                     let revision = transaction.seqnum();
                     (OwnedReadHandle::Tx(Arc::new(transaction)), revision)
                 }
-                ReadSession::Pinned(_) | ReadSession::Reader(_) => return Ok(None),
+                ReadSession::Pinned(_) | ReadSession::Reader(_) => return Err(crate::Error::Constraint("a fixed read scope is unavailable; reopen the catalog with snapshot support".into())),
             }
         };
         crate::transaction::commit::refuse_mid_migration(handle.borrow()).await?;
@@ -112,7 +114,7 @@ impl ReadOnlyCatalog {
         };
         let mut reads = self.clone();
         reads.pinned = Some(Arc::new(PinnedRead { handle, revision }));
-        Ok(Some(IndexReadScope { reads, identity }))
+        Ok(IndexReadScope { reads, identity })
     }
 }
 
@@ -127,13 +129,28 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn read_scope_refuses_an_unpinned_read_surface() {
+        let objects = Arc::new(InMemory::new());
+        let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
+            .await
+            .unwrap();
+        let mut reader = Catalog::open_read_only(objects, CatalogOptions::default())
+            .await
+            .unwrap();
+        reader.reader_scopes = None;
+        assert!(reader.index_read_scope().await.is_err());
+        reader.close().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn acknowledged_commits_have_a_published_checkpoint() {
         let objects = Arc::new(InMemory::new());
         let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
             .await
             .unwrap();
         catalog
-            .commit(|transaction| {
+            .commit_materialized(|transaction| {
                 transaction.set_option(crate::OptionScope::Global, "probe", "published")
             })
             .await
@@ -170,7 +187,7 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .commit(|transaction| {
+            .commit_materialized(|transaction| {
                 transaction.set_option(crate::OptionScope::Global, "probe", "before")
             })
             .await
@@ -178,24 +195,16 @@ mod tests {
         let reader = Catalog::open_read_only(objects, CatalogOptions::default())
             .await
             .unwrap();
-        let first = reader
-            .index_read_scope()
-            .await
-            .unwrap()
-            .expect("read-only scope");
-        let shared = reader
-            .index_read_scope()
-            .await
-            .unwrap()
-            .expect("shared scope");
+        let first = reader.index_read_scope().await.unwrap();
+        let shared = reader.index_read_scope().await.unwrap();
         assert_eq!(first.identity(), shared.identity());
         catalog
-            .commit(|transaction| {
+            .commit_materialized(|transaction| {
                 transaction.set_option(crate::OptionScope::Global, "probe", "after")
             })
             .await
             .unwrap();
-        let next = reader.index_read_scope().await.unwrap().expect("new scope");
+        let next = reader.index_read_scope().await.unwrap();
         assert_ne!(first.identity(), next.identity());
         assert_eq!(
             crate::ffi_support::catalog_read::global_option(first.reads(), "probe")
@@ -240,7 +249,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let scope = catalog.index_read_scope().await.unwrap().unwrap();
+        let scope = catalog.index_read_scope().await.unwrap();
         assert_eq!(
             crate::ffi_support::dump_schemas(scope.reads())
                 .await
@@ -248,7 +257,7 @@ mod tests {
                 .len(),
             1
         );
-        assert!(scope.reads().snapshot().await.is_err());
+        assert!(scope.reads().materialized().await.is_err());
         drop(scope);
         catalog.close().await.unwrap();
     }
@@ -261,12 +270,16 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .commit(|transaction| transaction.set_option(OptionScope::Global, "probe", "before"))
+            .commit_materialized(|transaction| {
+                transaction.set_option(OptionScope::Global, "probe", "before")
+            })
             .await
             .unwrap();
-        let scope = catalog.index_read_scope().await.unwrap().unwrap();
+        let scope = catalog.index_read_scope().await.unwrap();
         catalog
-            .commit(|transaction| transaction.set_option(OptionScope::Global, "probe", "after"))
+            .commit_materialized(|transaction| {
+                transaction.set_option(OptionScope::Global, "probe", "after")
+            })
             .await
             .unwrap();
         let pinned = crate::ffi_support::dump_options(scope.reads())
@@ -313,7 +326,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(committer.store.as_ref(), Store::Committer { .. }));
-        let scope = committer.index_read_scope().await.unwrap().unwrap();
+        let scope = committer.index_read_scope().await.unwrap();
         let OwnedReadHandle::Checkpoint(reader) = &scope.reads().pinned.as_ref().unwrap().handle
         else {
             panic!("committer scope must own a checkpoint");

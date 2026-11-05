@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     options.flush_interval = Duration::from_millis(flush);
     let catalog = Catalog::open(Arc::new(InMemory::new()), options).await?;
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             let column = ColumnDef {
                 name: "value".into(),
                 column_type: "BIGINT".into(),
@@ -105,23 +105,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_value: None,
                 children: Vec::new(),
             };
-            tx.create_table(SchemaId::new(0), "target", std::slice::from_ref(&column))?;
+            tx.create_table(SchemaId::new(0), "target", std::slice::from_ref(&column))
+                .await?;
             for index in 0..tables {
-                let table = tx.create_table(
-                    SchemaId::new(0),
-                    &format!("unrelated-{index}"),
-                    std::slice::from_ref(&column),
-                )?;
+                let table = tx
+                    .create_table(
+                        SchemaId::new(0),
+                        &format!("unrelated-{index}"),
+                        std::slice::from_ref(&column),
+                    )
+                    .await?;
                 for index in 0..files {
-                    tx.register_data_file(table, file(index), &[])?;
+                    tx.register_data_file(table, file(index), &[]).await?;
                 }
             }
             Ok(())
         })
         .await?;
-    let held = catalog.snapshot().await?;
+    let held = catalog.read_scope().await?;
     let table = held
         .table_by_name(SchemaId::new(0), "target")
+        .await?
         .ok_or("missing target")?
         .id;
     for sample in 0..5 {
@@ -172,12 +176,15 @@ async fn mutate(
     group: usize,
     sample: usize,
 ) -> moraine::Result<()> {
+    fn change(
+        table: TableId,
+        rows: u64,
+    ) -> impl for<'a> Fn(&'a mut Transaction) -> futures::future::BoxFuture<'a, moraine::Result<()>>
+    {
+        move |tx| Box::pin(async move { tx.update_table_stats(table, rows, 128).await })
+    }
     let changes: Vec<_> = (0..group)
-        .map(|member| {
-            move |tx: &mut Transaction| {
-                tx.update_table_stats(table, (sample * group + member) as u64, 128)
-            }
-        })
+        .map(|member| change(table, (sample * group + member) as u64))
         .collect();
     let members: Vec<moraine::CommitMember<'_>> = changes
         .iter()

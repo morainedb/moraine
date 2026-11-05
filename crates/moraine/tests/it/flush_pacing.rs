@@ -27,7 +27,7 @@ async fn open(store: &Arc<CountingStore>, spacing: Duration, flush_on_commit: bo
 async fn commit_schema(catalog: &Catalog, name: &str) {
     let name = name.to_owned();
     catalog
-        .commit(move |tx| tx.create_schema(&name).map(|_| ()))
+        .commit(async move |tx| tx.create_schema(&name).await.map(|_| ()))
         .await
         .unwrap();
 }

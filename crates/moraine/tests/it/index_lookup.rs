@@ -15,32 +15,37 @@ async fn index_read_scope_survives_a_concurrent_index_drop() {
     let catalog = open_memory().await;
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").unwrap().id;
-            let table = tx.create_table(schema, "scoped", &[col("value")])?;
-            let index = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_value".into(),
-                    columns: vec![moraine::ColumnId::new(1)],
-                    unique: true,
-                },
-                &[IndexEntry {
-                    row_id: 7,
-                    values: vec![Some(key(10))],
-                }],
-            )?;
+        .commit(async |tx| {
+            let schema = tx.schema_by_name("main").await.unwrap().unwrap().id;
+            let table = tx.create_table(schema, "scoped", &[col("value")]).await?;
+            let index = tx
+                .create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_value".into(),
+                        columns: vec![moraine::ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[IndexEntry {
+                        row_id: 7,
+                        values: vec![Some(key(10))],
+                    }],
+                )
+                .await?;
             created.set(Some((table, index)));
             Ok(())
         })
         .await
         .unwrap();
     let (table, index) = created.get().unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
-    let unchanged = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
+    let unchanged = catalog.index_read_scope().await.unwrap();
     assert_eq!(scope.identity(), unchanged.identity());
-    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
-    let changed = catalog.index_read_scope().await.unwrap().unwrap();
+    catalog
+        .commit(async |tx| tx.drop_index(index).await)
+        .await
+        .unwrap();
+    let changed = catalog.index_read_scope().await.unwrap();
     assert_ne!(scope.identity(), changed.identity());
     assert_eq!(
         scope
@@ -53,10 +58,12 @@ async fn index_read_scope_survives_a_concurrent_index_drop() {
     assert!(
         scope
             .reads()
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .index_by_name(table, "by_value")
+            .await
+            .unwrap()
             .is_some()
     );
     assert!(
@@ -77,27 +84,34 @@ async fn index_lookup_many_returns_the_union_of_distinct_keys() {
     let catalog = open_memory().await;
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "items", &[col("value")])?;
-            let index = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_value".to_owned(),
-                    columns: vec![moraine::ColumnId::new(1)],
-                    unique: true,
-                },
-                &[
-                    IndexEntry {
-                        row_id: 0,
-                        values: vec![Some(key(10))],
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "items", &[col("value")]).await?;
+            let index = tx
+                .create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_value".to_owned(),
+                        columns: vec![moraine::ColumnId::new(1)],
+                        unique: true,
                     },
-                    IndexEntry {
-                        row_id: 1,
-                        values: vec![Some(key(20))],
-                    },
-                ],
-            )?;
+                    &[
+                        IndexEntry {
+                            row_id: 0,
+                            values: vec![Some(key(10))],
+                        },
+                        IndexEntry {
+                            row_id: 1,
+                            values: vec![Some(key(20))],
+                        },
+                    ],
+                )
+                .await?;
             created.set(Some((table, index)));
             Ok(())
         })
@@ -123,18 +137,25 @@ async fn index_lookup_many_accepts_an_empty_key_set() {
     let catalog = open_memory().await;
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "items", &[col("value")])?;
-            let index = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_value".to_owned(),
-                    columns: vec![moraine::ColumnId::new(1)],
-                    unique: true,
-                },
-                &[],
-            )?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "items", &[col("value")]).await?;
+            let index = tx
+                .create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_value".to_owned(),
+                        columns: vec![moraine::ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[],
+                )
+                .await?;
             created.set(Some((table, index)));
             Ok(())
         })
@@ -162,9 +183,9 @@ async fn a_chunked_batch_answers_what_single_key_lookups_answer() {
     let catalog = open_memory().await;
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").unwrap().id;
-            let table = tx.create_table(schema, "chunked", &[col("value")])?;
+        .commit(async |tx| {
+            let schema = tx.schema_by_name("main").await.unwrap().unwrap().id;
+            let table = tx.create_table(schema, "chunked", &[col("value")]).await?;
             // Two rows per value, so a probe returns more than it is asked.
             let entries: Vec<_> = (0..VALUES)
                 .flat_map(|value| {
@@ -174,15 +195,17 @@ async fn a_chunked_batch_answers_what_single_key_lookups_answer() {
                     })
                 })
                 .collect();
-            let index = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_value".into(),
-                    columns: vec![moraine::ColumnId::new(1)],
-                    unique: false,
-                },
-                &entries,
-            )?;
+            let index = tx
+                .create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_value".into(),
+                        columns: vec![moraine::ColumnId::new(1)],
+                        unique: false,
+                    },
+                    &entries,
+                )
+                .await?;
             created.set(Some((table, index)));
             Ok(())
         })
@@ -216,7 +239,7 @@ async fn a_chunked_batch_answers_what_single_key_lookups_answer() {
         "a batch resolved across tasks disagreed with single-key lookups"
     );
 
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     assert_eq!(
         scope
             .reads()

@@ -33,7 +33,7 @@ async fn write_memory_measurement_fixture() {
     .unwrap();
     let table = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let columns: Vec<_> = (0..20)
                 .map(|column| ColumnDef {
@@ -50,7 +50,7 @@ async fn write_memory_measurement_fixture() {
         .await
         .unwrap();
     let table_id = table.get().unwrap().get();
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     let columns: Vec<_> = snapshot
         .columns_of(table.get().unwrap())
         .into_iter()
@@ -155,8 +155,7 @@ async fn measure_active_writer_reader_generations() {
         write_memory_generation(&writer, generation).await;
         let started = std::time::Instant::now();
         match reader.index_read_scope().await {
-            Ok(Some(scope)) => scopes.push(scope),
-            Ok(None) => panic!("fixed reader required"),
+            Ok(scope) => scopes.push(scope),
             Err(error) => {
                 eprintln!("reader_refused={error}");
                 memory_observation("refused", generation, started.elapsed().as_millis());
@@ -171,7 +170,7 @@ async fn measure_active_writer_reader_generations() {
     writer.close().await.unwrap();
     let started = std::time::Instant::now();
     let reader = Catalog::open_read_only(objects, options).await.unwrap();
-    let scope = reader.index_read_scope().await.unwrap().unwrap();
+    let scope = reader.index_read_scope().await.unwrap();
     memory_observation("sst", 0, started.elapsed().as_millis());
     drop(scope);
     reader.close().await.unwrap();
@@ -235,7 +234,7 @@ async fn unused_reader_generation_releases_replay_before_rotating() {
     for generation in 1..=12 {
         write_memory_generation(&writer, generation).await;
         let started = std::time::Instant::now();
-        let scope = reader.index_read_scope().await.unwrap().unwrap();
+        let scope = reader.index_read_scope().await.unwrap();
         memory_observation("sequential", generation, started.elapsed().as_millis());
         drop(scope);
     }

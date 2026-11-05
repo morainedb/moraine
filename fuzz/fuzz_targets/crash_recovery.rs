@@ -76,7 +76,7 @@ fuzz_target!(|data: &[u8]| {
         let seed = Arc::new(FreezingStore::thawed(Arc::clone(&backing)));
         let catalog = open(seed).await.expect("seeding a fresh store must open");
         catalog
-            .commit(|tx| tx.create_schema("before").map(|_| ()))
+            .commit(async |tx| tx.create_schema("before").await.map(|_| ()))
             .await
             .expect("the seed commit runs on a thawed store");
         catalog.close().await.expect("closing a thawed store");
@@ -89,9 +89,9 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(Ok(catalog)) = opened {
             let _ = tokio::time::timeout(
                 UNTIL_CRASH,
-                catalog.commit(|tx| {
-                    let schema = tx.create_schema("after")?;
-                    tx.create_table(schema, "t", &[column("a")])?;
+                catalog.commit(async |tx| {
+                    let schema = tx.create_schema("after").await?;
+                    tx.create_table(schema, "t", &[column("a")]).await?;
                     Ok(())
                 }),
             )
@@ -106,23 +106,32 @@ fuzz_target!(|data: &[u8]| {
         let catalog = open(recovered)
             .await
             .expect("a store crashed mid-commit must still open");
-        let view = catalog.snapshot().await.expect("and must still be read");
+        let view = catalog.read_scope().await.expect("and must still be read");
 
         // The guarantee. The commit either landed whole or not at all, so
         // `after` and its table stand or fall together — a schema with no
         // table is the torn state atomicity forbids.
-        let schema = view.schema_by_name("after");
+        let schema = view
+            .schema_by_name("after")
+            .await
+            .expect("reading the recovered schema");
         let landed = schema.is_some();
         if landed {
             let id = schema.expect("just checked").id;
             assert!(
-                view.table_by_name(id, "t").is_some(),
+                view.table_by_name(id, "t")
+                    .await
+                    .expect("reading the recovered table")
+                    .is_some(),
                 "torn commit at write offset {allowance}: schema `after` landed without its table"
             );
         }
         // `before` predates the crash and is durable either way.
         assert!(
-            view.schema_by_name("before").is_some(),
+            view.schema_by_name("before")
+                .await
+                .expect("reading the durable schema")
+                .is_some(),
             "a committed schema vanished after a crash at write offset {allowance}"
         );
 

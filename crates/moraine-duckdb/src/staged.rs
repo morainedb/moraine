@@ -236,7 +236,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
         }
         // SAFETY: caller contract for the optional snapshot.
         let snapshot = unsafe { snapshot.as_ref() };
-        let tx = if let Some(scope) = snapshot.and_then(|snapshot| snapshot.read_alias.as_ref()) {
+        let tx = if let Some(scope) = snapshot.map(|snapshot| snapshot.read_alias.as_ref()) {
             staged_begin_scoped(
                 handle_ref.catalog.writer()?,
                 handle_ref.data_store.clone(),
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
                 handle_ref.catalog.writer()?,
                 handle_ref.data_store.clone(),
                 handle_ref.data_prefix.clone(),
-                snapshot.and_then(|snapshot| snapshot.snapshot.clone()),
+                None,
             )?
         };
         Ok(Box::new(MoraineTxHandle {

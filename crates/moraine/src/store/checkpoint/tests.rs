@@ -275,7 +275,9 @@ async fn closing_a_writer_publishes_the_flushed_manifest() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.set_option(crate::OptionScope::Global, "close-probe", "persisted"))
+        .commit_materialized(|tx| {
+            tx.set_option(crate::OptionScope::Global, "close-probe", "persisted")
+        })
         .await
         .unwrap();
     catalog.close().await.unwrap();

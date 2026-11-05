@@ -549,7 +549,7 @@ async fn stages_table_create_and_snapshot_bump() {
     let id = tx.commit().await.unwrap();
     assert_eq!(id.get(), 1);
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     let tables = snapshot.tables_in(crate::catalog::SchemaId::new(0));
     assert_eq!(tables.len(), 1);
     assert_eq!(tables[0].name, "t");
@@ -581,12 +581,12 @@ async fn staged_columns_advance_the_field_id_counter() {
     // Drop the max-id column, then add: the freed id must not return.
     let table = TableId::new(1);
     catalog
-        .commit(|tx| tx.drop_column(table, ColumnId::new(5)))
+        .commit_materialized(|tx| tx.drop_column(table, ColumnId::new(5)))
         .await
         .unwrap();
     let added = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             added.set(Some(tx.add_column(
                 table,
                 &ColumnDef {
@@ -609,7 +609,7 @@ async fn staged_columns_advance_the_field_id_counter() {
 
     // The counter-only table update stayed in place: one live table
     // row for snapshot 1's create, no counter-minted history version.
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(snapshot.tables_in(SchemaId::new(0)).len(), 1);
 }
 
@@ -694,7 +694,7 @@ async fn encryption_keys_round_trip_through_staged_rows() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let table = head.tables_in(crate::catalog::SchemaId::new(0))[0].id;
     assert_eq!(
         head.data_files_of(table)[0].encryption_key.as_deref(),
@@ -746,14 +746,14 @@ async fn update_set_end_moves_the_old_version_to_history() {
     ));
     rename.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert_eq!(
         head.tables_in(crate::catalog::SchemaId::new(1))[0].name,
         "t_new"
     );
 
     let past = catalog
-        .snapshot_at(crate::catalog::SnapshotId::new(1))
+        .materialized_at(crate::catalog::SnapshotId::new(1))
         .await
         .unwrap();
     assert_eq!(
@@ -803,7 +803,7 @@ async fn rename_survives_insert_before_end_order() {
     ));
     rename.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let live = head.tables_in(crate::catalog::SchemaId::new(1));
     assert_eq!(live.len(), 1, "exactly one live table after rename");
     assert_eq!(live[0].name, "t_new");
@@ -838,7 +838,7 @@ async fn a_schema_creating_commit_commits_alone_and_surfaces_its_lost_race() {
     );
 
     // The store reflects only the winner: schema `a`, not `b`.
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(head.schema_by_name("a").is_some());
     assert!(head.schema_by_name("b").is_none());
 }
@@ -1231,7 +1231,7 @@ async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 TableId::new(1),
                 &IndexDef {
@@ -1583,7 +1583,7 @@ async fn inline_chunks_share_one_schema_and_decode_once_each() {
     let (catalog, first_index_id) = catalog_with_indexed_inline_table(false).await;
     let second_index_id = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 TableId::new(1),
                 &IndexDef {
@@ -1781,7 +1781,7 @@ async fn catalog_with_deferred_indexed_table() -> (Catalog, u64) {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index_ordered_with_maintenance(
                 TableId::new(1),
                 &IndexDef {
@@ -1836,7 +1836,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
 
     assert_eq!(report.snapshot_id, SnapshotId::new(3));
     assert_eq!(report.deferred_indexes, vec![IndexId::new(index_id)]);
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(
         snapshot.indexes_of(crate::catalog::TableId::new(1))[0].state,
         crate::catalog::IndexState::Maintaining
@@ -3656,7 +3656,7 @@ async fn create_index_backfills_inline_null_rows() {
     // Create a unique index with that backfill; IS NULL finds the NULL row.
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 TableId::new(1),
                 &IndexDef {
@@ -5129,7 +5129,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let spec = &head.partitions[&1][&10];
     assert_eq!(spec.begin_snapshot, 1);
     assert_eq!(spec.columns.len(), 1);
@@ -5162,7 +5162,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(!head.partitions[&1].contains_key(&10));
     assert!(head.partitions[&1].contains_key(&11));
     // The file still names the spec it was written under.
@@ -5170,7 +5170,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
 
     // Time travel reconstructs spec 10 at snapshot 1.
     let at_one = catalog
-        .snapshot_at(crate::catalog::SnapshotId::new(1))
+        .materialized_at(crate::catalog::SnapshotId::new(1))
         .await
         .unwrap();
     assert!(at_one.partitions[&1].contains_key(&10));
@@ -5205,7 +5205,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(head.partitions.get(&1).is_none_or(imbl::OrdMap::is_empty));
 
     catalog.close().await.unwrap();
@@ -5234,7 +5234,7 @@ async fn sort_spec_rows_land_fold_and_time_travel() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let spec = &head.sorts[&1][&20];
     assert_eq!(spec.begin_snapshot, 1);
     assert_eq!(spec.expressions.len(), 1);
@@ -5263,12 +5263,12 @@ async fn sort_spec_rows_land_fold_and_time_travel() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(!head.sorts[&1].contains_key(&20));
     assert_eq!(head.sorts[&1][&21].expressions[0].expression, "v || 'x'");
 
     let at_one = catalog
-        .snapshot_at(crate::catalog::SnapshotId::new(1))
+        .materialized_at(crate::catalog::SnapshotId::new(1))
         .await
         .unwrap();
     assert!(at_one.sorts[&1].contains_key(&20));
@@ -5362,7 +5362,7 @@ async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let tags = head.tags_of(1);
     assert_eq!(tags.len(), 2);
     assert_eq!(
@@ -5498,7 +5498,7 @@ async fn column_alter_carries_tags_forward() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let column = &head.columns[&1][&1];
     assert_eq!(column.column_name, "renamed");
     assert_eq!(column.tags.len(), 1);
@@ -5570,7 +5570,7 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     let id = tx.commit().await.unwrap();
     assert_eq!(id.get(), 2, "maintenance must not advance head");
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert_eq!(head.current_snapshot().id.get(), 2);
     let schedule = head.scheduled_deletions();
     assert_eq!(schedule.len(), 1);
@@ -5586,12 +5586,12 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     // reclaimed, so `SnapshotExpired`, not a plain miss; the survivor
     // resolves, and the pruned history row is gone from the dump surface.
     let expired = catalog
-        .snapshot_at(crate::catalog::SnapshotId::new(1))
+        .materialized_at(crate::catalog::SnapshotId::new(1))
         .await
         .unwrap_err();
     assert!(matches!(expired, Error::SnapshotExpired(_)), "{expired}");
     let surviving = catalog
-        .snapshot_at(crate::catalog::SnapshotId::new(2))
+        .materialized_at(crate::catalog::SnapshotId::new(2))
         .await
         .unwrap();
     assert!(
@@ -5675,7 +5675,7 @@ async fn the_file_stats_sweep_reclaims_each_orphan_once() {
 
     assert!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .file_column_stats
@@ -5724,7 +5724,7 @@ async fn cleanup_forgets_the_schedule() {
     });
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(head.scheduled_deletions().is_empty());
     assert_eq!(head.current_snapshot().id.get(), 2);
     catalog.close().await.unwrap();
@@ -5858,7 +5858,7 @@ async fn merge_shaped_commit_replaces_files_and_schedules_sources() {
     let id = tx.commit().await.unwrap();
     assert_eq!(id.get(), 2, "compaction mints an ordinary snapshot");
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let files = head.data_files_of(crate::catalog::TableId::new(1));
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].id.get(), 11);
@@ -6037,7 +6037,7 @@ async fn rewrite_shaped_commit_ends_rows_and_rebases_the_new_file() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let files = head.data_files_of(crate::catalog::TableId::new(1));
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].id.get(), 12);
@@ -6180,7 +6180,7 @@ async fn macro_rows_land_fold_and_drop() {
     .await
     .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let stored = &head.macros[&10];
     assert_eq!(stored.begin_snapshot, 1);
     assert_eq!(stored.implementations.len(), 2);
@@ -6209,9 +6209,9 @@ async fn macro_rows_land_fold_and_drop() {
     ));
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(head.macros.is_empty());
-    let past = catalog.snapshot_at(SnapshotId::new(1)).await.unwrap();
+    let past = catalog.materialized_at(SnapshotId::new(1)).await.unwrap();
     let past_macro = &past.macros[&10];
     assert_eq!(past_macro.end_snapshot, Some(2));
     assert_eq!(past_macro.implementations.len(), 2);
@@ -6367,7 +6367,7 @@ async fn mapping_rows_land_fold_and_serve_time_travel() {
     .await
     .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     let stored = &head.mappings[&1][&21];
     assert_eq!(stored.map_type, "map_by_name");
     assert_eq!(stored.name_mappings.len(), 3);
@@ -6377,7 +6377,7 @@ async fn mapping_rows_land_fold_and_serve_time_travel() {
     assert_eq!(head.data_files[&1][&7].mapping_id, Some(21));
 
     // Unversioned: a time-travel view still serves the mapping.
-    let past = catalog.snapshot_at(SnapshotId::new(1)).await.unwrap();
+    let past = catalog.materialized_at(SnapshotId::new(1)).await.unwrap();
     assert_eq!(past.mappings[&1][&21].name_mappings.len(), 3);
     catalog.close().await.unwrap();
 }
@@ -6750,7 +6750,7 @@ async fn a_snapshot_id_that_does_not_advance_the_head_is_refused() {
             "the loser must carry the text DuckLake's commit loop retries on: {err}"
         );
 
-        let snapshot = catalog.snapshot().await.unwrap();
+        let snapshot = catalog.materialized().await.unwrap();
         assert_eq!(snapshot.current_snapshot().id.get(), 1);
         assert!(
             snapshot
@@ -6849,7 +6849,7 @@ async fn staged_option_rows_set_scoped_options_without_minting_a_snapshot() {
         .await
         .unwrap();
     let head_before = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .current_snapshot()
@@ -6877,7 +6877,7 @@ async fn staged_option_rows_set_scoped_options_without_minting_a_snapshot() {
             let reader = Catalog::open_read_only(store, CatalogOptions::default())
                 .await
                 .unwrap();
-            let value = reader.snapshot().await.unwrap().option(scope, key);
+            let value = reader.materialized().await.unwrap().option(scope, key);
             reader.close().await.unwrap();
             value
         }
@@ -7007,7 +7007,7 @@ async fn duplicate_live_ids_are_refused_on_every_primary_keyed_kind() {
     }
 
     // Nothing landed: head still stands where the seed left it.
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(snapshot.current_snapshot().id.get(), 1);
     assert_eq!(
         snapshot
@@ -7092,7 +7092,7 @@ async fn re_inserting_an_id_whose_row_ended_in_the_same_commit_is_accepted() {
     ));
     tx.commit().await.unwrap();
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(
         snapshot
             .schema_by_id(crate::catalog::SchemaId::new(7))
@@ -7128,7 +7128,7 @@ async fn staged_rows_enforce_no_name_uniqueness() {
     .await
     .unwrap();
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     let schemas: Vec<_> = snapshot
         .schemas()
         .into_iter()
@@ -7674,7 +7674,7 @@ async fn column_mapping_delete_reclaims_the_record_and_its_embedded_rows() {
     .await
     .unwrap();
     assert_eq!(
-        catalog.snapshot().await.unwrap().mappings[&1][&21]
+        catalog.materialized().await.unwrap().mappings[&1][&21]
             .name_mappings
             .len(),
         2
@@ -7688,7 +7688,7 @@ async fn column_mapping_delete_reclaims_the_record_and_its_embedded_rows() {
     });
     tx.commit().await.unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.materialized().await.unwrap();
     assert!(
         head.mappings
             .get(&1)
@@ -7998,7 +7998,7 @@ async fn a_writers_view_stands_at_the_snapshot_its_last_commit_minted() {
     ));
     let minted = setup.commit().await.unwrap();
     assert_eq!(
-        catalog.snapshot().await.unwrap().snapshot.snapshot_id,
+        catalog.materialized().await.unwrap().snapshot.snapshot_id,
         minted.get(),
         "the view stands at the first commit"
     );
@@ -8018,7 +8018,7 @@ async fn a_writers_view_stands_at_the_snapshot_its_last_commit_minted() {
     ));
     let minted = flush.commit().await.unwrap();
     assert_eq!(
-        catalog.snapshot().await.unwrap().snapshot.snapshot_id,
+        catalog.materialized().await.unwrap().snapshot.snapshot_id,
         minted.get(),
         "the view stands at the flush"
     );
@@ -8042,7 +8042,7 @@ async fn a_writers_view_stands_at_the_snapshot_its_last_commit_minted() {
     let minted = next.commit().await.unwrap();
 
     assert_eq!(
-        catalog.snapshot().await.unwrap().snapshot.snapshot_id,
+        catalog.materialized().await.unwrap().snapshot.snapshot_id,
         minted.get(),
         "the writer must not serve a view behind the commit it just made"
     );
@@ -8071,7 +8071,10 @@ async fn an_oversized_batch_is_refused_rather_than_staged() {
     }
 
     // Nothing landed: the store still stands where it did.
-    assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 0);
+    assert_eq!(
+        catalog.materialized().await.unwrap().snapshot.snapshot_id,
+        0
+    );
 }
 
 /// An update counts twice against the budget, because it both ends the
@@ -8322,7 +8325,7 @@ fn only_a_flush_s_own_operations_may_exceed_the_ceiling() {
 async fn view_column_tags_end_in_place() {
     let catalog = open().await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             tx.create_view(schema, "v", "duckdb", "SELECT 1 AS amount")?;
             Ok(())
@@ -8330,7 +8333,7 @@ async fn view_column_tags_end_in_place() {
         .await
         .unwrap();
     let view = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .views
@@ -8377,7 +8380,7 @@ async fn view_column_tags_end_in_place() {
         ));
         tx.commit().await.unwrap();
     }
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(snapshot.views[&view].begin_snapshot, 1);
     let db_tx = catalog.begin_write_tx().unwrap();
     let reader = StagedTransaction::begin_detached_on(&catalog, db_tx);

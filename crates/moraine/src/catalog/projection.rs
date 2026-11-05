@@ -436,7 +436,7 @@ mod tests {
             let _ = dump_snapshots(&catalog).await.unwrap();
 
             catalog
-                .commit(|tx| {
+                .commit_materialized(|tx| {
                     let main = tx.schemas()[0].id;
                     let table = tx.create_table(
                         main,

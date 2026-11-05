@@ -139,12 +139,7 @@ impl MetadataCursor {
         table_id: Option<u64>,
         live_bound: Option<u64>,
     ) -> Result<Self> {
-        let scope = catalog
-            .index_read_scope()
-            .await?
-            .ok_or_else(|| Error::Constraint("metadata cursor requires a fixed read scope".into()))?
-            .reads()
-            .clone();
+        let scope = catalog.index_read_scope().await?.reads().clone();
         let source =
             MetadataSource::open(scope.owned_read_handle(), table, table_id, live_bound).await?;
         Ok(Self {

@@ -22,30 +22,35 @@ fn options_stream_with_fixed_facts_under_a_small_memory_budget() {
         .unwrap();
         let payload = "x".repeat(4096);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").unwrap().id;
-                tx.set_option(OptionScope::Global, "created_by", "stored-shadow")?;
+            .commit(async |tx| {
+                let schema = tx.schema_by_name("main").await.unwrap().unwrap().id;
+                tx.set_option(OptionScope::Global, "created_by", "stored-shadow")
+                    .await?;
                 for id in 0..512 {
-                    let table = tx.create_table(
-                        schema,
-                        &format!("t_{id}"),
-                        &[ColumnDef {
-                            name: "i".into(),
-                            column_type: "BIGINT".into(),
-                            nulls_allowed: true,
-                            default_value: None,
-                            children: Vec::new(),
-                        }],
-                    )?;
+                    let table = tx
+                        .create_table(
+                            schema,
+                            &format!("t_{id}"),
+                            &[ColumnDef {
+                                name: "i".into(),
+                                column_type: "BIGINT".into(),
+                                nulls_allowed: true,
+                                default_value: None,
+                                children: Vec::new(),
+                            }],
+                        )
+                        .await?;
                     for option in 0..8 {
                         tx.set_option(
                             OptionScope::Table(table),
                             &format!("measure_{option}"),
                             &payload,
-                        )?;
+                        )
+                        .await?;
                     }
                     if id == 0 {
-                        tx.set_option(OptionScope::Table(table), "version", "table-version")?;
+                        tx.set_option(OptionScope::Table(table), "version", "table-version")
+                            .await?;
                     }
                 }
                 Ok(())
@@ -88,45 +93,49 @@ fn staged_statistics_scan_stays_bounded_after_a_delete() {
         .unwrap();
         let payload = "x".repeat(4096);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").unwrap().id;
-                let table = tx.create_table(
-                    schema,
-                    "files",
-                    &[ColumnDef {
-                        name: "i".into(),
-                        column_type: "VARCHAR".into(),
-                        nulls_allowed: true,
-                        default_value: None,
-                        children: Vec::new(),
-                    }],
-                )?;
-                let column = tx.columns_of(table)[0].id;
+            .commit(async |tx| {
+                let schema = tx.schema_by_name("main").await.unwrap().unwrap().id;
+                let table = tx
+                    .create_table(
+                        schema,
+                        "files",
+                        &[ColumnDef {
+                            name: "i".into(),
+                            column_type: "VARCHAR".into(),
+                            nulls_allowed: true,
+                            default_value: None,
+                            children: Vec::new(),
+                        }],
+                    )
+                    .await?;
+                let column = tx.columns_of(table).await.unwrap()[0].id;
                 for id in 0..2048 {
-                    let file = tx.register_data_file(
-                        table,
-                        moraine::DataFile {
-                            path: format!("file_{id}.parquet"),
-                            path_is_relative: true,
-                            file_format: "parquet".into(),
-                            record_count: 1,
-                            file_size_bytes: 1024,
-                            footer_size: 128,
-                            encryption_key: None,
-                            partition_values: Vec::new(),
-                            column_stats: vec![moraine::FileColumnStats {
-                                column_id: column,
-                                column_size_bytes: 1024,
-                                value_count: Some(1),
-                                null_count: Some(0),
-                                min_value: Some(payload.clone()),
-                                max_value: Some(payload.clone()),
-                                contains_nan: None,
-                                extra_stats: None,
-                            }],
-                        },
-                        &[],
-                    )?;
+                    let file = tx
+                        .register_data_file(
+                            table,
+                            moraine::DataFile {
+                                path: format!("file_{id}.parquet"),
+                                path_is_relative: true,
+                                file_format: "parquet".into(),
+                                record_count: 1,
+                                file_size_bytes: 1024,
+                                footer_size: 128,
+                                encryption_key: None,
+                                partition_values: Vec::new(),
+                                column_stats: vec![moraine::FileColumnStats {
+                                    column_id: column,
+                                    column_size_bytes: 1024,
+                                    value_count: Some(1),
+                                    null_count: Some(0),
+                                    min_value: Some(payload.clone()),
+                                    max_value: Some(payload.clone()),
+                                    contains_nan: None,
+                                    extra_stats: None,
+                                }],
+                            },
+                            &[],
+                        )
+                        .await?;
                     if id == 0 {
                         first_file.set(Some(file.get()));
                     }

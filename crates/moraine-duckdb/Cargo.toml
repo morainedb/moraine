@@ -34,4 +34,5 @@ cbindgen = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+parquet = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

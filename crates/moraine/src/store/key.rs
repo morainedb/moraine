@@ -141,7 +141,7 @@ pub(crate) struct HistoryKey {
 
 /// A temporally versioned catalog entity. Lives in `current` while live; its
 /// `history` mirror appends `end_snapshot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum EntityKey {
     /// `ducklake_schema`.
     Schema {

@@ -23,8 +23,8 @@
 //! let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
 //!
 //! let v1 = catalog
-//!     .commit(|tx| {
-//!         let sales = tx.create_schema("sales")?;
+//!     .commit(async |tx| {
+//!         let sales = tx.create_schema("sales").await?;
 //!         tx.create_table(
 //!             sales,
 //!             "orders",
@@ -35,18 +35,18 @@
 //!                 default_value: None,
 //!                 children: Vec::new(),
 //!             }],
-//!         )?;
+//!         ).await?;
 //!         Ok(())
 //!     })
 //!     .await?;
 //!
 //! // The head sees the latest shape (plus the bootstrap-minted `main`)...
-//! let head = catalog.snapshot().await?;
-//! assert_eq!(head.schemas().len(), 2);
+//! let head = catalog.read_scope().await?;
+//! assert_eq!(head.schemas().await?.len(), 2);
 //!
-//! // ...while `v1` remains queryable by time travel, forever.
-//! let past = catalog.snapshot_at(v1).await?;
-//! assert_eq!(past.schemas().len(), 2);
+//! // ...while `v1` remains queryable while retained.
+//! let past = catalog.read_scope_at(v1).await?;
+//! assert_eq!(past.schemas().await?.len(), 2);
 //! # Ok::<(), moraine::Error>(()) }).unwrap();
 //! ```
 //!
@@ -91,13 +91,13 @@
 //! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 //! # let object_store = Arc::new(InMemory::new());
 //! # let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
-//! catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+//! catalog.commit(async |tx| tx.create_schema("sales").await.map(|_| ())).await?;
 //! let checkpoint = catalog.create_checkpoint(None).await?;
 //!
 //! let mut options = CatalogOptions::default();
 //! options.checkpoint = Some(checkpoint);
 //! let reader = Catalog::open_read_only(object_store, options).await?;
-//! assert!(reader.snapshot().await?.schema_by_name("sales").is_some());
+//! assert!(reader.read_scope().await?.schema_by_name("sales").await?.is_some());
 //! # Ok::<(), moraine::Error>(()) }).unwrap();
 //! ```
 //!
@@ -127,7 +127,7 @@
 //! let mut options = CatalogOptions::default();
 //! options.wal_store = Some(log.clone());
 //! let catalog = Catalog::open(object_store, options).await?;
-//! catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+//! catalog.commit(async |tx| tx.create_schema("sales").await.map(|_| ())).await?;
 //! # catalog.close().await?;
 //! # Ok::<(), moraine::Error>(()) }).unwrap();
 //! ```
@@ -181,7 +181,7 @@
 //! # use object_store::memory::InMemory;
 //! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 //! let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-//! catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+//! catalog.commit(async |tx| tx.create_schema("sales").await.map(|_| ())).await?;
 //!
 //! let census = catalog.store_census(CensusRequest::default()).await?;
 //! // Every subspace is reported, so two censuses compare row by row.
@@ -309,10 +309,10 @@ pub use memory::{
 mod transaction;
 
 pub use catalog::{
-    BuildStep, CATALOG_VERSION, CachePreload, Catalog, CatalogOptions, CatalogSnapshot,
-    CensusRequest, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
-    CommitMember, CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId,
-    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, Demoted, ExcludedPositions,
+    BuildStep, CATALOG_VERSION, CachePreload, Catalog, CatalogCursor, CatalogOptions,
+    CatalogSnapshot, CensusRequest, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder,
+    ColumnStats, CommitMember, CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile,
+    DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, Demoted, ExcludedPositions,
     FileColumnStats, FileIndexEntry, FileIndexRemoval, FileRowCandidate, FlushedDataFile,
     IndexComparison, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexPredicate,
     IndexPredicateRows, IndexReadIdentity, IndexReadScope, IndexState, IndexVerification,
@@ -320,11 +320,11 @@ pub use catalog::{
     MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
     MaintenanceStatusPass, MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome,
     MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId, PartitionSpec,
-    ReadOnlyCatalog, RecentRow, RowSummaryProgress, RowSummaryPublish, SUPERSEDED_CATALOG_VERSION,
-    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
-    SortSpec, StoreCensus, StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge,
-    SubspaceName, TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
-    serves_catalog_version, store_paths_overlap,
+    ReadOnlyCatalog, ReadScope, RecentRow, RowSummaryProgress, RowSummaryPublish,
+    SUPERSEDED_CATALOG_VERSION, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo,
+    SortId, SortKeyDef, SortSpec, StoreCensus, StoreCheckpoint, StoreObjects, SubspaceCensus,
+    SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp,
+    ViewId, ViewInfo, serves_catalog_version, store_paths_overlap,
 };
 pub use commit_log::{
     CatalogHooks, CommitLogProvider, CommitLogSettings, CommitStore, Inspect, ReaderSession,

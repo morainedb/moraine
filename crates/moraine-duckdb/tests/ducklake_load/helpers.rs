@@ -84,29 +84,36 @@ pub fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
             .expect("test setup: open catalog");
 
         catalog
-            .commit(|tx| {
-                let main = tx.schema_by_name("main").expect("bootstrap mints main").id;
+            .commit(async |tx| {
+                let main = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap mints main")
+                    .id;
 
-                let t = tx.create_table(
-                    main,
-                    "t_old",
-                    &[
-                        ColumnDef {
-                            name: "id".into(),
-                            column_type: "BIGINT".into(),
-                            nulls_allowed: false,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                        ColumnDef {
-                            name: "amount".into(),
-                            column_type: "DOUBLE".into(),
-                            nulls_allowed: true,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                )?;
+                let t = tx
+                    .create_table(
+                        main,
+                        "t_old",
+                        &[
+                            ColumnDef {
+                                name: "id".into(),
+                                column_type: "BIGINT".into(),
+                                nulls_allowed: false,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                            ColumnDef {
+                                name: "amount".into(),
+                                column_type: "DOUBLE".into(),
+                                nulls_allowed: true,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                        ],
+                    )
+                    .await?;
                 tx.register_data_file(
                     t,
                     DataFile {
@@ -121,10 +128,11 @@ pub fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
                         column_stats: vec![],
                     },
                     &[],
-                )?;
+                )
+                .await?;
                 // History depth: `t_old`'s current row ends, a history row is
                 // written, and a new current row for `t` begins.
-                tx.rename_table(t, "t")?;
+                tx.rename_table(t, "t").await?;
 
                 Ok(())
             })

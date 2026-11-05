@@ -19,7 +19,7 @@ async fn fixture() -> (Arc<InMemory>, TableId) {
         .unwrap();
     let table = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let id = tx.create_table(
                 schema,
@@ -49,7 +49,7 @@ async fn fixture() -> (Arc<InMemory>, TableId) {
         .unwrap();
     let table = table.get().unwrap();
     catalog
-        .commit(|tx| tx.inline_delete(table, 2, &[]))
+        .commit_materialized(|tx| tx.inline_delete(table, 2, &[]))
         .await
         .unwrap();
     catalog.close().await.unwrap();
@@ -89,7 +89,7 @@ async fn a_writer_scans_a_table_once_and_folds_every_batch_after_it() {
     };
     let tables = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let column = ColumnDef {
                 name: "a".into(),
@@ -111,7 +111,7 @@ async fn a_writer_scans_a_table_once_and_folds_every_batch_after_it() {
     assert_eq!(builds(), 1);
 
     catalog
-        .commit(|tx| tx.inline_insert(unrelated, &chunk, &[]).map(|_| ()))
+        .commit_materialized(|tx| tx.inline_insert(unrelated, &chunk, &[]).map(|_| ()))
         .await
         .unwrap();
     assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_some());
@@ -120,7 +120,7 @@ async fn a_writer_scans_a_table_once_and_folds_every_batch_after_it() {
     // A tombstone moves no range: the directory stands, and the row is
     // still resolved as dead from the tombstone beside it.
     catalog
-        .commit(|tx| tx.inline_delete(looked_up, 1, &[]))
+        .commit_materialized(|tx| tx.inline_delete(looked_up, 1, &[]))
         .await
         .unwrap();
     assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_none());
@@ -133,7 +133,7 @@ async fn a_writer_scans_a_table_once_and_folds_every_batch_after_it() {
     // A chunk arriving moves ranges, and the fold carries it: the row it
     // holds resolves, from a directory rebuilt without a scan.
     catalog
-        .commit(|tx| tx.inline_insert(looked_up, &chunk, &[]).map(|_| ()))
+        .commit_materialized(|tx| tx.inline_insert(looked_up, &chunk, &[]).map(|_| ()))
         .await
         .unwrap();
     assert!(catalog.recent_row(looked_up, 2).await.unwrap().is_some());
@@ -154,10 +154,10 @@ async fn requested_rows_resolve_deletions_across_skipped_tombstones() {
     let catalog = Catalog::open(store, CatalogOptions::default())
         .await
         .unwrap();
-    let before_deletes = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+    let before_deletes = catalog.materialized().await.unwrap().snapshot.snapshot_id;
     for row in [3, 4] {
         catalog
-            .commit(|tx| tx.inline_delete(table, row, &[]))
+            .commit_materialized(|tx| tx.inline_delete(table, row, &[]))
             .await
             .unwrap();
     }
@@ -399,7 +399,7 @@ async fn a_confirmation_opens_one_tombstone_scan_whatever_it_asks_about() {
         .unwrap();
     let table = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let id = tx.create_table(
                 schema,
@@ -427,7 +427,7 @@ async fn a_confirmation_opens_one_tombstone_scan_whatever_it_asks_about() {
         .unwrap();
     let table = table.get().unwrap();
     catalog
-        .commit(|tx| tx.inline_delete(table, 7, &[]))
+        .commit_materialized(|tx| tx.inline_delete(table, 7, &[]))
         .await
         .unwrap();
 

@@ -442,10 +442,7 @@ fn resolve_data_store(
     if adopting {
         let to_record = data_root.clone().unwrap_or_default();
         runtime
-            .block_on(catalog.writer()?.commit(move |tx| {
-                tx.set_option(moraine::OptionScope::Global, "data_path", &to_record)?;
-                Ok(())
-            }))
+            .block_on(catalog.writer()?.adopt_data_path(&to_record))
             .map_err(AbiError::from)?;
     }
 
@@ -937,7 +934,7 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
 /// Free a non-null result exactly once with [`moraine_string_free`].
 ///
 /// Cancellable via `probe`/`probe_ctx`, exactly as
-/// [`super::moraine_snapshot`].
+/// [`super::moraine_snapshot_scoped`].
 ///
 /// # Safety
 ///
@@ -1294,7 +1291,7 @@ pub unsafe extern "C" fn moraine_string_free(ptr: *mut c_char) {
 /// before the flag existed reads as not encrypted.
 ///
 /// Cancellable via `probe`/`probe_ctx`, exactly as
-/// [`super::moraine_snapshot`].
+/// [`super::moraine_snapshot_scoped`].
 ///
 /// # Safety
 ///

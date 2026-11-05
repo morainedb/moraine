@@ -19,9 +19,9 @@ async fn composite_predicates_resolve_against_a_real_pinned_store() {
         .await
         .unwrap();
     let (table, a, b) = seed(&catalog, false).await;
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let reads = scope.reads();
-    let snapshot = reads.snapshot().await.unwrap();
+    let snapshot = reads.materialized().await.unwrap();
     for (comparisons, expected) in [
         (
             vec![(b, Any(vec![number(2)])), (a, Any(vec![number(0)]))],
@@ -51,7 +51,7 @@ async fn composite_predicates_resolve_against_a_real_pinned_store() {
             .map(|(column, comparison)| IndexPredicate { column, comparison })
             .collect::<Vec<_>>();
         let result = reads
-            .index_predicate_rows(&snapshot, table, &predicates)
+            .index_predicate_rows_projected(&snapshot, table, &predicates)
             .await
             .unwrap()
             .unwrap();
@@ -63,7 +63,7 @@ async fn composite_predicates_resolve_against_a_real_pinned_store() {
     }
     assert!(
         reads
-            .index_predicate_rows(
+            .index_predicate_rows_projected(
                 &snapshot,
                 table,
                 &[IndexPredicate {
@@ -82,7 +82,7 @@ async fn composite_predicates_resolve_against_a_real_pinned_store() {
 async fn seed(catalog: &Catalog, unique: bool) -> (TableId, ColumnId, ColumnId) {
     let ids = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let table = tx.create_table(
                 schema,
@@ -136,8 +136,8 @@ async fn a_unique_prefix_does_not_omit_null_bearing_trailing_keys() {
         .await
         .unwrap();
     let (table, a, b) = seed(&catalog, true).await;
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
-    let snapshot = scope.reads().snapshot().await.unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
+    let snapshot = scope.reads().materialized().await.unwrap();
     let predicate = IndexPredicate {
         column: a,
         comparison: Any(vec![number(1)]),
@@ -145,14 +145,14 @@ async fn a_unique_prefix_does_not_omit_null_bearing_trailing_keys() {
     assert!(
         scope
             .reads()
-            .index_predicate_rows(&snapshot, table, std::slice::from_ref(&predicate))
+            .index_predicate_rows_projected(&snapshot, table, std::slice::from_ref(&predicate))
             .await
             .unwrap()
             .is_none()
     );
     let result = scope
         .reads()
-        .index_predicate_rows(
+        .index_predicate_rows_projected(
             &snapshot,
             table,
             &[
@@ -178,7 +178,7 @@ async fn broad_predicates_decline_instead_of_collecting_all_matches() {
         .unwrap();
     let (table, a, b) = seed(&catalog, false).await;
     let info = catalog
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .indexes_of(table)
@@ -199,9 +199,9 @@ async fn broad_predicates_decline_instead_of_collecting_all_matches() {
         }
     }
     transaction.commit().await.unwrap();
-    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap();
     let reads = scope.reads();
-    let snapshot = reads.snapshot().await.unwrap();
+    let snapshot = reads.materialized().await.unwrap();
     for comparisons in [
         vec![(a, Any(vec![number(0)])), (b, Any(vec![number(1)]))],
         vec![(a, Lower(number(0), true))],
@@ -213,7 +213,7 @@ async fn broad_predicates_decline_instead_of_collecting_all_matches() {
             .collect::<Vec<_>>();
         assert!(
             reads
-                .index_predicate_rows(&snapshot, table, &predicates)
+                .index_predicate_rows_projected(&snapshot, table, &predicates)
                 .await
                 .unwrap()
                 .is_none()

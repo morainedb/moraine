@@ -114,11 +114,16 @@ async fn measure_materialization_by_catalog_size() {
         for t in 0..tables {
             let columns = columns.clone();
             catalog
-                .commit(move |tx| {
-                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                    let table = tx.create_table(schema, &format!("t{t}"), &columns)?;
+                .commit(async move |tx| {
+                    let schema = tx
+                        .schema_by_name("main")
+                        .await
+                        .unwrap()
+                        .expect("bootstrap")
+                        .id;
+                    let table = tx.create_table(schema, &format!("t{t}"), &columns).await?;
                     for _ in 0..FILES_PER_TABLE {
-                        tx.register_data_file(table, datafile(100), &[])?;
+                        tx.register_data_file(table, datafile(100), &[]).await?;
                     }
                     Ok(())
                 })
@@ -129,13 +134,15 @@ async fn measure_materialization_by_catalog_size() {
 
         // Live entity count, measured rather than assumed.
         let probe = open_with(store.clone(), SEED_FLUSH_MS).await;
-        let view = probe.snapshot().await.unwrap();
-        let entities: usize = view
-            .schemas()
-            .iter()
-            .flat_map(|s| view.tables_in(s.id))
-            .map(|t| 1 + view.columns_of(t.id).len() + view.data_files_of(t.id).len())
-            .sum();
+        let view = probe.read_scope().await.unwrap();
+        let mut entities = 0;
+        for schema in view.schemas().await.unwrap() {
+            for table in view.tables_in(schema.id).await.unwrap() {
+                entities += 1
+                    + view.columns_of(table.id).await.unwrap().len()
+                    + view.data_files_of(table.id).await.unwrap().len();
+            }
+        }
 
         probe.close().await.unwrap();
 
@@ -146,7 +153,7 @@ async fn measure_materialization_by_catalog_size() {
         for _ in 0..REPEATS {
             let probe = open_with(store.clone(), SEED_FLUSH_MS).await;
             let start = Instant::now();
-            let view = probe.snapshot().await.unwrap();
+            let view = probe.read_scope().await.unwrap();
             samples.push(start.elapsed());
             std::hint::black_box(&view);
             probe.close().await.unwrap();
@@ -204,9 +211,16 @@ async fn measure_attach_cost_by_dead_fraction() {
             let columns = columns.clone();
             let made = std::cell::Cell::new(None);
             catalog
-                .commit(|tx| {
-                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                    made.set(Some(tx.create_table(schema, &format!("t{t}"), &columns)?));
+                .commit(async |tx| {
+                    let schema = tx
+                        .schema_by_name("main")
+                        .await
+                        .unwrap()
+                        .expect("bootstrap")
+                        .id;
+                    made.set(Some(
+                        tx.create_table(schema, &format!("t{t}"), &columns).await?,
+                    ));
                     Ok(())
                 })
                 .await
@@ -225,9 +239,10 @@ async fn measure_attach_cost_by_dead_fraction() {
             let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
             let batch = tables.clone();
             catalog
-                .commit(move |tx| {
+                .commit(async move |tx| {
                     for &table in &batch {
-                        tx.update_table_stats(table, 100 + round as u64, 4_096)?;
+                        tx.update_table_stats(table, 100 + round as u64, 4_096)
+                            .await?;
                     }
                     Ok(())
                 })
@@ -277,7 +292,7 @@ async fn measure_attach_cost_by_dead_fraction() {
         for _ in 0..REPEATS {
             let probe = open_reader(store.clone()).await;
             let start = Instant::now();
-            let view = probe.snapshot().await.unwrap();
+            let view = probe.read_scope().await.unwrap();
             samples.push(start.elapsed());
             std::hint::black_box(&view);
             probe.close().await.unwrap();
@@ -308,9 +323,16 @@ async fn churn_into_ssts(store: &Arc<InMemory>, tables: usize, columns: usize, r
         let columns = columns.clone();
         let made = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                made.set(Some(tx.create_table(schema, &format!("t{t}"), &columns)?));
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                made.set(Some(
+                    tx.create_table(schema, &format!("t{t}"), &columns).await?,
+                ));
                 Ok(())
             })
             .await
@@ -323,9 +345,10 @@ async fn churn_into_ssts(store: &Arc<InMemory>, tables: usize, columns: usize, r
         let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
         let batch = made_tables.clone();
         catalog
-            .commit(move |tx| {
+            .commit(async move |tx| {
                 for &table in &batch {
-                    tx.update_table_stats(table, 100 + round as u64, 4_096)?;
+                    tx.update_table_stats(table, 100 + round as u64, 4_096)
+                        .await?;
                 }
                 Ok(())
             })
@@ -414,7 +437,7 @@ async fn measure_attach_cost_under_get_latency() {
                     .await
                     .unwrap();
                 let start = Instant::now();
-                let view = probe.snapshot().await.unwrap();
+                let view = probe.read_scope().await.unwrap();
                 samples.push(start.elapsed());
                 std::hint::black_box(&view);
                 probe.close().await.unwrap();
@@ -459,15 +482,20 @@ async fn measure_attach_cost_by_index_size() {
 
         let created = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                let table = tx.create_table(schema, "t", &[col("a")])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                let table = tx.create_table(schema, "t", &[col("a")]).await?;
                 let def = IndexDef {
                     name: "idx".into(),
                     columns: vec![ColumnId::new(1)],
                     unique: true,
                 };
-                created.set(Some((table, tx.create_index(table, &def, &[])?)));
+                created.set(Some((table, tx.create_index(table, &def, &[]).await?)));
                 Ok(())
             })
             .await
@@ -493,12 +521,12 @@ async fn measure_attach_cost_by_index_size() {
                 })
                 .collect();
             catalog
-                .commit(move |tx| {
+                .commit(async move |tx| {
                     let file = DataFile {
                         path: format!("f{k}.parquet"),
                         ..datafile(BATCH)
                     };
-                    tx.register_data_file(table, file, &entries)?;
+                    tx.register_data_file(table, file, &entries).await?;
                     Ok(())
                 })
                 .await
@@ -536,7 +564,7 @@ async fn measure_attach_cost_by_index_size() {
             opens.push(start.elapsed());
 
             let start = Instant::now();
-            let view = probe.snapshot().await.unwrap();
+            let view = probe.read_scope().await.unwrap();
             views.push(start.elapsed());
             std::hint::black_box(&view);
             probe.close().await.unwrap();
@@ -580,9 +608,14 @@ async fn measure_commit_latency_by_flush_interval() {
         let store = Arc::new(InMemory::new());
         let catalog = open_with(store, flush_ms).await;
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                tx.create_table(schema, "warmup", &[col("a")])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                tx.create_table(schema, "warmup", &[col("a")]).await?;
                 Ok(())
             })
             .await
@@ -592,9 +625,15 @@ async fn measure_commit_latency_by_flush_interval() {
         for i in 0..COMMITS {
             let start = Instant::now();
             catalog
-                .commit(move |tx| {
-                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                    tx.create_table(schema, &format!("t{i}"), &[col("a")])?;
+                .commit(async move |tx| {
+                    let schema = tx
+                        .schema_by_name("main")
+                        .await
+                        .unwrap()
+                        .expect("bootstrap")
+                        .id;
+                    tx.create_table(schema, &format!("t{i}"), &[col("a")])
+                        .await?;
                     Ok(())
                 })
                 .await
@@ -656,20 +695,33 @@ async fn measure_commit_throughput_by_concurrency() {
         // One table per caller, created up front so the timed burst is
         // appends only.
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
                 for t in 0..concurrency {
-                    tx.create_table(schema, &format!("t{t}"), &[col("a")])?;
+                    tx.create_table(schema, &format!("t{t}"), &[col("a")])
+                        .await?;
                 }
                 Ok(())
             })
             .await
             .unwrap();
-        let head = catalog.snapshot().await.unwrap();
-        let schema = head.schema_by_name("main").unwrap().id;
-        let tables: Vec<_> = (0..concurrency)
-            .map(|t| head.table_by_name(schema, &format!("t{t}")).unwrap().id)
-            .collect();
+        let head = catalog.read_scope().await.unwrap();
+        let schema = head.schema_by_name("main").await.unwrap().unwrap().id;
+        let mut tables = Vec::new();
+        for table in 0..concurrency {
+            tables.push(
+                head.table_by_name(schema, &format!("t{table}"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+            );
+        }
 
         let per_caller = COMMITS / concurrency;
         let wal_before = store.wal_writes();
@@ -681,8 +733,10 @@ async fn measure_commit_throughput_by_concurrency() {
                 tokio::spawn(async move {
                     for _ in 0..per_caller {
                         catalog
-                            .commit(move |tx| {
-                                tx.register_data_file(table, datafile(10), &[]).map(|_| ())
+                            .commit(async move |tx| {
+                                tx.register_data_file(table, datafile(10), &[])
+                                    .await
+                                    .map(|_| ())
                             })
                             .await
                             .unwrap();
@@ -757,9 +811,15 @@ async fn measure_commit_latency_by_write_rtt() {
             for i in 0..COMMITS {
                 let start = Instant::now();
                 catalog
-                    .commit(move |tx| {
-                        let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                        tx.create_table(schema, &format!("t{i}"), &[col("a")])?;
+                    .commit(async move |tx| {
+                        let schema = tx
+                            .schema_by_name("main")
+                            .await
+                            .unwrap()
+                            .expect("bootstrap")
+                            .id;
+                        tx.create_table(schema, &format!("t{i}"), &[col("a")])
+                            .await?;
                         Ok(())
                     })
                     .await
@@ -794,9 +854,14 @@ async fn measure_reclaim_by_batch_size() {
         let catalog = open_with(store, SEED_FLUSH_MS).await;
         let index = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                let table = tx.create_table(schema, "t", &[col("a")])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                let table = tx.create_table(schema, "t", &[col("a")]).await?;
                 let def = IndexDef {
                     name: "idx".into(),
                     columns: vec![ColumnId::new(1)],
@@ -811,14 +876,14 @@ async fn measure_reclaim_by_batch_size() {
                         })],
                     })
                     .collect();
-                index.set(Some(tx.create_index(table, &def, &entries)?));
+                index.set(Some(tx.create_index(table, &def, &entries).await?));
                 Ok(())
             })
             .await
             .unwrap();
         let index = index.get().expect("index created");
         catalog
-            .commit(move |tx| tx.drop_index(index))
+            .commit(async move |tx| tx.drop_index(index).await)
             .await
             .unwrap();
         catalog.close().await.unwrap();
@@ -898,11 +963,18 @@ async fn measure_read_concurrency_under_io_latency() {
         let catalog = open_with(raw.clone(), SEED_FLUSH_MS).await;
         for t in 0..TABLES {
             catalog
-                .commit(move |tx| {
-                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                    let table = tx.create_table(schema, &format!("t{t}"), &[col("a")])?;
+                .commit(async move |tx| {
+                    let schema = tx
+                        .schema_by_name("main")
+                        .await
+                        .unwrap()
+                        .expect("bootstrap")
+                        .id;
+                    let table = tx
+                        .create_table(schema, &format!("t{t}"), &[col("a")])
+                        .await?;
                     for _ in 0..8 {
-                        tx.register_data_file(table, datafile(100), &[])?;
+                        tx.register_data_file(table, datafile(100), &[]).await?;
                     }
                     Ok(())
                 })
@@ -938,7 +1010,7 @@ async fn measure_read_concurrency_under_io_latency() {
             let handles: Vec<_> = (0..k)
                 .map(|_| {
                     let catalog = catalog.clone();
-                    tokio::spawn(async move { catalog.snapshot().await.map(|_| ()) })
+                    tokio::spawn(async move { catalog.read_scope().await.map(|_| ()) })
                 })
                 .collect();
             for handle in handles {
@@ -992,15 +1064,20 @@ async fn measure_index_maintenance_by_store_size() {
 
         let created = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                let table = tx.create_table(schema, "t", &[col("a")])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                let table = tx.create_table(schema, "t", &[col("a")]).await?;
                 let def = IndexDef {
                     name: "idx".into(),
                     columns: vec![ColumnId::new(1)],
                     unique: true,
                 };
-                created.set(Some((table, tx.create_index(table, &def, &[])?)));
+                created.set(Some((table, tx.create_index(table, &def, &[]).await?)));
                 Ok(())
             })
             .await
@@ -1030,12 +1107,12 @@ async fn measure_index_maintenance_by_store_size() {
 
             let start = Instant::now();
             catalog
-                .commit(move |tx| {
+                .commit(async move |tx| {
                     let file = DataFile {
                         path: format!("f{k}.parquet"),
                         ..datafile(BATCH)
                     };
-                    tx.register_data_file(table, file, &entries)?;
+                    tx.register_data_file(table, file, &entries).await?;
                     Ok(())
                 })
                 .await
@@ -1095,6 +1172,7 @@ async fn measure_index_maintenance_by_store_size() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement, not a test: run with --ignored --nocapture"]
 #[allow(clippy::unwrap_used)]
+#[allow(clippy::too_many_lines)]
 async fn measure_cpu_bound_decode_under_worker_pressure() {
     const HEAVY_TABLES: usize = 400;
     const COLS_PER_TABLE: usize = 8;
@@ -1112,11 +1190,16 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
         for t in 0..HEAVY_TABLES {
             let columns = columns.clone();
             catalog
-                .commit(move |tx| {
-                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                    let table = tx.create_table(schema, &format!("t{t}"), &columns)?;
+                .commit(async move |tx| {
+                    let schema = tx
+                        .schema_by_name("main")
+                        .await
+                        .unwrap()
+                        .expect("bootstrap")
+                        .id;
+                    let table = tx.create_table(schema, &format!("t{t}"), &columns).await?;
                     for _ in 0..FILES_PER_TABLE {
-                        tx.register_data_file(table, datafile(100), &[])?;
+                        tx.register_data_file(table, datafile(100), &[]).await?;
                     }
                     Ok(())
                 })
@@ -1129,9 +1212,16 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
     {
         let catalog = open_with(small_store.clone(), SEED_FLUSH_MS).await;
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                tx.create_table(schema, "one", &[col("a")]).map(|_| ())
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                tx.create_table(schema, "one", &[col("a")])
+                    .await
+                    .map(|_| ())
             })
             .await
             .unwrap();
@@ -1152,7 +1242,7 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
     let mut idle = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
         let start = Instant::now();
-        std::hint::black_box(small.snapshot().await.unwrap());
+        std::hint::black_box(small.read_scope().await.unwrap());
         idle.push(start.elapsed());
     }
     let idle = Stats::of(idle);
@@ -1176,7 +1266,7 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
             let decoders: Vec<_> = (0..k)
                 .map(|_| {
                     let heavy = heavy.clone();
-                    tokio::spawn(async move { heavy.snapshot().await.map(|_| ()) })
+                    tokio::spawn(async move { heavy.read_scope().await.map(|_| ()) })
                 })
                 .collect();
             // Queued behind K decodes already in the pool's run queue.
@@ -1184,7 +1274,7 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
                 let small = small.clone();
                 tokio::spawn(async move {
                     let start = Instant::now();
-                    small.snapshot().await.map(|_| ())?;
+                    small.read_scope().await.map(|_| ())?;
                     Ok::<_, moraine::Error>(start.elapsed())
                 })
             };
@@ -1270,11 +1360,16 @@ async fn measure_warm_read_attribution() {
     for t in 0..TABLES {
         let columns = columns.clone();
         catalog
-            .commit(move |tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                let table = tx.create_table(schema, &format!("t{t}"), &columns)?;
+            .commit(async move |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                let table = tx.create_table(schema, &format!("t{t}"), &columns).await?;
                 for _ in 0..16 {
-                    tx.register_data_file(table, datafile(100), &[])?;
+                    tx.register_data_file(table, datafile(100), &[]).await?;
                 }
                 Ok(())
             })
@@ -1282,7 +1377,7 @@ async fn measure_warm_read_attribution() {
             .unwrap();
     }
     // Warm the handle: from here every read below is served from the view.
-    catalog.snapshot().await.unwrap();
+    catalog.read_scope().await.unwrap();
 
     println!("\n# 0009 warm read (in-memory object_store)");
     println!("# {TABLES} tables, {READS} reads per thread, all served from a held view");
@@ -1296,7 +1391,7 @@ async fn measure_warm_read_attribution() {
             let catalog = Arc::clone(&catalog);
             tokio::spawn(async move {
                 for _ in 0..READS {
-                    catalog.snapshot().await.unwrap();
+                    catalog.read_scope().await.unwrap();
                 }
             })
         },
@@ -1304,7 +1399,7 @@ async fn measure_warm_read_attribution() {
     .await;
 
     let reader = Arc::new(open_reader(store.clone()).await);
-    reader.snapshot().await.unwrap();
+    reader.read_scope().await.unwrap();
     read_ladder(
         "Read-only handle (session, then two point reads):",
         &concurrency,
@@ -1313,7 +1408,7 @@ async fn measure_warm_read_attribution() {
             let reader = Arc::clone(&reader);
             tokio::spawn(async move {
                 for _ in 0..READS {
-                    reader.snapshot().await.unwrap();
+                    reader.read_scope().await.unwrap();
                 }
             })
         },
@@ -1323,16 +1418,16 @@ async fn measure_warm_read_attribution() {
     // The floor: handing back the same `Arc` with no check around it. The
     // gap to the first ladder is what checking the fence costs, which is
     // all a warm read does beyond serving the view.
-    let view = catalog.snapshot().await.unwrap();
+    let view = catalog.read_scope().await.unwrap();
     read_ladder(
         "The held view alone, no fence check:",
         &concurrency,
         READS,
         || {
-            let view = Arc::clone(&view);
+            let view = view.clone();
             tokio::spawn(async move {
                 for _ in 0..READS {
-                    std::hint::black_box(Arc::clone(&view));
+                    std::hint::black_box(view.clone());
                 }
             })
         },
@@ -1364,9 +1459,14 @@ async fn measure_reader_round_trips_under_get_latency() {
     for t in 0..TABLES {
         let columns = columns.clone();
         writer
-            .commit(move |tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                tx.create_table(schema, &format!("t{t}"), &columns)?;
+            .commit(async move |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                tx.create_table(schema, &format!("t{t}"), &columns).await?;
                 Ok(())
             })
             .await
@@ -1396,12 +1496,12 @@ async fn measure_reader_round_trips_under_get_latency() {
             .await
             .unwrap();
         // Warm: from here a read is two point reads and a cache hit.
-        reader.snapshot().await.unwrap();
+        reader.read_scope().await.unwrap();
 
         let mut samples = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
             let start = Instant::now();
-            let view = reader.snapshot().await.unwrap();
+            let view = reader.read_scope().await.unwrap();
             samples.push(start.elapsed());
             std::hint::black_box(&view);
         }
@@ -1419,7 +1519,7 @@ async fn measure_reader_round_trips_under_get_latency() {
                 .await
                 .unwrap();
             let start = Instant::now();
-            let view = fresh.snapshot().await.unwrap();
+            let view = fresh.read_scope().await.unwrap();
             cold.push(start.elapsed());
             std::hint::black_box(&view);
             fresh.close().await.unwrap();
@@ -1500,15 +1600,20 @@ async fn measure_probe_cost_by_index_size() {
 
         let created = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                let table = tx.create_table(schema, "t", &[col("a")])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                let table = tx.create_table(schema, "t", &[col("a")]).await?;
                 let def = IndexDef {
                     name: "idx".into(),
                     columns: vec![ColumnId::new(1)],
                     unique: true,
                 };
-                created.set(Some((table, tx.create_index(table, &def, &[])?)));
+                created.set(Some((table, tx.create_index(table, &def, &[]).await?)));
                 Ok(())
             })
             .await
@@ -1528,12 +1633,12 @@ async fn measure_probe_cost_by_index_size() {
                 })
                 .collect();
             catalog
-                .commit(move |tx| {
+                .commit(async move |tx| {
                     let file = DataFile {
                         path: format!("f{k}.parquet"),
                         ..datafile(BATCH)
                     };
-                    tx.register_data_file(table, file, &entries)?;
+                    tx.register_data_file(table, file, &entries).await?;
                     Ok(())
                 })
                 .await

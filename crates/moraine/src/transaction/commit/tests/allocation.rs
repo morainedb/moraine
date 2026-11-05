@@ -160,7 +160,7 @@ async fn snapshot_refresh() {
     for tables in [16, 128, 1024] {
         let (catalog, ids) = seeded_wide_catalog(tables, 4).await;
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 for &table in &ids {
                     for file in 0..8 {
                         tx.register_data_file(table, bulk_file(&format!("f{file}"), 1), &[])?;
@@ -170,9 +170,9 @@ async fn snapshot_refresh() {
             })
             .await
             .unwrap();
-        let base = catalog.snapshot().await.unwrap();
+        let base = catalog.materialized().await.unwrap();
         catalog
-            .commit(|tx| tx.update_table_stats(ids[0], 9, 90))
+            .commit_materialized(|tx| tx.update_table_stats(ids[0], 9, 90))
             .await
             .unwrap();
         let tx = catalog.begin_write_tx().unwrap();
@@ -211,11 +211,11 @@ async fn warm_reads() {
     let durability = Durability::default();
     for tables in [16, 128, 1024] {
         let (catalog, _) = seeded_wide_catalog(tables, 4).await;
-        let held = catalog.snapshot().await.unwrap();
+        let held = catalog.materialized().await.unwrap();
         let mut totals = Totals::default();
         let measurement = Measurement::start(&catalog, &durability);
         for _ in 0..2000 {
-            let view = catalog.snapshot().await.unwrap();
+            let view = catalog.materialized().await.unwrap();
             assert!(Arc::ptr_eq(&held, &view));
             std::hint::black_box(view);
         }
@@ -239,7 +239,7 @@ async fn indexed_catalog(entries: u64) -> (Catalog, Arc<InMemory>, TableId, Inde
     .unwrap();
     let ids = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let table = tx.create_table(
                 schema,
@@ -368,7 +368,7 @@ async fn index_maintenance() {
                 let file = bulk_file(&format!("append-{sample}"), batch);
                 let measurement = Measurement::start(&catalog, &durability);
                 catalog
-                    .commit(|tx| {
+                    .commit_materialized(|tx| {
                         tx.register_data_file(table, file.clone(), &entries)
                             .map(|_| ())
                     })
@@ -431,7 +431,7 @@ fn profile_index_append(
 ) -> stats_alloc::Stats {
     let measurement = Region::new(ALLOCATOR);
     runtime
-        .block_on(catalog.commit(|tx| {
+        .block_on(catalog.commit_materialized(|tx| {
             tx.register_data_file(table, file.clone(), entries)
                 .map(|_| ())
         }))
@@ -528,7 +528,7 @@ async fn index_maintenance_input_order() {
             }
             let measurement = Measurement::start(&catalog, &durability);
             catalog
-                .commit(|tx| {
+                .commit_materialized(|tx| {
                     tx.register_data_file(table, file.clone(), &entries)
                         .map(|_| ())
                 })

@@ -59,7 +59,7 @@ async fn commits_write_their_log_to_the_wal_store() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
 
@@ -92,7 +92,7 @@ async fn a_reopen_replays_the_log_from_the_wal_store() {
     // commit the reopen has to find in the log.
     let written_out = objects(&catalog_store).await.1;
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     assert_eq!(
@@ -109,10 +109,12 @@ async fn a_reopen_replays_the_log_from_the_wal_store() {
         .unwrap();
     assert!(
         reopened
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some()
     );
 }
@@ -128,7 +130,7 @@ async fn a_read_only_catalog_reads_the_wal_store() {
         .await
         .unwrap();
     writer
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     drop(writer);
@@ -138,10 +140,12 @@ async fn a_read_only_catalog_reads_the_wal_store() {
         .unwrap();
     assert!(
         reader
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some()
     );
 }
@@ -214,7 +218,7 @@ async fn a_catalog_lost_before_any_flush_is_still_refused() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     drop(catalog);
@@ -233,10 +237,12 @@ async fn a_catalog_lost_before_any_flush_is_still_refused() {
         .unwrap();
     assert!(
         reopened
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some()
     );
 }
@@ -275,7 +281,7 @@ async fn the_census_counts_the_log_on_the_wal_store() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
 
@@ -309,7 +315,7 @@ async fn a_move_adopts_a_log_store_and_then_requires_it() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     catalog.close().await.unwrap();
@@ -337,14 +343,16 @@ async fn a_move_adopts_a_log_store_and_then_requires_it() {
     .unwrap();
     assert!(
         reopened
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some()
     );
     reopened
-        .commit(|tx| tx.create_schema("ops").map(|_| ()))
+        .commit(async |tx| tx.create_schema("ops").await.map(|_| ()))
         .await
         .unwrap();
     assert!(
@@ -370,7 +378,7 @@ async fn a_move_carries_an_unflushed_commit_across() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     // No close: the commit is durable in the log and nowhere else.
@@ -393,10 +401,12 @@ async fn a_move_carries_an_unflushed_commit_across() {
         .unwrap();
     assert!(
         reopened
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some(),
         "the commit in the old log must have been written out before the move"
     );
@@ -419,7 +429,7 @@ async fn a_move_is_reversible_and_idempotent() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
     catalog.close().await.unwrap();
@@ -441,10 +451,12 @@ async fn a_move_is_reversible_and_idempotent() {
         .unwrap();
     assert!(
         reopened
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("sales")
+            .await
+            .unwrap()
             .is_some()
     );
 }

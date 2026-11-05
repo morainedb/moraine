@@ -29,11 +29,16 @@ async fn a_read_only_handle_materializes_once() {
     .await
     .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            let table = tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            let table = tx.create_table(schema, "t", &[col("a")]).await?;
             for _ in 0..64 {
-                tx.register_data_file(table, datafile(100), &[])?;
+                tx.register_data_file(table, datafile(100), &[]).await?;
             }
             Ok(())
         })
@@ -50,14 +55,17 @@ async fn a_read_only_handle_materializes_once() {
     .unwrap();
 
     // The first view is the materialization, and is allowed to read.
-    let first = reader.snapshot().await.unwrap();
+    let first = reader.read_scope().await.unwrap();
     let cold = counting.take_reads();
     assert!(cold > 0, "a cold view read nothing");
 
     // Every later view serves the same catalog for a small, constant cost.
     for _ in 0..8 {
-        let view = reader.snapshot().await.unwrap();
-        assert_eq!(view.schemas().len(), first.schemas().len());
+        let view = reader.read_scope().await.unwrap();
+        assert_eq!(
+            view.schemas().await.unwrap().len(),
+            first.schemas().await.unwrap().len()
+        );
     }
     let warm = counting.take_reads();
 
@@ -90,11 +98,16 @@ async fn a_materialization_reads_ahead_rather_than_block_by_block() {
     // fetches one at a time issues an order more reads than one that does
     // not, whatever the block size turns out to be.
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            let table = tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            let table = tx.create_table(schema, "t", &[col("a")]).await?;
             for _ in 0..4_000 {
-                tx.register_data_file(table, datafile(100), &[])?;
+                tx.register_data_file(table, datafile(100), &[]).await?;
             }
             Ok(())
         })
@@ -111,13 +124,17 @@ async fn a_materialization_reads_ahead_rather_than_block_by_block() {
     .unwrap();
     counting.take_reads();
 
-    let view = reader.snapshot().await.unwrap();
+    let view = reader.read_scope().await.unwrap();
     let reads = counting.take_reads();
-    let files = view
-        .tables_in(view.schemas()[0].id)
-        .first()
-        .map(|table| view.data_files_of(table.id).len())
-        .unwrap_or_default();
+    let tables = view
+        .tables_in(view.schemas().await.unwrap()[0].id)
+        .await
+        .unwrap();
+    let files = if let Some(table) = tables.first() {
+        view.data_files_of(table.id).await.unwrap().len()
+    } else {
+        0
+    };
 
     assert!(files >= 4_000, "seed did not land: {files} files");
     // One round trip per 4 KiB block would be in the thousands here. The
@@ -149,11 +166,16 @@ async fn a_read_only_handle_scans_once_for_many_dumps() {
     .await
     .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            let table = tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            let table = tx.create_table(schema, "t", &[col("a")]).await?;
             for _ in 0..2_000 {
-                tx.register_data_file(table, datafile(100), &[])?;
+                tx.register_data_file(table, datafile(100), &[]).await?;
             }
             Ok(())
         })
@@ -200,24 +222,26 @@ async fn a_read_only_handle_scans_once_for_many_dumps() {
 async fn a_read_after_a_commit_sees_the_commit() {
     let (catalog, schema, table_a, _) = seeded().await;
 
-    let first = catalog.snapshot().await.unwrap();
-    assert!(first.table_by_name(schema, "late").is_none());
+    let first = catalog.read_scope().await.unwrap();
+    assert!(first.table_by_name(schema, "late").await.unwrap().is_none());
 
     catalog
-        .commit(|tx| {
-            tx.create_table(schema, "late", &[col("x")])?;
-            tx.register_data_file(table_a, datafile(5), &[])?;
+        .commit(async |tx| {
+            tx.create_table(schema, "late", &[col("x")]).await?;
+            tx.register_data_file(table_a, datafile(5), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let second = catalog.snapshot().await.unwrap();
+    let second = catalog.read_scope().await.unwrap();
     let late = second
         .table_by_name(schema, "late")
+        .await
+        .unwrap()
         .expect("a cached read must see the new table");
-    assert_eq!(second.columns_of(late.id).len(), 1);
-    assert_eq!(second.data_files_of(table_a).len(), 1);
+    assert_eq!(second.columns_of(late.id).await.unwrap().len(), 1);
+    assert_eq!(second.data_files_of(table_a).await.unwrap().len(), 1);
 
     catalog.close().await.unwrap();
 }
@@ -228,27 +252,27 @@ async fn a_read_after_a_commit_sees_the_commit() {
 async fn repeated_reads_agree() {
     let (catalog, schema, table_a, _) = seeded().await;
     catalog
-        .commit(|tx| {
-            tx.register_data_file(table_a, datafile(3), &[])?;
+        .commit(async |tx| {
+            tx.register_data_file(table_a, datafile(3), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let first = catalog.snapshot().await.unwrap();
-    let second = catalog.snapshot().await.unwrap();
+    let first = catalog.read_scope().await.unwrap();
+    let second = catalog.read_scope().await.unwrap();
 
     assert_eq!(
         first.current_snapshot().id.get(),
         second.current_snapshot().id.get()
     );
     assert_eq!(
-        first.tables_in(schema).len(),
-        second.tables_in(schema).len()
+        first.tables_in(schema).await.unwrap().len(),
+        second.tables_in(schema).await.unwrap().len()
     );
     assert_eq!(
-        first.data_files_of(table_a).len(),
-        second.data_files_of(table_a).len()
+        first.data_files_of(table_a).await.unwrap().len(),
+        second.data_files_of(table_a).await.unwrap().len()
     );
 
     catalog.close().await.unwrap();
@@ -259,20 +283,19 @@ async fn repeated_reads_agree() {
 #[tokio::test]
 async fn a_cached_read_matches_a_cold_reopen() {
     let (catalog, schema, table_a, table_b) = seeded().await;
-    let warm = catalog.snapshot().await.unwrap();
-    assert_eq!(warm.tables_in(schema).len(), 2);
+    let warm = catalog.read_scope().await.unwrap();
+    assert_eq!(warm.tables_in(schema).await.unwrap().len(), 2);
 
     let wide = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            tx.register_data_file(table_a, datafile(7), &[])?;
-            tx.rename_table(table_b, "renamed")?;
-            tx.create_view(schema, "v", "duckdb", "SELECT 1")?;
-            wide.set(Some(tx.create_table(
-                schema,
-                "wide",
-                &[col("x"), col("y")],
-            )?));
+        .commit(async |tx| {
+            tx.register_data_file(table_a, datafile(7), &[]).await?;
+            tx.rename_table(table_b, "renamed").await?;
+            tx.create_view(schema, "v", "duckdb", "SELECT 1").await?;
+            wide.set(Some(
+                tx.create_table(schema, "wide", &[col("x"), col("y")])
+                    .await?,
+            ));
             Ok(())
         })
         .await
@@ -282,33 +305,45 @@ async fn a_cached_read_matches_a_cold_reopen() {
     // Dropping a column ends one child of a table the same commit did not
     // create, which is the fold's over-cascade trap.
     catalog
-        .commit(|tx| {
-            let second = tx.columns_of(wide)[1].id;
-            tx.drop_column(wide, second)
+        .commit(async |tx| {
+            let second = tx.columns_of(wide).await.unwrap()[1].id;
+            tx.drop_column(wide, second).await
         })
         .await
         .unwrap();
 
     // The live handle answers from its folded-forward cache.
-    let cached = catalog.snapshot().await.unwrap();
+    let cached = catalog.read_scope().await.unwrap();
     let head = cached.current_snapshot().id;
 
     // A cold handle over the same store has no cache and must scan.
     let cold = catalog
-        .snapshot_at(SnapshotId::new(head.get()))
+        .read_scope_at(SnapshotId::new(head.get()))
         .await
         .unwrap();
 
-    assert_eq!(cached.tables_in(schema).len(), cold.tables_in(schema).len());
-    assert!(cached.table_by_name(schema, "renamed").is_some());
-    assert!(cached.view_by_name(schema, "v").is_some());
     assert_eq!(
-        cached.data_files_of(table_a).len(),
-        cold.data_files_of(table_a).len()
+        cached.tables_in(schema).await.unwrap().len(),
+        cold.tables_in(schema).await.unwrap().len()
+    );
+    assert!(
+        cached
+            .table_by_name(schema, "renamed")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(cached.view_by_name(schema, "v").await.unwrap().is_some());
+    assert_eq!(
+        cached.data_files_of(table_a).await.unwrap().len(),
+        cold.data_files_of(table_a).await.unwrap().len()
     );
     // The drop must end exactly one column, not cascade to the table.
-    assert_eq!(cached.columns_of(wide).len(), cold.columns_of(wide).len());
-    assert_eq!(cached.columns_of(wide).len(), 1);
+    assert_eq!(
+        cached.columns_of(wide).await.unwrap().len(),
+        cold.columns_of(wide).await.unwrap().len()
+    );
+    assert_eq!(cached.columns_of(wide).await.unwrap().len(), 1);
 
     catalog.close().await.unwrap();
 }
@@ -319,35 +354,53 @@ async fn a_cached_read_matches_a_cold_reopen() {
 async fn a_held_view_is_unmoved_by_later_commits() {
     let (catalog, schema, table_a, table_b) = seeded().await;
 
-    let held = catalog.snapshot().await.unwrap();
+    let held = catalog.read_scope().await.unwrap();
     let at = held.current_snapshot().id.get();
-    let tables_before = held.tables_in(schema).len();
-    let files_before = held.data_files_of(table_a).len();
+    let tables_before = held.tables_in(schema).await.unwrap().len();
+    let files_before = held.data_files_of(table_a).await.unwrap().len();
 
     for round in 0..4u64 {
         catalog
-            .commit(|tx| {
-                tx.register_data_file(table_a, datafile(round), &[])?;
-                tx.create_table(schema, &format!("later{round}"), &[col("x")])?;
+            .commit(async |tx| {
+                tx.register_data_file(table_a, datafile(round), &[]).await?;
+                tx.create_table(schema, &format!("later{round}"), &[col("x")])
+                    .await?;
                 Ok(())
             })
             .await
             .unwrap();
     }
-    catalog.commit(|tx| tx.drop_table(table_b)).await.unwrap();
+    catalog
+        .commit(async |tx| tx.drop_table(table_b).await)
+        .await
+        .unwrap();
 
     assert_eq!(held.current_snapshot().id.get(), at);
-    assert_eq!(held.tables_in(schema).len(), tables_before);
-    assert_eq!(held.data_files_of(table_a).len(), files_before);
-    assert!(held.table_by_name(schema, "later0").is_none());
-    assert!(held.table_by_name(schema, "b").is_some());
+    assert_eq!(held.tables_in(schema).await.unwrap().len(), tables_before);
+    assert_eq!(
+        held.data_files_of(table_a).await.unwrap().len(),
+        files_before
+    );
+    assert!(
+        held.table_by_name(schema, "later0")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(held.table_by_name(schema, "b").await.unwrap().is_some());
 
     // The same view, rebuilt from `history` at the same snapshot, agrees —
     // so what the held value shows is the catalog at `at`, not a stale
     // accident of how it was built.
-    let travelled = catalog.snapshot_at(SnapshotId::new(at)).await.unwrap();
-    assert_eq!(travelled.tables_in(schema).len(), tables_before);
-    assert_eq!(travelled.data_files_of(table_a).len(), files_before);
+    let travelled = catalog.read_scope_at(SnapshotId::new(at)).await.unwrap();
+    assert_eq!(
+        travelled.tables_in(schema).await.unwrap().len(),
+        tables_before
+    );
+    assert_eq!(
+        travelled.data_files_of(table_a).await.unwrap().len(),
+        files_before
+    );
 
     catalog.close().await.unwrap();
 }
@@ -363,9 +416,9 @@ async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
         .await
         .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.create_schema("s")?;
-            tx.create_table(schema, "t", &[col("x")])?;
+        .commit(async |tx| {
+            let schema = tx.create_schema("s").await?;
+            tx.create_table(schema, "t", &[col("x")]).await?;
             Ok(())
         })
         .await
@@ -375,31 +428,31 @@ async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
     let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
         .await
         .unwrap();
-    let first = reader.snapshot().await.unwrap();
-    let schema = first.schema_by_name("s").unwrap().id;
-    assert!(first.table_by_name(schema, "t").is_some());
+    let first = reader.read_scope().await.unwrap();
+    let schema = first.schema_by_name("s").await.unwrap().unwrap().id;
+    assert!(first.table_by_name(schema, "t").await.unwrap().is_some());
 
     // The second read is served from the cache and must not drift.
-    let second = reader.snapshot().await.unwrap();
+    let second = reader.read_scope().await.unwrap();
     assert_eq!(
         first.current_snapshot().id.get(),
         second.current_snapshot().id.get()
     );
     assert_eq!(
-        second.tables_in(schema).len(),
-        first.tables_in(schema).len()
+        second.tables_in(schema).await.unwrap().len(),
+        first.tables_in(schema).await.unwrap().len()
     );
-    assert!(second.table_by_name(schema, "t").is_some());
+    assert!(second.table_by_name(schema, "t").await.unwrap().is_some());
 
     // And it matches what a rebuild from the store at the same snapshot
     // shows, so the cache is not the only thing that believes it.
     let scanned = reader
-        .snapshot_at(SnapshotId::new(first.current_snapshot().id.get()))
+        .read_scope_at(SnapshotId::new(first.current_snapshot().id.get()))
         .await
         .unwrap();
     assert_eq!(
-        scanned.tables_in(schema).len(),
-        first.tables_in(schema).len()
+        scanned.tables_in(schema).await.unwrap().len(),
+        first.tables_in(schema).await.unwrap().len()
     );
 
     writer.close().await.unwrap();
@@ -430,9 +483,14 @@ async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
         .await
         .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            tx.create_table(schema, "t", &[col("a")]).await?;
             Ok(())
         })
         .await
@@ -442,9 +500,14 @@ async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
     let reader = Catalog::open_read_only(object_store, options)
         .await
         .unwrap();
-    let view = reader.snapshot().await.unwrap();
-    let schema = view.schema_by_name("main").expect("bootstrap").id;
-    assert!(view.table_by_name(schema, "t").is_some());
+    let view = reader.read_scope().await.unwrap();
+    let schema = view
+        .schema_by_name("main")
+        .await
+        .unwrap()
+        .expect("bootstrap")
+        .id;
+    assert!(view.table_by_name(schema, "t").await.unwrap().is_some());
     reader.close().await.unwrap();
 
     let _ = std::fs::remove_dir_all(&cache);
@@ -468,9 +531,14 @@ async fn the_cache_reports_what_it_served() {
         .await
         .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            tx.create_table(schema, "t", &[col("a")]).await?;
             Ok(())
         })
         .await
@@ -482,10 +550,19 @@ async fn the_cache_reports_what_it_served() {
     let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
         .await
         .unwrap();
-    let view = reader.snapshot().await.unwrap();
+    let view = reader.read_scope().await.unwrap();
     assert!(
-        view.table_by_name(view.schema_by_name("main").expect("bootstrap").id, "t")
-            .is_some()
+        view.table_by_name(
+            view.schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id,
+            "t"
+        )
+        .await
+        .unwrap()
+        .is_some()
     );
     reader.close().await.unwrap();
 
@@ -523,9 +600,14 @@ async fn each_catalog_tallies_its_own_reads() {
         .await
         .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            tx.create_table(schema, "t", &[col("a")]).await?;
             Ok(())
         })
         .await
@@ -540,10 +622,19 @@ async fn each_catalog_tallies_its_own_reads() {
     let busy = Catalog::open_read_only(busy_store, CatalogOptions::default())
         .await
         .unwrap();
-    let view = busy.snapshot().await.unwrap();
+    let view = busy.read_scope().await.unwrap();
     assert!(
-        view.table_by_name(view.schema_by_name("main").expect("bootstrap").id, "t")
-            .is_some()
+        view.table_by_name(
+            view.schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id,
+            "t"
+        )
+        .await
+        .unwrap()
+        .is_some()
     );
 
     let busy_tally = busy.cache_tally();
@@ -589,10 +680,16 @@ async fn a_scan_does_not_evict_what_probes_need() {
     // Enough tables that a `current` scan walks real blocks rather than
     // one, so the scan is a genuine eviction opportunity.
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
             for n in 0..64 {
-                tx.create_table(schema, &format!("t{n}"), &[col("a")])?;
+                tx.create_table(schema, &format!("t{n}"), &[col("a")])
+                    .await?;
             }
             Ok(())
         })
@@ -605,9 +702,9 @@ async fn a_scan_does_not_evict_what_probes_need() {
         .unwrap();
 
     // Warm: whatever this costs, it is what a repeat should cost.
-    let _ = reader.snapshot().await.unwrap();
+    let _ = reader.read_scope().await.unwrap();
     let before_repeat = reader.cache_tally();
-    let _ = reader.snapshot().await.unwrap();
+    let _ = reader.read_scope().await.unwrap();
     let warm_misses = reader.cache_tally().metadata_misses - before_repeat.metadata_misses;
 
     // A full scan of every subspace, then the same read again.
@@ -622,7 +719,7 @@ async fn a_scan_does_not_evict_what_probes_need() {
     assert!(!census.subspaces.is_empty());
 
     let before_after_scan = reader.cache_tally();
-    let _ = reader.snapshot().await.unwrap();
+    let _ = reader.read_scope().await.unwrap();
     let after_scan_misses =
         reader.cache_tally().metadata_misses - before_after_scan.metadata_misses;
     reader.close().await.unwrap();
@@ -646,9 +743,14 @@ async fn attached_catalogs_share_one_cache() {
             .await
             .unwrap();
         writer
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                tx.create_table(schema, "t", &[col("a")])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                tx.create_table(schema, "t", &[col("a")]).await?;
                 Ok(())
             })
             .await
@@ -659,13 +761,13 @@ async fn attached_catalogs_share_one_cache() {
     let first = Catalog::open_read_only(first_store, CatalogOptions::default())
         .await
         .unwrap();
-    let _ = first.snapshot().await.unwrap();
+    let _ = first.read_scope().await.unwrap();
     let after_first = moraine::cache_tally();
 
     let second = Catalog::open_read_only(second_store, CatalogOptions::default())
         .await
         .unwrap();
-    let _ = second.snapshot().await.unwrap();
+    let _ = second.read_scope().await.unwrap();
     let after_second = moraine::cache_tally();
 
     first.close().await.unwrap();
@@ -691,10 +793,16 @@ async fn a_preload_warms_before_the_first_read() {
         .await
         .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
             for n in 0..32 {
-                tx.create_table(schema, &format!("t{n}"), &[col("a")])?;
+                tx.create_table(schema, &format!("t{n}"), &[col("a")])
+                    .await?;
             }
             Ok(())
         })
@@ -728,8 +836,8 @@ async fn a_preload_warms_before_the_first_read() {
         "preload traffic was not attributed separately: {after_open:?}"
     );
 
-    let view = reader.snapshot().await.unwrap();
-    assert!(view.schema_by_name("main").is_some());
+    let view = reader.read_scope().await.unwrap();
+    assert!(view.schema_by_name("main").await.unwrap().is_some());
     reader.close().await.unwrap();
 }
 
@@ -749,11 +857,16 @@ async fn the_shared_cache_reports_metadata_apart_from_data_blocks() {
     .await
     .unwrap();
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            let table = tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            let table = tx.create_table(schema, "t", &[col("a")]).await?;
             for _ in 0..256 {
-                tx.register_data_file(table, datafile(100), &[])?;
+                tx.register_data_file(table, datafile(100), &[]).await?;
             }
             Ok(())
         })
@@ -768,7 +881,7 @@ async fn the_shared_cache_reports_metadata_apart_from_data_blocks() {
     )
     .await
     .unwrap();
-    reader.snapshot().await.unwrap();
+    reader.read_scope().await.unwrap();
 
     let status = moraine::cache_status();
     assert!(status.metadata_occupancy_bytes > 0, "{status:?}");
@@ -799,32 +912,42 @@ async fn a_handle_does_not_retain_decoded_catalogs() {
     assert_eq!(writer.projection_bytes(), 0);
 
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            let table = tx.create_table(schema, "t", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            let table = tx.create_table(schema, "t", &[col("a")]).await?;
             for _ in 0..64 {
-                tx.register_data_file(table, datafile(100), &[])?;
+                tx.register_data_file(table, datafile(100), &[]).await?;
             }
             Ok(())
         })
         .await
         .unwrap();
-    writer.snapshot().await.unwrap();
+    writer.read_scope().await.unwrap();
     let small = writer.projection_bytes();
     assert_eq!(small, 0, "the caller owns the materialized catalog");
 
     writer
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap").id;
-            let table = tx.create_table(schema, "u", &[col("b")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            let table = tx.create_table(schema, "u", &[col("b")]).await?;
             for _ in 0..512 {
-                tx.register_data_file(table, datafile(100), &[])?;
+                tx.register_data_file(table, datafile(100), &[]).await?;
             }
             Ok(())
         })
         .await
         .unwrap();
-    writer.snapshot().await.unwrap();
+    writer.read_scope().await.unwrap();
 
     assert_eq!(writer.projection_bytes(), 0);
     writer.close().await.unwrap();
@@ -852,24 +975,31 @@ async fn warming_a_table_reads_its_probe_ranges() {
         .unwrap();
         let created = std::cell::Cell::new(None);
         writer
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap").id;
-                let table = tx.create_table(schema, "items", &[col("value")])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap")
+                    .id;
+                let table = tx.create_table(schema, "items", &[col("value")]).await?;
                 let entries = (0..2_000_u64)
                     .map(|row_id| IndexEntry {
                         row_id,
                         values: vec![Some(key(i128::from(row_id)))],
                     })
                     .collect::<Vec<_>>();
-                let index = tx.create_index(
-                    table,
-                    &IndexDef {
-                        name: "by_value".to_owned(),
-                        columns: vec![moraine::ColumnId::new(1)],
-                        unique: false,
-                    },
-                    &entries,
-                )?;
+                let index = tx
+                    .create_index(
+                        table,
+                        &IndexDef {
+                            name: "by_value".to_owned(),
+                            columns: vec![moraine::ColumnId::new(1)],
+                            unique: false,
+                        },
+                        &entries,
+                    )
+                    .await?;
                 created.set(Some((table, index)));
                 Ok(())
             })
@@ -888,7 +1018,7 @@ async fn warming_a_table_reads_its_probe_ranges() {
     )
     .await
     .unwrap();
-    reader.snapshot().await.unwrap();
+    reader.read_scope().await.unwrap();
     counting.take_reads();
 
     reader.warm_tables(&[table]).await.unwrap();

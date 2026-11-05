@@ -110,7 +110,7 @@ fn dump_failure_keeps_outputs_untouched_and_releases_converted_rows() {
                 ptr::null_mut(),
                 &raw mut error,
                 async move |catalog: &moraine::ReadOnlyCatalog| {
-                    catalog.snapshot().await?;
+                    catalog.read_scope().await?;
                     Ok(vec![completed, failure])
                 },
             )

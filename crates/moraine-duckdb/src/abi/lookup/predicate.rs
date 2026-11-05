@@ -123,7 +123,7 @@ pub unsafe extern "C" fn moraine_index_predicate_rows(
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
-                reads.index_predicate_rows(&snapshot, table_id, &predicates),
+                reads.index_predicate_rows_projected(&snapshot, table_id, &predicates),
             )
         }?;
         let Some(result) = result else {

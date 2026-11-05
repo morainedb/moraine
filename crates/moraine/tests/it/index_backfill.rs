@@ -42,9 +42,14 @@ async fn scoped_backfill_reads_registered_files_from_the_data_store() {
 
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "orders", &[col("a")]).await?;
             tx.register_data_file(
                 table,
                 moraine::DataFile {
@@ -53,7 +58,8 @@ async fn scoped_backfill_reads_registered_files_from_the_data_store() {
                     ..datafile(3)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             created.set(Some(table));
             Ok(())
         })

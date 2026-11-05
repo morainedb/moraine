@@ -53,7 +53,7 @@ async fn name_migration_resumes_through_log_slots_and_preserves_adoption() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             for id in 0..300 {
                 tx.create_schema(&format!("schema_{id}"))?;
             }
@@ -111,7 +111,7 @@ async fn name_migration_resumes_through_log_slots_and_preserves_adoption() {
     }
     session.finish();
     catalog
-        .commit(|tx| tx.create_schema("after_migration").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("after_migration").map(|_| ()))
         .await
         .unwrap();
     let session = catalog.begin_read().await.unwrap();
@@ -200,7 +200,7 @@ async fn delete_target_migration_resumes_through_log_slots() {
     let reader = Catalog::open_read_only(objects.clone(), options.clone())
         .await
         .unwrap();
-    let scope = reader.index_read_scope().await.unwrap().unwrap();
+    let scope = reader.index_read_scope().await.unwrap();
     let read = scope.reads().begin_read().await.unwrap();
     assert_eq!(
         read::read_format(read.handle())

@@ -144,7 +144,7 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
             let data_store = handle_ref.data_store.as_ref().ok_or_else(|| {
                 AbiError::invalid_argument("position resolution requires a data store")
             })?;
-            let locate = reads.locate_row_positions_at(
+            let locate = reads.locate_row_positions_at_projected(
                 &view,
                 data_store,
                 &handle_ref.data_prefix,

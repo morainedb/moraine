@@ -122,7 +122,7 @@ Verbs on `Transaction`:
 | `create_index(table, name, columns, unique)` | Insert the definition; build entries for every live row (see Coverage) in the same commit. |
 | `drop_index(index)` | End the definition into `history`. Entries are orphaned and reclaimed lazily (see Reclamation). |
 
-`CatalogSnapshot` exposes `indexes_of(table)` and
+`ReadScope` exposes `indexes_of(table)` and
 `index_by_schema_name(schema, name)`; domain types include `IndexId` and
 `IndexInfo`. New index names are case-insensitively unique within a schema,
 checked inside the creation commit for both SQL and embedding callers.
@@ -613,9 +613,9 @@ bounded by how much data may sit inlined.
 
 ### Lookups
 
-One accessor family on `CatalogSnapshot`, served under the snapshot's pinned
-read handle so the lookup and the catalog it points into are one consistent
-cut:
+One accessor family on `ReadOnlyCatalog`, served through `ReadScope::reads()`
+on the pinned read handle so the lookup and its catalog metadata share one
+consistent revision:
 
 - `index_lookup(table, index, key_values) -> Vec<u64>` — point-get
   (unique) or prefix scan (non-unique) in `index`. Consumers join the returned

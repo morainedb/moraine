@@ -439,7 +439,7 @@ async fn fresh_reader_sees_committed_head() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("visible").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("visible").map(|_| ()))
         .await
         .unwrap();
 
@@ -497,7 +497,7 @@ async fn flush_on_commit_lands_the_write_without_waiting_for_the_interval() {
 
     let started = Instant::now();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_schema("s")?;
             Ok(())
         })
@@ -530,7 +530,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
     // dedups to that one table.
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let table = tx.create_table(
                 schema,
@@ -553,7 +553,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
 
     // A data-only commit changes no table's shape.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(
                 table,
                 DataFile {
@@ -596,7 +596,7 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
         .unwrap();
     let table = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let column = |name: &str| ColumnDef {
                 name: name.into(),
@@ -693,7 +693,7 @@ async fn create_index_persists_definition_and_entries_without_changing_format() 
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -710,7 +710,7 @@ async fn create_index_persists_definition_and_entries_without_changing_format() 
         .unwrap();
     let index_id = index.get().unwrap();
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     let infos = snapshot.indexes_of(table);
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].id, index_id);
@@ -744,7 +744,7 @@ async fn deferred_index_is_non_unique_and_preserves_the_format() {
     let (catalog, table) = catalog_with_two_column_table().await;
 
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_index_ordered_with_maintenance(
                 table,
                 &IndexDef {
@@ -761,7 +761,7 @@ async fn deferred_index_is_non_unique_and_preserves_the_format() {
         .await
         .unwrap();
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(
         snapshot.indexes_of(table)[0].maintenance,
         IndexMaintenance::Deferred
@@ -769,7 +769,7 @@ async fn deferred_index_is_non_unique_and_preserves_the_format() {
     assert_eq!(read_format_version(&catalog).await, MAX_FORMAT_VERSION);
 
     let error = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_index_ordered_with_maintenance(
                 table,
                 &IndexDef {
@@ -794,7 +794,7 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
     use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     let err = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_index(
                 table,
                 &IndexDef {
@@ -813,7 +813,7 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
     // The aborted commit left no index and preserved the format.
     assert!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .indexes_of(table)
@@ -828,7 +828,7 @@ async fn non_unique_index_accepts_duplicate_values() {
     use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_index(
                 table,
                 &IndexDef {
@@ -842,7 +842,15 @@ async fn non_unique_index_accepts_duplicate_values() {
         })
         .await
         .unwrap();
-    assert_eq!(catalog.snapshot().await.unwrap().indexes_of(table).len(), 1);
+    assert_eq!(
+        catalog
+            .materialized()
+            .await
+            .unwrap()
+            .indexes_of(table)
+            .len(),
+        1
+    );
     catalog.close().await.unwrap();
 }
 
@@ -857,7 +865,7 @@ async fn null_indexed_value_gets_no_entry_so_unique_admits_many() {
     // Two NULL rows under a unique index: NULLs get no entry, so no
     // collision.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_index(
                 table,
                 &IndexDef {
@@ -871,7 +879,15 @@ async fn null_indexed_value_gets_no_entry_so_unique_admits_many() {
         })
         .await
         .unwrap();
-    assert_eq!(catalog.snapshot().await.unwrap().indexes_of(table).len(), 1);
+    assert_eq!(
+        catalog
+            .materialized()
+            .await
+            .unwrap()
+            .indexes_of(table)
+            .len(),
+        1
+    );
     catalog.close().await.unwrap();
 }
 
@@ -882,7 +898,7 @@ async fn register_three_row_file(
     use crate::catalog::DataFile;
     let file = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.register_data_file(
                 table,
                 DataFile {
@@ -915,7 +931,7 @@ async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -955,7 +971,7 @@ async fn index_lookup_returns_all_rows_for_a_non_unique_value() {
     register_three_row_file(&catalog, table).await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // Rows 0 and 2 share value 10; row 1 is 20.
             let id = tx.create_index(
                 table,
@@ -997,7 +1013,7 @@ async fn index_range_selects_unique_values_in_a_bounded_interval() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // Rows 0,1,2 hold ascending values 10,20,30.
             let id = tx.create_index(
                 table,
@@ -1080,7 +1096,7 @@ async fn index_range_reverse_serves_the_opposite_order() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -1140,7 +1156,7 @@ async fn index_range_refuses_a_bound_wider_than_the_index() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -1183,7 +1199,7 @@ async fn index_range_over_a_non_unique_index_returns_every_matching_row() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // Rows 0 and 2 share value 10; row 1 is 20.
             let id = tx.create_index(
                 table,
@@ -1262,7 +1278,7 @@ async fn index_range_excludes_nulls_from_an_open_side() {
 
         let index = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let id = tx.create_index_ordered(
                     table,
                     &IndexDef {
@@ -1310,7 +1326,7 @@ async fn descending_index_scans_high_value_first() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index_ordered(
                 table,
                 &IndexDef {
@@ -1388,7 +1404,7 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // Row 0 holds a=10; rows 1 and 2 are both a=NULL. A unique index
             // must accept two NULL rows — SQL treats NULLs as distinct.
             let id = tx.create_index(
@@ -1469,7 +1485,7 @@ async fn composite_index_nulls_matches_a_leading_prefix() {
     };
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // row 0: (5, NULL); row 1: (5, 3); row 2: (7, NULL).
             let id = tx.create_index(
                 table,
@@ -1524,7 +1540,7 @@ async fn index_range_spans_a_composite_prefix_and_window() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // row 0: (5, 10); row 1: (5, 20); row 2: (7, 10).
             let id = tx.create_index(
                 table,
@@ -1633,7 +1649,7 @@ async fn index_range_prefix_bound_carries_over_a_descending_value() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // 256 and 512 both end in a zero byte, which frames to `0x01 0x00`
             // and complements to `0xFE 0xFF` under a descending column.
             let id = tx.create_index_ordered(
@@ -1717,7 +1733,7 @@ async fn index_range_over_mixed_directions_requires_a_pinned_prefix() {
 
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             // row 0: (5, 10); row 1: (5, 20); row 2: (7, 10).
             let id = tx.create_index_ordered(
                 table,
@@ -1811,7 +1827,7 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -1842,13 +1858,13 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
 
     // A non-empty file on an indexed table with no entries is refused.
     let refused = catalog
-        .commit(|tx| tx.register_data_file(table, file(), &[]).map(|_| ()))
+        .commit_materialized(|tx| tx.register_data_file(table, file(), &[]).map(|_| ()))
         .await;
     assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
 
     // With entries it lands; ordinals map to row ids 0 and 1.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(
                 table,
                 file(),
@@ -1920,7 +1936,7 @@ async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -1938,7 +1954,7 @@ async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
     let index = index.get().unwrap();
 
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(table, bulk_file("a.parquet", COUNT), &{
                 bulk_file_entries(index, 0, COUNT)
             })
@@ -1952,7 +1968,7 @@ async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
     let mut duplicated = bulk_file_entries(index, i128::from(COUNT), COUNT);
     duplicated[700].values = vec![Some(int_value(42))];
     let err = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(table, bulk_file("b.parquet", COUNT), &duplicated)
                 .map(|_| ())
         })
@@ -1977,7 +1993,7 @@ async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
 
     // A fresh bulk commit after the abort lands, and both files resolve.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(table, bulk_file("c.parquet", COUNT), &{
                 bulk_file_entries(index, i128::from(COUNT), COUNT)
             })
@@ -2010,7 +2026,7 @@ async fn bulk_unique_commit_frees_values_deleted_in_the_same_commit() {
     let index = std::cell::Cell::new(None);
     let file = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -2035,7 +2051,7 @@ async fn bulk_unique_commit_frees_values_deleted_in_the_same_commit() {
     // One commit: kill every first-file row (freeing its value), and
     // register a new file re-claiming every one of those values.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let removals: Vec<FileIndexRemoval> = (0..COUNT)
                 .map(|row_id| FileIndexRemoval {
                     index,
@@ -2073,7 +2089,7 @@ async fn bulk_commit_over_two_unique_indexes_names_the_violated_index() {
     let by_a = std::cell::Cell::new(None);
     let by_b = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let a = tx.create_index(
                 table,
                 &IndexDef {
@@ -2107,7 +2123,7 @@ async fn bulk_commit_over_two_unique_indexes_names_the_violated_index() {
         entries
     };
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(table, bulk_file("a.parquet", COUNT), &both(0, 100_000))
                 .map(|_| ())
         })
@@ -2118,7 +2134,7 @@ async fn bulk_commit_over_two_unique_indexes_names_the_violated_index() {
     let mut entries = both(i128::from(COUNT), 100_000 + i128::from(COUNT));
     entries[usize::try_from(COUNT).unwrap() + 900].values = vec![Some(int_value(100_042))];
     let err = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(table, bulk_file("b.parquet", COUNT), &entries)
                 .map(|_| ())
         })
@@ -2145,7 +2161,7 @@ async fn catalog_with_indexed_data_file() -> (
     let index = std::cell::Cell::new(None);
     let file = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -2211,7 +2227,7 @@ async fn register_delete_file_removes_the_entries_it_names() {
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
 
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_delete_file(
                 table,
                 delete_file(file),
@@ -2252,7 +2268,7 @@ async fn register_delete_file_removes_the_entries_it_names() {
 async fn register_delete_file_must_supply_index_entries() {
     let (catalog, table, _, file) = catalog_with_indexed_data_file().await;
     let refused = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_delete_file(table, delete_file(file), &[])
                 .map(|_| ())
         })
@@ -2268,7 +2284,7 @@ async fn register_delete_file_rejects_index_entries_without_deletes() {
     use crate::catalog::FileIndexRemoval;
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
     let refused = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_delete_file(
                 table,
                 crate::catalog::DeleteFile {
@@ -2294,7 +2310,7 @@ async fn register_delete_file_rejects_an_out_of_range_row_id() {
     use crate::catalog::FileIndexRemoval;
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
     let refused = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_delete_file(
                 table,
                 delete_file(file),
@@ -2317,7 +2333,7 @@ async fn unique_index_rejects_a_duplicate_value_across_commits() {
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -2358,7 +2374,7 @@ async fn unique_index_rejects_a_duplicate_value_across_commits() {
 
     // First value 10 lands.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let (file, entry) = one_row_with(10);
             tx.register_data_file(table, file, &[entry]).map(|_| ())
         })
@@ -2367,7 +2383,7 @@ async fn unique_index_rejects_a_duplicate_value_across_commits() {
     // A later commit inserting the same value 10 (different row) is
     // rejected by the point-get against the winner's entry.
     let dup = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let (file, entry) = one_row_with(10);
             tx.register_data_file(table, file, &[entry]).map(|_| ())
         })
@@ -2395,7 +2411,7 @@ async fn scoped_read_covers_a_registration_end_to_end() {
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -2448,7 +2464,7 @@ async fn scoped_read_covers_a_registration_end_to_end() {
         .unwrap();
     assert_eq!(entries.len(), 3);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(
                 table,
                 DataFile {
@@ -2483,7 +2499,7 @@ async fn ddl_on_an_indexed_column_is_guarded() {
     use crate::catalog::{ColumnAlteration, ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_index(
                 table,
                 &IndexDef {
@@ -2500,11 +2516,11 @@ async fn ddl_on_an_indexed_column_is_guarded() {
 
     // Dropping or retyping the indexed column is refused.
     let dropped = catalog
-        .commit(|tx| tx.drop_column(table, ColumnId::new(1)))
+        .commit_materialized(|tx| tx.drop_column(table, ColumnId::new(1)))
         .await;
     assert!(matches!(dropped, Err(Error::Constraint(_))), "{dropped:?}");
     let retyped = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.alter_column(
                 table,
                 ColumnId::new(1),
@@ -2520,11 +2536,11 @@ async fn ddl_on_an_indexed_column_is_guarded() {
     // Renaming the indexed column, and retyping a non-indexed column,
     // are unaffected.
     catalog
-        .commit(|tx| tx.rename_column(table, ColumnId::new(1), "a2"))
+        .commit_materialized(|tx| tx.rename_column(table, ColumnId::new(1), "a2"))
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.alter_column(
                 table,
                 ColumnId::new(2),
@@ -2578,7 +2594,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     register_three_row_file(&single, table_single).await;
     let single_index = std::cell::Cell::new(None);
     single
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table_single,
                 &def(),
@@ -2596,7 +2612,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     register_three_row_file(&staged, table_staged).await;
     let staged_index = std::cell::Cell::new(None);
     staged
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index_staged(table_staged, &def())?;
             staged_index.set(Some(id));
             Ok(())
@@ -2619,7 +2635,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
 
     // Two batches, the second final.
     staged
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_step(staged_index, &[entry(0, 10), entry(1, 20)], false)
                 .map(|_| ())
         })
@@ -2627,7 +2643,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
         .unwrap();
     let final_state = std::cell::Cell::new(None);
     staged
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let state = tx.build_index_step(staged_index, &[entry(2, 30)], true)?;
             final_state.set(Some(state));
             Ok(())
@@ -2678,7 +2694,7 @@ async fn staged_ordered_create_records_orders_and_matches_single_commit() {
     register_three_row_file(&single, table_single).await;
     let single_index = std::cell::Cell::new(None);
     single
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index_ordered(
                 table_single,
                 &def(),
@@ -2695,7 +2711,7 @@ async fn staged_ordered_create_records_orders_and_matches_single_commit() {
     register_three_row_file(&staged, table_staged).await;
     let staged_index = std::cell::Cell::new(None);
     staged
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index_staged_ordered(table_staged, &def(), &orders())?;
             staged_index.set(Some(id));
             Ok(())
@@ -2705,7 +2721,7 @@ async fn staged_ordered_create_records_orders_and_matches_single_commit() {
     let staged_index = staged_index.get().unwrap();
 
     let info = staged
-        .snapshot()
+        .materialized()
         .await
         .unwrap()
         .indexes_of(table_staged)
@@ -2714,14 +2730,14 @@ async fn staged_ordered_create_records_orders_and_matches_single_commit() {
     assert_eq!(info.nulls, vec![NullOrder::First]);
 
     staged
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_step(staged_index, &[entry(0, 10), entry(1, 20)], false)
                 .map(|_| ())
         })
         .await
         .unwrap();
     staged
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_step(staged_index, &[entry(2, 30)], true)
                 .map(|_| ())
         })
@@ -2750,7 +2766,7 @@ async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
     register_three_row_file(&catalog, table).await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index_staged(
                 table,
                 &IndexDef {
@@ -2768,7 +2784,7 @@ async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
 
     // The build covers row 0, which holds value 10.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_step(index, &[entry(0, 10)], false)
                 .map(|_| ())
         })
@@ -2777,7 +2793,7 @@ async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
 
     // A writer now registers a file whose row claims that same value.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(
                 table,
                 DataFile {
@@ -2802,7 +2818,7 @@ async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
         .await
         .expect("the writer's commit lands rather than failing on the building index");
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.materialized().await.unwrap();
     assert_eq!(
         snapshot.indexes_of(table).remove(0).state,
         IndexState::Poisoned,
@@ -2821,7 +2837,7 @@ async fn a_writer_duplicating_a_value_on_a_ready_index_still_fails() {
     use crate::catalog::FileIndexEntry;
     let (catalog, table, index, _) = catalog_with_indexed_data_file().await;
     let refused = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(
                 table,
                 crate::catalog::DataFile {
@@ -2855,7 +2871,7 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
     register_three_row_file(&catalog, table).await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index_staged(
                 table,
                 &IndexDef {
@@ -2876,7 +2892,7 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
     // is building. The build's driver is what turns the poison into the
     // caller's `Constraint`.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_step(index, &[entry(0, 10), entry(1, 10)], false)
                 .map(|_| ())
         })
@@ -2884,7 +2900,7 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
         .expect("the step lands; the duplicate poisons the definition");
     assert_eq!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .indexes_of(table)
@@ -2896,14 +2912,14 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
     // Complete the build, then a further step on the ready index is
     // refused.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_step(index, &[entry(0, 10)], true)
                 .map(|_| ())
         })
         .await
         .unwrap();
     let after_ready = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.build_index_step(index, &[entry(1, 20)], false)
                 .map(|_| ())
         })
@@ -2925,7 +2941,7 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
     register_three_row_file(&catalog, table).await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -2948,7 +2964,10 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
         Err(Error::Constraint(_))
     ));
 
-    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(index))
+        .await
+        .unwrap();
 
     // A bounded sweep deletes the three orphaned entries, then reports
     // nothing left.
@@ -2984,7 +3003,7 @@ async fn indexed(
     let entries: Vec<_> = (0..count).map(|i| entry(i, i128::from(i) * 10)).collect();
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -3044,7 +3063,10 @@ async fn maintain_sweeps_a_dropped_index_and_is_idempotent() {
     assert_eq!(untouched.index_entries_reclaimed, 0);
     assert_eq!(index_entry_count(&catalog).await, 3);
 
-    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(index))
+        .await
+        .unwrap();
 
     let swept = catalog
         .maintain(MaintenanceRequest::default())
@@ -3082,7 +3104,7 @@ async fn maintain_does_not_read_a_swept_range_block_by_block() {
     let catalog = open().await.unwrap();
     let table = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let column = ColumnDef {
                 name: "a".into(),
@@ -3100,7 +3122,10 @@ async fn maintain_does_not_read_a_swept_range_block_by_block() {
     let dead = indexed(&catalog, table, "dead", DEAD_ENTRIES).await;
     let live = indexed(&catalog, table, "live", 3).await;
     assert!(dead.get() < live.get());
-    catalog.commit(|tx| tx.drop_index(dead)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(dead))
+        .await
+        .unwrap();
     catalog.flush_memtable().await.unwrap();
     catalog.close().await.unwrap();
 
@@ -3146,8 +3171,14 @@ async fn maintain_spares_live_indexes_interleaved_by_id() {
     assert!(first.get() < live.get() && live.get() < last.get());
 
     // Drop the lowest and highest ids, leaving a live index between them.
-    catalog.commit(|tx| tx.drop_index(first)).await.unwrap();
-    catalog.commit(|tx| tx.drop_index(last)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(first))
+        .await
+        .unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(last))
+        .await
+        .unwrap();
 
     let report = catalog
         .maintain(MaintenanceRequest::default())
@@ -3187,7 +3218,10 @@ async fn maintain_reclaims_both_indexes_of_a_dropped_table() {
     indexed(&catalog, table, "also_a", 2).await;
     assert_eq!(index_entry_count(&catalog).await, 5);
 
-    catalog.commit(|tx| tx.drop_table(table)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_table(table))
+        .await
+        .unwrap();
 
     let report = catalog
         .maintain(MaintenanceRequest::default())
@@ -3208,9 +3242,12 @@ async fn maintain_batches_without_advancing_head() {
     let (catalog, table) = catalog_with_two_column_table().await;
     register_three_row_file(&catalog, table).await;
     let index = indexed(&catalog, table, "by_a", 10).await;
-    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(index))
+        .await
+        .unwrap();
 
-    let before = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let before = catalog.materialized().await.unwrap().current_snapshot().id;
 
     let report = catalog
         .maintain(MaintenanceRequest {
@@ -3223,7 +3260,7 @@ async fn maintain_batches_without_advancing_head() {
     assert_eq!(report.index_entries_reclaimed, 10);
     assert_eq!(index_entry_count(&catalog).await, 0);
 
-    let after = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let after = catalog.materialized().await.unwrap().current_snapshot().id;
     assert_eq!(before, after, "a maintenance pass must not advance head");
 
     catalog.close().await.unwrap();
@@ -3240,7 +3277,10 @@ async fn maintain_resumes_each_batch_where_the_last_one_stopped() {
     let (catalog, table) = catalog_with_two_column_table().await;
     register_three_row_file(&catalog, table).await;
     let index = indexed(&catalog, table, "by_a", 25).await;
-    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(index))
+        .await
+        .unwrap();
 
     let report = catalog
         .maintain(MaintenanceRequest {
@@ -3276,7 +3316,7 @@ async fn maintain_streams_a_dead_range_in_one_scan() {
     let catalog = open().await.unwrap();
     let table = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let column = ColumnDef {
                 name: "a".into(),
@@ -3292,7 +3332,10 @@ async fn maintain_streams_a_dead_range_in_one_scan() {
         .unwrap();
     let table = table.get().unwrap();
     let dead = indexed(&catalog, table, "dead", DEAD_ENTRIES).await;
-    catalog.commit(|tx| tx.drop_index(dead)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(dead))
+        .await
+        .unwrap();
     catalog.flush_memtable().await.unwrap();
     catalog.close().await.unwrap();
 
@@ -3389,7 +3432,10 @@ fn maintain_reports_sweep_progress_and_completion() {
             let (catalog, table) = catalog_with_two_column_table().await;
             register_three_row_file(&catalog, table).await;
             let index = indexed(&catalog, table, "by_a", 200).await;
-            catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+            catalog
+                .commit_materialized(|tx| tx.drop_index(index))
+                .await
+                .unwrap();
 
             let report = catalog
                 .maintain(MaintenanceRequest {
@@ -3467,7 +3513,13 @@ async fn maintain_refuses_a_read_only_catalog() {
     // there is no runtime refusal to assert — `reader.maintain(..)` does not
     // compile. What a reader keeps is the read surface.
     assert_eq!(
-        reader.snapshot().await.unwrap().current_snapshot().id.get(),
+        reader
+            .materialized()
+            .await
+            .unwrap()
+            .current_snapshot()
+            .id
+            .get(),
         0
     );
     reader.close().await.unwrap();
@@ -3545,7 +3597,10 @@ async fn maintain_does_not_conflict_with_a_live_writer() {
 
     let dead = indexed(&catalog, table, "dead", 6).await;
     let live = indexed(&catalog, table, "live", 3).await;
-    catalog.commit(|tx| tx.drop_index(dead)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(dead))
+        .await
+        .unwrap();
 
     // Interleave: sweep a batch, then land a file carrying a new entry
     // for the live index, and repeat.
@@ -3562,7 +3617,7 @@ async fn maintain_does_not_conflict_with_a_live_writer() {
 
         let path = format!("live-{round}.parquet");
         catalog
-            .commit(move |tx| {
+            .commit_materialized(move |tx| {
                 tx.register_data_file(
                     table,
                     DataFile {
@@ -3605,7 +3660,10 @@ async fn maintain_skips_the_sweep_when_disabled() {
     let (catalog, table) = catalog_with_two_column_table().await;
     register_three_row_file(&catalog, table).await;
     let index = indexed(&catalog, table, "by_a", 3).await;
-    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_index(index))
+        .await
+        .unwrap();
 
     let report = catalog
         .maintain(MaintenanceRequest {
@@ -3626,7 +3684,7 @@ async fn drop_index_ends_definition_and_keeps_format() {
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let id = tx.create_index(
                 table,
                 &IndexDef {
@@ -3643,12 +3701,12 @@ async fn drop_index_ends_definition_and_keeps_format() {
         .unwrap();
 
     catalog
-        .commit(|tx| tx.drop_index(index.get().unwrap()))
+        .commit_materialized(|tx| tx.drop_index(index.get().unwrap()))
         .await
         .unwrap();
     assert!(
         catalog
-            .snapshot()
+            .materialized()
             .await
             .unwrap()
             .indexes_of(table)
@@ -3681,7 +3739,7 @@ async fn caller_owned_snapshot_matches_a_fresh_scan() {
     let keep = std::cell::Cell::new(None);
     let doomed = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let k = tx.create_table(schema, "keep", &[column("a"), column("b")])?;
             let d = tx.create_table(schema, "doomed", &[column("x")])?;
@@ -3696,7 +3754,7 @@ async fn caller_owned_snapshot_matches_a_fresh_scan() {
     let doomed = doomed.get().unwrap();
 
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(
                 keep,
                 DataFile {
@@ -3719,7 +3777,7 @@ async fn caller_owned_snapshot_matches_a_fresh_scan() {
         .unwrap();
 
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.rename_table(keep, "keep2")?;
             let second = tx.columns_of(keep)[1].id;
             tx.drop_column(keep, second)
@@ -3727,7 +3785,10 @@ async fn caller_owned_snapshot_matches_a_fresh_scan() {
         .await
         .unwrap();
 
-    catalog.commit(|tx| tx.drop_table(doomed)).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_table(doomed))
+        .await
+        .unwrap();
 
     let tx = catalog.begin_write_tx().unwrap();
     let stamp = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
@@ -3735,7 +3796,7 @@ async fn caller_owned_snapshot_matches_a_fresh_scan() {
     let fresh = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
     tx.rollback();
 
-    let cached = catalog.snapshot().await.unwrap();
+    let cached = catalog.materialized().await.unwrap();
     assert_eq!(catalog.memory_tally().projection_bytes, 0);
 
     assert_eq!(cached.snapshot.snapshot_id, fresh.snapshot.snapshot_id);
@@ -3771,7 +3832,7 @@ async fn seeded_catalog(tables: usize) -> (crate::catalog::Catalog, Vec<crate::c
 
     let ids = std::cell::RefCell::new(Vec::new());
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             for index in 0..tables {
                 let id =
@@ -3805,7 +3866,7 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
         .await
         .unwrap();
     writer
-        .commit(|tx| tx.create_schema("before").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("before").map(|_| ()))
         .await
         .unwrap();
 
@@ -3819,7 +3880,7 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
     let reader = Catalog::open_read_only(store.clone(), options)
         .await
         .unwrap();
-    reader.snapshot().await.unwrap();
+    reader.materialized().await.unwrap();
 
     plant_migration_marker(&writer).await;
 
@@ -3828,7 +3889,7 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
     // the next call.
     let mut refused = None;
     for _ in 0..100 {
-        if let Err(err) = reader.snapshot().await {
+        if let Err(err) = reader.materialized().await {
             refused = Some(err);
             break;
         }
@@ -3846,12 +3907,12 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
 #[tokio::test]
 async fn the_migration_marker_refuses_a_commit_with_a_warm_cache() {
     let (catalog, _) = seeded_catalog(3).await;
-    catalog.snapshot().await.unwrap();
+    catalog.materialized().await.unwrap();
 
     plant_migration_marker(&catalog).await;
 
     let err = catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.create_schema("late")?;
             Ok(())
         })
@@ -3978,7 +4039,7 @@ async fn a_landed_commit_stamps_its_own_head_clear() {
     let projections = catalog.projections();
 
     catalog
-        .commit(|tx| tx.create_schema("after").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("after").map(|_| ()))
         .await
         .unwrap();
 
@@ -4092,7 +4153,7 @@ async fn every_batch_moves_the_head_stamp() {
 
     // A snapshot-minting batch moves both halves.
     catalog
-        .commit(|tx| tx.create_schema("more").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("more").map(|_| ()))
         .await
         .unwrap();
     let minted = stamp(&catalog).await;
@@ -4101,7 +4162,7 @@ async fn every_batch_moves_the_head_stamp() {
 
     // An option write mints no snapshot, so only the count moves.
     catalog
-        .commit(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
+        .commit_materialized(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
         .await
         .unwrap();
     let maintained = stamp(&catalog).await;
@@ -4125,18 +4186,18 @@ async fn an_incremental_refresh_matches_a_full_rematerialization() {
     // A gap that exercises every shape the fold has to get right: a new
     // record, a changed one, an ended child, and a whole ended subtree.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(tables[0], bulk_file("f0.parquet", 3), &[])
                 .map(|_| ())
         })
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.rename_table(tables[1], "renamed"))
+        .commit_materialized(|tx| tx.rename_table(tables[1], "renamed"))
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("s").unwrap().id;
             tx.create_table(
                 schema,
@@ -4154,13 +4215,16 @@ async fn an_incremental_refresh_matches_a_full_rematerialization() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let second = tx.columns_of(tables[3])[1].id;
             tx.drop_column(tables[3], second)
         })
         .await
         .unwrap();
-    catalog.commit(|tx| tx.drop_table(tables[2])).await.unwrap();
+    catalog
+        .commit_materialized(|tx| tx.drop_table(tables[2]))
+        .await
+        .unwrap();
 
     let tx = catalog.begin_write_tx().unwrap();
     let handle = ReadHandle::Tx(&tx);
@@ -4208,11 +4272,11 @@ async fn a_refresh_declines_a_gap_a_maintenance_batch_landed_in() {
     tx.rollback();
 
     catalog
-        .commit(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
+        .commit_materialized(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(tables[0], bulk_file("f0.parquet", 3), &[])
                 .map(|_| ())
         })
@@ -4247,7 +4311,7 @@ async fn a_refresh_declines_a_gap_swept_out_of_the_changelog_window() {
     let commits = usize::try_from(CHANGELOG_WINDOW).unwrap() + 2;
     for round in 0..commits {
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 tx.register_data_file(tables[0], bulk_file(&format!("f{round}.parquet"), 3), &[])
                     .map(|_| ())
             })
@@ -4300,7 +4364,7 @@ async fn a_refresh_declines_churn_that_outruns_the_catalog() {
 
     for index in 0..6u64 {
         catalog
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 tx.register_data_file(tables[0], bulk_file(&format!("f{index}.parquet"), 3), &[])
                     .map(|_| ())
             })
@@ -4366,7 +4430,7 @@ async fn measure_refresh_versus_rematerialization() {
             for round in 0..commits {
                 let target = table_ids[round % table_ids.len()];
                 catalog
-                    .commit(|tx| {
+                    .commit_materialized(|tx| {
                         for file in 0..FILES_PER_COMMIT {
                             tx.register_data_file(
                                 target,
@@ -4455,7 +4519,7 @@ async fn measure_changelog_read_cost() {
         let (catalog, tables) = seeded_wide_catalog(1, COLUMNS).await;
         for round in 0..commits {
             catalog
-                .commit(|tx| {
+                .commit_materialized(|tx| {
                     // Stats for every column, as DuckLake supplies them: a
                     // registration's changelog is mostly its stats keys.
                     let stats = tx
@@ -4548,7 +4612,7 @@ async fn seeded_wide_catalog(
 
     let ids = std::cell::RefCell::new(Vec::new());
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             for index in 0..tables {
                 ids.borrow_mut()
@@ -4605,7 +4669,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     // write. It is invisible to the attempt: the transaction is already
     // open at an earlier sequence.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_data_file(tables[0], bulk_file("winner.parquet", 3), &[])
                 .map(|_| ())
         })
@@ -4691,7 +4755,7 @@ async fn a_commit_landing_mid_materialization_is_invisible_to_the_whole_pass() {
     // A commit lands in the middle of the pass, changing both halves of
     // what it is about to read.
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("s").unwrap().id;
             tx.create_table(
                 schema,
@@ -4781,7 +4845,7 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
     .await
     .unwrap();
     writer
-        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("s").map(|_| ()))
         .await
         .unwrap();
 
@@ -4800,7 +4864,7 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
         // Later passes run clean.
         if pass == 0 {
             writer
-                .commit(|tx| tx.create_schema("late").map(|_| ()))
+                .commit_materialized(|tx| tx.create_schema("late").map(|_| ()))
                 .await
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4922,7 +4986,7 @@ async fn a_mixed_delete_commit_classifies_at_table_grain_from_its_record() {
     let table = tables[0];
     let file = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             file.set(Some(tx.register_data_file(
                 table,
                 bulk_file("f0.parquet", 3),
@@ -4933,10 +4997,10 @@ async fn a_mixed_delete_commit_classifies_at_table_grain_from_its_record() {
         .await
         .unwrap();
     let file = file.get().unwrap();
-    let head_before = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+    let head_before = catalog.materialized().await.unwrap().snapshot.snapshot_id;
 
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             tx.register_delete_file(table, delete_file(file), &[])?;
             tx.inline_delete(table, 0, &[])
         })
@@ -5023,11 +5087,11 @@ async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
         .await
         .unwrap();
     displaced
-        .commit(|tx| tx.create_schema("before").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("before").map(|_| ()))
         .await
         .unwrap();
     // Warm: the handle now holds a head view and serves reads from it.
-    displaced.snapshot().await.unwrap();
+    displaced.materialized().await.unwrap();
 
     // The displacing writer, taking the epoch exactly as a migrator does,
     // then writing the marker a migration's start batch writes.
@@ -5067,7 +5131,7 @@ async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
                 break;
             }
         }
-        if let Err(err) = displaced.snapshot().await {
+        if let Err(err) = displaced.materialized().await {
             noticed = Some(err);
             break;
         }
@@ -5097,7 +5161,7 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
         unique: false,
     };
 
-    let base = catalog.snapshot().await.unwrap();
+    let base = catalog.materialized().await.unwrap();
     let db_tx = Arc::new(CommitSession::folder(catalog.begin_write_tx().unwrap()));
     let prepared = prepare_and_stage(
         &db_tx,
@@ -5155,7 +5219,7 @@ async fn folder_with_table(
     let folder = Catalog::open(backing, log_options(provider)).await.unwrap();
     let table = std::cell::Cell::new(None);
     folder
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.create_schema("s")?;
             let column = |name: &str| ColumnDef {
                 name: name.into(),
@@ -5212,8 +5276,11 @@ async fn a_committer_sweeps_a_dropped_index_through_the_log() {
     let (folder, table) = folder_with_table(Arc::clone(&backing), Arc::clone(&provider)).await;
     register_three_row_file(&folder, table).await;
     let index = indexed(&folder, table, "by_a", 3).await;
-    folder.commit(|tx| tx.drop_index(index)).await.unwrap();
-    let head_before = folder.snapshot().await.unwrap().snapshot.snapshot_id;
+    folder
+        .commit_materialized(|tx| tx.drop_index(index))
+        .await
+        .unwrap();
+    let head_before = folder.materialized().await.unwrap().snapshot.snapshot_id;
     assert_eq!(index_entry_count(&folder).await, 3);
 
     let committer = Catalog::open(
@@ -5236,7 +5303,7 @@ async fn a_committer_sweeps_a_dropped_index_through_the_log() {
         "the folder is served the sweep's slots"
     );
     assert_eq!(
-        folder.snapshot().await.unwrap().snapshot.snapshot_id,
+        folder.materialized().await.unwrap().snapshot.snapshot_id,
         head_before,
         "a sweep preserves the head snapshot"
     );
@@ -5256,7 +5323,7 @@ async fn a_committer_records_a_pass_against_the_head() {
     let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let provider = Arc::new(TestProvider::default());
     let (folder, _table) = folder_with_table(Arc::clone(&backing), Arc::clone(&provider)).await;
-    let head = folder.snapshot().await.unwrap().snapshot.snapshot_id;
+    let head = folder.materialized().await.unwrap().snapshot.snapshot_id;
 
     let committer = Catalog::open(
         Arc::clone(&backing),
@@ -5277,7 +5344,10 @@ async fn a_committer_records_a_pass_against_the_head() {
     assert_eq!(recorded[0].trigger, "manual");
     assert_eq!(recorded[0].head_snapshot_id, head);
     assert!(recorded[0].work_pending);
-    assert_eq!(folder.snapshot().await.unwrap().snapshot.snapshot_id, head);
+    assert_eq!(
+        folder.materialized().await.unwrap().snapshot.snapshot_id,
+        head
+    );
 
     committer.close().await.unwrap();
     folder.close().await.unwrap();
@@ -5297,7 +5367,7 @@ async fn store_census_of_reads_the_manifest_leg_without_opening() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .commit_materialized(|tx| tx.create_schema("s").map(|_| ()))
         .await
         .unwrap();
     catalog.flush_memtable().await.unwrap();

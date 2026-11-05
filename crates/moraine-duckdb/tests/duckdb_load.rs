@@ -98,8 +98,8 @@ fn seed(dir: &Path) {
             .expect("test setup: open catalog");
 
         catalog
-            .commit(|tx| {
-                let schema = tx.create_schema("s")?;
+            .commit(async |tx| {
+                let schema = tx.create_schema("s").await?;
 
                 tx.create_table(
                     schema,
@@ -111,28 +111,31 @@ fn seed(dir: &Path) {
                         default_value: None,
                         children: Vec::new(),
                     }],
-                )?;
+                )
+                .await?;
 
-                let t = tx.create_table(
-                    schema,
-                    "t",
-                    &[
-                        ColumnDef {
-                            name: "id".into(),
-                            column_type: "BIGINT".into(),
-                            nulls_allowed: false,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                        ColumnDef {
-                            name: "amount".into(),
-                            column_type: "DOUBLE".into(),
-                            nulls_allowed: true,
-                            default_value: None,
-                            children: Vec::new(),
-                        },
-                    ],
-                )?;
+                let t = tx
+                    .create_table(
+                        schema,
+                        "t",
+                        &[
+                            ColumnDef {
+                                name: "id".into(),
+                                column_type: "BIGINT".into(),
+                                nulls_allowed: false,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                            ColumnDef {
+                                name: "amount".into(),
+                                column_type: "DOUBLE".into(),
+                                nulls_allowed: true,
+                                default_value: None,
+                                children: Vec::new(),
+                            },
+                        ],
+                    )
+                    .await?;
                 tx.register_data_file(
                     t,
                     DataFile {
@@ -147,9 +150,11 @@ fn seed(dir: &Path) {
                         column_stats: vec![],
                     },
                     &[],
-                )?;
+                )
+                .await?;
 
-                tx.create_view(schema, "t_v", "duckdb", "select * from t")?;
+                tx.create_view(schema, "t_v", "duckdb", "select * from t")
+                    .await?;
 
                 Ok(())
             })

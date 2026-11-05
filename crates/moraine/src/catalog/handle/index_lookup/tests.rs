@@ -16,7 +16,7 @@ async fn range_and_null_scans_recheck_a_definition_removed_during_the_pass() {
         let writer = Catalog::open(store.clone(), options.clone()).await.unwrap();
         let ids = Cell::new(None);
         writer
-            .commit(|tx| {
+            .commit_materialized(|tx| {
                 let schema = tx.schema_by_name("main").unwrap().id;
                 let table = tx.create_table(
                     schema,
@@ -52,7 +52,9 @@ async fn range_and_null_scans_recheck_a_definition_removed_during_the_pass() {
         let result = reader
             .lookup_at_head(&mut session, table, index, async |handle, info| {
                 attempts.set(attempts.get() + 1);
-                let head = writer.commit(|tx| tx.drop_index(index)).await?;
+                let head = writer
+                    .commit_materialized(|tx| tx.drop_index(index))
+                    .await?;
                 writer.close().await?;
                 // Bring the pass's own handle up to the drop, rather than
                 // waiting for a poll to happen to do it.
@@ -100,7 +102,7 @@ async fn range_and_null_scans_recheck_a_definition_removed_during_the_pass() {
 async fn indexed_inline_table(catalog: &Catalog) -> (TableId, IndexId) {
     let ids = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit_materialized(|tx| {
             let schema = tx.schema_by_name("main").unwrap().id;
             let table = tx.create_table(
                 schema,

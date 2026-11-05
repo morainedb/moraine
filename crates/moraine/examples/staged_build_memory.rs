@@ -76,9 +76,10 @@ async fn main() -> BenchResult<()> {
     catalog.close().await?;
     drop(catalog);
     let catalog = Catalog::open(store, options).await?;
-    let snapshot = catalog.snapshot().await?;
+    let snapshot = catalog.read_scope().await?;
     let column = snapshot
         .columns_of(table)
+        .await?
         .first()
         .ok_or("column missing")?
         .id;
@@ -144,21 +145,25 @@ async fn seed(
 ) -> BenchResult<(moraine::TableId, usize)> {
     let table = Cell::new(None);
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             let schema = tx
                 .schema_by_name("main")
+                .await?
                 .ok_or("main schema missing")
                 .map_err(|error| moraine::Error::NotFound(error.into()))?
                 .id;
-            table.set(Some(tx.create_table(
-                schema,
-                "inline_memory",
-                &[ColumnDef {
-                    name: "a".into(),
-                    column_type: "VARCHAR".into(),
-                    ..Default::default()
-                }],
-            )?));
+            table.set(Some(
+                tx.create_table(
+                    schema,
+                    "inline_memory",
+                    &[ColumnDef {
+                        name: "a".into(),
+                        column_type: "VARCHAR".into(),
+                        ..Default::default()
+                    }],
+                )
+                .await?,
+            ));
             Ok(())
         })
         .await?;
@@ -168,7 +173,7 @@ async fn seed(
         let chunk = chunk(position * rows, rows, width)?;
         source_bytes += chunk.arrow_body.len();
         catalog
-            .commit(|tx| tx.inline_insert(table, &chunk, &[]).map(|_| ()))
+            .commit(async |tx| tx.inline_insert(table, &chunk, &[]).await.map(|_| ()))
             .await?;
     }
     Ok((table, source_bytes))

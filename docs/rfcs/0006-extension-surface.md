@@ -1399,3 +1399,14 @@ before storing the prepared plan. See RFC 0016 for the eligibility and cost rule
   Rejected: reimplements a wire protocol and still must satisfy the same
   metadata semantics — cost with no offsetting benefit, and brittle against
   protocol changes.
+
+### Fixed snapshot handles
+
+`moraine_snapshot_scoped` is the only snapshot-opening ABI entry point. It
+returns a fixed metadata/index/inline read scope or an error; it never builds a
+whole-catalog snapshot. Descriptor exports load their requested metadata.
+Selective row scans resolve only their table and requested source files, so
+planning and execution cannot trigger whole-catalog rebuilds. Immediate index
+creation/drop, data-path adoption, and catalog-version changes use scoped core
+mutations. One-shot index derivation pins its sources and rechecks both snapshot
+ID and batch sequence before publishing the index.

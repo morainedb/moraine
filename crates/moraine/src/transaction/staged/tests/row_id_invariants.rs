@@ -234,7 +234,7 @@ async fn commit_merge(catalog: &Catalog, store: &Arc<InMemory>, output: Vec<Cell
 /// Table 1's live data files as of `snapshot`, by id.
 async fn live_file_ids(catalog: &Catalog, snapshot: u64) -> Vec<u64> {
     let view = catalog
-        .snapshot_at(crate::catalog::SnapshotId::new(snapshot))
+        .materialized_at(crate::catalog::SnapshotId::new(snapshot))
         .await
         .unwrap();
     view.data_files_of(crate::catalog::TableId::new(1))

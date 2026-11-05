@@ -43,11 +43,21 @@ fn referenced_file_names(store_dir: &std::path::Path) -> Vec<String> {
         let catalog = Catalog::open(store, CatalogOptions::default())
             .await
             .expect("open the catalog");
-        let head = catalog.snapshot().await.expect("snapshot");
-        let schema = head.schema_by_name("main").expect("main schema");
-        let table = head.table_by_name(schema.id, "t").expect("table t");
+        let head = catalog.read_scope().await.expect("snapshot");
+        let schema = head
+            .schema_by_name("main")
+            .await
+            .unwrap()
+            .expect("main schema");
+        let table = head
+            .table_by_name(schema.id, "t")
+            .await
+            .unwrap()
+            .expect("table t");
         let names = head
             .data_files_of(table.id)
+            .await
+            .unwrap()
             .iter()
             .map(|file| {
                 file.path

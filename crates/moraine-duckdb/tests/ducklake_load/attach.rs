@@ -570,15 +570,26 @@ fn ducklake_encrypted_writes_encrypted_files_and_reads_back() {
         let catalog = Catalog::open(store, CatalogOptions::default())
             .await
             .expect("open catalog");
-        let head = catalog.snapshot().await.expect("snapshot");
+        let head = catalog.read_scope().await.expect("snapshot");
         assert_eq!(
-            head.option(OptionScope::Global, "encrypted").as_deref(),
+            head.option(OptionScope::Global, "encrypted")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("true")
         );
 
-        let schema = head.schema_by_name("main").expect("main schema");
-        let table = head.table_by_name(schema.id, "t").expect("table t");
-        let data_files = head.data_files_of(table.id);
+        let schema = head
+            .schema_by_name("main")
+            .await
+            .unwrap()
+            .expect("main schema");
+        let table = head
+            .table_by_name(schema.id, "t")
+            .await
+            .unwrap()
+            .expect("table t");
+        let data_files = head.data_files_of(table.id).await.unwrap();
         assert!(!data_files.is_empty());
         for file in &data_files {
             assert!(

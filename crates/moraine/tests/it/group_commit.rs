@@ -35,7 +35,7 @@ async fn a_group_costs_one_flush_where_separate_commits_cost_one_each() {
     let before_separate = store.writes_attempted();
     for name in ["s1", "s2", "s3"] {
         catalog
-            .commit(move |tx| tx.create_schema(name).map(|_| ()))
+            .commit(async move |tx| tx.create_schema(name).await.map(|_| ()))
             .await
             .unwrap();
     }
@@ -44,9 +44,15 @@ async fn a_group_costs_one_flush_where_separate_commits_cost_one_each() {
     let before_group = store.writes_attempted();
     catalog
         .commit_group(&[
-            &|tx: &mut Transaction| tx.create_schema("g1").map(|_| ()),
-            &|tx: &mut Transaction| tx.create_schema("g2").map(|_| ()),
-            &|tx: &mut Transaction| tx.create_schema("g3").map(|_| ()),
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("g1").await.map(|_| ()) })
+            },
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("g2").await.map(|_| ()) })
+            },
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("g3").await.map(|_| ()) })
+            },
         ])
         .await
         .unwrap();
@@ -67,7 +73,7 @@ async fn a_group_costs_one_flush_where_separate_commits_cost_one_each() {
 async fn every_member_mints_its_own_consecutive_snapshot() {
     let catalog = open_memory().await;
     let start = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .current_snapshot()
@@ -76,9 +82,15 @@ async fn every_member_mints_its_own_consecutive_snapshot() {
 
     let ids = catalog
         .commit_group(&[
-            &|tx: &mut Transaction| tx.create_schema("one").map(|_| ()),
-            &|tx: &mut Transaction| tx.create_schema("two").map(|_| ()),
-            &|tx: &mut Transaction| tx.create_schema("three").map(|_| ()),
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("one").await.map(|_| ()) })
+            },
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("two").await.map(|_| ()) })
+            },
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("three").await.map(|_| ()) })
+            },
         ])
         .await
         .unwrap();
@@ -87,10 +99,13 @@ async fn every_member_mints_its_own_consecutive_snapshot() {
         ids.iter().map(|id| id.get()).collect::<Vec<_>>(),
         vec![start + 1, start + 2, start + 3]
     );
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     assert_eq!(head.current_snapshot().id.get(), start + 3);
     for name in ["one", "two", "three"] {
-        assert!(head.schema_by_name(name).is_some(), "{name} is missing");
+        assert!(
+            head.schema_by_name(name).await.unwrap().is_some(),
+            "{name} is missing"
+        );
     }
     catalog.close().await.unwrap();
 }
@@ -105,26 +120,40 @@ async fn a_member_sees_the_state_the_previous_member_committed() {
     catalog
         .commit_group(&[
             &|tx: &mut Transaction| {
-                let schema = tx.create_schema("shop")?;
-                tx.create_table(schema, "orders", &[col("id")]).map(|_| ())
+                Box::pin(async move {
+                    let schema = tx.create_schema("shop").await?;
+                    tx.create_table(schema, "orders", &[col("id")])
+                        .await
+                        .map(|_| ())
+                })
             },
             &|tx: &mut Transaction| {
-                let schema = tx
-                    .schema_by_name("shop")
-                    .expect("the first member's schema");
-                let table = tx
-                    .table_by_name(schema.id, "orders")
-                    .expect("the first member's table");
-                tx.add_column(table.id, &col("total")).map(|_| ())
+                Box::pin(async move {
+                    let schema = tx
+                        .schema_by_name("shop")
+                        .await
+                        .unwrap()
+                        .expect("the first member's schema");
+                    let table = tx
+                        .table_by_name(schema.id, "orders")
+                        .await
+                        .unwrap()
+                        .expect("the first member's table");
+                    tx.add_column(table.id, &col("total")).await.map(|_| ())
+                })
             },
         ])
         .await
         .unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
-    let schema = head.schema_by_name("shop").unwrap();
-    let table = head.table_by_name(schema.id, "orders").unwrap();
-    assert_eq!(head.columns_of(table.id).len(), 2);
+    let head = catalog.read_scope().await.unwrap();
+    let schema = head.schema_by_name("shop").await.unwrap().unwrap();
+    let table = head
+        .table_by_name(schema.id, "orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.columns_of(table.id).await.unwrap().len(), 2);
     catalog.close().await.unwrap();
 }
 
@@ -137,22 +166,42 @@ async fn time_travel_resolves_each_member_separately() {
 
     let ids = catalog
         .commit_group(&[
-            &|tx: &mut Transaction| tx.create_schema("first").map(|_| ()),
-            &|tx: &mut Transaction| tx.create_schema("second").map(|_| ()),
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("first").await.map(|_| ()) })
+            },
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("second").await.map(|_| ()) })
+            },
         ])
         .await
         .unwrap();
 
-    let after_first = catalog.snapshot_at(ids[0]).await.unwrap();
-    assert!(after_first.schema_by_name("first").is_some());
+    let after_first = catalog.read_scope_at(ids[0]).await.unwrap();
+    assert!(after_first.schema_by_name("first").await.unwrap().is_some());
     assert!(
-        after_first.schema_by_name("second").is_none(),
+        after_first
+            .schema_by_name("second")
+            .await
+            .unwrap()
+            .is_none(),
         "the second member's schema must not exist at the first member's snapshot"
     );
 
-    let after_second = catalog.snapshot_at(ids[1]).await.unwrap();
-    assert!(after_second.schema_by_name("first").is_some());
-    assert!(after_second.schema_by_name("second").is_some());
+    let after_second = catalog.read_scope_at(ids[1]).await.unwrap();
+    assert!(
+        after_second
+            .schema_by_name("first")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        after_second
+            .schema_by_name("second")
+            .await
+            .unwrap()
+            .is_some()
+    );
     catalog.close().await.unwrap();
 }
 
@@ -163,7 +212,7 @@ async fn time_travel_resolves_each_member_separately() {
 async fn a_member_that_stages_nothing_mints_no_snapshot() {
     let catalog = open_memory().await;
     let start = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .current_snapshot()
@@ -172,9 +221,13 @@ async fn a_member_that_stages_nothing_mints_no_snapshot() {
 
     let ids = catalog
         .commit_group(&[
-            &|tx: &mut Transaction| tx.create_schema("before").map(|_| ()),
-            &|_tx: &mut Transaction| Ok(()),
-            &|tx: &mut Transaction| tx.create_schema("after").map(|_| ()),
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("before").await.map(|_| ()) })
+            },
+            &|_tx: &mut Transaction| Box::pin(async move { Ok(()) }),
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("after").await.map(|_| ()) })
+            },
         ])
         .await
         .unwrap();
@@ -192,13 +245,13 @@ async fn a_member_that_stages_nothing_mints_no_snapshot() {
 #[allow(clippy::unwrap_used)]
 async fn an_empty_group_commits_nothing() {
     let catalog = open_memory().await;
-    let start = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let start = catalog.read_scope().await.unwrap().current_snapshot().id;
 
     let members: [CommitMember<'_>; 0] = [];
     assert!(catalog.commit_group(&members).await.unwrap().is_empty());
 
     assert_eq!(
-        catalog.snapshot().await.unwrap().current_snapshot().id,
+        catalog.read_scope().await.unwrap().current_snapshot().id,
         start
     );
     catalog.close().await.unwrap();
@@ -212,26 +265,32 @@ async fn an_empty_group_commits_nothing() {
 #[allow(clippy::unwrap_used)]
 async fn a_failing_member_aborts_the_whole_group() {
     let catalog = open_memory().await;
-    let start = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let start = catalog.read_scope().await.unwrap().current_snapshot().id;
 
     let err = catalog
         .commit_group(&[
-            &|tx: &mut Transaction| tx.create_schema("dup").map(|_| ()),
-            &|tx: &mut Transaction| tx.create_schema("dup").map(|_| ()),
-            &|tx: &mut Transaction| tx.create_schema("never").map(|_| ()),
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("dup").await.map(|_| ()) })
+            },
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("dup").await.map(|_| ()) })
+            },
+            &|tx: &mut Transaction| {
+                Box::pin(async move { tx.create_schema("never").await.map(|_| ()) })
+            },
         ])
         .await
         .unwrap_err();
     assert!(matches!(err, Error::AlreadyExists(_)), "{err:?}");
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     assert_eq!(
         head.current_snapshot().id,
         start,
         "an aborted group must leave the head where it was"
     );
-    assert!(head.schema_by_name("dup").is_none());
-    assert!(head.schema_by_name("never").is_none());
+    assert!(head.schema_by_name("dup").await.unwrap().is_none());
+    assert!(head.schema_by_name("never").await.unwrap().is_none());
     catalog.close().await.unwrap();
 }
 
@@ -241,7 +300,7 @@ async fn a_failing_member_aborts_the_whole_group() {
 async fn a_group_of_one_is_an_ordinary_commit() {
     let catalog = open_memory().await;
     let start = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .current_snapshot()
@@ -249,7 +308,9 @@ async fn a_group_of_one_is_an_ordinary_commit() {
         .get();
 
     let ids = catalog
-        .commit_group(&[&|tx: &mut Transaction| tx.create_schema("alone").map(|_| ())])
+        .commit_group(&[&|tx: &mut Transaction| {
+            Box::pin(async move { tx.create_schema("alone").await.map(|_| ()) })
+        }])
         .await
         .unwrap();
 
@@ -259,10 +320,12 @@ async fn a_group_of_one_is_an_ordinary_commit() {
     );
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .schema_by_name("alone")
+            .await
+            .unwrap()
             .is_some()
     );
     catalog.close().await.unwrap();
@@ -282,7 +345,7 @@ async fn concurrent_commits_coalesce_without_being_asked() {
     for round in 0..COMMITS {
         let name = format!("alone_{round}");
         catalog
-            .commit(move |tx| tx.create_schema(&name).map(|_| ()))
+            .commit(async move |tx| tx.create_schema(&name).await.map(|_| ()))
             .await
             .unwrap();
     }
@@ -295,7 +358,7 @@ async fn concurrent_commits_coalesce_without_being_asked() {
         let name = format!("together_{round}");
         running.push(tokio::spawn(async move {
             catalog
-                .commit(move |tx| tx.create_schema(&name).map(|_| ()))
+                .commit(async move |tx| tx.create_schema(&name).await.map(|_| ()))
                 .await
         }));
     }
@@ -336,7 +399,7 @@ async fn a_cancelled_commit_never_strands_the_batch_it_left() {
             let deadline = std::time::Duration::from_micros(round * 200 + 1);
             let _ = tokio::time::timeout(
                 deadline,
-                abandoning.commit(move |tx| tx.create_schema(&doomed).map(|_| ())),
+                abandoning.commit(async move |tx| tx.create_schema(&doomed).await.map(|_| ())),
             )
             .await;
         });
@@ -345,7 +408,7 @@ async fn a_cancelled_commit_never_strands_the_batch_it_left() {
         let name = format!("survivor_{round}");
         let lands = tokio::spawn(async move {
             surviving
-                .commit(move |tx| tx.create_schema(&name).map(|_| ()))
+                .commit(async move |tx| tx.create_schema(&name).await.map(|_| ()))
                 .await
         });
 
@@ -357,10 +420,13 @@ async fn a_cancelled_commit_never_strands_the_batch_it_left() {
         landed.unwrap().unwrap();
     }
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     for round in 0..16 {
         assert!(
-            head.schema_by_name(&format!("survivor_{round}")).is_some(),
+            head.schema_by_name(&format!("survivor_{round}"))
+                .await
+                .unwrap()
+                .is_some(),
             "round {round}'s surviving commit is missing"
         );
     }
@@ -380,25 +446,29 @@ async fn a_group_losing_a_disjoint_race_retries_every_member() {
     let group = tokio::spawn(async move {
         grouped
             .commit_group(&[
-                &|tx: &mut Transaction| tx.add_column(a, &col("g1")).map(|_| ()),
-                &|tx: &mut Transaction| tx.add_column(a, &col("g2")).map(|_| ()),
+                &|tx: &mut Transaction| {
+                    Box::pin(async move { tx.add_column(a, &col("g1")).await.map(|_| ()) })
+                },
+                &|tx: &mut Transaction| {
+                    Box::pin(async move { tx.add_column(a, &col("g2")).await.map(|_| ()) })
+                },
             ])
             .await
     });
     let single = tokio::spawn(async move {
-        lone.commit(move |tx| tx.add_column(b, &col("s1")).map(|_| ()))
+        lone.commit(async move |tx| tx.add_column(b, &col("s1")).await.map(|_| ()))
             .await
     });
     group.await.unwrap().unwrap();
     single.await.unwrap().unwrap();
 
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     assert_eq!(
-        head.columns_of(a).len(),
+        head.columns_of(a).await.unwrap().len(),
         3,
         "both grouped members must land"
     );
-    assert_eq!(head.columns_of(b).len(), 2);
+    assert_eq!(head.columns_of(b).await.unwrap().len(), 2);
     catalog.close().await.unwrap();
 }
 
@@ -602,7 +672,7 @@ async fn concurrent_staged_commits_coalesce_without_being_asked() {
         "{TABLES} concurrent staged commits wrote {together} objects, the same {TABLES} one \
          at a time wrote {separate}; staged commits are supposed to share batches"
     );
-    let head = catalog.snapshot().await.unwrap();
+    let head = catalog.read_scope().await.unwrap();
     assert_eq!(head.current_snapshot().id.get(), TABLES + 1);
     catalog.close().await.unwrap();
 }
@@ -627,8 +697,8 @@ async fn a_writer_without_siblings_pays_no_spacing() {
     let before = store.writes_attempted();
     for index in 0..5 {
         catalog
-            .commit(|tx| {
-                tx.create_schema(&format!("s{index}"))?;
+            .commit(async |tx| {
+                tx.create_schema(&format!("s{index}")).await?;
                 Ok(())
             })
             .await

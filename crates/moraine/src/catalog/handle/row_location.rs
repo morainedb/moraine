@@ -438,7 +438,7 @@ impl ReadOnlyCatalog {
     /// # store: &moraine::DataStore, table: moraine::TableId, file: moraine::DataFileId)
     /// # -> Result<(), moraine::Error> {
     /// let files = reads
-    ///     .locate_row_positions_at(snapshot, store, "", table, &[(42, file)])
+    ///     .locate_row_positions_at_projected(snapshot, store, "", table, &[(42, file)])
     ///     .await?;
     /// assert_eq!(files.len(), 1);
     /// # Ok(())
@@ -449,7 +449,8 @@ impl ReadOnlyCatalog {
     /// Returns [`Error::NotFound`] for an unknown table, a store error if a
     /// named file cannot be read, or [`Error::RowPosition`] if a row or file
     /// cannot be positioned exactly.
-    pub async fn locate_row_positions_at(
+    #[doc(hidden)]
+    pub async fn locate_row_positions_at_projected(
         &self,
         snapshot: &CatalogSnapshot,
         data_store: &DataStore,
@@ -827,10 +828,7 @@ impl ReadOnlyCatalog {
         since: Option<SnapshotId>,
     ) -> Result<RowSummaryPublish> {
         use crate::store::read::{EntityRecord, EntityRecordKind, OwnedEntityCursor, Versions};
-        let scope = self
-            .index_read_scope()
-            .await?
-            .ok_or_else(|| Error::Constraint("publication requires a fixed read scope".into()))?;
+        let scope = self.index_read_scope().await?;
         let handle = scope.reads().owned_read_handle();
         let mut cursor =
             OwnedEntityCursor::open(handle.clone(), EntityRecordKind::File, Versions::Live, None)

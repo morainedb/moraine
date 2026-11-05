@@ -37,8 +37,8 @@ async fn row_ids(catalog: &Catalog, table: TableId) -> Vec<u64> {
 async fn an_inlined_chunk_reads_back_with_dense_ids_and_its_bytes() {
     let (catalog, _, table, _) = seeded().await;
     let start = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("rows-a", 3), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("rows-a", 3), &[]).await?;
             Ok(())
         })
         .await
@@ -73,23 +73,23 @@ async fn an_inlined_chunk_reads_back_with_dense_ids_and_its_bytes() {
 async fn row_ids_continue_across_chunks_commits_and_data_files() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(|tx| {
-            assert_eq!(tx.inline_insert(table, &chunk("a", 2), &[])?, 0);
-            assert_eq!(tx.inline_insert(table, &chunk("b", 1), &[])?, 2);
+        .commit(async |tx| {
+            assert_eq!(tx.inline_insert(table, &chunk("a", 2), &[]).await?, 0);
+            assert_eq!(tx.inline_insert(table, &chunk("b", 1), &[]).await?, 2);
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
-            tx.register_data_file(table, datafile(5), &[])?;
+        .commit(async |tx| {
+            tx.register_data_file(table, datafile(5), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
-            assert_eq!(tx.inline_insert(table, &chunk("c", 1), &[])?, 8);
+        .commit(async |tx| {
+            assert_eq!(tx.inline_insert(table, &chunk("c", 1), &[]).await?, 8);
             Ok(())
         })
         .await
@@ -97,10 +97,12 @@ async fn row_ids_continue_across_chunks_commits_and_data_files() {
 
     assert_eq!(row_ids(&catalog, table).await, vec![0, 1, 2, 8]);
     let stats = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .table_stats(table)
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(stats.next_row_id, 9);
     // Inlined rows count as rows: four inlined plus the file's five.
@@ -111,14 +113,14 @@ async fn row_ids_continue_across_chunks_commits_and_data_files() {
 async fn a_tombstoned_row_disappears_from_the_live_rows() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 3), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.inline_delete(table, 1, &[]))
+        .commit(async |tx| tx.inline_delete(table, 1, &[]).await)
         .await
         .unwrap();
 
@@ -136,10 +138,12 @@ async fn a_tombstoned_row_disappears_from_the_live_rows() {
 
     // Deletes leave statistics alone, exactly as a delete file does.
     let stats = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .table_stats(table)
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(stats.record_count, 3);
 }
@@ -150,19 +154,19 @@ async fn a_tombstoned_row_disappears_from_the_live_rows() {
 async fn recent_rows_at_reads_the_rows_live_at_a_past_snapshot() {
     let (catalog, _, table, _) = seeded().await;
     let inserted = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 3), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
     let tombstoned = catalog
-        .commit(|tx| tx.inline_delete(table, 1, &[]))
+        .commit(async |tx| tx.inline_delete(table, 1, &[]).await)
         .await
         .unwrap();
     let appended = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("b", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[]).await?;
             Ok(())
         })
         .await
@@ -212,8 +216,8 @@ async fn recent_rows_at_refuses_a_snapshot_beyond_the_head() {
 async fn recent_rows_at_finds_nothing_once_the_rows_are_flushed() {
     let (catalog, _, table, _) = seeded().await;
     let inlined = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 3), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[]).await?;
             Ok(())
         })
         .await
@@ -224,7 +228,7 @@ async fn recent_rows_at_finds_nothing_once_the_rows_are_flushed() {
     );
 
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.flush_inlined_data(
                 table,
                 0,
@@ -237,7 +241,8 @@ async fn recent_rows_at_finds_nothing_once_the_rows_are_flushed() {
                     begin_snapshot: inlined,
                     partial_max: None,
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -252,10 +257,12 @@ async fn recent_rows_at_finds_nothing_once_the_rows_are_flushed() {
     );
     assert_eq!(
         catalog
-            .snapshot_at(inlined)
+            .read_scope_at(inlined)
             .await
             .unwrap()
             .data_files_of(table)
+            .await
+            .unwrap()
             .len(),
         1,
         "the rows are in the backdated file instead"
@@ -266,8 +273,8 @@ async fn recent_rows_at_finds_nothing_once_the_rows_are_flushed() {
 async fn recent_rows_are_scoped_to_their_table() {
     let (catalog, _, a, b) = seeded().await;
     catalog
-        .commit(|tx| {
-            tx.inline_insert(a, &chunk("a", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(a, &chunk("a", 1), &[]).await?;
             Ok(())
         })
         .await
@@ -282,8 +289,8 @@ async fn recent_rows_are_scoped_to_their_table() {
 async fn an_empty_chunk_is_refused() {
     let (catalog, _, table, _) = seeded().await;
     let err = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("", 0), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("", 0), &[]).await?;
             Ok(())
         })
         .await
@@ -295,8 +302,9 @@ async fn an_empty_chunk_is_refused() {
 async fn inlining_into_an_absent_table_is_not_found() {
     let (catalog, _, _, _) = seeded().await;
     let err = catalog
-        .commit(|tx| {
-            tx.inline_insert(TableId::new(9999), &chunk("a", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(TableId::new(9999), &chunk("a", 1), &[])
+                .await?;
             Ok(())
         })
         .await
@@ -311,8 +319,8 @@ async fn inlining_into_an_absent_table_is_not_found() {
 async fn a_flush_drains_the_chunks_and_registers_the_backdated_file() {
     let (catalog, _, table, _) = seeded().await;
     let inlined = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 3), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[]).await?;
             Ok(())
         })
         .await
@@ -323,14 +331,16 @@ async fn a_flush_drains_the_chunks_and_registers_the_backdated_file() {
         ..datafile(3)
     };
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             let flushed = FlushedDataFile {
                 file: file.clone(),
                 row_id_start: 0,
                 begin_snapshot: inlined,
                 partial_max: None,
             };
-            let ids = tx.flush_inlined_data(table, 0, std::slice::from_ref(&flushed))?;
+            let ids = tx
+                .flush_inlined_data(table, 0, std::slice::from_ref(&flushed))
+                .await?;
             assert_eq!(ids.len(), 1);
             Ok(())
         })
@@ -341,39 +351,39 @@ async fn a_flush_drains_the_chunks_and_registers_the_backdated_file() {
         catalog.recent_rows(table).await.unwrap().is_empty(),
         "the drained chunks are gone"
     );
-    let head = catalog.snapshot().await.unwrap();
-    let files = head.data_files_of(table);
+    let head = catalog.read_scope().await.unwrap();
+    let files = head.data_files_of(table).await.unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].row_id_start, Some(0), "row ids are preserved");
     // The rows were counted when they were inlined; the flush adds only
     // the file's bytes.
-    let stats = head.table_stats(table).unwrap();
+    let stats = head.table_stats(table).await.unwrap().unwrap();
     assert_eq!(stats.record_count, 3);
     assert_eq!(stats.next_row_id, 3);
     assert_eq!(stats.file_size_bytes, 30);
 
     // Backdated: the file is live at the snapshot the rows were inlined at.
-    let past = catalog.snapshot_at(inlined).await.unwrap();
-    assert_eq!(past.data_files_of(table).len(), 1);
+    let past = catalog.read_scope_at(inlined).await.unwrap();
+    assert_eq!(past.data_files_of(table).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn a_flush_with_no_files_drains_wholly_tombstoned_chunks() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 1), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.inline_delete(table, 0, &[]))
+        .commit(async |tx| tx.inline_delete(table, 0, &[]).await)
         .await
         .unwrap();
     catalog
-        .commit(|tx| {
-            tx.flush_inlined_data(table, 0, &[])?;
+        .commit(async |tx| {
+            tx.flush_inlined_data(table, 0, &[]).await?;
             Ok(())
         })
         .await
@@ -382,10 +392,12 @@ async fn a_flush_with_no_files_drains_wholly_tombstoned_chunks() {
     assert!(catalog.recent_rows(table).await.unwrap().is_empty());
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .data_files_of(table)
+            .await
+            .unwrap()
             .is_empty()
     );
 }
@@ -397,8 +409,8 @@ async fn a_flush_with_no_files_drains_wholly_tombstoned_chunks() {
 async fn one_commit_inlines_into_a_table_and_flushes_it() {
     let (catalog, _, table, _) = seeded().await;
     let inlined = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 2), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 2), &[]).await?;
             Ok(())
         })
         .await
@@ -409,8 +421,8 @@ async fn one_commit_inlines_into_a_table_and_flushes_it() {
         ..datafile(2)
     };
     catalog
-        .commit(move |tx| {
-            tx.inline_insert(table, &chunk("b", 1), &[])?;
+        .commit(async move |tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[]).await?;
             tx.flush_inlined_data(
                 table,
                 0,
@@ -420,7 +432,8 @@ async fn one_commit_inlines_into_a_table_and_flushes_it() {
                     begin_snapshot: inlined,
                     partial_max: None,
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -434,10 +447,10 @@ async fn one_commit_inlines_into_a_table_and_flushes_it() {
     );
     assert_eq!(rows[0].chunk_body.as_slice(), b"b");
 
-    let head = catalog.snapshot().await.unwrap();
-    assert_eq!(head.data_files_of(table).len(), 1);
+    let head = catalog.read_scope().await.unwrap();
+    assert_eq!(head.data_files_of(table).await.unwrap().len(), 1);
     // Two rows in the file, one still inlined, counted once each.
-    let stats = head.table_stats(table).unwrap();
+    let stats = head.table_stats(table).await.unwrap().unwrap();
     assert_eq!((stats.record_count, stats.next_row_id), (3, 3));
 }
 
@@ -449,16 +462,16 @@ async fn one_commit_inlines_into_a_table_and_flushes_it() {
 async fn tombstoning_a_row_the_same_commit_flushes_is_refused() {
     let (catalog, _, table, _) = seeded().await;
     let inlined = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 3), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
     let err = catalog
-        .commit(move |tx| {
-            tx.inline_delete(table, 1, &[])?;
+        .commit(async move |tx| {
+            tx.inline_delete(table, 1, &[]).await?;
             tx.flush_inlined_data(
                 table,
                 0,
@@ -471,7 +484,8 @@ async fn tombstoning_a_row_the_same_commit_flushes_is_refused() {
                     begin_snapshot: inlined,
                     partial_max: None,
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -484,7 +498,7 @@ async fn tombstoning_a_row_the_same_commit_flushes_is_refused() {
     // A tombstone against a version the flush does not drain is untouched
     // by the rule.
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.inline_insert(
                 table,
                 &InlineChunk {
@@ -493,14 +507,15 @@ async fn tombstoning_a_row_the_same_commit_flushes_is_refused() {
                     ..chunk("v1", 1)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(move |tx| {
-            tx.inline_delete(table, 3, &[])?;
+        .commit(async move |tx| {
+            tx.inline_delete(table, 3, &[]).await?;
             tx.flush_inlined_data(
                 table,
                 0,
@@ -513,7 +528,8 @@ async fn tombstoning_a_row_the_same_commit_flushes_is_refused() {
                     begin_snapshot: inlined,
                     partial_max: None,
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -529,16 +545,16 @@ async fn tombstoning_a_row_the_same_commit_flushes_is_refused() {
 async fn a_flushed_file_may_not_claim_the_ids_its_own_commit_minted() {
     let (catalog, _, table, _) = seeded().await;
     let inlined = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 2), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 2), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
     let err = catalog
-        .commit(move |tx| {
-            tx.inline_insert(table, &chunk("b", 1), &[])?;
+        .commit(async move |tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[]).await?;
             tx.flush_inlined_data(
                 table,
                 0,
@@ -551,7 +567,8 @@ async fn a_flushed_file_may_not_claim_the_ids_its_own_commit_minted() {
                     begin_snapshot: inlined,
                     partial_max: None,
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -563,8 +580,8 @@ async fn a_flushed_file_may_not_claim_the_ids_its_own_commit_minted() {
 async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
     let (catalog, _, table, _) = seeded().await;
     let inlined = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 2), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 2), &[]).await?;
             Ok(())
         })
         .await
@@ -573,7 +590,7 @@ async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
     // Not backdated: a record beginning at (or above) this commit's own
     // snapshot would hide the rows from the snapshots they were live at.
     let not_backdated = catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.flush_inlined_data(
                 table,
                 0,
@@ -583,7 +600,8 @@ async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
                     begin_snapshot: SnapshotId::new(u64::MAX),
                     partial_max: None,
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -595,7 +613,7 @@ async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
 
     // Past the allocated ids: the file claims rows the table never minted.
     let past_end = catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.flush_inlined_data(
                 table,
                 0,
@@ -605,7 +623,8 @@ async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
                     begin_snapshot: inlined,
                     partial_max: None,
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -620,10 +639,10 @@ async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
 async fn several_chunks_in_one_commit_all_survive() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 1), &[])?;
-            tx.inline_insert(table, &chunk("b", 1), &[])?;
-            tx.inline_insert(table, &chunk("c", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 1), &[]).await?;
+            tx.inline_insert(table, &chunk("b", 1), &[]).await?;
+            tx.inline_insert(table, &chunk("c", 1), &[]).await?;
             Ok(())
         })
         .await
@@ -644,8 +663,8 @@ async fn several_chunks_in_one_commit_all_survive() {
 async fn schema_versions_are_independent_through_read_and_flush() {
     let (catalog, _, table, _) = seeded().await;
     catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("v0", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("v0", 1), &[]).await?;
             tx.inline_insert(
                 table,
                 &InlineChunk {
@@ -654,7 +673,8 @@ async fn schema_versions_are_independent_through_read_and_flush() {
                     ..chunk("v1", 1)
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -672,8 +692,8 @@ async fn schema_versions_are_independent_through_read_and_flush() {
     assert_eq!(schema_of(1), b"schema-v1");
 
     catalog
-        .commit(|tx| {
-            tx.flush_inlined_data(table, 0, &[])?;
+        .commit(async |tx| {
+            tx.flush_inlined_data(table, 0, &[]).await?;
             Ok(())
         })
         .await
@@ -689,9 +709,16 @@ async fn schema_versions_are_independent_through_read_and_flush() {
 #[allow(clippy::unwrap_used)]
 async fn indexed() -> (Catalog, TableId, moraine::IndexId) {
     let (catalog, _, table, _) = seeded().await;
-    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let column = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .columns_of(table)
+        .await
+        .unwrap()[0]
+        .id;
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.create_index(
                 table,
                 &IndexDef {
@@ -700,16 +727,19 @@ async fn indexed() -> (Catalog, TableId, moraine::IndexId) {
                     unique: false,
                 },
                 &[],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
         .unwrap();
     let index = catalog
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .index_by_name(table, "by_x")
+        .await
+        .unwrap()
         .unwrap()
         .id;
 
@@ -730,8 +760,8 @@ fn indexed_value(v: i128) -> IndexKeyValue {
 async fn an_uncovered_inline_insert_into_an_indexed_table_is_refused() {
     let (catalog, table, _) = Box::pin(indexed()).await;
     let err = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 1), &[]).await?;
             Ok(())
         })
         .await
@@ -739,7 +769,7 @@ async fn an_uncovered_inline_insert_into_an_indexed_table_is_refused() {
     assert!(matches!(err, Error::Constraint(_)), "{err}");
 
     let err = catalog
-        .commit(|tx| tx.inline_delete(table, 0, &[]))
+        .commit(async |tx| tx.inline_delete(table, 0, &[]).await)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Constraint(_)), "{err}");
@@ -751,7 +781,7 @@ async fn an_uncovered_inline_insert_into_an_indexed_table_is_refused() {
 async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
     let (catalog, table, index) = Box::pin(indexed()).await;
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.inline_insert(
                 table,
                 &chunk("a", 2),
@@ -767,7 +797,8 @@ async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
                         values: vec![Some(indexed_value(20))],
                     },
                 ],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -777,7 +808,7 @@ async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
     let found = catalog.index_lookup(table, index, &twenty).await.unwrap();
     assert_eq!(found, vec![1]);
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.inline_delete(
                 table,
                 1,
@@ -787,6 +818,7 @@ async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
                     values: vec![Some(indexed_value(20))],
                 }],
             )
+            .await
         })
         .await
         .unwrap();
@@ -805,7 +837,7 @@ async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
 async fn an_inline_delete_refuses_a_removal_for_another_row() {
     let (catalog, table, index) = Box::pin(indexed()).await;
     let err = catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.inline_delete(
                 table,
                 0,
@@ -815,6 +847,7 @@ async fn an_inline_delete_refuses_a_removal_for_another_row() {
                     values: vec![Some(indexed_value(1))],
                 }],
             )
+            .await
         })
         .await
         .unwrap_err();
@@ -833,10 +866,15 @@ async fn inlined_rows_survive_a_reopen() {
             .unwrap();
         let created = std::cell::Cell::new(None);
         catalog
-            .commit(|tx| {
-                let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-                let table = tx.create_table(schema, "orders", &[col("a")])?;
-                tx.inline_insert(table, &chunk("durable", 2), &[])?;
+            .commit(async |tx| {
+                let schema = tx
+                    .schema_by_name("main")
+                    .await
+                    .unwrap()
+                    .expect("bootstrap schema")
+                    .id;
+                let table = tx.create_table(schema, "orders", &[col("a")]).await?;
+                tx.inline_insert(table, &chunk("durable", 2), &[]).await?;
                 created.set(Some(table));
                 Ok(())
             })
@@ -864,22 +902,22 @@ async fn inlined_rows_survive_a_reopen() {
 async fn a_flushed_file_spanning_snapshots_carries_its_partial_max() {
     let (catalog, _, table, _) = seeded().await;
     let first = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 2), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 2), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
     let second = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("b", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[]).await?;
             Ok(())
         })
         .await
         .unwrap();
 
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.flush_inlined_data(
                 table,
                 0,
@@ -892,22 +930,31 @@ async fn a_flushed_file_spanning_snapshots_carries_its_partial_max() {
                     begin_snapshot: first,
                     partial_max: Some(second),
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
         .unwrap();
 
-    let files = catalog.snapshot().await.unwrap().data_files_of(table);
+    let files = catalog
+        .read_scope()
+        .await
+        .unwrap()
+        .data_files_of(table)
+        .await
+        .unwrap();
     assert_eq!(files[0].partial_max, Some(second));
     // Backdated to the earliest all the same: the file is live at the
     // snapshot its oldest rows were inlined at.
     assert_eq!(
         catalog
-            .snapshot_at(first)
+            .read_scope_at(first)
             .await
             .unwrap()
             .data_files_of(table)
+            .await
+            .unwrap()
             .len(),
         1
     );
@@ -919,8 +966,8 @@ async fn a_flushed_file_spanning_snapshots_carries_its_partial_max() {
 async fn a_partial_max_outside_the_drained_snapshots_is_refused() {
     let (catalog, _, table, _) = seeded().await;
     let inlined = catalog
-        .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 1), &[])?;
+        .commit(async |tx| {
+            tx.inline_insert(table, &chunk("a", 1), &[]).await?;
             Ok(())
         })
         .await
@@ -931,7 +978,7 @@ async fn a_partial_max_outside_the_drained_snapshots_is_refused() {
         SnapshotId::new(u64::MAX),
     ] {
         let err = catalog
-            .commit(move |tx| {
+            .commit(async move |tx| {
                 tx.flush_inlined_data(
                     table,
                     0,
@@ -944,7 +991,8 @@ async fn a_partial_max_outside_the_drained_snapshots_is_refused() {
                         begin_snapshot: inlined,
                         partial_max: Some(partial_max),
                     }],
-                )?;
+                )
+                .await?;
                 Ok(())
             })
             .await

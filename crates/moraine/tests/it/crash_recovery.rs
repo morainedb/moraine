@@ -144,9 +144,9 @@ async fn durable_commit_survives_a_crash_before_its_acknowledgement() {
         .unwrap();
     let ids = std::cell::Cell::new(None);
     writer
-        .commit(|tx| {
-            let schema = tx.create_schema("sales")?;
-            let table = tx.create_table(schema, "orders", &[col("id")])?;
+        .commit(async |tx| {
+            let schema = tx.create_schema("sales").await?;
+            let table = tx.create_table(schema, "orders", &[col("id")]).await?;
             ids.set(Some((schema, table)));
             Ok(())
         })
@@ -154,10 +154,14 @@ async fn durable_commit_survives_a_crash_before_its_acknowledgement() {
         .unwrap();
     let (schema, table) = ids.get().unwrap();
     writer
-        .commit(move |tx| tx.register_data_file(table, datafile(100), &[]).map(|_| ()))
+        .commit(async move |tx| {
+            tx.register_data_file(table, datafile(100), &[])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap();
-    let head = writer.snapshot().await.unwrap().current_snapshot().id;
+    let head = writer.read_scope().await.unwrap().current_snapshot().id;
 
     // Death between the durable flush and the caller's ack: drop the
     // handle without closing it, so nothing is flushed on the way out.
@@ -166,22 +170,26 @@ async fn durable_commit_survives_a_crash_before_its_acknowledgement() {
     let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
         .await
         .unwrap();
-    let recovered = reopened.snapshot().await.unwrap();
+    let recovered = reopened.read_scope().await.unwrap();
     assert_eq!(
         recovered.current_snapshot().id,
         head,
         "the landed commit is durable across the crash"
     );
     assert!(
-        recovered.schema_by_name("sales").is_some(),
+        recovered.schema_by_name("sales").await.unwrap().is_some(),
         "and the snapshot resolves fully, not partially"
     );
-    assert_eq!(recovered.data_files_of(table).len(), 1);
+    assert_eq!(recovered.data_files_of(table).await.unwrap().len(), 1);
 
     // The caller re-drives the guarded operation it never got an ack for:
     // the guard surfaces instead of a duplicate or a corrupted commit.
     let err = reopened
-        .commit(move |tx| tx.create_table(schema, "orders", &[col("id")]).map(|_| ()))
+        .commit(async move |tx| {
+            tx.create_table(schema, "orders", &[col("id")])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap_err();
     assert!(matches!(err, Error::AlreadyExists(_)), "got {err:?}");
@@ -191,12 +199,18 @@ async fn durable_commit_survives_a_crash_before_its_acknowledgement() {
     // lands *cleanly* — row id ranges stay dense and disjoint rather than
     // colliding with the pre-crash commit's.
     reopened
-        .commit(move |tx| tx.register_data_file(table, datafile(100), &[]).map(|_| ()))
+        .commit(async move |tx| {
+            tx.register_data_file(table, datafile(100), &[])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap();
-    let after = reopened.snapshot().await.unwrap();
+    let after = reopened.read_scope().await.unwrap();
     let mut starts: Vec<u64> = after
         .data_files_of(table)
+        .await
+        .unwrap()
         .iter()
         .filter_map(|file| file.row_id_start)
         .collect();
@@ -273,13 +287,13 @@ async fn concurrent_genesis_leaves_exactly_one_catalog() {
         let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
             .await
             .unwrap();
-        let snapshot = reopened.snapshot().await.unwrap();
+        let snapshot = reopened.read_scope().await.unwrap();
         assert_eq!(
             snapshot.current_snapshot().id.get(),
             0,
             "round {round}: genesis leaves head at snapshot 0; a second genesis would advance it"
         );
-        let schemas = snapshot.schemas();
+        let schemas = snapshot.schemas().await.unwrap();
         assert_eq!(
             schemas.len(),
             1,
@@ -308,13 +322,13 @@ async fn a_genesis_fenced_mid_bootstrap_re_attempts_and_lands() {
         .await
         .expect("the re-attempt creates the catalog the fenced attempt could not");
 
-    let snapshot = catalog.snapshot().await.unwrap();
+    let snapshot = catalog.read_scope().await.unwrap();
     assert_eq!(
         snapshot.current_snapshot().id.get(),
         0,
         "one genesis, not one per attempt"
     );
-    let schemas = snapshot.schemas();
+    let schemas = snapshot.schemas().await.unwrap();
     assert_eq!(schemas.len(), 1);
     assert_eq!(schemas[0].name, "main");
     catalog.close().await.unwrap();
@@ -355,9 +369,9 @@ async fn a_lost_manifest_race_surfaces_typed_rather_than_as_a_store_error() {
     let reopened = Catalog::open(backing, CatalogOptions::default())
         .await
         .unwrap();
-    let snapshot = reopened.snapshot().await.unwrap();
+    let snapshot = reopened.read_scope().await.unwrap();
     assert_eq!(snapshot.current_snapshot().id.get(), 0);
-    assert_eq!(snapshot.schemas().len(), 1);
+    assert_eq!(snapshot.schemas().await.unwrap().len(), 1);
     reopened.close().await.unwrap();
 }
 
@@ -375,38 +389,44 @@ async fn takeover_reads_the_durable_head_and_continues_from_it() {
         .await
         .unwrap();
     first
-        .commit(|tx| tx.create_schema("landed").map(|_| ()))
+        .commit(async |tx| tx.create_schema("landed").await.map(|_| ()))
         .await
         .unwrap();
-    let head_at_first = first.snapshot().await.unwrap().current_snapshot().id;
+    let head_at_first = first.read_scope().await.unwrap().current_snapshot().id;
 
     // The second writer never saw the first's memory, only the store.
     let second = Catalog::open(backing.clone(), CatalogOptions::default())
         .await
         .unwrap();
-    let taken_over = second.snapshot().await.unwrap();
+    let taken_over = second.read_scope().await.unwrap();
     assert_eq!(
         taken_over.current_snapshot().id,
         head_at_first,
         "a durable commit survives the takeover intact"
     );
     assert!(
-        taken_over.schema_by_name("landed").is_some(),
+        taken_over.schema_by_name("landed").await.unwrap().is_some(),
         "the new writer sees the landed commit, not a partial view of it"
     );
 
     second
-        .commit(|tx| tx.create_schema("after_takeover").map(|_| ()))
+        .commit(async |tx| tx.create_schema("after_takeover").await.map(|_| ()))
         .await
         .unwrap();
-    let advanced = second.snapshot().await.unwrap();
+    let advanced = second.read_scope().await.unwrap();
     assert_eq!(
         advanced.current_snapshot().id.get(),
         head_at_first.get() + 1,
         "the new writer advances the inherited head by one"
     );
-    assert!(advanced.schema_by_name("landed").is_some());
-    assert!(advanced.schema_by_name("after_takeover").is_some());
+    assert!(advanced.schema_by_name("landed").await.unwrap().is_some());
+    assert!(
+        advanced
+            .schema_by_name("after_takeover")
+            .await
+            .unwrap()
+            .is_some()
+    );
     second.close().await.unwrap();
 }
 
@@ -423,21 +443,21 @@ async fn fenced_writer_that_resumes_writes_nothing() {
         .await
         .unwrap();
     displaced
-        .commit(|tx| tx.create_schema("before_takeover").map(|_| ()))
+        .commit(async |tx| tx.create_schema("before_takeover").await.map(|_| ()))
         .await
         .unwrap();
 
     let successor = Catalog::open(backing.clone(), CatalogOptions::default())
         .await
         .unwrap();
-    let head_after_takeover = successor.snapshot().await.unwrap().current_snapshot().id;
+    let head_after_takeover = successor.read_scope().await.unwrap().current_snapshot().id;
 
     let before = inventory(&backing).await;
 
     // The displaced writer resumes and tries to commit against a premise
     // the takeover already invalidated.
     let err = displaced
-        .commit(|tx| tx.create_schema("stale").map(|_| ()))
+        .commit(async |tx| tx.create_schema("stale").await.map(|_| ()))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Fenced(_)), "got {err:?}");
@@ -448,13 +468,19 @@ async fn fenced_writer_that_resumes_writes_nothing() {
         "a fenced writer must leave the store byte-identical"
     );
 
-    let snapshot = successor.snapshot().await.unwrap();
+    let snapshot = successor.read_scope().await.unwrap();
     assert_eq!(snapshot.current_snapshot().id, head_after_takeover);
     assert!(
-        snapshot.schema_by_name("stale").is_none(),
+        snapshot.schema_by_name("stale").await.unwrap().is_none(),
         "the fenced writer's commit must be invisible"
     );
-    assert!(snapshot.schema_by_name("before_takeover").is_some());
+    assert!(
+        snapshot
+            .schema_by_name("before_takeover")
+            .await
+            .unwrap()
+            .is_some()
+    );
     successor.close().await.unwrap();
 }
 
@@ -491,10 +517,15 @@ async fn catalog_with_table(backing: &Arc<InMemory>) -> (Catalog, TableId) {
         .unwrap();
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
-            tx.register_data_file(table, datafile(7), &[])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx.create_table(schema, "orders", &[col("a")]).await?;
+            tx.register_data_file(table, datafile(7), &[]).await?;
             created.set(Some(table));
             Ok(())
         })
@@ -516,8 +547,8 @@ async fn interrupted_index_build_resumes_from_its_persisted_cursor() {
 
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            created.set(Some(tx.create_index_staged(table, &index_def())?));
+        .commit(async |tx| {
+            created.set(Some(tx.create_index_staged(table, &index_def()).await?));
             Ok(())
         })
         .await
@@ -526,8 +557,9 @@ async fn interrupted_index_build_resumes_from_its_persisted_cursor() {
 
     // One step lands durably, then the process dies mid-build.
     catalog
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.build_index_step(index, &[entry(0), entry(1), entry(2)], false)
+                .await
                 .map(|_| ())
         })
         .await
@@ -538,10 +570,12 @@ async fn interrupted_index_build_resumes_from_its_persisted_cursor() {
         .await
         .unwrap();
     let building = reopened
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .indexes_of(table)
+        .await
+        .unwrap()
         .remove(0);
     assert_eq!(
         building.state,
@@ -564,18 +598,21 @@ async fn interrupted_index_build_resumes_from_its_persisted_cursor() {
 
     // Resume past the cursor and finish.
     reopened
-        .commit(move |tx| {
+        .commit(async move |tx| {
             tx.build_index_step(index, &[entry(3), entry(4), entry(5), entry(6)], true)
+                .await
                 .map(|_| ())
         })
         .await
         .unwrap();
 
     let finished = reopened
-        .snapshot()
+        .read_scope()
         .await
         .unwrap()
         .indexes_of(table)
+        .await
+        .unwrap()
         .remove(0);
     assert_eq!(finished.state, IndexState::Ready);
     for row_id in 0..7 {
@@ -604,8 +641,8 @@ async fn interrupted_entry_reclamation_converges_on_re_run() {
 
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            created.set(Some(tx.create_index_staged(table, &index_def())?));
+        .commit(async |tx| {
+            created.set(Some(tx.create_index_staged(table, &index_def()).await?));
             Ok(())
         })
         .await
@@ -613,11 +650,11 @@ async fn interrupted_entry_reclamation_converges_on_re_run() {
     let index = created.get().unwrap();
     let entries: Vec<IndexEntry> = (0..7).map(entry).collect();
     catalog
-        .commit(move |tx| tx.build_index_step(index, &entries, true).map(|_| ()))
+        .commit(async move |tx| tx.build_index_step(index, &entries, true).await.map(|_| ()))
         .await
         .unwrap();
     catalog
-        .commit(move |tx| tx.drop_index(index))
+        .commit(async move |tx| tx.drop_index(index).await)
         .await
         .unwrap();
 
@@ -648,9 +685,9 @@ async fn interrupted_entry_reclamation_converges_on_re_run() {
     assert_eq!(again.indexes_swept, 0);
 
     // The sweep touched only the dead index's entries.
-    let snapshot = reopened.snapshot().await.unwrap();
-    assert_eq!(snapshot.data_files_of(table).len(), 1);
-    assert!(snapshot.table_by_id(table).is_some());
+    let snapshot = reopened.read_scope().await.unwrap();
+    assert_eq!(snapshot.data_files_of(table).await.unwrap().len(), 1);
+    assert!(snapshot.table_by_id(table).await.unwrap().is_some());
     reopened.close().await.unwrap();
 }
 
@@ -669,10 +706,11 @@ async fn catalog_with_planted_options(backing: &Arc<InMemory>) -> Vec<SchemaId> 
         .unwrap();
     let created = std::cell::RefCell::new(Vec::new());
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             for index in 1..=PLANTED_OPTIONS {
-                let schema = tx.create_schema(&format!("s{index}"))?;
-                tx.set_option(OptionScope::Schema(schema), "planted", &schema.to_string())?;
+                let schema = tx.create_schema(&format!("s{index}")).await?;
+                tx.set_option(OptionScope::Schema(schema), "planted", &schema.to_string())
+                    .await?;
                 created.borrow_mut().push(schema);
             }
             Ok(())
@@ -776,21 +814,27 @@ async fn interrupted_migration_refuses_readers_and_resumes_exactly_once() {
         let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
             .await
             .unwrap_or_else(|error| panic!("attach after {point:?}: {error:?}"));
-        let snapshot = reopened.snapshot().await.unwrap();
+        let snapshot = reopened.read_scope().await.unwrap();
         for schema in &schemas {
             assert_eq!(
-                snapshot.option(OptionScope::Table(TableId::new(schema.get())), "planted"),
+                snapshot
+                    .option(OptionScope::Table(TableId::new(schema.get())), "planted")
+                    .await
+                    .unwrap(),
                 Some(schema.to_string()),
                 "{point:?}"
             );
             assert_eq!(
-                snapshot.option(OptionScope::Schema(*schema), "planted"),
+                snapshot
+                    .option(OptionScope::Schema(*schema), "planted")
+                    .await
+                    .unwrap(),
                 None,
                 "{point:?}"
             );
         }
         assert_eq!(
-            snapshot.schemas().len(),
+            snapshot.schemas().await.unwrap().len(),
             usize::try_from(PLANTED_OPTIONS).unwrap() + 1,
             "the rewrite touched options, not schemas, at {point:?}"
         );
@@ -823,7 +867,14 @@ async fn a_live_reader_refuses_once_another_writer_plants_a_marker() {
         .await
         .unwrap();
     assert_eq!(
-        reader.snapshot().await.unwrap().schemas().len(),
+        reader
+            .read_scope()
+            .await
+            .unwrap()
+            .schemas()
+            .await
+            .unwrap()
+            .len(),
         schemas.len() + 1,
         "the reader is healthy before the keyspace starts moving"
     );
@@ -856,7 +907,7 @@ async fn a_live_reader_refuses_once_another_writer_plants_a_marker() {
 async fn poll_until_refused(reader: &moraine::ReadOnlyCatalog) -> Error {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match reader.snapshot().await {
+        match reader.read_scope().await {
             Err(error) => return error,
             Ok(_) => assert!(
                 std::time::Instant::now() < deadline,
@@ -896,10 +947,10 @@ async fn commit_whose_wal_never_landed_is_invisible() {
         .await
         .unwrap();
     catalog
-        .commit(|tx| tx.create_schema("durable").map(|_| ()))
+        .commit(async |tx| tx.create_schema("durable").await.map(|_| ()))
         .await
         .unwrap();
-    let head_before = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let head_before = catalog.read_scope().await.unwrap().current_snapshot().id;
 
     // The process dies: the batch can still be staged in memory, but
     // nothing it writes will ever reach object storage.
@@ -907,7 +958,7 @@ async fn commit_whose_wal_never_landed_is_invisible() {
     assert_never_landed(
         tokio::time::timeout(
             UNTIL_CRASH,
-            catalog.commit(|tx| tx.create_schema("lost").map(|_| ())),
+            catalog.commit(async |tx| tx.create_schema("lost").await.map(|_| ())),
         )
         .await,
     );
@@ -917,18 +968,18 @@ async fn commit_whose_wal_never_landed_is_invisible() {
     let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
         .await
         .unwrap();
-    let recovered = reopened.snapshot().await.unwrap();
+    let recovered = reopened.read_scope().await.unwrap();
     assert_eq!(
         recovered.current_snapshot().id,
         head_before,
         "the head must not move for a commit that never became durable"
     );
     assert!(
-        recovered.schema_by_name("lost").is_none(),
+        recovered.schema_by_name("lost").await.unwrap().is_none(),
         "no record of the undurable commit may be visible"
     );
     assert!(
-        recovered.schema_by_name("durable").is_some(),
+        recovered.schema_by_name("durable").await.unwrap().is_some(),
         "the commit that did land is untouched"
     );
     reopened.close().await.unwrap();
@@ -940,11 +991,18 @@ async fn commit_whose_wal_never_landed_is_invisible() {
 async fn table_to_drop(catalog: &Catalog) -> TableId {
     let created = std::cell::Cell::new(None);
     catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a"), col("b"), col("c")])?;
-            tx.register_data_file(table, datafile(10), &[])?;
-            tx.register_data_file(table, datafile(20), &[])?;
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap schema")
+                .id;
+            let table = tx
+                .create_table(schema, "orders", &[col("a"), col("b"), col("c")])
+                .await?;
+            tx.register_data_file(table, datafile(10), &[]).await?;
+            tx.register_data_file(table, datafile(20), &[]).await?;
             created.set(Some(table));
             Ok(())
         })
@@ -970,7 +1028,10 @@ async fn multi_tombstone_drop_is_never_observed_half_done() {
         .unwrap();
     let table = table_to_drop(&probe).await;
     let before_drop = probe_store.writes_attempted();
-    probe.commit(move |tx| tx.drop_table(table)).await.unwrap();
+    probe
+        .commit(async move |tx| tx.drop_table(table).await)
+        .await
+        .unwrap();
     let boundaries = probe_store.writes_attempted() - before_drop;
     probe.close().await.unwrap();
     assert!(
@@ -991,8 +1052,11 @@ async fn multi_tombstone_drop_is_never_observed_half_done() {
         // the allowance covers every write the drop makes, it commits
         // normally — that is the end of the sweep, not a failure.
         store.freeze_after(i64::try_from(stop_after).unwrap());
-        let outcome =
-            tokio::time::timeout(UNTIL_CRASH, catalog.commit(move |tx| tx.drop_table(table))).await;
+        let outcome = tokio::time::timeout(
+            UNTIL_CRASH,
+            catalog.commit(async move |tx| tx.drop_table(table).await),
+        )
+        .await;
         if !matches!(outcome, Ok(Ok(_))) {
             interrupted += 1;
         }
@@ -1001,25 +1065,25 @@ async fn multi_tombstone_drop_is_never_observed_half_done() {
         let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
             .await
             .unwrap();
-        let recovered = reopened.snapshot().await.unwrap();
-        if recovered.table_by_id(table).is_some() {
+        let recovered = reopened.read_scope().await.unwrap();
+        if recovered.table_by_id(table).await.unwrap().is_some() {
             assert_eq!(
-                recovered.columns_of(table).len(),
+                recovered.columns_of(table).await.unwrap().len(),
                 3,
                 "stopping after {stop_after} writes left a table missing columns"
             );
             assert_eq!(
-                recovered.data_files_of(table).len(),
+                recovered.data_files_of(table).await.unwrap().len(),
                 2,
                 "stopping after {stop_after} writes left a table missing files"
             );
         } else {
             assert!(
-                recovered.columns_of(table).is_empty(),
+                recovered.columns_of(table).await.unwrap().is_empty(),
                 "stopping after {stop_after} writes dropped a table but kept its columns"
             );
             assert!(
-                recovered.data_files_of(table).is_empty(),
+                recovered.data_files_of(table).await.unwrap().is_empty(),
                 "stopping after {stop_after} writes dropped a table but kept its files"
             );
         }
@@ -1077,13 +1141,13 @@ async fn interrupted_genesis_is_never_observed_half_created() {
                     "stopping genesis after {stop_after} writes left an unopenable store: {err:?}"
                 )
             });
-        let snapshot = reopened.snapshot().await.unwrap_or_else(|err| {
+        let snapshot = reopened.read_scope().await.unwrap_or_else(|err| {
             panic!(
                 "stopping genesis after {stop_after} writes left a half-created catalog: {err:?}"
             )
         });
         assert_eq!(snapshot.current_snapshot().id.get(), 0);
-        let schemas = snapshot.schemas();
+        let schemas = snapshot.schemas().await.unwrap();
         assert_eq!(schemas.len(), 1, "stopping after {stop_after} writes");
         assert_eq!(schemas[0].name, "main");
         reopened.close().await.unwrap();
@@ -1103,12 +1167,20 @@ const GROUP_MEMBERS: [&str; 3] = ["m1", "m2", "m3"];
 /// member, so the batch carries far more than the head pointer.
 #[allow(clippy::unwrap_used)]
 async fn commit_a_group(catalog: &Catalog) -> Result<Vec<moraine::SnapshotId>, Error> {
-    let member = |name: &'static str| {
-        move |tx: &mut moraine::Transaction| {
-            let schema = tx.create_schema(name)?;
-            tx.create_table(schema, "rows", &[col("x")]).map(|_| ())
+    fn member(
+        name: &'static str,
+    ) -> impl for<'a> Fn(
+        &'a mut moraine::Transaction,
+    ) -> futures::future::BoxFuture<'a, moraine::Result<()>> {
+        move |tx| {
+            Box::pin(async move {
+                let schema = tx.create_schema(name).await?;
+                tx.create_table(schema, "rows", &[col("x")])
+                    .await
+                    .map(|_| ())
+            })
         }
-    };
+    }
     let (first, second, third) = (
         member(GROUP_MEMBERS[0]),
         member(GROUP_MEMBERS[1]),
@@ -1148,7 +1220,7 @@ async fn a_group_is_never_observed_half_committed() {
             .await
             .unwrap();
         let start = catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .current_snapshot()
@@ -1168,11 +1240,11 @@ async fn a_group_is_never_observed_half_committed() {
         let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
             .await
             .unwrap();
-        let recovered = reopened.snapshot().await.unwrap();
-        let landed = GROUP_MEMBERS
-            .iter()
-            .filter(|name| recovered.schema_by_name(name).is_some())
-            .count();
+        let recovered = reopened.read_scope().await.unwrap();
+        let mut landed = 0;
+        for name in GROUP_MEMBERS {
+            landed += usize::from(recovered.schema_by_name(name).await.unwrap().is_some());
+        }
         assert!(
             landed == 0 || landed == GROUP_MEMBERS.len(),
             "stopping after {stop_after} writes left {landed} of {} members committed",

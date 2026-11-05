@@ -36,11 +36,11 @@ async fn seeded_files(files: usize) -> (Catalog, TableId, Arc<GatedReadStore>) {
     }
     let created = Cell::new(None);
     catalog
-        .commit(|tx| {
-            let main = tx.schema_by_name("main").unwrap().id;
-            let table = tx.create_table(main, "orders", &[col("a")])?;
+        .commit(async |tx| {
+            let main = tx.schema_by_name("main").await.unwrap().unwrap().id;
+            let table = tx.create_table(main, "orders", &[col("a")]).await?;
             for file in &registrations {
-                tx.register_data_file(table, file.clone(), &[])?;
+                tx.register_data_file(table, file.clone(), &[]).await?;
             }
             created.set(Some(table));
             Ok(())
@@ -65,10 +65,12 @@ async fn missing_data_store_is_refused_before_creating_a_definition() {
     assert_eq!(head(&catalog).await, before);
     assert!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .indexes_of(table)
+            .await
+            .unwrap()
             .is_empty()
     );
 }
@@ -76,8 +78,14 @@ async fn missing_data_store_is_refused_before_creating_a_definition() {
 #[allow(clippy::unwrap_used)]
 async fn expiry_during_build(files: usize, step: usize) {
     let (catalog, table, gate) = seeded_files(files).await;
-    let snapshot = catalog.snapshot().await.unwrap();
-    let expired = snapshot.data_files_of(table).last().unwrap().id;
+    let snapshot = catalog.read_scope().await.unwrap();
+    let expired = snapshot
+        .data_files_of(table)
+        .await
+        .unwrap()
+        .last()
+        .unwrap()
+        .id;
     let definition = def(true);
     let build = Box::pin(catalog.create_index_staged(
         table,
@@ -93,8 +101,12 @@ async fn expiry_during_build(files: usize, step: usize) {
         // step to be durable rather than assuming the arrival implies it.
         if files > 1 {
             loop {
-                let snapshot = catalog.snapshot().await.unwrap();
-                let index = snapshot.index_by_name(table, "by_a").unwrap();
+                let snapshot = catalog.read_scope().await.unwrap();
+                let index = snapshot
+                    .index_by_name(table, "by_a")
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if index.build_cursor == Some(0) {
                     break;
                 }
@@ -102,7 +114,7 @@ async fn expiry_during_build(files: usize, step: usize) {
             }
         }
         catalog
-            .commit(|tx| tx.expire_data_file(table, expired))
+            .commit(async |tx| tx.expire_data_file(table, expired).await)
             .await
             .unwrap();
         gate.open();
@@ -135,7 +147,7 @@ async fn expiry_during_build(files: usize, step: usize) {
         );
     }
     catalog
-        .commit(|tx| {
+        .commit(async |tx| {
             tx.register_data_file(
                 table,
                 moraine::DataFile {
@@ -147,7 +159,8 @@ async fn expiry_during_build(files: usize, step: usize) {
                     ordinal: 0,
                     values: vec![Some(int(first_expired))],
                 }],
-            )?;
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -212,7 +225,11 @@ fn inline_chunk(value: i64) -> moraine::InlineChunk {
 async fn a_buffered_inline_row_is_not_restored_after_deletion() {
     let (catalog, table, gate) = seeded_files(1).await;
     catalog
-        .commit(|tx| tx.inline_insert(table, &inline_chunk(99), &[]).map(|_| ()))
+        .commit(async |tx| {
+            tx.inline_insert(table, &inline_chunk(99), &[])
+                .await
+                .map(|_| ())
+        })
         .await
         .unwrap();
     let definition = def(true);
@@ -227,8 +244,8 @@ async fn a_buffered_inline_row_is_not_restored_after_deletion() {
     let delete = async {
         gate.arrival().await;
         catalog
-            .commit(|tx| {
-                let index = tx.index_by_name(table, "by_a").unwrap().id;
+            .commit(async |tx| {
+                let index = tx.index_by_name(table, "by_a").await.unwrap().unwrap().id;
                 tx.inline_delete(
                     table,
                     2,
@@ -238,6 +255,7 @@ async fn a_buffered_inline_row_is_not_restored_after_deletion() {
                         values: vec![Some(int(99))],
                     }],
                 )
+                .await
             })
             .await
             .unwrap();
@@ -278,12 +296,19 @@ async fn a_buffered_inline_row_is_not_restored_after_deletion() {
 async fn empty_and_inline_only_tables_need_no_data_store() {
     for inline in [false, true] {
         let (catalog, table, _) = seeded_files(1).await;
-        let file = catalog.snapshot().await.unwrap().data_files_of(table)[0].id;
+        let file = catalog
+            .read_scope()
+            .await
+            .unwrap()
+            .data_files_of(table)
+            .await
+            .unwrap()[0]
+            .id;
         catalog
-            .commit(|tx| {
-                tx.expire_data_file(table, file)?;
+            .commit(async |tx| {
+                tx.expire_data_file(table, file).await?;
                 if inline {
-                    tx.inline_insert(table, &inline_chunk(99), &[])?;
+                    tx.inline_insert(table, &inline_chunk(99), &[]).await?;
                 }
                 Ok(())
             })
@@ -308,7 +333,7 @@ async fn empty_and_inline_only_tables_need_no_data_store() {
 async fn a_missing_store_does_not_discard_an_existing_build() {
     let (catalog, table, _) = seeded_files(1).await;
     catalog
-        .commit(|tx| tx.create_index_staged(table, &def(true)).map(|_| ()))
+        .commit(async |tx| tx.create_index_staged(table, &def(true)).await.map(|_| ()))
         .await
         .unwrap();
     let before = head(&catalog).await;
@@ -319,10 +344,12 @@ async fn a_missing_store_does_not_discard_an_existing_build() {
     assert_eq!(head(&catalog).await, before);
     assert_eq!(
         catalog
-            .snapshot()
+            .read_scope()
             .await
             .unwrap()
             .index_by_name(table, "by_a")
+            .await
+            .unwrap()
             .unwrap()
             .state,
         IndexState::Building

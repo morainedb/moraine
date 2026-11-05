@@ -122,7 +122,7 @@ async fn legacy_targets_scan_and_migration_resumes_between_batches() {
     let reader = Catalog::open_read_only(store.clone(), CatalogOptions::default())
         .await
         .unwrap();
-    let scope = reader.index_read_scope().await.unwrap().unwrap();
+    let scope = reader.index_read_scope().await.unwrap();
     let read = scope.reads().begin_read().await.unwrap();
     assert_eq!(
         read::read_format(read.handle())

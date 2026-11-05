@@ -10,7 +10,7 @@ expensive-to-reverse decision the project requires an RFC for (key layout —
 RFC 0002/0005; commit protocol — RFC 0004; public API shape — here). The
 surface is four types — `Catalog` (the read-write handle), `ReadOnlyCatalog`
 (the read surface a read-only attach gets, which `Catalog` derefs to),
-`CatalogSnapshot` (an immutable materialized read view), and `Transaction`
+`ReadScope` (a fixed, demand-loaded read view), and `Transaction`
 (the mutation handle passed to a commit closure) — over an error taxonomy with one variant per failure domain.
 Writes go through a closure-with-retry model so the RFC 0002 single-`WriteBatch`
 atomicity invariant and conflict-retry loop live in the core, not duplicated in
@@ -21,7 +21,7 @@ semantics.
 
 ## Goals
 
-- One read API, usable both standalone (`catalog.snapshot()`) and inside a
+- One read API, usable both standalone (`catalog.read_scope()`) and inside a
   commit (the `Transaction` handed to the closure exposes the same accessors). A host
   learns the accessors once.
 - The atomicity invariant (RFC 0002: one catalog commit is exactly one SlateDB
@@ -61,11 +61,9 @@ DuckDB bridge owns the sync↔async translation. It does spawn *tasks* onto the
 runtime already driving it, which is how a commit's durable write survives its
 caller being cancelled (RFC 0010); that needs no runtime of its own.
 
-RFC 0002 establishes the read model this API exposes: a client builds an
-in-memory catalog by scanning the `current` subspace at attach; the live catalog
-is small by design, name→id resolution happens against that in-memory
-snapshot, and the hot path never scans history. This RFC turns that model into
-types.
+Catalog metadata can be larger than memory. Opening a scope pins a store
+revision without decoding the catalog. Point lookups and typed cursors load
+metadata on demand; Foyer owns block reuse, and callers own decoded results.
 
 ## Design
 
@@ -90,15 +88,18 @@ alongside `Error`/`Result`.
   refusal are gone with it. The runtime check survives in exactly one place,
   the extension shim, because a C ABI has one handle type and no types of
   its own to refuse with; that is the boundary where a type argument ends.
-- **`CatalogSnapshot`** — an immutable, materialized read view built by
-  scanning `current` (or `current` + the relevant `history` ranges, for time travel) per
-  RFC 0002. All accessors are in-memory; after construction it never touches
-  the store. Lives in `catalog`.
-- **`Transaction`** — the mutation handle passed to the commit closure. It `Deref`s to
-  `CatalogSnapshot`, so every read accessor is available inside a commit for
-  name→id resolution and validation, and adds the mutators. The commit
-  machinery (retry, `WriteBatch` assembly, `current`↔`history` bookkeeping) lives in
-  `transaction`; `Transaction` is its public face.
+- **`ReadScope`** — a fixed store revision plus a current or historical
+  snapshot ID. Fallible asynchronous lookups load only their requested records.
+  `CatalogCursor<T>` owns a pinned scope and streams typed metadata one record
+  at a time. Neither retains a decoded catalog cache.
+- **`Transaction`** — the asynchronous mutation handle passed to `commit`.
+  It loads validation dependencies on demand, preserves staged reads, and has
+  no `Deref` to a materialized snapshot. The commit protocol owns allocation,
+  conflict detection, retries, and atomic publication.
+
+`CatalogSnapshot` is an internal operation projection used by translation and
+an unstable ABI seam. There is no public whole-catalog materialization entry
+point. Unit tests may build complete reference views to check scoped behavior.
 
 Public catalog instants use `Timestamp`, a signed microsecond count from the
 Unix epoch. `SnapshotInfo::time`, `ScheduledDeletion::schedule_start`, and
@@ -152,23 +153,29 @@ catalog-wide decoded map. Unversioned metadata and versioned entities must
 observe that same revision. Decoded values belong to the consuming operation;
 there is no decoded-object cache.
 
-`CatalogSnapshot` remains an explicit materialization API with its existing
-in-memory accessors. Its caller pays for the complete result. It must not be
-an implicit prerequisite for opening a read scope, querying one table, or
-committing a small mutation. Compatibility methods returning `Vec` retain
-their complete results; cursor consumers process and release bounded batches.
-
-
 ```rust
-let snapshot = catalog.snapshot().await?;                 // current catalog
-let past = catalog.snapshot_at(snapshot_id).await?;   // time travel
+let current = catalog.read_scope().await?;
+let past = catalog.read_scope_at(snapshot_id).await?;
+let schema = current.schema_by_name("sales").await?;
+let mut schemas = current.scan_schemas().await?;
+while let Some(schema) = schemas.next().await? {
+    // Process and release each descriptor.
+}
 ```
 
-Both return caller-owned `Arc<CatalogSnapshot>` values. `snapshot()` scans
-`current`; `snapshot_at(S)` also reads the relevant `history` ranges and
-filters visibility. The handle retains neither result nor decoded scan rows.
-The `Arc` allows callers to share an explicitly materialized view. Ordinary
-operations should use fixed read scopes and demand-loaded projections.
+Both scope constructors pin a fixed store revision and validate the requested
+snapshot against retention. Historical entity reads seek the requested
+identity or range and filter lifecycle visibility. Unversioned metadata uses
+the same pinned store revision. Scope acquisition must fail if it cannot pin;
+it never falls back to a catalog-wide materialization or a following reader.
+`current_snapshot()` is synchronous because scope acquisition already read the
+header. Other metadata lookups are asynchronous and fallible. Collection
+accessors retain their requested result; `scan_*` cursors bound enumeration
+memory to a store page and one decoded record.
+
+The old `snapshot()` and `snapshot_at()` methods and the eager `moraine_snapshot`
+ABI entry point are removed. Hosts migrate to fixed scopes; there is no eager
+compatibility path.
 
 `ffi_support::catalog_read::table_sources_for` resolves an exact schema/table
 name and point-reads only the requested current data-file IDs at one read point.
@@ -183,10 +190,11 @@ columns, index definitions and table statistics; referenced file mappings;
 and a scan of each affected table's delete-file directory retaining only
 records targeting referenced files. These partial projections are never
 installed as complete catalog snapshots. Rebase retains the caller's fixed
-authored read scope until its dependencies are resolved. The explicit public verb
-closure API still requires a complete working snapshot. Internal index build and
-certification commits instead declare their table dependencies and fold pending
-batch writes into that operation-owned projection.
+authored read scope until its dependencies are resolved. Public verb callbacks
+load dependencies as operations request them, extending both the original
+premise and the staged view without overwriting earlier mutations. Internal
+index, option, data-path, and version changes declare their required premises
+and fold pending batch writes into that operation-owned projection.
 
 Internal immediate/staged backfills and index verification stream current file
 records and resolve delete files per target at the same fixed read point. Their
@@ -204,7 +212,7 @@ only the last page. Large tables therefore require a streaming metadata pass
 on each uncached row lookup; Foyer serves storage blocks, and the data cache
 continues to serve immutable file summaries.
 
-Accessors (all in-memory, name→id resolved internally):
+Accessors (asynchronous and fallible except `current_snapshot`, names resolved internally):
 
 | Accessor | Returns |
 |---|---|
@@ -222,20 +230,19 @@ Accessors (all in-memory, name→id resolved internally):
 | `option(scope, key)` | resolved option value |
 | `current_snapshot()` | snapshot id + metadata of this view |
 
-Reads issue no store I/O after the snapshot is built — a `CatalogSnapshot` is a
-value, not a cursor.
+Reads perform store I/O on demand at the scope's fixed revision.
 
 Inlined rows (RFC 0005) are the one read the snapshot does **not** serve.
 `recent_rows(table)`, `recent_rows_at(table, snapshot)` and
 `recent_row(table, row_id)` are `Catalog` methods, each one contiguous range
 scan of the `inline` subspace — at head, or, for `recent_rows_at`, at the
-snapshot named. That id resolves through the rule `snapshot_at` uses, so an
+snapshot named. That id resolves through the rule `read_scope_at` uses, so an
 unminted id and an expired one are refused the same way whichever read is
 asking. They are row
 data, not catalog metadata: an inlined chunk carries the table's actual values
 as an Arrow IPC body, so materializing them into every `CatalogSnapshot` would
 put unbounded row bytes behind an accessor the whole catalog shares and break
-the complete-result memory cost the materialized compatibility view carries
+the complete-result memory cost a collection accessor carries
 on. Rows of one chunk share one body and rows of one schema version share one
 schema, so each set of bytes is read and returned once however many rows
 reference it.
@@ -268,52 +275,45 @@ marked `#[non_exhaustive]` so fields can be added without a break:
 ### Writes: closure-with-retry
 
 ```rust
-let new_snapshot: SnapshotId = catalog.commit(|tx| {
-    let s = tx.create_schema("sales")?;
-    let t = tx.create_table(s, "orders", columns)?;
-    tx.register_data_file(t, data_file)?;
+let new_snapshot: SnapshotId = catalog.commit(async |tx| {
+    let schema = tx.create_schema("sales").await?;
+    let table = tx.create_table(schema, "orders", columns).await?;
+    tx.register_data_file(table, data_file.clone(), &[]).await?;
     Ok(())
 }).await?;
 ```
 
-`commit` reads a fresh `CatalogSnapshot`, constructs a `Tx` over it, runs the
-closure to accumulate mutations, assembles exactly one `WriteBatch` (RFC 0002
-atomicity invariant), and commits it under the protocol of RFC 0004. On a
-transient write-write race it retries the whole cycle — including re-reading
-the snapshot and re-running the closure — up to a bounded budget. On a logical
-error it aborts immediately.
+`commit` starts with the head and allocation counters. Each read or mutation
+loads its own dependencies through the batch's read session. An operation
+projection holds original records and a separate staged view, so a later read
+sees earlier changes without replacing them when new dependencies arrive.
+Name checks, cascades, index upkeep, options, and ID allocation keep their
+existing validation. The accumulated delta is published atomically.
 
-Because the closure may run more than once, it must be pure and idempotent:
-its only effects are the `Transaction` mutators it calls and the value it returns.
-This is documented on `commit` and is the single most important contract of
-the API. The re-run is not merely permitted, it is load-bearing: RFC 0004's
-benign-race retry re-runs the closure against the fresh snapshot precisely
-so that logical premises (name uniqueness, entity existence) are
-re-validated against the state that won the race — a mechanical re-stage
-without the closure would commit duplicate names. Two Rust-shape
-consequences follow and are part of the contract, not incidental: the
-closure is **`Fn`, not `FnOnce`** (it cannot consume captured values — move
-clones in, or stage owned data on the `Transaction`), and it is **synchronous** (no
-I/O of its own; name→id resolution and staging run against the in-memory
-snapshot, and anything slow — writing Parquet, say — happens *before*
-`commit`, per the RFC 0005 data-before-metadata order). Snapshot allocation
-is implicit — a successful `commit` produces one new snapshot; there is no
-explicit `begin_snapshot` verb.
+Callbacks implement `AsyncFn` and may be retried after a benign head race.
+They must not consume captured state or perform external side effects; write
+Parquet before entering the callback. Asynchronous catalog methods perform
+fallible metadata reads, not independent commits. A callback error aborts its
+whole member, and a group error aborts every member. A following commit-log
+reader moving during dependency loading produces a conflict rather than
+publishing a mixed premise.
 
-`commit_group` is the same surface for several closures at once:
+`commit_group` accepts heterogeneous callbacks returning boxed `Send` futures:
 
 ```rust
-let ids: Vec<SnapshotId> = catalog.commit_group(&[
-    &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
-    &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
+let ids = catalog.commit_group(&[
+    &|tx: &mut Transaction| Box::pin(async move {
+        tx.create_schema("sales").await.map(|_| ())
+    }),
+    &|tx: &mut Transaction| Box::pin(async move {
+        tx.create_schema("ops").await.map(|_| ())
+    }),
 ]).await?;
 ```
 
-Members are `CommitMember`: a trait object, so one call can pass closures
-that do different things, and `Sync`, so a grouped commit is as spawnable
-as a lone one. Every contract above holds per member, purity included — a
-lost race re-runs the whole group. One snapshot id comes back per member,
-in member order.
+`CommitMember` callbacks are `Sync`. Members run in order, observe the preceding
+members' staged writes, and receive distinct snapshot IDs. A benign race
+re-runs the entire group, preserving atomicity and validation.
 
 This is the explicit half of RFC 0004's group commit. The implicit half
 needs no API, since concurrent `commit` callers are batched without asking;
