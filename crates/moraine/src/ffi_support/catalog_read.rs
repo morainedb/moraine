@@ -110,7 +110,7 @@ pub async fn index_table(
     } else {
         TableRead::Definition
     };
-    named_table(catalog, schema, table, selection).await
+    named_table(catalog, schema, table, selection, None).await
 }
 
 async fn named_table(
@@ -118,6 +118,7 @@ async fn named_table(
     schema: &str,
     table: &str,
     selection: crate::transaction::table_read::TableRead,
+    files: Option<&[crate::DataFileId]>,
 ) -> Result<CatalogSnapshot> {
     use crate::{
         store::key::NameKind,
@@ -132,7 +133,18 @@ async fn named_table(
         let table_id = names::lookup(session.handle(), NameKind::Table, schema_id, table)
             .await?
             .ok_or_else(|| Error::NotFound(format!("table {schema}.{table}")))?;
-        load_table(session.handle(), crate::TableId::new(table_id), selection).await
+        let table = crate::TableId::new(table_id);
+        let mut view = load_table(session.handle(), table, selection).await?;
+        if let Some(files) = files {
+            crate::transaction::table_read::load_sources_for(
+                session.handle(),
+                &mut view,
+                table,
+                files,
+            )
+            .await?;
+        }
+        Ok(view)
     })
     .await;
     session.finish();
@@ -154,6 +166,27 @@ pub async fn table_sources(
         schema,
         table,
         crate::transaction::table_read::TableRead::Sources,
+        None,
+    )
+    .await
+}
+
+/// Loads descriptors and only the named files and their live delete files.
+///
+/// # Errors
+/// Returns an error when the table or a required record cannot be read.
+pub async fn table_sources_for(
+    catalog: &ReadOnlyCatalog,
+    schema: &str,
+    table: &str,
+    files: &[crate::DataFileId],
+) -> Result<CatalogSnapshot> {
+    named_table(
+        catalog,
+        schema,
+        table,
+        crate::transaction::table_read::TableRead::Definition,
+        Some(files),
     )
     .await
 }

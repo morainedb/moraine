@@ -160,3 +160,100 @@ async fn name_maintenance_preserves_exact_spelling_and_duplicate_order() {
     assert!(index_table(&catalog, "main", "SAME", false).await.is_err());
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn positioning_sources_do_not_decode_other_files_or_mappings() {
+    use crate::store::{proto, value};
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            tx.create_table(
+                schema,
+                "chosen",
+                &[crate::ColumnDef {
+                    name: "id".into(),
+                    column_type: "BIGINT".into(),
+                    nulls_allowed: true,
+                    default_value: None,
+                    children: Vec::new(),
+                }],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let definition = index_table(&catalog, "main", "chosen", false)
+        .await
+        .unwrap();
+    let table_id = *definition.tables.keys().next().unwrap();
+    let column_id = definition.columns[&table_id]
+        .keys()
+        .next()
+        .copied()
+        .unwrap();
+    let file = proto::DataFileValue {
+        table_id,
+        data_file_id: 3,
+        mapping_id: Some(1),
+        ..Default::default()
+    };
+    let write = catalog.begin_write_tx().unwrap();
+    for (key, bytes) in [
+        (
+            Key::current(EntityKey::File {
+                table_id,
+                data_file_id: 3,
+            }),
+            value::encode_value(&file),
+        ),
+        (
+            Key::current(EntityKey::File {
+                table_id,
+                data_file_id: 999,
+            }),
+            b"corrupt unrelated file".to_vec(),
+        ),
+        (
+            Key::current(EntityKey::Mapping {
+                table_id,
+                mapping_id: 1,
+            }),
+            value::encode_value(&proto::MappingValue {
+                table_id,
+                mapping_id: 1,
+                map_type: "map_by_name".into(),
+                name_mappings: vec![proto::NameMapping {
+                    target_field_id: column_id,
+                    source_name: "physical".into(),
+                    ..Default::default()
+                }],
+            }),
+        ),
+        (
+            Key::current(EntityKey::Mapping {
+                table_id,
+                mapping_id: 999,
+            }),
+            b"corrupt unrelated mapping".to_vec(),
+        ),
+    ] {
+        write.put(key.encode(), bytes).unwrap();
+    }
+    catalog.commit_write_tx(write).await.unwrap();
+    let selected = table_sources_for(&catalog, "main", "chosen", &[crate::DataFileId::new(3)])
+        .await
+        .unwrap();
+    assert_eq!(selected.data_files[&table_id].len(), 1);
+    assert!(selected.mappings.is_empty());
+    let read = catalog.begin_read().await.unwrap();
+    let columns = selected
+        .file_read_columns_at(read.handle(), crate::TableId::new(table_id), &file)
+        .await
+        .unwrap();
+    assert_eq!(columns[0].source_name.as_deref(), Some("physical"));
+    read.finish();
+    catalog.close().await.unwrap();
+}

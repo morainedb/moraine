@@ -83,14 +83,20 @@ impl ReaderScopes {
             {
                 return Ok(latest.clone());
             }
-            readers
-                .generations
-                .retain(|reader| reader.strong_count() != 0);
             let unused_latest = readers
                 .latest
                 .as_ref()
                 .is_some_and(|reader| Arc::strong_count(reader) == 1);
-            if readers.generations.len() >= MAX_READER_GENERATIONS && !unused_latest {
+            if unused_latest && let Some(latest) = readers.latest.take() {
+                match Arc::try_unwrap(latest) {
+                    Ok(latest) => latest.retire().await,
+                    Err(latest) => readers.latest = Some(latest),
+                }
+            }
+            readers
+                .generations
+                .retain(|reader| reader.strong_count() != 0);
+            if readers.generations.len() >= MAX_READER_GENERATIONS {
                 return Err(Error::Constraint("too many live catalog read generations; finish an older transaction before opening another".into()));
             }
             let created = Instant::now();

@@ -2081,7 +2081,7 @@ fn raising_a_fresh_stores_format_is_idempotent() {
     // A dry run answers what a raise would do, twice over, without doing
     // it — the pre-flight a one-way door needs.
     let probed = raise_with("the dry run", ", dry_run := true");
-    assert_eq!(probed, (9, 9));
+    assert_eq!(probed, (11, 11));
     assert_eq!(
         raise_with("the second dry run", ", dry_run := true"),
         probed,

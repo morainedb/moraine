@@ -1107,3 +1107,13 @@ Publishing checkpoints whose data is already in SSTs avoids replay copies and
 uses Foyer's normal demand-loaded path. The publication cadence and flushing
 policy remain separate from admission: current publication still covers every
 acknowledged durable commit and can require WAL replay.
+
+### Reclaiming an unused reader generation
+
+Before opening a newer published checkpoint, a reader scope drops its cached
+previous generation when no caller still holds it and waits for that reader's
+WAL replay memory to be released. Checkpoint deletion can finish asynchronously
+after memory release. Active scopes keep their readers and byte reservations;
+replacing the cache cannot invalidate those scopes. A failed new open does not
+retain a partial replay allowance. Both reader generation count and shared
+working-memory admission bound overlapping readers.

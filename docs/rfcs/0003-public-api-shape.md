@@ -170,6 +170,12 @@ filters visibility. The handle retains neither result nor decoded scan rows.
 The `Arc` allows callers to share an explicitly materialized view. Ordinary
 operations should use fixed read scopes and demand-loaded projections.
 
+`ffi_support::catalog_read::table_sources_for` resolves an exact schema/table
+name and point-reads only the requested current data-file IDs at one read point.
+It streams that table's delete-file records and retains only records targeting
+those files. Committed file-name mappings are fetched by mapping ID when a file
+is read; source projections do not retain the table's mapping directory.
+
 Accessors (all in-memory, name→id resolved internally):
 
 | Accessor | Returns |

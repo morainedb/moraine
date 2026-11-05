@@ -87,3 +87,49 @@ MORAINE_WORKING_MEMORY_BYTES=16777216 \
 MORAINE_MEMORY_FIXTURE="$PWD/.context/catalog-memory-100000" \
 cargo test -p moraine --lib deep_preload_uses_bounded_working_memory -- --ignored
 ```
+
+## Active-writer reader generations
+
+A core-process measurement on 2026-11-05 used local object storage, a 16 MiB
+Foyer memory cache, and a 32 MiB shared working allowance. Each writer commit
+added 384 statistics records with 2 KiB values (768 KiB of value text). The writer
+remained open; its published checkpoints included WAL-durable metadata. These
+are debug-build core measurements, not DuckDB RSS or remote-storage latency.
+
+Holding five generations simultaneously reserved 24.7 MiB for replay. The sixth
+reader was refused without increasing retained reservations or invalidating the
+older readers. RSS grew from 38.6 MiB at baseline to 61.5 MiB with five readers;
+the failed open peaked at 66.1 MiB. After releasing the readers and closing the
+writer, which flushes SSTs, a fresh reader reserved about 2 KiB. RSS remained
+67.0 MiB in that same process: allocator retention, writer buffers, and cache
+memory do not disappear when replay reservations are released. This is an
+admission bound, not a hard RSS cap.
+
+A second measurement opened and released one generation at a time. It exposed
+an unnecessary overlap: the cached previous reader and its cleanup task could
+retain replay bytes while the replacement opened. At generation nine, retained
+working memory was 29.7 MiB and generation ten failed. The reader lifecycle now
+retires an unused cached generation and waits for its replay memory to release
+before opening its replacement. With that fix, generation nine reserved
+14.8 MiB and all twelve generations succeeded. Generation twelve reserved
+19.8 MiB, used 65.3 MiB RSS, and opened in 18 ms. Active older scopes still keep
+their reservations and remain subject to the shared admission limit.
+
+Reproduce in a fresh directory for each run:
+
+```sh
+MORAINE_WORKING_MEMORY_BYTES=33554432 \
+MORAINE_MEMORY_FIXTURE="$PWD/.context/active-writer-new" \
+cargo test -p moraine --lib measure_active_writer_reader_generations \
+  --locked -- --ignored --nocapture
+
+MORAINE_WORKING_MEMORY_BYTES=33554432 \
+MORAINE_MEMORY_FIXTURE="$PWD/.context/sequential-reader-new" \
+cargo test -p moraine --lib unused_reader_generation_releases_replay_before_rotating \
+  --locked -- --ignored --nocapture
+```
+
+These measurements preserve WAL-fresh publication. There is no forced SST flush
+per commit. WAL replay remains non-evictable inside SlateDB; SST-backed reads use
+Foyer. The adapter admits retained replay after one upstream batch is decoded,
+so that transient batch and native allocator overhead remain outside the bound.

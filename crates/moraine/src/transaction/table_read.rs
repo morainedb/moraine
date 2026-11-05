@@ -15,7 +15,7 @@ use crate::{
 pub(crate) enum TableRead {
     /// The table, schema, columns, indexes, and table statistics.
     Definition,
-    /// Definitions plus registered files, delete files, and mappings.
+    /// Definitions plus registered data and delete files.
     Sources,
     /// Definitions, file presence, and the schema's other table and index
     /// names.
@@ -70,11 +70,7 @@ pub(crate) async fn load_table(
             records(handle, &mut view, kind, Some(table_id)).await?;
         }
         if matches!(selection, TableRead::Sources) {
-            for kind in [
-                EntityRecordKind::File,
-                EntityRecordKind::DeleteFile,
-                EntityRecordKind::Mapping,
-            ] {
+            for kind in [EntityRecordKind::File, EntityRecordKind::DeleteFile] {
                 records(handle, &mut view, kind, Some(table_id)).await?;
             }
         }
@@ -109,6 +105,47 @@ pub(crate) async fn load_table(
         Ok(view)
     })
     .await
+}
+
+/// Reads requested files and streams delete records, retaining only their
+/// targets.
+pub(crate) async fn load_sources_for(
+    handle: ReadHandle<'_>,
+    view: &mut CatalogSnapshot,
+    table: TableId,
+    files: &[crate::DataFileId],
+) -> Result<()> {
+    let _memory = crate::MemoryReservation::reserve((size_of_val(files) as u64).saturating_mul(2))?;
+    let mut files = files.to_vec();
+    files.sort_unstable();
+    files.dedup();
+    for file in &files {
+        point(
+            handle,
+            view,
+            EntityKey::File {
+                table_id: table.get(),
+                data_file_id: file.get(),
+            },
+        )
+        .await?;
+    }
+    if !files.is_empty() {
+        let mut cursor = EntityCursor::open(
+            handle,
+            EntityRecordKind::DeleteFile,
+            Versions::Live,
+            Some(table.get()),
+        )
+        .await?;
+        while let Some((record, _memory)) = cursor.next().await? {
+            if matches!(&record, EntityRecord::DeleteFile(row) if files.binary_search(&crate::DataFileId::new(row.data_file_id)).is_ok())
+            {
+                retain(view, record)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ReadOnlyCatalog {
