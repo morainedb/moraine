@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: morainedb/moraine
-  ref: 4400ad063bf631f594475ff9642e5403f59ec93c
+  ref: 7eaf0114c273a569f36186d3c355c94e866450c3
 
 docs:
   hello_world: |
