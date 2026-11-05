@@ -41,8 +41,8 @@ jobs:
       # own warm-starts from a compatible one. Saving from a pull request
       # is off by default; without it a second push to one starts from
       # `main` rather than from what the first push compiled. Its entries
-      # live in that pull request's own cache scope, which
-      # `gh cache delete --all --ref refs/pull/<number>/merge` reclaims.
+      # live in that pull request's own cache scope; closing or merging
+      # the pull request deletes them through `cleanup-pr-caches.yml`.
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-key-suffix: fmt
