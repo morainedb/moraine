@@ -83,11 +83,24 @@ bool EmitsRowIds(const std::vector<duckdb::column_t> &column_ids) {
 using OwnedMetadataCursor = std::unique_ptr<MoraineMetadataCursor, decltype(&moraine_metadata_cursor_free)>;
 
 OwnedMetadataCursor OpenMetadataCursor(MoraineCatalogHandle *handle, const MetadataTableSpec &spec, uint64_t scope,
-                                       uint64_t live_bound, duckdb::ClientContext &context) {
+                                       uint64_t live_bound, duckdb::ClientContext &context, MoraineTxHandle *staged) {
 	MoraineMetadataCursor *cursor = nullptr;
 	MoraineError err {};
-	if (moraine_metadata_cursor_open(handle, spec.write_table_kind, scope, live_bound, &cursor,
-	                                 moraine_shim_is_interrupted, &context, &err) != MORAINE_OK) {
+	auto code = staged == nullptr
+	                ? moraine_metadata_cursor_open(handle, spec.write_table_kind, scope, live_bound, &cursor,
+	                                               moraine_shim_is_interrupted, &context, &err)
+	                : moraine_tx_metadata_cursor_open(staged, spec.write_table_kind, scope, live_bound, &cursor,
+	                                                  moraine_shim_is_interrupted, &context, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	return OwnedMetadataCursor(cursor, moraine_metadata_cursor_free);
+}
+
+OwnedMetadataCursor ForkMetadataCursor(MoraineMetadataCursor *source, duckdb::ClientContext &context) {
+	MoraineMetadataCursor *cursor = nullptr;
+	MoraineError err {};
+	if (moraine_metadata_cursor_fork(source, &cursor, moraine_shim_is_interrupted, &context, &err) != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
 	return OwnedMetadataCursor(cursor, moraine_metadata_cursor_free);
@@ -98,18 +111,18 @@ OwnedMetadataCursor OpenMetadataCursor(MoraineCatalogHandle *handle, const Metad
 struct MetadataRowResolver {
 	MoraineCatalogHandle *handle;
 	const MetadataTableSpec &spec;
-	uint64_t scope;
-	uint64_t live_bound;
 	duckdb::ClientContext &context;
-	OwnedMetadataCursor cursor {nullptr, moraine_metadata_cursor_free};
+	OwnedMetadataCursor cursor;
 	uint64_t offset = 0;
 	MetadataRows page;
 
 	const std::vector<duckdb::Value> *Resolve(uint64_t index) {
-		if (cursor == nullptr || index < offset) {
-			cursor = OpenMetadataCursor(handle, spec, scope, live_bound, context);
+		if (index < offset) {
+			cursor = ForkMetadataCursor(cursor.get(), context);
 			offset = 0;
-			page.clear();
+			page = spec.fixed_page_provider == nullptr
+			           ? MetadataRows {}
+			           : spec.fixed_page_provider(handle, moraine_shim_is_interrupted, &context);
 		}
 		while (index >= offset + page.size()) {
 			offset += page.size();
@@ -134,15 +147,20 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 	auto &catalog = LiveBoundCatalog(context, bind_data);
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
-	if (bind_data.spec->page_provider != nullptr && transaction.StagedTxIfOpen() == nullptr) {
+	auto *staged = transaction.StagedTxIfOpen();
+	if (bind_data.spec->page_provider != nullptr && (staged == nullptr || bind_data.spec->staged_page_supported)) {
 		auto *handle = moraine_snapshot_read_handle(transaction.Snapshot());
 		if (handle != nullptr) {
 			auto scope = bind_data.scope.IsValid() ? bind_data.scope.GetIndex() : UINT64_MAX;
 			auto live_bound = bind_data.live_bound.IsValid() ? bind_data.live_bound.GetIndex() : UINT64_MAX;
-			state->cursor = OpenMetadataCursor(handle, *bind_data.spec, scope, live_bound, context);
+			state->cursor = OpenMetadataCursor(handle, *bind_data.spec, scope, live_bound, context, staged);
+			if (bind_data.spec->fixed_page_provider != nullptr) {
+				state->page = bind_data.spec->fixed_page_provider(handle, moraine_shim_is_interrupted, &context);
+			}
 			if (EmitsRowIds(state->column_ids)) {
 				auto resolver = std::make_shared<MetadataRowResolver>(
-				    MetadataRowResolver {handle, *bind_data.spec, scope, live_bound, context});
+				    MetadataRowResolver {handle, *bind_data.spec, context,
+				                         ForkMetadataCursor(state->cursor.get(), context), 0, state->page});
 				state->row_id_base = transaction.RegisterScannedCursor(
 				    *bind_data.spec, [resolver](uint64_t index) { return resolver->Resolve(index); });
 			}

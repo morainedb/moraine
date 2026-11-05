@@ -1150,6 +1150,17 @@ pub(crate) fn history_entity_prefix(entity: EntityKey) -> Vec<u8> {
     encoded
 }
 
+/// Schema versions belonging to one table, ordered by begin snapshot.
+pub(crate) fn schema_version_table_prefix(table_id: u64) -> Vec<u8> {
+    let mut encoded = Key::SchemaVersion {
+        table_id,
+        begin_snapshot: 0,
+    }
+    .encode();
+    encoded.truncate(encoded.len() - size_of::<u64>());
+    encoded
+}
+
 /// Byte prefix of every scheduled-file record in `current`.
 pub(crate) fn current_gc_file_prefix() -> Vec<u8> {
     prefix_of(&Key::Current(CurrentKey::GcFile { data_file_id: 0 }), 2)
@@ -2072,6 +2083,18 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn schema_version_prefix_covers_exactly_one_table(table_id in any::<u64>(), begin_snapshot in any::<u64>(), schema_version in any::<u64>()) {
+            let key = Key::SchemaVersion { table_id, begin_snapshot };
+            let encoded = key.encode();
+            prop_assert_eq!(Key::decode(&encoded).unwrap(), key);
+            prop_assert!(encoded.starts_with(&schema_version_table_prefix(table_id)));
+            prop_assert!(!encoded.starts_with(&schema_version_table_prefix(table_id.wrapping_add(1))));
+            let value = crate::store::proto::SchemaVersionValue { schema_version };
+            let decoded: crate::store::proto::SchemaVersionValue = crate::store::value::decode_value(&crate::store::value::encode_value(&value)).unwrap();
+            prop_assert_eq!(decoded, value);
+        }
+
         #[test]
         fn entity_history_prefix_covers_exactly_one_identity(
             table_id in any::<u64>(), data_file_id in any::<u64>(), end_snapshot in any::<u64>(),

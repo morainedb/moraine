@@ -63,6 +63,7 @@ mod index_upkeep;
 pub(crate) mod inline;
 mod memory;
 mod overlay;
+pub(crate) mod paging;
 mod rebase;
 use rebase::Rebase;
 

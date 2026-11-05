@@ -8,6 +8,7 @@ use prost::Message as _;
 use tracing::debug;
 
 mod cursor;
+pub(crate) mod schema_versions;
 pub(crate) use cursor::{EntityCursor, OwnedEntityCursor, OwnedSnapshotCursor};
 
 use crate::{

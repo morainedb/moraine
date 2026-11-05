@@ -12,11 +12,13 @@ use crate::{
     store::read::{self, EntityRecord, EntityRecordKind, OwnedEntityCursor, OwnedSnapshotCursor},
 };
 
+mod schema_versions;
+
 const PAGE_RECORDS: usize = 64;
 
 /// One metadata page and its working-memory allowance.
 pub struct MetadataPage<T> {
-    /// Decoded records in store order.
+    /// Decoded records in deterministic cursor order.
     pub records: Vec<T>,
     _memory: Vec<Arc<MemoryReservation>>,
 }
@@ -24,6 +26,12 @@ pub struct MetadataPage<T> {
 /// A metadata scan retaining one immutable read point, without a decoded cache.
 pub struct MetadataCursor {
     table: TableKind,
+    scope: ReadOnlyCatalog,
+    table_id: Option<u64>,
+    live_bound: Option<u64>,
+    overlay: Option<Arc<crate::transaction::staged::paging::Overlay>>,
+    inserted: usize,
+    base_finished: bool,
     source: MetadataSource,
     pending: Option<Box<dyn Any + Send>>,
 }
@@ -31,40 +39,32 @@ pub struct MetadataCursor {
 enum MetadataSource {
     Entities(OwnedEntityCursor),
     Snapshots(OwnedSnapshotCursor),
+    SchemaVersions(Box<schema_versions::Cursor>),
 }
 
-struct PendingRows<T> {
-    records: std::vec::IntoIter<T>,
-    memory: Arc<MemoryReservation>,
-}
-
-impl MetadataCursor {
-    /// Opens the current and, when needed, ended records for one metadata kind.
-    /// `live_bound` skips ended versions only when it reaches the pinned head.
-    ///
-    /// # Errors
-    /// Returns an error for unsupported kinds or an unavailable read scope.
-    pub async fn open(
-        catalog: &ReadOnlyCatalog,
+impl MetadataSource {
+    async fn open(
+        handle: crate::store::handle::OwnedReadHandle,
         table: TableKind,
         table_id: Option<u64>,
         live_bound: Option<u64>,
     ) -> Result<Self> {
-        let scope = catalog.index_read_scope().await?.ok_or_else(|| {
-            Error::Constraint("metadata cursor requires a fixed read scope".into())
-        })?;
-        let handle = scope.reads().owned_read_handle();
-        if matches!(table, TableKind::Snapshot | TableKind::SnapshotChanges) {
+        if matches!(
+            table,
+            TableKind::Snapshot | TableKind::SnapshotChanges | TableKind::SchemaVersions
+        ) {
             if table_id.is_some() {
                 return Err(Error::Constraint(
-                    "snapshots do not support a table scope".into(),
+                    "snapshot and schema-version cursors do not support a table scope".into(),
                 ));
             }
-            return Ok(Self {
-                table,
-                source: MetadataSource::Snapshots(OwnedSnapshotCursor::open(handle).await?),
-                pending: None,
-            });
+            return if table == TableKind::SchemaVersions {
+                Ok(Self::SchemaVersions(Box::new(
+                    schema_versions::Cursor::open(handle).await?,
+                )))
+            } else {
+                Ok(Self::Snapshots(OwnedSnapshotCursor::open(handle).await?))
+            };
         }
         let kind = match table {
             TableKind::Schema => EntityRecordKind::Schema,
@@ -99,23 +99,105 @@ impl MetadataCursor {
                     "parent tags do not support a table scope".into(),
                 ));
             }
-            return Ok(Self {
-                table,
-                pending: None,
-                source: MetadataSource::Entities(
-                    OwnedEntityCursor::open_latest(handle, kind).await?,
-                ),
-            });
+            return Ok(Self::Entities(
+                OwnedEntityCursor::open_latest(handle, kind).await?,
+            ));
         }
         let head = crate::transaction::commit::read_head_value(handle.borrow()).await?;
         let versions = read::versions_for(live_bound, Some(head.snapshot_id));
+        Ok(Self::Entities(
+            OwnedEntityCursor::open(handle, kind, versions, table_id).await?,
+        ))
+    }
+}
+
+struct PendingRows<T> {
+    records: std::vec::IntoIter<T>,
+    memory: Arc<MemoryReservation>,
+}
+
+impl MetadataCursor {
+    /// Opens the current and, when needed, ended records for one metadata kind.
+    /// `live_bound` skips ended versions only when it reaches the pinned head.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported kinds or an unavailable read scope.
+    pub async fn open(
+        catalog: &ReadOnlyCatalog,
+        table: TableKind,
+        table_id: Option<u64>,
+        live_bound: Option<u64>,
+    ) -> Result<Self> {
+        let scope = catalog
+            .index_read_scope()
+            .await?
+            .ok_or_else(|| Error::Constraint("metadata cursor requires a fixed read scope".into()))?
+            .reads()
+            .clone();
+        let source =
+            MetadataSource::open(scope.owned_read_handle(), table, table_id, live_bound).await?;
         Ok(Self {
             table,
+            scope,
+            table_id,
+            live_bound,
+            overlay: None,
+            inserted: 0,
+            base_finished: false,
+            source,
             pending: None,
-            source: MetadataSource::Entities(
-                OwnedEntityCursor::open(handle, kind, versions, table_id).await?,
-            ),
         })
+    }
+
+    pub(crate) fn with_overlay(
+        mut self,
+        overlay: Arc<crate::transaction::staged::paging::Overlay>,
+    ) -> Self {
+        if let MetadataSource::SchemaVersions(cursor) = &mut self.source {
+            cursor.overlay = Some(overlay.clone());
+        }
+        self.overlay = Some(overlay);
+        self
+    }
+
+    /// Restarts this scan at its original read point and authored overlay.
+    ///
+    /// # Errors
+    /// Returns an error if the retained read point can no longer be read.
+    pub async fn fork(&self) -> Result<Self> {
+        let mut cursor =
+            Self::open(&self.scope, self.table, self.table_id, self.live_bound).await?;
+        if let Some(overlay) = &self.overlay {
+            cursor = cursor.with_overlay(overlay.clone());
+        }
+        Ok(cursor)
+    }
+
+    async fn next_entity(&mut self) -> Result<Option<(EntityRecord, MemoryReservation)>> {
+        let MetadataSource::Entities(cursor) = &mut self.source else {
+            return Err(Error::Constraint(
+                "entity page requested from a different cursor".into(),
+            ));
+        };
+        while !self.base_finished {
+            let Some((record, memory)) = cursor.next().await? else {
+                self.base_finished = true;
+                break;
+            };
+            let record = match &self.overlay {
+                Some(overlay) => overlay.apply(record)?,
+                None => Some(record),
+            };
+            if let Some(record) = record {
+                return Ok(Some((record, memory)));
+            }
+        }
+        let Some(overlay) = &self.overlay else {
+            return Ok(None);
+        };
+        let row = overlay.inserted(self.inserted)?;
+        self.inserted += usize::from(row.is_some());
+        Ok(row)
     }
 
     /// Reads a bounded page for snapshot headers or their change descriptions.
@@ -131,11 +213,43 @@ impl MetadataCursor {
         };
         let mut records = Vec::new();
         let mut memory = Vec::new();
-        for _ in 0..PAGE_RECORDS {
+        while records.len() < PAGE_RECORDS {
             let Some((record, allowance)) = cursor.next().await? else {
                 break;
             };
+            if self
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| !overlay.includes_snapshot(record.snapshot_id))
+            {
+                continue;
+            }
             records.push(record);
+            memory.push(Arc::new(allowance));
+        }
+        Ok(MetadataPage {
+            records,
+            _memory: memory,
+        })
+    }
+
+    /// Reads stored and legacy schema versions followed by file floor rows.
+    ///
+    /// # Errors
+    /// Returns an error for the wrong cursor kind or an invalid stored record.
+    pub async fn schema_versions(&mut self) -> Result<MetadataPage<super::SchemaVersionRow>> {
+        let MetadataSource::SchemaVersions(cursor) = &mut self.source else {
+            return Err(Error::Constraint(
+                "schema-version page requested from another cursor".into(),
+            ));
+        };
+        let mut records = Vec::new();
+        let mut memory = Vec::new();
+        for _ in 0..PAGE_RECORDS {
+            let Some((row, allowance)) = cursor.next().await? else {
+                break;
+            };
+            records.push(row);
             memory.push(Arc::new(allowance));
         }
         Ok(MetadataPage {
@@ -154,11 +268,6 @@ impl MetadataCursor {
                 "metadata cursor called with the wrong row kind".into(),
             ));
         }
-        let MetadataSource::Entities(cursor) = &mut self.source else {
-            return Err(Error::Constraint(
-                "entity page requested from snapshot cursor".into(),
-            ));
-        };
         let mut records = Vec::new();
         let mut memory = Vec::new();
         // Embedded children may produce no rows. Only EOF returns an empty page.
@@ -169,7 +278,7 @@ impl MetadataCursor {
                         Error::Corruption("metadata cursor changed its output type".into())
                     })?
                 } else {
-                    let Some((record, allowance)) = cursor.next().await? else {
+                    let Some((record, allowance)) = self.next_entity().await? else {
                         return Ok(MetadataPage {
                             records,
                             _memory: memory,

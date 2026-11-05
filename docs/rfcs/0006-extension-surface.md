@@ -683,11 +683,31 @@ a backward request restarts its cursor. Sequential mutations traverse the
 metadata once more; arbitrary row order can cause repeated scans. Array-based
 providers retain their operation-owned rows for identity resolution.
 
-Schema-version projections, synthetic option rows, and staged metadata overlays
-still use result arrays. They must move to
-bounded cursors before every metadata operation can be independent of result
-size. Neither attachment nor transaction retains a decoded metadata-row cache.
+All 28 committed metadata kinds and 26 staged kinds use bounded output pages.
+Staged column-tag and view-column-tag projections still use result arrays.
+Neither attachment nor transaction retains a decoded metadata-row cache.
 DuckDB's planning and result memory remains separate from the core cursor budget.
+
+A staged cursor freezes relevant authored operations at open. It streams committed
+parents through those edits, then emits surviving authored rows. The frozen plan
+is charged to working memory and shared with cursor forks. Forks restart at the
+same fixed read point and authored state, so later edits cannot change UPDATE or
+DELETE row identities. Table inserts inherit field-ID counters only from prior
+versions surviving at that operation. Embedded child projections retain only
+operation-sized owner maps, not committed parent directories.
+
+Schema-version scans emit stored rows, then legacy snapshot-derived rows absent
+from the stored keyspace, then missing file floor rows. Two ordered file cursors
+reduce current and ended files to one minimum begin snapshot per table. A floor
+uses the first stored schema-version key; when legacy-only rows exist and that
+key does not cover the oldest file, the cursor scans snapshots for that table's
+earliest legacy row. This compatibility path trades repeated snapshot reads for
+bounded memory. No catalog-wide schema-version or file map is retained.
+
+Option scans emit fixed global facts as a bounded first page and stream stored
+options afterward. Stored global version, writer, encryption, and data-path
+entries are suppressed; table-scoped entries with those names remain visible.
+Row-ID replay includes the same fixed prefix.
 
 Index and row-position ABI calls load table-specific descriptor projections.
 Until persistent name indexes land, resolving their schema and table names

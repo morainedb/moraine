@@ -36,6 +36,7 @@ mod deletes;
 mod index;
 mod inline;
 mod maintenance;
+mod metadata_paging;
 mod migrate;
 mod move_wal;
 mod partitioning;

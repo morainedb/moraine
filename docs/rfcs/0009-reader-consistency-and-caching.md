@@ -242,8 +242,9 @@ through ABI conversion; freeing the page releases its rows. Cancellation or a
 failed read invalidates that cursor. An expired checkpoint lease also rejects
 prefetched scan entries.
 
-Synthetic option rows, schema-version projections, and staged metadata overlays
-still have array-based paths. These must move to bounded cursors before claiming that every metadata
+Schema-version projections stream stored and legacy rows and compute file
+floors with two ordered file cursors. Options stream after a bounded prefix of
+synthetic facts. Staged metadata overlays still have array-based paths. These must move to bounded cursors before claiming that every metadata
 operation is independent of result size. Streaming row IDs resolve through a replay cursor; array-based overlays still
 retain their operation rows for mutation resolution.
 
@@ -1081,3 +1082,28 @@ index also reads table and index names in its schema to preserve name checks.
 Backfill and row-location reads omit unrelated tables and file-column statistics;
 their operation-owned file inventories remain proportional to the addressed
 table. The explicit public closure-commit API still materializes its premises.
+
+
+### WAL replay admission
+
+Read-only SlateDB memtables retain rows replayed from the WAL independently of
+Foyer's SST block cache. The WAL-reader adapter admits each returned batch to the
+process-wide working budget before copying it into compact shared bytes and
+handing it to SlateDB. The reservation follows key and value slices through
+memtables and returned values. Its estimate is twice the payload plus 320 bytes
+per row for replay and memtable bookkeeping. Overlapping readers compete for
+that same budget; an admission failure rejects the new replay without evicting
+an existing reader's state.
+
+This bounds admitted retained bytes, not process RSS or WAL decoding itself.
+SlateDB produces one batch before the adapter can inspect its size. Native WAL
+prefetch is limited to 512 KiB, two tasks, and 256 KiB read-ahead targets; these
+are soft block-fetch limits. A large batch, custom WAL provider buffers, allocator
+overhead, and DuckDB allocations remain outside this estimate. Compacting the
+batch adds a replay copy but prevents surviving slices from pinning unaccounted
+WAL blocks. This does not introduce a decoded catalog-object cache.
+
+Publishing checkpoints whose data is already in SSTs avoids replay copies and
+uses Foyer's normal demand-loaded path. The publication cadence and flushing
+policy remain separate from admission: current publication still covers every
+acknowledged durable commit and can require WAL replay.

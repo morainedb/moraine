@@ -28,6 +28,7 @@ mod inline_history;
 mod inline_pruning;
 mod located_inline_update;
 mod overlay;
+mod paging;
 mod row_id_invariants;
 mod rows;
 

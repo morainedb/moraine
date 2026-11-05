@@ -90,7 +90,7 @@ impl StagingMemory {
     }
 }
 
-fn payload_bytes(op: &RowOperation) -> usize {
+pub(super) fn payload_bytes(op: &RowOperation) -> usize {
     match op {
         RowOperation::Insert { cells, .. }
         | RowOperation::Delete { cells, .. }

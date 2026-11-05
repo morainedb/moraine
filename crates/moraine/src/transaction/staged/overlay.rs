@@ -65,6 +65,14 @@ pub(super) fn overlay_versioned<T: Versioned>(
     ops: &[RowOperation],
     rows: Vec<T>,
 ) -> Result<Vec<T>> {
+    overlay_versioned_with_inheritance(ops, rows, |_, _| {})
+}
+
+pub(super) fn overlay_versioned_with_inheritance<T: Versioned>(
+    ops: &[RowOperation],
+    rows: Vec<T>,
+    mut inherit: impl FnMut(usize, &mut T),
+) -> Result<Vec<T>> {
     // A delete vacates its slot rather than shifting the rest down, so the
     // positions an entity holds stay valid for the whole pass. Every op
     // reaches its entity's versions through `positions` instead of walking
@@ -77,7 +85,7 @@ pub(super) fn overlay_versioned<T: Versioned>(
         }
     }
 
-    for op in ops {
+    for (operation_index, op) in ops.iter().enumerate() {
         match op {
             RowOperation::Insert { table, cells } if *table == T::KIND => {
                 let mut row = T::decode_row(cells)?;
@@ -88,6 +96,7 @@ pub(super) fn overlay_versioned<T: Versioned>(
                     .filter_map(|&index| rows[index].as_ref())
                     .collect();
                 row.carry_forward(&prior);
+                inherit(operation_index, &mut row);
                 slots.push(rows.len());
                 rows.push(Some(row));
             }
@@ -132,7 +141,7 @@ pub(super) fn overlay_versioned<T: Versioned>(
 /// The `(entity, new begin_snapshot)` an `UPDATE ... SET begin_snapshot`
 /// names. DuckLake issues one only against `ducklake_data_file`, during a
 /// delete-rewrite.
-fn decode_begin(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, u64)> {
+pub(super) fn decode_begin(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, u64)> {
     if table != TableKind::DataFile {
         return Err(Error::Constraint(format!(
             "update_set_begin is not defined for {table:?}"

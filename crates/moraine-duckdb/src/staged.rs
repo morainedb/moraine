@@ -69,6 +69,63 @@ impl MoraineTxHandle {
     }
 }
 
+/// Freezes the transaction's authored rows for a paged metadata scan.
+///
+/// # Safety
+/// The transaction must be live; outputs and error must be writable. The probe
+/// and context must be callable from any thread for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_metadata_cursor_open(
+    tx: *mut MoraineTxHandle,
+    table_kind: i32,
+    table_id: u64,
+    live_bound: u64,
+    out: *mut *mut crate::metadata_cursor::MoraineMetadataCursor,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || {
+        if tx.is_null() || out.is_null() {
+            return Err(AbiError::invalid_argument(
+                "null staged cursor input or output",
+            ));
+        }
+        // SAFETY: caller supplies a live transaction whose catalog outlives it.
+        let tx = unsafe { &*tx };
+        // SAFETY: the transaction retains its live catalog pointer.
+        let catalog = unsafe { &*tx.catalog };
+        let transaction = tx.lock()?;
+        let kind = decode_table_kind(table_kind)?;
+        // SAFETY: callback and context obey the caller's lifetime contract.
+        let cursor = unsafe {
+            catalog.block_on_cancellable(
+                probe,
+                probe_ctx,
+                transaction.metadata_cursor(
+                    kind,
+                    (table_id != u64::MAX).then_some(table_id),
+                    (live_bound != u64::MAX).then_some(live_bound),
+                ),
+            )
+        }?;
+        Ok(crate::metadata_cursor::MoraineMetadataCursor::new(
+            cursor, catalog,
+        ))
+    };
+    // SAFETY: caller supplies a writable error pointer if non-null.
+    match unsafe { guard(err, attempt) } {
+        Ok(cursor) => {
+            // SAFETY: checked non-null output is writable by contract.
+            unsafe {
+                *out = Box::into_raw(cursor);
+            }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// Decodes the ABI's `table_kind` through the core's wire table
 /// (`TableKind::ALL`).
 fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {

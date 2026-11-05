@@ -3643,6 +3643,16 @@ void moraine_register_log_sink(const struct MoraineCatalogHandle *handle,
 // not be called from inside a sink.
 void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
 
+// Restarts a scan with the same read point and frozen authored rows.
+//
+// # Safety
+// The cursor must be live; outputs, error, and probe follow the open contract.
+int32_t moraine_metadata_cursor_fork(struct MoraineMetadataCursor *cursor,
+                                     struct MoraineMetadataCursor **out,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
+
 // Opens a fixed metadata scan; `u64::MAX` means no table or live bound.
 //
 // # Safety
@@ -3965,6 +3975,32 @@ int32_t moraine_metadata_cursor_view_column_tags(struct MoraineMetadataCursor *c
                                                  MoraineInterruptProbe probe,
                                                  void *probe_ctx,
                                                  struct MoraineError *err);
+
+// Reads a page of schema versions; the matching dump free function releases
+// it.
+//
+// # Safety
+// The cursor, outputs, probe, and error follow the cursor-open contract.
+int32_t moraine_metadata_cursor_schema_versions(struct MoraineMetadataCursor *cursor,
+                                                struct MoraineSchemaVersionRow **out_items,
+                                                size_t *out_len,
+                                                MoraineInterruptProbe probe,
+                                                void *probe_ctx,
+                                                struct MoraineError *err);
+
+// Freezes the transaction's authored rows for a paged metadata scan.
+//
+// # Safety
+// The transaction must be live; outputs and error must be writable. The probe
+// and context must be callable from any thread for this call.
+int32_t moraine_tx_metadata_cursor_open(struct MoraineTxHandle *tx,
+                                        int32_t table_kind,
+                                        uint64_t table_id,
+                                        uint64_t live_bound,
+                                        struct MoraineMetadataCursor **out,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
 
 // Opens a staged-row transaction at the current head and writes the
 // resulting handle to `*out`.

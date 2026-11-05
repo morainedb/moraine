@@ -108,6 +108,9 @@ struct MetadataTableSpec {
 	// Preserve field order: table specs use positional initializers.
 	MetadataScopedRowProvider scoped_provider = nullptr;
 	MetadataPageProvider page_provider = nullptr;
+	// A bounded prefix of synthetic rows, replayed with the same read handle.
+	MetadataRowProvider fixed_page_provider = nullptr;
+	bool staged_page_supported = false;
 };
 
 // Builds operation-owned rows, including the staged overlay when present.
