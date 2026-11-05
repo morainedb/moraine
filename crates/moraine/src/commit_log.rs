@@ -76,7 +76,7 @@ impl SlotEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotOffer {
     /// The commit holds `sequence`, and this process's store has applied
-    /// it, or been served it.
+    /// it, or been served it, and a durable read checkpoint covers it.
     Won {
         /// The sequence won.
         sequence: u64,
@@ -133,7 +133,8 @@ pub trait CommitStore: Any + fmt::Debug + Send + Sync + 'static {
     /// Offers `commit` as the slot at `sequence`, which the caller derives
     /// from the state the commit was prepared against: a stale state names
     /// a taken slot and loses. The sequence may be at most one past what
-    /// this process's store knows.
+    /// this process's store knows. A win may return only after a durable
+    /// checkpoint covers the slot; publication failure is an unknown outcome.
     ///
     /// # Errors
     ///
@@ -211,6 +212,17 @@ pub trait TakeStore: Send + Sync + 'static {
     ///
     /// As [`Catalog::open`](crate::Catalog::open).
     async fn take(&self) -> Result<Option<(Db, Arc<dyn WriterSession>)>>;
+
+    /// Opens a temporary writer for checkpoint publication without an L0 flush.
+    /// The caller must close it with `flush_type: None`.
+    ///
+    /// # Errors
+    /// Returns the open error, or a constraint error when `take` declines.
+    async fn take_for_publication(&self) -> Result<(Db, Arc<dyn WriterSession>)> {
+        self.take().await?.ok_or_else(|| {
+            Error::Constraint("checkpoint publication could not take the store".to_owned())
+        })
+    }
 }
 
 /// A check the library runs on every slot before it folds it. A slot the
@@ -232,6 +244,24 @@ pub struct CatalogHooks {
     pub object_store: Arc<dyn ObjectStore>,
     /// The cadence and the waits.
     pub settings: CommitLogSettings,
+}
+
+impl CatalogHooks {
+    /// Publishes the writer's durable state for fixed catalog readers.
+    /// Call after applying a won slot and again after flushing it to SSTs.
+    ///
+    /// # Errors
+    /// Returns an error when WAL durability or checkpoint publication fails.
+    pub async fn publish(&self, db: &Db) -> Result<()> {
+        db.flush().await?;
+        let admin =
+            slatedb::admin::AdminBuilder::new(self.path.clone(), Arc::clone(&self.object_store))
+                .build();
+        crate::store::checkpoint::Publisher::new(db.clone(), admin)
+            .through(db.status().durable_seq)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 impl fmt::Debug for CatalogHooks {

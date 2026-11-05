@@ -409,9 +409,11 @@ fn resolve_data_store(
         s3_creds,
     } = arguments;
     let recorded = runtime
-        .block_on(catalog.reads().snapshot())
-        .map_err(AbiError::from)?
-        .data_path();
+        .block_on(moraine::ffi_support::catalog_read::global_option(
+            catalog.reads(),
+            "data_path",
+        ))
+        .map_err(AbiError::from)?;
     // Recorded only after the overlap check below, so a refused attach
     // leaves nothing behind.
     let mut adopting = false;
@@ -961,10 +963,17 @@ pub unsafe extern "C" fn moraine_data_path(
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
         // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        let path = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::catalog_read::global_option(
+                    handle_ref.catalog.reads(),
+                    "data_path",
+                ),
+            )
         }?;
-        let path_ptr = match snapshot.data_path() {
+        let path_ptr = match path {
             Some(path) => to_c_string(path)?.into_raw(),
             None => ptr::null_mut(),
         };
@@ -1004,12 +1013,17 @@ pub unsafe extern "C" fn moraine_catalog_version(
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
         // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        let recorded = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::catalog_read::global_option(
+                    handle_ref.catalog.reads(),
+                    "version",
+                ),
+            )
         }?;
-        let version = snapshot
-            .option(moraine::OptionScope::Global, "version")
-            .unwrap_or_else(|| moraine::CATALOG_VERSION.to_string());
+        let version = recorded.unwrap_or_else(|| moraine::CATALOG_VERSION.to_string());
         let version_ptr = to_c_string(version)?.into_raw();
         // SAFETY: `out` is non-null and writable per the caller contract.
         unsafe { *out = version_ptr };
@@ -1308,14 +1322,18 @@ pub unsafe extern "C" fn moraine_catalog_encrypted(
         let handle_ref = unsafe { &*handle };
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
-        let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        let encrypted = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::catalog_read::global_option(
+                    handle_ref.catalog.reads(),
+                    "encrypted",
+                ),
+            )
         }?;
 
-        Ok(snapshot
-            .option(moraine::OptionScope::Global, "encrypted")
-            .as_deref()
-            == Some("true"))
+        Ok(encrypted.as_deref() == Some("true"))
     };
 
     // SAFETY: `err` validity is this function's own safety contract.

@@ -248,7 +248,16 @@ pub unsafe extern "C" fn moraine_index_create(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::catalog_read::index_table(
+                    handle_ref.catalog.reads(),
+                    schema,
+                    table,
+                    true,
+                ),
+            )
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let schema_id = snapshot
@@ -445,7 +454,7 @@ pub unsafe extern "C" fn moraine_indexes(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, moraine::ffi_support::catalog_read::index_table(handle_ref.catalog.reads(), schema, table, false))
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let owned: Vec<(
@@ -564,7 +573,16 @@ pub unsafe extern "C" fn moraine_index_verify(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::catalog_read::index_table(
+                    handle_ref.catalog.reads(),
+                    schema,
+                    table,
+                    false,
+                ),
+            )
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let data_store = handle_ref.data_store.clone();

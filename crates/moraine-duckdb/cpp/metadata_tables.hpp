@@ -72,6 +72,8 @@ struct MetadataTxProviders {
 	MetadataTxScopedRowProvider scoped_provider;
 };
 
+using MetadataPageProvider = MetadataRows (*)(MoraineMetadataCursor *, MoraineInterruptProbe, void *);
+
 struct MetadataTableSpec {
 	const char *name;
 	std::vector<MetadataColumnSpec> columns;
@@ -105,16 +107,15 @@ struct MetadataTableSpec {
 	//
 	// Preserve field order: table specs use positional initializers.
 	MetadataScopedRowProvider scoped_provider = nullptr;
+	MetadataPageProvider page_provider = nullptr;
 };
 
-// Cache rows for this transaction so scans and staged writes resolve the same row IDs.
-// Opening or ending a staged transaction clears the cache; staging invalidates the affected table.
-// A live_bound narrows versioned reads only through an open staged transaction.
+// Builds operation-owned rows, including the staged overlay when present.
 std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
                                                     const MetadataTableSpec &spec,
                                                     duckdb::optional_idx live_bound = duckdb::optional_idx());
 
-// Cache one table's rows, including staged changes, keyed by table_id.
+// Builds one table's rows, including staged changes.
 // Fall back to MetadataRowsFor when a scoped provider is unavailable.
 std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
                                                           const MetadataTableSpec &spec, uint64_t table_id,

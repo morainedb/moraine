@@ -47,6 +47,8 @@ pub(crate) enum ScanShape {
     /// A sequential walk with bounded read-ahead and no cache admission, for
     /// a consumer that derives as it goes.
     Streaming,
+    /// A table's metadata: bounded read-ahead with block-cache admission.
+    Metadata,
     /// A targeted lookup; its blocks are admitted.
     Probe,
     /// One equality prefix, with bounded read-ahead and cache admission.
@@ -90,7 +92,7 @@ impl ScanShape {
     fn options(self, order: ScanOrder) -> ScanOptions {
         let (read_ahead_bytes, max_fetch_tasks) = match self {
             Self::Bulk | Self::Probe => (SCAN_READ_AHEAD_BYTES, SCAN_FETCH_TASKS),
-            Self::Streaming => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
+            Self::Streaming | Self::Metadata => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
             Self::Equality => (EQUALITY_READ_AHEAD_BYTES, 2),
             // SlateDB rounds the read-ahead up to one block.
             Self::Seek => (1, 1),
@@ -98,7 +100,10 @@ impl ScanShape {
         ScanOptions {
             read_ahead_bytes,
             max_fetch_tasks,
-            cache_blocks: matches!(self, Self::Probe | Self::Equality | Self::Seek),
+            cache_blocks: matches!(
+                self,
+                Self::Probe | Self::Equality | Self::Seek | Self::Metadata
+            ),
             order: order.iteration_order(),
             ..ScanOptions::default()
         }
@@ -111,14 +116,44 @@ impl ScanShape {
 pub(crate) enum ReadHandle<'a> {
     /// A snapshot-isolated read-write transaction (`Db::begin`).
     Tx(&'a DbTransaction),
+    /// A read-only snapshot owned by the writer process.
+    Snapshot(&'a slatedb::DbSnapshot),
     /// A read-only reader following the manifest.
     Reader(&'a DbReader),
+    /// A fixed reader with an independently renewed checkpoint.
+    Checkpoint(&'a Arc<super::checkpoint::CheckpointReader>),
     /// The writer itself, read without a transaction; each read is atomic
     /// on its own.
     Writer(&'a Db),
 }
 
+/// A scan that retains and checks its checkpoint protection between batches.
+pub(crate) struct ScanIterator {
+    iterator: DbIterator,
+    checkpoint: Option<Arc<super::checkpoint::CheckpointReader>>,
+}
+
+impl ScanIterator {
+    pub(crate) async fn next(&mut self) -> Result<Option<KeyValue>, slatedb::Error> {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.reader()?;
+        }
+        let next = self.iterator.next().await?;
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.reader()?;
+        }
+        Ok(next)
+    }
+}
+
 impl ReadHandle<'_> {
+    /// Refuses a checkpoint whose lease no longer protects its backing files.
+    pub(crate) fn validate(&self) -> Result<(), slatedb::Error> {
+        if let Self::Checkpoint(reader) = self {
+            reader.reader()?;
+        }
+        Ok(())
+    }
     /// Point read of one key.
     pub(crate) async fn get<K: AsRef<[u8]> + Send>(
         &self,
@@ -126,7 +161,13 @@ impl ReadHandle<'_> {
     ) -> Result<Option<Bytes>, slatedb::Error> {
         match self {
             Self::Tx(tx) => tx.get(key).await,
+            Self::Snapshot(snapshot) => snapshot.get(key).await,
             Self::Reader(reader) => reader.get(key).await,
+            Self::Checkpoint(reader) => {
+                let value = reader.reader()?.get(key).await?;
+                reader.reader()?;
+                Ok(value)
+            }
             Self::Writer(db) => db.get(key).await,
         }
     }
@@ -135,7 +176,7 @@ impl ReadHandle<'_> {
     /// state: true for a transaction, false for a manifest-following reader
     /// and for the writer's latest state.
     pub(crate) fn is_isolated(&self) -> bool {
-        matches!(self, Self::Tx(_))
+        matches!(self, Self::Tx(_) | Self::Snapshot(_) | Self::Checkpoint(_))
     }
 
     /// Brings a reader up to the store as it stands, so a pass can see
@@ -152,7 +193,7 @@ impl ReadHandle<'_> {
     pub(crate) async fn refresh(&self) -> Result<(), slatedb::Error> {
         match self {
             Self::Reader(reader) => reader.refresh().await,
-            Self::Tx(_) | Self::Writer(_) => Ok(()),
+            Self::Tx(_) | Self::Snapshot(_) | Self::Writer(_) | Self::Checkpoint(_) => Ok(()),
         }
     }
 
@@ -163,7 +204,7 @@ impl ReadHandle<'_> {
         prefix: P,
         subrange: T,
         shape: ScanShape,
-    ) -> Result<DbIterator, slatedb::Error>
+    ) -> Result<ScanIterator, slatedb::Error>
     where
         P: AsRef<[u8]> + Send,
         T: ByteRangeBounds + Send,
@@ -179,15 +220,20 @@ impl ReadHandle<'_> {
         subrange: T,
         shape: ScanShape,
         order: ScanOrder,
-    ) -> Result<DbIterator, slatedb::Error>
+    ) -> Result<ScanIterator, slatedb::Error>
     where
         P: AsRef<[u8]> + Send,
         T: ByteRangeBounds + Send,
     {
         let options = shape.options(order);
-        match self {
+        let iterator = match self {
             Self::Tx(tx) => {
                 tx.scan_prefix_with_options(prefix, subrange, &options)
+                    .await
+            }
+            Self::Snapshot(snapshot) => {
+                snapshot
+                    .scan_prefix_with_options(prefix, subrange, &options)
                     .await
             }
             Self::Reader(reader) => {
@@ -195,11 +241,24 @@ impl ReadHandle<'_> {
                     .scan_prefix_with_options(prefix, subrange, &options)
                     .await
             }
+            Self::Checkpoint(reader) => {
+                reader
+                    .reader()?
+                    .scan_prefix_with_options(prefix, subrange, &options)
+                    .await
+            }
             Self::Writer(db) => {
                 db.scan_prefix_with_options(prefix, subrange, &options)
                     .await
             }
-        }
+        }?;
+        Ok(ScanIterator {
+            iterator,
+            checkpoint: match self {
+                Self::Checkpoint(reader) => Some((*reader).clone()),
+                _ => None,
+            },
+        })
     }
 
     /// The highest key suffix under `prefix`, or `None` when it holds no
@@ -321,8 +380,12 @@ impl ReadHandle<'_> {
 pub(crate) enum OwnedReadHandle {
     /// A transaction shared by every read in one pinned scope.
     Tx(Arc<DbTransaction>),
+    /// A read-only snapshot shared by the scopes using its sequence.
+    Snapshot(Arc<slatedb::DbSnapshot>),
     /// A read-only reader following the manifest.
     Reader(Arc<DbReader>),
+    /// A fixed reader shared by the scopes using its checkpoint.
+    Checkpoint(Arc<super::checkpoint::CheckpointReader>),
     /// The writer's latest state. `Db` is a handle, so this clones one.
     Writer(Db),
 }
@@ -332,7 +395,9 @@ impl OwnedReadHandle {
     pub(crate) fn borrow(&self) -> ReadHandle<'_> {
         match self {
             Self::Tx(transaction) => ReadHandle::Tx(transaction),
+            Self::Snapshot(snapshot) => ReadHandle::Snapshot(snapshot),
             Self::Reader(reader) => ReadHandle::Reader(reader),
+            Self::Checkpoint(reader) => ReadHandle::Checkpoint(reader),
             Self::Writer(db) => ReadHandle::Writer(db),
         }
     }
@@ -344,7 +409,7 @@ pub(crate) enum ReadSession {
     /// A read-write transaction, rolled back on `finish`.
     Tx(DbTransaction),
     /// A read transaction shared by every read in one pinned scope.
-    Pinned(Arc<DbTransaction>),
+    Pinned(OwnedReadHandle),
     /// A read-only reader, shared with the catalog.
     Reader(Arc<DbReader>),
 }
@@ -354,7 +419,7 @@ impl ReadSession {
     pub(crate) fn handle(&self) -> ReadHandle<'_> {
         match self {
             Self::Tx(tx) => ReadHandle::Tx(tx),
-            Self::Pinned(tx) => ReadHandle::Tx(tx),
+            Self::Pinned(handle) => handle.borrow(),
             Self::Reader(reader) => ReadHandle::Reader(reader),
         }
     }

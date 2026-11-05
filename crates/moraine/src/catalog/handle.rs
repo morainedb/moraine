@@ -9,12 +9,16 @@ mod index_probe_cache;
 pub use index_predicate::{IndexComparison, IndexPredicate, IndexPredicateRows};
 mod index_read_scope;
 mod index_verify;
+mod reader_scopes;
 pub use index_verify::IndexVerification;
 mod inline_scan;
 mod maintenance;
+#[cfg(test)]
+mod memory_fixture;
 mod revision_memo;
 mod row_location;
 mod row_lookup;
+use crate::transaction::table_read;
 mod table_warm;
 #[cfg(test)]
 mod tests;
@@ -43,11 +47,7 @@ use tracing::{info, warn};
 use crate::{
     catalog::{
         CatalogSnapshot, RecentRow, SnapshotId, StoreCheckpoint, TableId, Timestamp,
-        projection::{
-            ProjectionCache, cache_epoch, cached_head_view, fold_replayed_writes, held_head_view,
-            install_head_view_at, install_shared_current_entities, shared_current_entities,
-            view_head,
-        },
+        projection::ProjectionCache,
     },
     commit_log::LogCommitter,
     data_file,
@@ -60,7 +60,6 @@ use crate::{
         census,
         handle::{ReadHandle, ReadSession},
         open::{self, StoreBuilder},
-        proto::HeadValue,
     },
     transaction::{
         MigrationReport, Transaction, commit,
@@ -98,8 +97,8 @@ struct ReadTally {
     /// Read transactions opened on the writer.
     read_transactions: AtomicU64,
     materialize_micros: AtomicU64,
+    #[cfg(test)]
     current_scans: AtomicU64,
-    history_scans: AtomicU64,
 }
 
 impl ReadTally {
@@ -189,16 +188,6 @@ impl Store {
         match self {
             Self::Committer { commit_log, .. } => Some(commit_log),
             Self::Writer { .. } | Self::Reader(_) => None,
-        }
-    }
-
-    /// The writer behind this store, for a caller that needs to read after
-    /// its own transaction is spent — a lost staged commit, deciding what
-    /// it lost to.
-    pub(crate) fn writer_db(&self) -> Option<&Db> {
-        match self {
-            Self::Writer { db, .. } => Some(db),
-            Self::Reader(_) | Self::Committer { .. } => None,
         }
     }
 
@@ -563,6 +552,16 @@ struct Folder {
 
 #[async_trait::async_trait]
 impl crate::TakeStore for Folder {
+    async fn take_for_publication(&self) -> Result<(Db, Arc<dyn crate::WriterSession>)> {
+        // Publication replays the WAL and closes without writing an L0 file.
+        Box::pin(open_writer_db(
+            Arc::clone(&self.object_store),
+            &self.options,
+        ))
+        .await
+        .map(|(db, session, _format)| (db, session))
+    }
+
     async fn take(&self) -> Result<Option<(Db, Arc<dyn crate::WriterSession>)>> {
         // A fold writes an L0 file, and where the provider leaves
         // compaction to another process nothing merges those away. A
@@ -643,6 +642,20 @@ fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::Commit
         .commit_log
         .clone()
         .or_else(crate::commit_log::registered_commit_log)
+}
+
+/// Mints the log session used by an ordinary or fixed checkpoint reader.
+fn reader_session(
+    object_store: Arc<dyn ObjectStore>,
+    options: &CatalogOptions,
+    tail: bool,
+) -> Option<Arc<dyn crate::ReaderSession>> {
+    commit_log_provider(options).map(|provider| {
+        let log_store = StoreBuilder::new(&options.path, object_store)
+            .wal_object_store(wal_object_store(options))
+            .log_store();
+        provider.reader_session(log_store, &options.path, tail)
+    })
 }
 
 /// Whether a writer leaves compaction and collection to another process:
@@ -858,6 +871,7 @@ const MEMO_ENTRIES: usize = 4096;
 #[derive(Clone)]
 pub struct ReadOnlyCatalog {
     pinned: Option<Arc<index_read_scope::PinnedRead>>,
+    reader_scopes: Option<Arc<reader_scopes::ReaderScopes>>,
     store: Arc<Store>,
     reads: Arc<ReadTally>,
     cache: Arc<CacheCounters>,
@@ -885,7 +899,6 @@ pub struct ReadOnlyCatalog {
     >,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
-    materializing: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
@@ -933,16 +946,8 @@ impl std::ops::Deref for Catalog {
 }
 
 impl ReadOnlyCatalog {
-    /// The maintained-projection state shared by this handle's clones.
-    /// Forgets the cached head view, so the next read resolves the head
-    /// from the store instead of from memory.
-    ///
-    /// The cache is otherwise refreshed only by this catalog's own commits.
-    /// A caller whose commit was refused before it reached this catalog --
-    /// a host that resolves its own conflicts against the head it read here
-    /// -- would keep re-reading the same stale head and be refused for the
-    /// same reason forever, since the refusal never reaches the commit that
-    /// would have refreshed it. Costs one rescan.
+    /// Invalidates revision-derived lookup bounds after a host-side conflict.
+    /// Kept for callers using the former decoded-view invalidation API.
     pub fn forget_head_view(&self) {
         crate::catalog::projection::invalidate_head_view(self.projections());
     }
@@ -981,17 +986,13 @@ impl ReadOnlyCatalog {
         self.cache.tally()
     }
 
-    /// Estimated bytes in decoded catalog state, row directories, and scoped
-    /// probe results, outside the process-shared block-cache allowance.
-    /// Projections follow catalog size; directories and probe results have
-    /// separate eviction limits. Shared allocations can be counted twice.
+    /// Estimated bytes in bounded row directories and scoped probe results,
+    /// outside the process-shared block-cache allowance. Catalog descriptors
+    /// are operation-owned. Shared allocations can be counted twice.
     #[must_use]
     pub fn projection_bytes(&self) -> u64 {
-        self.projections
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.row_lookups
             .estimated_bytes()
-            .saturating_add(self.row_lookups.estimated_bytes())
             .saturating_add(self.index_probes.estimated_bytes())
             .saturating_add(self.located_rows.estimated_bytes())
             .saturating_add(self.positioned_files.estimated_bytes())
@@ -1047,34 +1048,20 @@ impl ReadOnlyCatalog {
 
     /// Records that the `current` half of the shared record set was
     /// scanned from the store.
+    #[cfg(test)]
     pub(crate) fn tally_current_scan(&self) {
         self.reads.current_scans.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records that the `history` half was scanned from the store.
-    pub(crate) fn tally_history_scan(&self) {
-        self.reads.history_scans.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// How many times each half of the shared record set has been scanned:
-    /// `(current, history)`. At one head each moves at most once.
+    /// The number of full current-subspace materializations.
     #[cfg(test)]
-    pub(crate) fn entity_scan_tallies(&self) -> (u64, u64) {
-        (
-            self.reads.current_scans.load(Ordering::Relaxed),
-            self.reads.history_scans.load(Ordering::Relaxed),
-        )
+    pub(crate) fn full_entity_scans(&self) -> u64 {
+        self.reads.current_scans.load(Ordering::Relaxed)
     }
 
     /// Records that a read resolved the head from the store.
     pub(crate) fn note_head_read(&self) {
         self.reads.head_reads.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// How many reads have resolved the head from the store.
-    #[cfg(test)]
-    pub(crate) fn head_reads(&self) -> u64 {
-        self.reads.head_reads.load(Ordering::Relaxed)
     }
 
     /// How many read transactions this handle has opened on the writer.
@@ -1087,10 +1074,17 @@ impl ReadOnlyCatalog {
     /// closed for any other reason. Reads the status channel only: no
     /// store read and no session.
     pub(crate) fn refuse_if_closed(&self) -> Result<()> {
-        let Some(status) = &self.writer_status else {
-            return Ok(());
+        let reason = if let Some(status) = &self.writer_status {
+            status.borrow().close_reason
+        } else {
+            match self.store.as_ref() {
+                Store::Reader(reader) | Store::Committer { reader, .. } => {
+                    reader.status().close_reason
+                }
+                Store::Writer { db, .. } => db.status().close_reason,
+            }
         };
-        match status.borrow().close_reason {
+        match reason {
             None => Ok(()),
             Some(CloseReason::Fenced) => Err(crate::error::fenced()),
             Some(reason) => Err(Error::Interrupted(format!(
@@ -1106,25 +1100,7 @@ impl ReadOnlyCatalog {
     /// The store revision a pinned read scope holds, under which a read's
     /// answer is fixed and may be memoized; `None` outside one.
     pub(crate) fn pinned_revision(&self) -> Option<u64> {
-        self.pinned
-            .as_ref()
-            .map(|pinned| pinned.transaction.seqnum())
-    }
-
-    pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
-        if let Some(pinned) = &self.pinned {
-            return Some(pinned.snapshot.clone());
-        }
-        if !self.holds_the_writer() {
-            return None;
-        }
-        held_head_view(&self.projections)
-    }
-
-    /// Whether this handle is the store's writer, and so the only thing
-    /// that can move `sys/head`.
-    pub(crate) fn holds_the_writer(&self) -> bool {
-        matches!(self.store.as_ref(), Store::Writer { .. })
+        self.pinned.as_ref().map(|pinned| pinned.revision)
     }
 
     /// The held view and a transaction-free read over the writer, on a
@@ -1134,11 +1110,15 @@ impl ReadOnlyCatalog {
     /// A handle owning what it reads through, so work on it can run on a
     /// task: the pinned scope's transaction when one is held, else the
     /// store's own writer or reader.
+    pub(crate) fn pinned_read_handle(&self) -> Option<ReadHandle<'_>> {
+        self.pinned.as_ref().map(|pinned| pinned.handle.borrow())
+    }
+
     pub(crate) fn owned_read_handle(&self) -> crate::store::handle::OwnedReadHandle {
         use crate::store::handle::OwnedReadHandle;
 
         if let Some(pinned) = &self.pinned {
-            return OwnedReadHandle::Tx(pinned.transaction.clone());
+            return pinned.handle.clone();
         }
         match self.store.as_ref() {
             Store::Writer { db, .. } => OwnedReadHandle::Writer(db.clone()),
@@ -1148,37 +1128,10 @@ impl ReadOnlyCatalog {
         }
     }
 
-    pub(crate) fn warm_writer_read(
-        &self,
-    ) -> Result<Option<(Arc<CatalogSnapshot>, ReadHandle<'_>)>> {
-        if let Some(pinned) = &self.pinned {
-            self.refuse_if_closed()?;
-            return Ok(Some((
-                pinned.snapshot.clone(),
-                ReadHandle::Tx(&pinned.transaction),
-            )));
-        }
-        let (Some(view), Some(db)) = (self.writer_head_view(), self.store.writer_db()) else {
-            return Ok(None);
-        };
-        self.refuse_if_closed()?;
-        self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
-
-        Ok(Some((view, ReadHandle::Writer(db))))
-    }
-
-    /// Whether `view` is still the view this handle holds, so a pass over
-    /// it saw no commit land.
-    pub(crate) fn still_holds(&self, view: &Arc<CatalogSnapshot>) -> bool {
-        self.writer_head_view()
-            .is_some_and(|held| Arc::ptr_eq(&held, view))
-    }
-
     /// An immutable view of the catalog at the latest committed snapshot.
     ///
-    /// Shared rather than owned: a warm handle hands back the view it
-    /// already holds, so repeated reads cost neither a store scan nor a
-    /// copy of the catalog.
+    /// Explicitly materializes all catalog entities. The caller owns this
+    /// allocation; the handle does not retain a decoded copy.
     ///
     /// # Errors
     ///
@@ -1306,99 +1259,30 @@ impl ReadOnlyCatalog {
         outcome
     }
 
-    /// The view at `at`, or at head when `None`. Time travel always
-    /// materializes: the cache holds head views only.
+    /// Materializes a caller-owned view at one store read point.
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
-        if at.is_some() {
-            let session = self.begin_read().await?;
-            let started = Instant::now();
-            let view = commit::materialize(session.handle(), at).await;
-            session.finish();
-            if view.is_ok() {
-                self.reads.materialized(started.elapsed());
-            }
-
-            return view.map(Arc::new);
-        }
-
-        // Captured before the first store read, so an invalidation racing
-        // this read cannot be overwritten by what it invalidated.
-        if let Some(view) = self.writer_head_view() {
-            self.refuse_if_closed()?;
-            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(view);
-        }
-
-        let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
-        let view = self.head_view(session.handle(), epoch).await;
+        let started = Instant::now();
+        let view = commit::materialize(session.handle(), at).await;
         session.finish();
-
-        view
-    }
-
-    /// The cached view when it already stands at head, a view refreshed
-    /// across the gap when it has fallen behind and the gap is replayable,
-    /// else a fresh materialization. Capture `epoch` before opening the
-    /// read session so an intervening invalidation prevents installation.
-    async fn head_view(&self, handle: ReadHandle<'_>, epoch: u64) -> Result<Arc<CatalogSnapshot>> {
-        if let Some(pinned) = &self.pinned {
-            return Ok(pinned.snapshot.clone());
+        if view.is_ok() {
+            self.reads.materialized(started.elapsed());
         }
-        let _materializing = self.materializing.lock().await;
-        let view = self.load_head_view(handle).await?;
-        install_head_view_at(&self.projections, epoch, Arc::clone(&view));
-        Ok(view)
+        view.map(Arc::new)
     }
 
+    #[cfg(test)]
+    async fn head_view(&self, handle: ReadHandle<'_>, _epoch: u64) -> Result<Arc<CatalogSnapshot>> {
+        self.load_head_view(handle).await
+    }
+
+    #[cfg(test)]
     async fn load_head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
         self.note_head_read();
-        let head = commit::read_head_value(handle).await?;
-        if let Some(cached) = cached_head_view(&self.projections, &head) {
-            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(cached);
-        }
-
-        if let Some(behind) = held_head_view(&self.projections)
-            && let Some((refreshed, writes)) = commit::refresh_with_writes(handle, &behind).await?
-        {
-            self.reads.refreshes.fetch_add(1, Ordering::Relaxed);
-            fold_replayed_writes(
-                &self.projections,
-                &view_head(&behind),
-                view_head(&refreshed),
-                &writes,
-            );
-            return Ok(Arc::new(refreshed));
-        }
-
-        // Derive from the shared `current` half before paying a scan. The
-        // stamp is re-verified under the same consistent cut the build
-        // reads through, so a derived view equals a scanned one; a store
-        // that moved in between reports `None` and falls through.
-        if let Some(current) = shared_current_entities(&self.projections, &head)
-            && let Some(view) = commit::materialize_from(handle, &head, &current).await?
-        {
-            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::new(view));
-        }
-
         let started = Instant::now();
-        let (view, records) = commit::materialize_capturing(handle).await?;
+        let view = commit::materialize(handle, None).await?;
         self.reads.materialized(started.elapsed());
         self.tally_current_scan();
-        // Stamped with the state the *view* settled at — the consistent
-        // cut may be newer than the head read above, never mismatched
-        // with the records.
-        install_shared_current_entities(
-            &self.projections,
-            HeadValue {
-                snapshot_id: view.snapshot.snapshot_id,
-                batch_seq: view.batch_seq,
-            },
-            records,
-        );
-
         Ok(Arc::new(view))
     }
 
@@ -1414,7 +1298,7 @@ impl ReadOnlyCatalog {
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
         if let Some(pinned) = &self.pinned {
             self.refuse_if_closed()?;
-            return Ok(ReadSession::Pinned(pinned.transaction.clone()));
+            return Ok(ReadSession::Pinned(pinned.handle.clone()));
         }
         let session = match self.store.as_ref() {
             Store::Writer { db, .. } => {
@@ -1460,9 +1344,27 @@ impl ReadOnlyCatalog {
         // A commit store closes the handle it was built over: a held store
         // is written out and let go of first.
         match self.store.as_ref() {
-            Store::Writer { db, .. } => db.close().await.map_err(Error::from),
-            Store::Reader(reader) => reader.close().await.map_err(Error::from),
-            Store::Committer { commit_log, .. } => commit_log.store.close().await,
+            Store::Writer { db, pacer, .. } => {
+                let publication = if db.status().close_reason.is_none() {
+                    pacer.publish_flushed().await.map_err(Error::from)
+                } else {
+                    Ok(())
+                };
+                let closed = db.close().await.map_err(Error::from);
+                publication.and(closed)
+            }
+            Store::Reader(reader) => {
+                if let Some(scopes) = &self.reader_scopes {
+                    scopes.close().await;
+                }
+                reader.close().await.map_err(Error::from)
+            }
+            Store::Committer { commit_log, .. } => {
+                if let Some(scopes) = &self.reader_scopes {
+                    scopes.close().await;
+                }
+                commit_log.store.close().await
+            }
         }
     }
 }
@@ -1666,6 +1568,7 @@ impl Catalog {
         Ok(Self {
             inner: ReadOnlyCatalog {
                 pinned: None,
+                reader_scopes: None,
                 writer_status: Some(db.subscribe()),
                 store: Arc::new(Store::Writer {
                     db,
@@ -1700,7 +1603,6 @@ impl Catalog {
                     None,
                 )),
                 projections,
-                materializing: Arc::default(),
                 refresh_on_read: false,
                 asked: None,
             },
@@ -1856,8 +1758,9 @@ impl Catalog {
     ) -> Result<()> {
         for _ in 0..commit::MAX_COMMIT_ATTEMPTS {
             let session = self.store.begin_commit_session()?;
-            let base = commit::head_view_for(session.handle(), &self.projections).await?;
-            let head = base.snapshot.snapshot_id;
+            let base = commit::read_head_value(session.handle()).await?;
+            commit::refuse_mid_migration_at(session.handle(), &self.projections, &base).await?;
+            let head = base.snapshot_id;
             let mut batch = writes.clone();
             batch.push(commit::head_stamp(head, base.batch_seq));
             let staged = commit::stage_writes_on(&session, &batch)?;
@@ -1869,15 +1772,8 @@ impl Catalog {
                 projections: &self.projections,
                 log: self.store.commit_log(),
             };
-            let submitted = commit::submit_batch(
-                Arc::new(session),
-                heads,
-                &batch,
-                staged,
-                commit::HeadViewUpdate::Rebuild(base),
-                landing,
-            )
-            .await?;
+            let submitted =
+                commit::submit_batch(Arc::new(session), heads, &batch, staged, landing).await?;
             match submitted {
                 commit::Submission::LostRace => {}
                 commit::Submission::Submitted(submitted) if await_durable => {
@@ -2114,12 +2010,7 @@ impl Catalog {
         // A reader over a log is built over a session: the committer's own,
         // or one minted here for a read-only open.
         let session = session.or_else(|| {
-            commit_log_provider(&options).map(|provider| {
-                let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
-                    .wal_object_store(wal_object_store.clone())
-                    .log_store();
-                provider.reader_session(log_store, &options.path, options.commit_log_tail)
-            })
+            reader_session(Arc::clone(&object_store), &options, options.commit_log_tail)
         });
         let store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store.clone())
@@ -2160,10 +2051,19 @@ impl Catalog {
         warn_if_slow_open_without_cache(&options, elapsed);
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         crate::catalog::projection::raise_format_floor(&projections, format);
+        let reader = Arc::new(reader);
+        let reader_scopes = Some({
+            Arc::new(reader_scopes::ReaderScopes::new(
+                located.clone(),
+                options.clone(),
+                reader.clone(),
+            ))
+        });
         Ok(ReadOnlyCatalog {
             pinned: None,
+            reader_scopes,
             writer_status: None,
-            store: Arc::new(Store::Reader(Arc::new(reader))),
+            store: Arc::new(Store::Reader(reader)),
             location: Arc::new(StoreLocation {
                 path: options.path,
                 object_store: located,
@@ -2192,7 +2092,6 @@ impl Catalog {
                 None,
             )),
             projections,
-            materializing: Arc::default(),
             refresh_on_read,
             asked,
         })

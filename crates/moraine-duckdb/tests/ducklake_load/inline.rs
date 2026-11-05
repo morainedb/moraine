@@ -633,49 +633,51 @@ fn ducklake_stored_option_raises_the_inlining_row_limit() {
     );
 }
 
-/// A single-row delete costs one pass over the table, not two.
-///
-/// Evaluating the predicate scans, and that is inherent. What is not is a
-/// second materialization to invert the rowid the scan emitted: the scan
-/// emits the row's own id, so the tombstoning sink stages it directly. The
-/// delete therefore costs what the equivalent read costs.
+/// A single-row delete reads each inline body once, as its predicate scan does.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn deleting_one_inlined_row_costs_one_pass_over_the_table() {
+    use std::fmt::Write;
     let dir = TempDir::new("inline-delete-cost");
     let data_dir = TempDir::new("inline-delete-cost-data");
     let store = dir.path();
     let data_path = data_dir.path();
-
-    run_ducklake_sql(store, data_path, "CREATE TABLE lake.main.t (i BIGINT);");
+    let mut setup = String::from("CREATE TABLE lake.main.t (i BIGINT);\n");
     for chunk in 0..40 {
-        run_ducklake_sql(
-            store,
-            data_path,
-            &format!("INSERT INTO lake.main.t VALUES ({chunk});"),
-        );
+        writeln!(setup, "INSERT INTO lake.main.t VALUES ({chunk});").unwrap();
     }
+    run_ducklake_sql(store, data_path, &setup);
 
-    // Both tallies and the statement between them share one session: the
-    // counters belong to the attach, so a second process restarts them.
-    let lookups = |statement: &str| -> u64 {
-        let tally = "SELECT metadata_hits + metadata_misses + block_hits + block_misses \
-                       FROM moraine_cache_tally('lake');";
-        let rows = csv_rows(&run_ducklake_sql(
-            store,
-            data_path,
-            &format!("{tally}\n{statement}\n{tally}"),
-        ));
-        let read = |row: &Vec<String>| row[0].parse::<u64>().expect("a tally is a number");
-        read(rows.last().expect("a closing tally")) - read(rows.first().expect("an opening tally"))
+    let bodies = |statement: &str| -> u64 {
+        let output = run_session_with_env(
+            &Attach::Moraine {
+                store_dir: store,
+                data_path,
+                options: ", META_CACHE_PRELOAD 'none'",
+                read_only: false,
+            },
+            &format!(
+                "CALL enable_logging(level => 'debug', storage => 'memory');
+                {statement}
+                SELECT 'bodies', count(*) FROM duckdb_logs WHERE type='moraine'
+                AND message LIKE '%reading inline chunk body%';"
+            ),
+            &[("MORAINE_LOG", "debug")],
+        );
+        assert!(output.status.success(), "{}", combined_output(&output));
+        csv_rows(&combined_output(&output))
+            .iter()
+            .find(|row| row[0] == "bodies")
+            .expect("body tally")[1]
+            .parse()
+            .expect("numeric tally")
     };
-
-    let scanned = lookups("SELECT count(*) FROM lake.main.t WHERE i = 39;");
-    let deleted = lookups("DELETE FROM lake.main.t WHERE i = 0;");
-    assert!(
-        deleted <= scanned + scanned / 10,
-        "the delete cost {deleted} lookups against the {scanned} its scan alone costs: the sink \
-         is reading the table a second time to invert the rowid"
+    let scanned = bodies("SELECT count(*) FROM lake.main.t WHERE i = 39;");
+    let deleted = bodies("DELETE FROM lake.main.t WHERE i = 0;");
+    assert_eq!(scanned, 40, "each of the forty chunk bodies is read once");
+    assert_eq!(
+        deleted, scanned,
+        "the delete sink must not reread inline bodies"
     );
 }
 

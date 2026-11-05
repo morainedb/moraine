@@ -7,22 +7,24 @@ use bytes::Bytes;
 use prost::Message as _;
 use tracing::debug;
 
+mod cursor;
+pub(crate) use cursor::{EntityCursor, OwnedEntityCursor, OwnedSnapshotCursor};
+
 use crate::{
     error::{Error, Result},
     store::{
         handle::{ReadHandle, ScanShape},
         key::{
             CurrentKey, EntityKey, EntityKind, HistoryKey, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
-            TableScopedKind, current_entity_kind_prefix, current_gc_file_prefix,
-            current_table_prefix, history_entity_kind_prefix, history_table_prefix,
-            subspace_prefix,
+            TableScopedKind, current_entity_kind_prefix, current_table_prefix,
+            history_entity_kind_prefix, history_table_prefix, subspace_prefix,
         },
         proto::{
-            ChangelogValue, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
-            FormatValue, GcFileValue, HeadValue, IndexValue, MacroValue, MaintenanceStatusValue,
-            MappingValue, MigrationValue, OptionScopeValue, PartitionValue, SchemaValue,
-            SchemaVersionValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
-            TableValue, TagValue, ViewValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
+            GcFileValue, HeadValue, IndexValue, MacroValue, MaintenanceStatusValue, MappingValue,
+            MigrationValue, OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue,
+            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
+            ViewValue,
         },
         value,
     },
@@ -141,6 +143,7 @@ pub(crate) enum EntityRecordKind {
     Option,
     Tag,
     GcFile,
+    Index,
 }
 
 impl EntityRecordKind {
@@ -168,6 +171,7 @@ impl EntityRecordKind {
             Self::Option => Some(EntityKind::Option),
             Self::Tag => Some(EntityKind::Tag),
             Self::GcFile => None,
+            Self::Index => Some(EntityKind::Index),
         }
     }
 
@@ -178,6 +182,12 @@ impl EntityRecordKind {
             Self::File => Some(TableScopedKind::File),
             Self::DeleteFile => Some(TableScopedKind::DeleteFile),
             Self::FileColumnStats => Some(TableScopedKind::FileColumnStats),
+            Self::Index => Some(TableScopedKind::Index),
+            Self::Partition => Some(TableScopedKind::Partition),
+            Self::Sort => Some(TableScopedKind::Sort),
+            Self::Mapping => Some(TableScopedKind::Mapping),
+            Self::TableStats => Some(TableScopedKind::TableStats),
+            Self::TableColumnStats => Some(TableScopedKind::TableColumnStats),
             _ => None,
         }
     }
@@ -421,10 +431,11 @@ where
 
 /// One commit's changelog, absent once it falls out of the retained
 /// window (or if the commit recorded none).
+#[cfg(test)]
 pub(crate) async fn read_changelog(
     handle: ReadHandle<'_>,
     snapshot_id: u64,
-) -> Result<Option<ChangelogValue>> {
+) -> Result<Option<crate::store::proto::ChangelogValue>> {
     read_singleton(handle, Key::Changelog { snapshot_id }).await
 }
 
@@ -615,25 +626,6 @@ pub(crate) async fn scan_current_records(handle: ReadHandle<'_>) -> Result<Recor
     Ok(records.into_iter().collect())
 }
 
-/// As [`scan_history_entities`], keyed for the shared record set.
-pub(crate) async fn scan_history_records(handle: ReadHandle<'_>) -> Result<RecordSet> {
-    let records = scan_decode_subspace(
-        handle,
-        Subspace::History,
-        history_entity_kind_prefix,
-        |encoded, key, bytes| {
-            let memory = crate::MemoryReservation::reserve(
-                (bytes.len() as u64).saturating_add(RECORD_BYTES),
-            )?;
-            let encoded = memory.into_bytes(encoded)?;
-            Ok((encoded, Arc::new(decode_history_record(key, &bytes)?)))
-        },
-    )
-    .await?;
-
-    Ok(records.into_iter().collect())
-}
-
 /// Every current and ended record of one catalog kind. Unversioned kinds
 /// read only `current`; scheduled-file records use their sibling key kind
 /// there rather than an [`EntityKey`].
@@ -664,6 +656,7 @@ pub(crate) fn versions_for(filter_snapshot: Option<u64>, head: Option<u64>) -> V
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn scan_entity_kind(
     handle: ReadHandle<'_>,
     kind: EntityRecordKind,
@@ -672,7 +665,7 @@ pub(crate) async fn scan_entity_kind(
     let Some(entity_kind) = kind.entity_kind() else {
         return scan_decode(
             handle,
-            current_gc_file_prefix(),
+            crate::store::key::current_gc_file_prefix(),
             ScanShape::Bulk,
             |key, bytes| match key {
                 Key::Current(CurrentKey::GcFile { .. }) => {

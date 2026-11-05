@@ -16,3 +16,5 @@ pub use migration::MigrationReport;
 pub(crate) use verbs::EncodedIndexEntry;
 pub use verbs::Transaction;
 pub use wal_move::WalStoreMove;
+
+pub(crate) mod table_read;

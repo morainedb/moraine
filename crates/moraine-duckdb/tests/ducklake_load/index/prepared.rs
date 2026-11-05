@@ -114,11 +114,10 @@ fn prepared_index_arguments_depending_on_session_state_are_rebound() {
     }
 }
 
-/// Replacement attachments invalidate plans; manifest readers conservatively
-/// rebind.
+/// Replacement attachments invalidate plans; readers reuse a fixed checkpoint.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged extensions"]
-fn prepared_index_reads_invalidate_on_reattach_and_refuse_reader_caching() {
+fn prepared_index_reads_invalidate_on_reattach_and_reuse_checkpoint() {
     let store = TempDir::new("index-prepared-reattach");
     let data = TempDir::new("index-prepared-reattach-data");
     let options = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -149,7 +148,7 @@ fn prepared_index_reads_invalidate_on_reattach_and_refuse_reader_caching() {
     assert!(output.status.success(), "{}", combined_output(&output));
     let rows = csv_rows(&combined_output(&output));
     assert!(
-        rows.contains(&vec!["probes".into(), "3".into()]),
+        rows.contains(&vec!["probes".into(), "1".into()]),
         "{rows:?}"
     );
     assert_eq!(rows.iter().filter(|row| row[0] == "hits").count(), 2);

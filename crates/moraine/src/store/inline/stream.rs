@@ -2,16 +2,14 @@
 
 use std::ops::Bound;
 
-use slatedb::DbIterator;
-
 use super::{
     Error, InlineChunkValue, InlineFileDeleteValue, InlineInlineDeleteValue, InlineKey,
     InlineOperation, InlineOperationKind, Key, ReadHandle, Result, ScanShape,
     inline_live_table_prefix, inline_row_tombstone_table_prefix, value,
 };
-use crate::store::proto::InlineBuildCursorValue;
+use crate::store::{handle::ScanIterator, proto::InlineBuildCursorValue};
 
-pub(crate) struct InlineChunks(DbIterator);
+pub(crate) struct InlineChunks(ScanIterator);
 
 impl InlineChunks {
     pub(crate) async fn open(
@@ -59,7 +57,7 @@ impl InlineChunks {
 
 /// Tombstone events in row order, retaining only the next event.
 pub(crate) struct InlineTombstones {
-    iterator: DbIterator,
+    iterator: ScanIterator,
     next: Option<(u64, u64)>,
 }
 

@@ -25,29 +25,6 @@ namespace moraine_duckdb {
 
 namespace {
 
-// The store state a dump's rows stand at.
-struct MoraineHeadStamp {
-	uint64_t snapshot_id;
-	uint64_t batch_seq;
-};
-
-// Reads the head stamp, reporting whether one exists. A store with no
-// head yet (mid-bootstrap) and a failed read both report false, which
-// costs a caller only the caching it would otherwise have done — never
-// correctness, so the error is swallowed rather than raised.
-bool ReadHeadStamp(MoraineCatalogHandle *handle, duckdb::ClientContext &context, MoraineHeadStamp &out) {
-	MoraineError err {};
-	bool present = false;
-	if (moraine_head_stamp(handle, &out.snapshot_id, &out.batch_seq, &present, moraine_shim_is_interrupted, &context,
-	                       &err) != MORAINE_OK) {
-		if (err.message != nullptr) {
-			moraine_error_free(err.message);
-		}
-		return false;
-	}
-	return present;
-}
-
 duckdb::optional_ptr<duckdb::TableCatalogEntry>
 MetadataScanTableEntry(duckdb::optional_ptr<const duckdb::FunctionData> bind_data) {
 	auto &data = bind_data->Cast<MetadataScanBindData>();
@@ -71,6 +48,11 @@ duckdb::Catalog &LiveBoundCatalog(duckdb::ClientContext &context, const Metadata
 }
 
 struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
+	std::unique_ptr<MoraineMetadataCursor, decltype(&moraine_metadata_cursor_free)> cursor {
+	    nullptr, moraine_metadata_cursor_free};
+	MetadataPageProvider page_provider = nullptr;
+	MetadataRows page;
+	duckdb::idx_t page_offset = 0;
 	// The next row to emit. Threads claim vectors of rows from it, so a
 	// row's id (`row_id_base` plus its index) is the same whichever thread
 	// emits it.
@@ -90,13 +72,55 @@ struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	uint64_t row_id_base = 0;
 
 	idx_t MaxThreads() const override {
-		return std::max<idx_t>(1, row_count / STANDARD_VECTOR_SIZE);
+		return cursor != nullptr ? 1 : std::max<idx_t>(1, row_count / STANDARD_VECTOR_SIZE);
 	}
 };
 
 bool EmitsRowIds(const std::vector<duckdb::column_t> &column_ids) {
 	return std::find(column_ids.begin(), column_ids.end(), duckdb::COLUMN_IDENTIFIER_ROW_ID) != column_ids.end();
 }
+
+using OwnedMetadataCursor = std::unique_ptr<MoraineMetadataCursor, decltype(&moraine_metadata_cursor_free)>;
+
+OwnedMetadataCursor OpenMetadataCursor(MoraineCatalogHandle *handle, const MetadataTableSpec &spec, uint64_t scope,
+                                       uint64_t live_bound, duckdb::ClientContext &context) {
+	MoraineMetadataCursor *cursor = nullptr;
+	MoraineError err {};
+	if (moraine_metadata_cursor_open(handle, spec.write_table_kind, scope, live_bound, &cursor,
+	                                 moraine_shim_is_interrupted, &context, &err) != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	return OwnedMetadataCursor(cursor, moraine_metadata_cursor_free);
+}
+
+// Replays one fixed scan only when a mutation resolves its row IDs. At most one
+// page is retained; an out-of-order request restarts the same immutable cursor.
+struct MetadataRowResolver {
+	MoraineCatalogHandle *handle;
+	const MetadataTableSpec &spec;
+	uint64_t scope;
+	uint64_t live_bound;
+	duckdb::ClientContext &context;
+	OwnedMetadataCursor cursor {nullptr, moraine_metadata_cursor_free};
+	uint64_t offset = 0;
+	MetadataRows page;
+
+	const std::vector<duckdb::Value> *Resolve(uint64_t index) {
+		if (cursor == nullptr || index < offset) {
+			cursor = OpenMetadataCursor(handle, spec, scope, live_bound, context);
+			offset = 0;
+			page.clear();
+		}
+		while (index >= offset + page.size()) {
+			offset += page.size();
+			page = spec.page_provider(cursor.get(), moraine_shim_is_interrupted, &context);
+			if (page.empty()) {
+				return nullptr;
+			}
+		}
+		return &page[index - offset];
+	}
+};
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duckdb::ClientContext &context,
                                                                             duckdb::TableFunctionInitInput &input) {
@@ -108,6 +132,25 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 		return state;
 	}
 	auto &catalog = LiveBoundCatalog(context, bind_data);
+	auto catalog_transaction = catalog.GetCatalogTransaction(context);
+	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+	if (bind_data.spec->page_provider != nullptr && transaction.StagedTxIfOpen() == nullptr) {
+		auto *handle = moraine_snapshot_read_handle(transaction.Snapshot());
+		if (handle != nullptr) {
+			auto scope = bind_data.scope.IsValid() ? bind_data.scope.GetIndex() : UINT64_MAX;
+			auto live_bound = bind_data.live_bound.IsValid() ? bind_data.live_bound.GetIndex() : UINT64_MAX;
+			state->cursor = OpenMetadataCursor(handle, *bind_data.spec, scope, live_bound, context);
+			if (EmitsRowIds(state->column_ids)) {
+				auto resolver = std::make_shared<MetadataRowResolver>(
+				    MetadataRowResolver {handle, *bind_data.spec, scope, live_bound, context});
+				state->row_id_base = transaction.RegisterScannedCursor(
+				    *bind_data.spec, [resolver](uint64_t index) { return resolver->Resolve(index); });
+			}
+			state->page_provider = bind_data.spec->page_provider;
+			return state;
+		}
+	}
+
 	if (bind_data.rows == nullptr) {
 		// A scan emitting row ids narrows like any other: the staged-write
 		// Sink resolves those ids against the run this scan registers
@@ -393,9 +436,35 @@ void EmitMetadataColumn(const MetadataRows &rows, duckdb::idx_t start, duckdb::i
 	}
 }
 
-void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+void MetadataScanFunctionImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
+                              duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<MetadataScanBindData>();
 	auto &state = data.global_state->Cast<MetadataScanGlobalState>();
+	if (state.cursor != nullptr) {
+		if (state.page_offset == state.page.size()) {
+			state.page = state.page_provider(state.cursor.get(), moraine_shim_is_interrupted, &context);
+			state.page_offset = 0;
+		}
+		auto count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, state.page.size() - state.page_offset);
+		auto start = state.offset.fetch_add(count);
+		if (start + count > MoraineTransaction::kScannedRunCapacity) {
+			throw duckdb::InvalidInputException("moraine: metadata scan exhausted its row identities");
+		}
+		for (duckdb::idx_t column = 0; column < state.column_ids.size(); column++) {
+			if (state.column_ids[column] == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+				auto ids = duckdb::FlatVector::GetDataMutable<int64_t>(output.data[column]);
+				for (duckdb::idx_t row = 0; row < count; row++) {
+					ids[row] = static_cast<int64_t>(state.row_id_base + start + row);
+				}
+			} else {
+				EmitMetadataColumn(state.page, state.page_offset, count, state.column_ids[column], output.data[column]);
+			}
+		}
+		state.page_offset += count;
+		output.SetChildCardinality(count);
+		return;
+	}
+
 	// A scan that deferred materialization holds its rows on the state;
 	// every other one holds them on the bind data.
 	auto &materialized = state.rows != nullptr ? state.rows : bind_data.rows;
@@ -492,80 +561,20 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
                                                     const MetadataTableSpec &spec, duckdb::optional_idx live_bound) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
-	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
-	auto *staged_tx = transaction.StagedTxIfOpen();
-
-	if (staged_tx != nullptr) {
-		// A writing transaction reads through its staged tx, which pins one
-		// read point for its whole life and overlays the rows staged so far.
-		// That is the pinning this function otherwise supplies.
-		//
-		// The read point cannot move under a materialization, so what makes
-		// one stale is this transaction staging into the same table —
-		// `StagedTxFor` drops exactly that entry as it hands out the tx.
-		// A commit attempt takes the staged tx, so the retry DuckLake drives
-		// between attempts opens a fresh one and re-reads through it.
-		// The staged tx pins one read point for its whole life, so a
-		// narrowed and an unnarrowed read of one table cannot stand at two
-		// heads — which is what confines the narrowing to this branch.
-		const bool live_only = live_bound.IsValid() && spec.live_narrowable;
-		if (auto cached = transaction.GetMetadataRows(spec, live_only)) {
-			return cached;
-		}
-		// Taken before the materialization it stamps: a row staged into
-		// this table while the set is built invalidates it, and the Put
-		// drops it rather than serving it.
-		auto epoch = transaction.MetadataRowsEpoch();
-		// A table with no staged reader serves committed state, which is
-		// right for one no transaction can write.
-		std::shared_ptr<const MetadataRows> rows;
-		if (live_only && spec.tx.live_provider) {
-			rows = std::make_shared<const MetadataRows>(
-			    spec.tx.live_provider(staged_tx, static_cast<uint64_t>(live_bound.GetIndex())));
-		} else if (spec.tx.provider) {
-			rows = std::make_shared<const MetadataRows>(
-			    spec.tx.provider(staged_tx, handle, moraine_shim_is_interrupted, &context));
-		} else {
-			rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
-		}
-		transaction.PutMetadataRows(spec, rows, live_only, epoch, std::nullopt);
-		return rows;
+	auto *handle = moraine_snapshot_read_handle(transaction.Snapshot());
+	if (handle == nullptr) {
+		handle = catalog.Cast<MoraineCatalog>().Handle();
 	}
-
-	if (auto cached = transaction.GetMetadataRows(spec)) {
-		return cached;
-	}
-	// Taken before the materialization it stamps, as in the staged branch:
-	// a staged tx opened while the set is built invalidates it.
-	auto epoch = transaction.MetadataRowsEpoch();
-
-	// The rows this attach dumped last time are byte-identical to a fresh
-	// dump whenever no batch landed since, so compare against the stamp
-	// the transaction's snapshot stands at before paying the ABI crossing
-	// again. A store with no head yet simply dumps.
-	auto &moraine_catalog = catalog.Cast<MoraineCatalog>();
-	MoraineHeadStamp before;
-	const bool stamped = transaction.SnapshotStamp(before.snapshot_id, before.batch_seq);
-	if (stamped) {
-		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq)) {
-			transaction.PutMetadataRows(spec, held, false, epoch, std::nullopt);
-			return held;
+	if (auto *staged = transaction.StagedTxIfOpen()) {
+		if (live_bound.IsValid() && spec.live_narrowable && spec.tx.live_provider) {
+			return std::make_shared<const MetadataRows>(spec.tx.live_provider(staged, live_bound.GetIndex()));
+		}
+		if (spec.tx.provider) {
+			return std::make_shared<const MetadataRows>(
+			    spec.tx.provider(staged, handle, moraine_shim_is_interrupted, &context));
 		}
 	}
-
-	auto rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
-	transaction.PutMetadataRows(spec, rows, false, epoch, std::nullopt);
-
-	// Hold them for the next transaction only if the store did not move
-	// under the dump: rows that straddled a commit stand at no single
-	// stamp, and holding them under the earlier one would serve a
-	// concurrent reader at that stamp a row set from beyond it.
-	MoraineHeadStamp after;
-	if (stamped && ReadHeadStamp(handle, context, after) && after.snapshot_id == before.snapshot_id &&
-	    after.batch_seq == before.batch_seq) {
-		moraine_catalog.HoldMetadataRows(spec, before.snapshot_id, before.batch_seq, rows);
-	}
-	return rows;
+	return std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
 }
 
 std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
@@ -573,82 +582,22 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
                                                           duckdb::optional_idx live_bound) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
-	if (spec.scope_column < 0 || spec.scoped_provider == nullptr) {
-		return MetadataRowsFor(context, catalog, spec, live_bound);
-	}
-	const std::optional<uint64_t> scope = table_id;
-
-	// Mid-write a read owes the staged tx's overlay, so the narrowed dump
-	// is the staged one, which carries it — and takes the live bound too,
-	// so a read naming a table and a snapshot pays for neither the other
-	// tables nor the ended versions.
-	if (auto *staged_tx = transaction.StagedTxIfOpen()) {
+	if (auto *staged = transaction.StagedTxIfOpen()) {
 		if (!spec.tx.scoped_provider) {
 			return MetadataRowsFor(context, catalog, spec, live_bound);
 		}
-		const bool live_only = live_bound.IsValid() && spec.live_narrowable;
-		if (auto cached = transaction.GetMetadataRows(spec, live_only, scope)) {
-			return cached;
-		}
-		// Taken before the dump it stamps: a row staged into this table
-		// while it is built invalidates it.
-		auto epoch = transaction.MetadataRowsEpoch();
-		const uint64_t filter_snapshot = live_only ? static_cast<uint64_t>(live_bound.GetIndex()) : kEveryVersion;
-		auto rows = std::make_shared<const MetadataRows>(spec.tx.scoped_provider(staged_tx, table_id, filter_snapshot));
-		// Held for this transaction only: the rows carry its uncommitted
-		// overlay, so the attach must never serve them to another.
-		transaction.PutMetadataRows(spec, rows, live_only, epoch, scope);
-		return rows;
+		auto filter = live_bound.IsValid() && spec.live_narrowable ? live_bound.GetIndex() : kEveryVersion;
+		return std::make_shared<const MetadataRows>(spec.tx.scoped_provider(staged, table_id, filter));
 	}
-
-	if (auto cached = transaction.GetMetadataRows(spec, false, scope)) {
-		return cached;
+	if (spec.scoped_provider == nullptr) {
+		return MetadataRowsFor(context, catalog, spec, live_bound);
 	}
-	// Taken before the materialization it stamps, as the unscoped path
-	// does: a staged tx opened while the set is built invalidates it.
-	auto epoch = transaction.MetadataRowsEpoch();
-
-	// A transaction that already materialized this table narrows what it
-	// holds. Reading the store again here would serve one scan of the table
-	// rows from beyond the point every other scan of it stands at.
-	if (auto held = transaction.GetMetadataRows(spec)) {
-		auto column = static_cast<duckdb::idx_t>(spec.scope_column);
-		MetadataRows narrowed;
-		for (auto &row : *held) {
-			if (column < row.size() && !row[column].IsNull() &&
-			    row[column].GetValue<int64_t>() == static_cast<int64_t>(table_id)) {
-				narrowed.push_back(row);
-			}
-		}
-		auto rows = std::make_shared<const MetadataRows>(std::move(narrowed));
-		transaction.PutMetadataRows(spec, rows, false, epoch, scope);
-		return rows;
+	auto *handle = moraine_snapshot_read_handle(transaction.Snapshot());
+	if (handle == nullptr) {
+		handle = catalog.Cast<MoraineCatalog>().Handle();
 	}
-
-	// As the unscoped path: the rows this attach last narrowed to this
-	// table are byte-identical to a fresh dump whenever no batch landed
-	// since, and are held only if the store did not move under the dump.
-	auto &moraine_catalog = catalog.Cast<MoraineCatalog>();
-	auto *handle = moraine_catalog.Handle();
-	MoraineHeadStamp before;
-	const bool stamped = transaction.SnapshotStamp(before.snapshot_id, before.batch_seq);
-	if (stamped) {
-		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq, scope)) {
-			transaction.PutMetadataRows(spec, held, false, epoch, scope);
-			return held;
-		}
-	}
-
-	auto rows = std::make_shared<const MetadataRows>(
+	return std::make_shared<const MetadataRows>(
 	    spec.scoped_provider(handle, table_id, moraine_shim_is_interrupted, &context));
-	transaction.PutMetadataRows(spec, rows, false, epoch, scope);
-
-	MoraineHeadStamp after;
-	if (stamped && ReadHeadStamp(handle, context, after) && after.snapshot_id == before.snapshot_id &&
-	    after.batch_seq == before.batch_seq) {
-		moraine_catalog.HoldMetadataRows(spec, before.snapshot_id, before.batch_seq, rows, scope);
-	}
-	return rows;
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
@@ -659,7 +608,7 @@ duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientC
 	scan_bind_data->catalog_name = ParentCatalog().GetName().GetIdentifierName();
 	// A narrowable kind is left unmaterialized for `InitGlobal`: the filter
 	// deciding how much of it to build has not been pushed down yet.
-	if (spec_.scope_column < 0 && !spec_.live_narrowable) {
+	if (spec_.page_provider == nullptr && spec_.scope_column < 0 && !spec_.live_narrowable) {
 		scan_bind_data->rows = MetadataRowsFor(context, ParentCatalog(), spec_);
 	}
 	scan_bind_data->table_entry = this;

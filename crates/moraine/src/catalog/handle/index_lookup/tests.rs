@@ -188,7 +188,7 @@ async fn probe(catalog: &ReadOnlyCatalog, table: TableId, index: IndexId) -> Pro
 /// A warm read-write handle resolves lookups and row locations from its
 /// held view and probes without a transaction, answering as a session does.
 #[tokio::test]
-async fn a_warm_writer_probes_without_a_head_read_or_a_transaction() {
+async fn repeated_probes_use_scoped_reads_without_retaining_catalog_views() {
     let store = Arc::new(InMemory::new());
     let options = CatalogOptions {
         reader_poll_interval: Duration::from_millis(10),
@@ -214,21 +214,13 @@ async fn a_warm_writer_probes_without_a_head_read_or_a_transaction() {
 
     // The first pass verifies the inline directory; from there it is warm.
     assert_eq!(probe(&writer, table, index).await, expected);
-    let (head_reads, read_transactions) = (writer.head_reads(), writer.read_transactions());
-
+    let read_transactions = writer.read_transactions();
+    let retained = writer.memory_tally().projection_bytes;
     for _ in 0..4 {
         assert_eq!(probe(&writer, table, index).await, expected);
+        assert_eq!(writer.memory_tally().projection_bytes, retained);
     }
-    assert_eq!(
-        writer.head_reads(),
-        head_reads,
-        "a warm read-write handle read `sys/head`"
-    );
-    assert_eq!(
-        writer.read_transactions(),
-        read_transactions,
-        "a warm read-write handle opened a read transaction"
-    );
+    assert!(writer.read_transactions() > read_transactions);
 
     reader.close().await.unwrap();
     writer.close().await.unwrap();

@@ -113,7 +113,16 @@ unsafe fn resolve_index<'a>(
 
     // SAFETY: caller contract for `probe`/`probe_ctx`.
     let snapshot = unsafe {
-        handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        handle_ref.block_on_cancellable(
+            probe,
+            probe_ctx,
+            moraine::ffi_support::catalog_read::index_table(
+                handle_ref.catalog.reads(),
+                schema,
+                table,
+                false,
+            ),
+        )
     }?;
     let table_id = resolve_table(&snapshot, schema, table)?;
     let index = snapshot

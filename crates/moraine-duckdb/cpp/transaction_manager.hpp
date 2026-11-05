@@ -1,5 +1,5 @@
 // A duckdb::TransactionManager backed by moraine: snapshot-per-transaction.
-// StartTransaction materializes one moraine_snapshot and hands out a
+// StartTransaction pins one moraine read scope and hands out a
 // MoraineTransaction that owns it; CommitTransaction commits the staged tx
 // (if one was opened) and RollbackTransaction discards it, both releasing
 // the snapshot.
@@ -27,7 +27,7 @@ namespace moraine_duckdb {
 class MoraineCatalog;
 
 // One DuckDB transaction's view of a moraine catalog: the snapshot
-// materialized at StartTransaction, plus the schema-entry cache built
+// pinned at StartTransaction, plus the schema-entry cache built
 // lazily against it. Cached CatalogEntry objects must outlive every
 // reference to them returned within the transaction.
 class MoraineTransaction : public duckdb::Transaction {
@@ -96,33 +96,6 @@ public:
 	// rollback becomes a no-op. Returns null if no write ever opened one.
 	MoraineTxHandle *TakeStagedTx();
 
-	// The one materialization of a synthesized `ducklake_*` table this
-	// transaction serves every reader of it from, or null before its first
-	// scan.
-	//
-	// Held across both read points a transaction can have, because neither
-	// moves under a materialization: before any write, the transaction's
-	// snapshot; after, the staged tx's own pinned read point. Opening a
-	// staged tx crosses between them and drops everything held; staging a
-	// row drops the table it lands in, whose overlay just changed. An
-	// `inline/*` row lands in no overlay and drops nothing.
-	// `MetadataRowsFor` (metadata_tables.hpp) is the only caller of this
-	// pair and states what rests on the sharing.
-	//
-	// A live-narrowed materialization is a different row set from the full
-	// one, so `live_only` keys them apart rather than letting either stand
-	// in for the other.
-	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec, bool live_only = false,
-	                                                    std::optional<uint64_t> scope = std::nullopt) const;
-
-	// The invalidation count the held materializations stand at. Taken
-	// before building a set and handed back to `PutMetadataRows`, which
-	// drops a set whose count has moved: a staged tx opened, or a row
-	// staged into its table, while it was being built.
-	uint64_t MetadataRowsEpoch() const;
-	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows, bool live_only,
-	                     uint64_t epoch, std::optional<uint64_t> scope = std::nullopt);
-
 	// Takes the rows one metadata scan emits row ids for, returning the id
 	// its first row carries. Ids come from a counter this transaction never
 	// rewinds, so a run stays addressable however its table is scanned or
@@ -130,9 +103,12 @@ public:
 	// the very rows the scan handed out, not a second materialization of
 	// them.
 	uint64_t RegisterScannedRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows);
+	using ScannedRowResolver = std::function<const std::vector<duckdb::Value> *(uint64_t)>;
+	static constexpr uint64_t kScannedRunCapacity = uint64_t(1) << 40;
+	uint64_t RegisterScannedCursor(const MetadataTableSpec &spec, ScannedRowResolver resolver);
 
 	// The row a scan emitted `row_id` for, or null if no run of this
-	// transaction covers it.
+	// transaction covers it. A streamed row stays valid until the next lookup.
 	const std::vector<duckdb::Value> *ScannedRow(const MetadataTableSpec &spec, uint64_t row_id) const;
 
 private:
@@ -141,6 +117,7 @@ private:
 		const MetadataTableSpec *spec;
 		uint64_t base;
 		std::shared_ptr<const MetadataRows> rows;
+		ScannedRowResolver resolver;
 	};
 
 	MoraineSnapshotHandle *snapshot_;
@@ -152,18 +129,7 @@ private:
 	uint64_t stamp_batch_seq_ = 0;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
-	// Keyed by scope as well as kind: a set narrowed to one table must
-	// never answer a read of the kind, and one table's narrowed set must
-	// never answer another's.
-	std::map<std::tuple<const MetadataTableSpec *, bool, std::optional<uint64_t>>, std::shared_ptr<const MetadataRows>>
-	    metadata_rows_;
-	// Bumped by every drop from the map above, so a Put that raced the
-	// drop is refused rather than resurrecting what it removed.
-	uint64_t metadata_rows_epoch_ = 0;
-	// Guards `staged_tx_` and the two members above, for the same
-	// concurrency `scanned_runs_lock_` serializes: scans init on the
-	// executor's threads while a Sink opens the staged tx and drops the
-	// materializations that move invalidates.
+	// Serializes opening and taking the staged transaction.
 	mutable std::mutex staged_state_lock_;
 	// Registered runs, by ascending base, and the next id to hand out.
 	// Guarded, because scans of one transaction init on the executor's
@@ -175,11 +141,6 @@ private:
 	// Opens the staged tx if this transaction has none, leaving what the
 	// two public accessors hold to them. Caller holds `staged_state_lock_`.
 	MoraineTxHandle *OpenStagedTx();
-
-	// Drop the held materializations — all of them, or one table's both
-	// keyings — and advance the epoch. Caller holds `staged_state_lock_`.
-	void DropMetadataRows();
-	void DropMetadataRowsFor(const MetadataTableSpec &spec);
 };
 
 class MoraineTransactionManager : public duckdb::TransactionManager {

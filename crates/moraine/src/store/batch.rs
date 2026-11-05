@@ -14,6 +14,7 @@ use crate::{
 /// One write of a committed batch: a put of the value bytes, or a delete
 /// when there are none.
 pub(crate) struct BatchWrite<'a> {
+    #[cfg(test)]
     encoded_key: &'a [u8],
     key: Key,
     bytes: Option<&'a [u8]>,
@@ -41,6 +42,7 @@ pub(crate) fn decode_batch(writes: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<Vec<
         .iter()
         .map(|(encoded_key, bytes)| {
             Ok(BatchWrite {
+                #[cfg(test)]
                 encoded_key,
                 key: Key::decode(encoded_key)?,
                 bytes: bytes.as_deref(),
@@ -54,6 +56,7 @@ impl BatchWrite<'_> {
         &self.key
     }
 
+    #[cfg(test)]
     pub(crate) fn encoded_key(&self) -> &[u8] {
         self.encoded_key
     }

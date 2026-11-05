@@ -252,24 +252,6 @@ public:
 		return *scheduler_;
 	}
 
-	// The rows this attach last dumped for `spec`, if the store still
-	// stands where they were dumped from. A miss (nothing held, or the
-	// stamp moved) returns null and the caller re-dumps.
-	std::shared_ptr<const MetadataRows> HeldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id,
-	                                                     uint64_t batch_seq,
-	                                                     std::optional<uint64_t> scope = std::nullopt) const;
-
-	// Holds `rows` as this attach's rows for `spec` at the given stamp,
-	// replacing whatever it held. Shared by every connection on the
-	// attach, so it is guarded.
-	void HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
-	                      std::shared_ptr<const MetadataRows> rows, std::optional<uint64_t> scope = std::nullopt);
-
-	// What this attach's held rows weigh, estimated as each set was held.
-	// Nothing else accounts for them: they are the shim's own allocation,
-	// outside both moraine's budgets and DuckDB's memory limit.
-	uint64_t HeldMetadataBytes() const;
-
 	// The snapshot id the most recent commit on this catalog landed. The
 	// batch may land a commit above the id DuckLake stamped on it, and
 	// DuckLake adopts a catalog-assigned id only through its server-side
@@ -287,27 +269,6 @@ private:
 	bool extended_catalog_ = false;
 	std::atomic<uint64_t> last_committed_snapshot_ {0};
 	duckdb::shared_ptr<MaintenanceScheduler> scheduler_;
-
-	// One dumped row set per synthesized table, stamped with the store
-	// state it was dumped at. DuckLake re-reads its metadata at every
-	// transaction start and autocommit makes every statement a
-	// transaction, so without this every statement re-pays the ABI
-	// crossing for rows that are byte-identical whenever no commit landed
-	// between them. Shared across the attach's connections, hence the
-	// mutex; the per-transaction pin above it is what makes a row index
-	// mean something within one transaction.
-	struct HeldRows {
-		uint64_t snapshot_id;
-		uint64_t batch_seq;
-		std::shared_ptr<const MetadataRows> rows;
-		uint64_t bytes;
-	};
-	// Keyed by scope as well as kind, as the per-transaction pin is. One
-	// entry per table narrowed to, and holding at a new stamp drops the
-	// kind's entries at older ones, so the map tracks what has been read
-	// since the last commit rather than every table ever addressed.
-	mutable std::mutex held_rows_lock_;
-	std::map<std::pair<const MetadataTableSpec *, std::optional<uint64_t>>, HeldRows> held_rows_;
 
 	// Ensures the active transaction's schema cache is populated from the
 	// listing ABI, then returns it.

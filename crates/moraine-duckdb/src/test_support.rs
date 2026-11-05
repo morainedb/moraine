@@ -45,6 +45,10 @@ impl Drop for TempDir {
 
 /// Attaches read-write to `dir` with defaults and asserts success.
 pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
+    attach_mode(dir, false)
+}
+
+pub(crate) fn attach_mode(dir: &Path, read_only: bool) -> *mut MoraineCatalogHandle {
     let c_path = CString::new(dir.to_str().expect("test path is UTF-8")).expect("no NUL in path");
     let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
     let mut err = MoraineError::default();
@@ -53,7 +57,7 @@ pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
         moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
-            false,
+            read_only,
             false,
             0,
             false,

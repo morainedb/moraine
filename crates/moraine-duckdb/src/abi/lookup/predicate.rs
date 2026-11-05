@@ -67,7 +67,7 @@ pub unsafe extern "C" fn moraine_index_predicate_rows(
         let reads = handle_ref.catalog.reads();
         // SAFETY: caller contract for interrupt callbacks.
         let snapshot =
-            unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, reads.snapshot()) }?;
+            unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, moraine::ffi_support::catalog_read::index_table(reads, schema, table, false)) }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let columns = snapshot.columns_of(table_id);
         // SAFETY: non-null above; caller provides the array length.

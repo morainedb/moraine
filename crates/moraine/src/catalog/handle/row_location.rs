@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use tracing::{debug, info, warn};
 
 mod publication;
@@ -23,6 +23,7 @@ use crate::{
     },
     data_file::{self, DataStore, FileSummary, SidecarSweep, sidecar},
     error::{Error, Result},
+    store::handle::ReadHandle,
     telemetry::milliseconds,
 };
 
@@ -306,7 +307,9 @@ impl ReadOnlyCatalog {
         }
 
         let started = Instant::now();
-        let snapshot = self.snapshot().await?;
+        let snapshot = self
+            .table_snapshot(table, super::table_read::TableRead::Sources)
+            .await?;
         let snapshot_ms = milliseconds(started.elapsed());
 
         // The two halves run concurrently, so their elapsed times overlap
@@ -697,9 +700,7 @@ impl ReadOnlyCatalog {
         data_prefix: &str,
         table: TableId,
     ) -> Result<RowSummaryPublish> {
-        let snapshot = self.snapshot().await?;
-
-        self.publish_tables(&snapshot, &data_store, data_prefix, vec![table], None)
+        self.publish_files(&data_store, data_prefix, Some(vec![table]), None)
             .await
     }
 
@@ -716,15 +717,7 @@ impl ReadOnlyCatalog {
         data_prefix: &str,
         since: SnapshotId,
     ) -> Result<RowSummaryPublish> {
-        let snapshot = self.snapshot().await?;
-        let tables = snapshot
-            .schemas()
-            .into_iter()
-            .flat_map(|schema| snapshot.tables_in(schema.id))
-            .map(|table| table.id)
-            .collect::<Vec<_>>();
-
-        self.publish_tables(&snapshot, &data_store, data_prefix, tables, Some(since))
+        self.publish_files(&data_store, data_prefix, None, Some(since))
             .await
     }
 
@@ -762,15 +755,7 @@ impl ReadOnlyCatalog {
         data_store: DataStore,
         data_prefix: &str,
     ) -> Result<RowSummaryPublish> {
-        let snapshot = self.snapshot().await?;
-        let tables = snapshot
-            .schemas()
-            .into_iter()
-            .flat_map(|schema| snapshot.tables_in(schema.id))
-            .map(|table| table.id)
-            .collect::<Vec<_>>();
-
-        self.publish_tables(&snapshot, &data_store, data_prefix, tables, None)
+        self.publish_files(&data_store, data_prefix, None, None)
             .await
     }
 
@@ -786,8 +771,7 @@ impl ReadOnlyCatalog {
         data_prefix: &str,
         tables: Vec<TableId>,
     ) -> Result<RowSummaryPublish> {
-        let snapshot = self.snapshot().await?;
-        self.publish_tables(&snapshot, &data_store, data_prefix, tables, None)
+        self.publish_files(&data_store, data_prefix, Some(tables), None)
             .await
     }
 
@@ -808,31 +792,115 @@ impl ReadOnlyCatalog {
         if tables.is_empty() {
             return Ok(RowSummaryPublish::default());
         }
-        let snapshot = self.snapshot().await?;
-        self.publish_tables(&snapshot, &data_store, data_prefix, tables, Some(since))
+        self.publish_files(&data_store, data_prefix, Some(tables), Some(since))
             .await
     }
 
-    async fn publish_tables(
+    async fn publish_files(
         &self,
-        snapshot: &CatalogSnapshot,
         data_store: &DataStore,
         data_prefix: &str,
-        tables: Vec<TableId>,
+        tables: Option<Vec<TableId>>,
         since: Option<SnapshotId>,
     ) -> Result<RowSummaryPublish> {
-        let mut outcomes = stream::iter(tables)
-            .map(|table| self.publish_table(snapshot, data_store, data_prefix, table, since))
-            .buffer_unordered(data_file::PUBLISH_CONCURRENCY);
+        use crate::store::read::{EntityRecord, EntityRecordKind, OwnedEntityCursor, Versions};
+        let scope = self
+            .index_read_scope()
+            .await?
+            .ok_or_else(|| Error::Constraint("publication requires a fixed read scope".into()))?;
+        let handle = scope.reads().owned_read_handle();
+        let mut cursor =
+            OwnedEntityCursor::open(handle.clone(), EntityRecordKind::File, Versions::Live, None)
+                .await?;
+        let tables: Option<HashSet<TableId>> = tables.map(|tables| tables.into_iter().collect());
         let mut total = RowSummaryPublish::default();
-        while let Some(table) = outcomes.try_next().await? {
-            total.files_considered = total
-                .files_considered
-                .saturating_add(table.files_considered);
-            total.summaries_built = total.summaries_built.saturating_add(table.summaries_built);
-            total.files_failed = total.files_failed.saturating_add(table.files_failed);
+        let mut done = false;
+        while !done {
+            let mut files = Vec::new();
+            while files.len() < data_file::PUBLISH_CONCURRENCY {
+                let Some((record, memory)) = cursor.next().await? else {
+                    done = true;
+                    break;
+                };
+                let EntityRecord::File(file) = record else {
+                    return Err(Error::Corruption(
+                        "file cursor returned another kind".into(),
+                    ));
+                };
+                if tables
+                    .as_ref()
+                    .is_some_and(|tables| !tables.contains(&TableId::new(file.table_id)))
+                    || since.is_some_and(|since| file.begin_snapshot <= since.get())
+                {
+                    continue;
+                }
+                files.push((file, memory));
+            }
+            let mut results = stream::iter(files)
+                .map(|(file, memory)| {
+                    let handle = handle.borrow();
+                    async move {
+                        let result = self
+                            .publish_registered_file(handle, data_store, data_prefix, &file)
+                            .await;
+                        drop(memory);
+                        (file.table_id, file.data_file_id, result)
+                    }
+                })
+                .buffer_unordered(data_file::PUBLISH_CONCURRENCY);
+            while let Some((table, file, result)) = results.next().await {
+                total.files_considered = total.files_considered.saturating_add(1);
+                match result {
+                    Ok(true) => total.summaries_built = total.summaries_built.saturating_add(1),
+                    Ok(false) => {}
+                    Err(error) => {
+                        total.files_failed = total.files_failed.saturating_add(1);
+                        warn!(table_id = table, data_file_id = file, %error, "publishing skipped a row summary it could not read");
+                    }
+                }
+            }
         }
         Ok(total)
+    }
+
+    async fn publish_registered_file(
+        &self,
+        handle: ReadHandle<'_>,
+        data_store: &DataStore,
+        data_prefix: &str,
+        file: &crate::store::proto::DataFileValue,
+    ) -> Result<bool> {
+        use crate::store::{
+            key::{EntityKey, Key},
+            proto::{SchemaValue, TableValue},
+            read::read_singleton,
+        };
+        let table = TableId::new(file.table_id);
+        let descriptor: TableValue = read_singleton(
+            handle,
+            Key::current(EntityKey::Table {
+                table_id: table.get(),
+            }),
+        )
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
+        let schema: SchemaValue = read_singleton(
+            handle,
+            Key::current(EntityKey::Schema {
+                schema_id: descriptor.schema_id,
+            }),
+        )
+        .await?
+        .ok_or_else(|| Error::Corruption("table references a missing schema".into()))?;
+        let table_prefix = format!("{}{}", schema.path, descriptor.path);
+        self.publish_file(
+            data_store,
+            data_prefix,
+            &table_prefix,
+            table,
+            data_file_info(file),
+        )
+        .await
     }
 
     async fn publish_file(
@@ -857,73 +925,5 @@ impl ReadOnlyCatalog {
             file.row_id_start,
         )
         .await
-    }
-
-    /// Publishes missing summaries without filling the reader's summary caches.
-    async fn publish_table(
-        &self,
-        snapshot: &CatalogSnapshot,
-        data_store: &DataStore,
-        data_prefix: &str,
-        table: TableId,
-        since: Option<SnapshotId>,
-    ) -> Result<RowSummaryPublish> {
-        let Some(files) = snapshot.data_files.get(&table.get()) else {
-            return Ok(RowSummaryPublish::default());
-        };
-        let mut files = files.values();
-        let mut files = std::iter::from_fn(|| {
-            files
-                .find(|file| since.is_none_or(|since| file.begin_snapshot > since.get()))
-                .map(|value| data_file_info(value))
-        })
-        .peekable();
-        if files.peek().is_none() {
-            return Ok(RowSummaryPublish::default());
-        }
-        let table_prefix = snapshot.table_data_prefix(table)?;
-        let mut published = RowSummaryPublish::default();
-
-        let mut outcomes = stream::iter(files.map(|file| {
-            let table_prefix = &table_prefix;
-            async move {
-                let id = file.id;
-                (
-                    id,
-                    self.publish_file(data_store, data_prefix, table_prefix, table, file)
-                        .await,
-                )
-            }
-        }))
-        .buffer_unordered(data_file::PUBLISH_CONCURRENCY);
-
-        while let Some((data_file_id, written)) = outcomes.next().await {
-            published.files_considered = published.files_considered.saturating_add(1);
-            match written {
-                Ok(true) => {
-                    published.summaries_built = published.summaries_built.saturating_add(1);
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    published.files_failed = published.files_failed.saturating_add(1);
-                    warn!(
-                        table_id = table.get(),
-                        data_file_id = data_file_id.get(),
-                        %error,
-                        "publishing skipped a row summary it could not read"
-                    );
-                }
-            }
-        }
-
-        debug!(
-            table_id = table.get(),
-            files_considered = published.files_considered,
-            summaries_built = published.summaries_built,
-            files_failed = published.files_failed,
-            "row summaries published"
-        );
-
-        Ok(published)
     }
 }

@@ -606,9 +606,9 @@ async fn a_scan_does_not_evict_what_probes_need() {
 
     // Warm: whatever this costs, it is what a repeat should cost.
     let _ = reader.snapshot().await.unwrap();
-    let before_repeat = moraine::cache_tally();
+    let before_repeat = reader.cache_tally();
     let _ = reader.snapshot().await.unwrap();
-    let warm_misses = moraine::cache_tally().metadata_misses - before_repeat.metadata_misses;
+    let warm_misses = reader.cache_tally().metadata_misses - before_repeat.metadata_misses;
 
     // A full scan of every subspace, then the same read again.
     let census = reader
@@ -621,10 +621,10 @@ async fn a_scan_does_not_evict_what_probes_need() {
         .unwrap();
     assert!(!census.subspaces.is_empty());
 
-    let before_after_scan = moraine::cache_tally();
+    let before_after_scan = reader.cache_tally();
     let _ = reader.snapshot().await.unwrap();
     let after_scan_misses =
-        moraine::cache_tally().metadata_misses - before_after_scan.metadata_misses;
+        reader.cache_tally().metadata_misses - before_after_scan.metadata_misses;
     reader.close().await.unwrap();
 
     assert!(
@@ -786,7 +786,7 @@ async fn the_shared_cache_reports_metadata_apart_from_data_blocks() {
 /// see the one cache no byte budget covers. It grows with the catalog and is
 /// replaced when the head moves, never evicted under pressure.
 #[tokio::test]
-async fn a_handle_reports_what_its_decoded_catalog_holds() {
+async fn a_handle_does_not_retain_decoded_catalogs() {
     let object_store = Arc::new(InMemory::new());
     let writer = Catalog::open(
         Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
@@ -811,7 +811,7 @@ async fn a_handle_reports_what_its_decoded_catalog_holds() {
         .unwrap();
     writer.snapshot().await.unwrap();
     let small = writer.projection_bytes();
-    assert!(small > 0, "a materialized catalog reports nothing");
+    assert_eq!(small, 0, "the caller owns the materialized catalog");
 
     writer
         .commit(|tx| {
@@ -826,11 +826,8 @@ async fn a_handle_reports_what_its_decoded_catalog_holds() {
         .unwrap();
     writer.snapshot().await.unwrap();
 
-    assert!(
-        writer.projection_bytes() > small,
-        "a larger catalog must report more: {small} then {}",
-        writer.projection_bytes()
-    );
+    assert_eq!(writer.projection_bytes(), 0);
+    writer.close().await.unwrap();
 }
 
 /// Warming a table reads its index and inline probe ranges, and an index

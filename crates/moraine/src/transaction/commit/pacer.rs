@@ -20,6 +20,7 @@ use tokio::time::Instant;
 /// and waiting longer coalesces nothing.
 pub(crate) struct FlushPacer {
     db: Db,
+    publication: Option<crate::store::checkpoint::Publisher>,
     spacing: Duration,
     state: Mutex<PacerState>,
     /// Serializes the flushes themselves, so a deferred one never overlaps
@@ -155,8 +156,22 @@ impl PacerState {
 }
 
 impl FlushPacer {
+    #[cfg(test)]
     pub(crate) fn new(db: Db, spacing: Duration) -> Arc<Self> {
         Arc::new(Self {
+            db,
+            publication: None,
+            spacing,
+            state: Mutex::new(PacerState::default()),
+            flushes: tokio::sync::Mutex::new(()),
+            stranded: tokio::sync::watch::Sender::new(0),
+            population: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn publishing(db: Db, spacing: Duration, admin: slatedb::admin::Admin) -> Arc<Self> {
+        Arc::new(Self {
+            publication: Some(crate::store::checkpoint::Publisher::new(db.clone(), admin)),
             db,
             spacing,
             state: Mutex::new(PacerState::default()),
@@ -164,6 +179,20 @@ impl FlushPacer {
             stranded: tokio::sync::watch::Sender::new(0),
             population: tokio::sync::Notify::new(),
         })
+    }
+
+    pub(crate) async fn publish_through(&self, sequence: u64) -> Result<(), slatedb::Error> {
+        if let Some(publication) = &self.publication {
+            publication.through(sequence).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn publish_flushed(&self) -> Result<(), slatedb::Error> {
+        if let Some(publication) = &self.publication {
+            publication.flushed().await?;
+        }
+        Ok(())
     }
 
     fn state(&self) -> MutexGuard<'_, PacerState> {

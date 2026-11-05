@@ -9,8 +9,8 @@
 //! kinds yield only their single current row since they are never mirrored
 //! to history. DuckLake filters lifecycles in SQL over these rows.
 //!
-//! Every function opens one fresh read session, and most are served from a
-//! maintained projection when its head matches rather than by rescanning.
+//! Entity dumps read only the requested kind or table through a fresh read
+//! session, without retaining decoded entities between calls.
 //! Unscoped calls spanning several `dump_*` reads are not snapshot-consistent;
 //! a read surface from `IndexReadScope` instead shares its pinned session.
 //! Opening that session refuses a store undergoing a structural migration, so
@@ -22,15 +22,13 @@
 //! instead — [`staged::StagedTransaction`]'s `visible_*` family, which
 //! overlays the staged rows onto the same records these functions scan.
 
-use std::{collections::BTreeMap, ops::Bound, sync::Arc};
-
-use bytes::Bytes;
+use std::collections::BTreeMap;
 
 use crate::{
-    catalog::{ReadOnlyCatalog, projection, projection::ProjectionCache},
+    catalog::ReadOnlyCatalog,
     error::{Error, Result},
     store::{
-        key::{TableScopedKind, current_table_prefix, history_table_prefix, increment_prefix},
+        key::TableScopedKind,
         proto::{
             ColumnTag, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
             GcFileValue, HeadValue, MacroValue, MappingValue, OptionScopeValue, PartitionValue,
@@ -38,14 +36,11 @@ use crate::{
             TableValue, TagValue, ViewColumnTag, ViewValue,
         },
         read::{
-            EntityRecord, RecordSet, read_head, scan_current_records, scan_history_records,
+            self, EntityCursor, EntityRecord, EntityRecordKind, Versions, read_head,
             scan_schema_versions, scan_snapshots,
         },
     },
 };
-
-#[doc(hidden)]
-pub mod metadata_export;
 
 /// The pinned store revision; an adapter must pair it with its attachment
 /// identity.
@@ -64,42 +59,14 @@ async fn session_head(
     read_head(session.handle()).await
 }
 
-/// The stamp of the view a read-write handle already holds, usable as a
-/// projection lookup key without a head read. `None` on a read-only handle
-/// or a writer whose view is not held. Only a lookup key: a miss falls
-/// through to the session path.
-fn writer_head(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
-    let Some(view) = catalog.writer_head_view() else {
-        return Ok(None);
-    };
-    catalog.refuse_if_closed()?;
-
-    Ok(Some(crate::catalog::projection::view_head(&view)))
-}
-
-/// Locks the shared projection state for reading, recovering a poisoned
-/// lock.
-fn projections_read(catalog: &ReadOnlyCatalog) -> std::sync::RwLockReadGuard<'_, ProjectionCache> {
-    catalog
-        .projections()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// As [`projections_read`], for writing (installs).
-fn projections_write(
-    catalog: &ReadOnlyCatalog,
-) -> std::sync::RwLockWriteGuard<'_, ProjectionCache> {
-    catalog
-        .projections()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
+#[doc(hidden)]
+pub mod catalog_read;
 #[doc(hidden)]
 pub mod index;
 #[doc(hidden)]
 pub mod inline;
+#[doc(hidden)]
+pub mod metadata_cursor;
 #[doc(hidden)]
 pub mod staged;
 
@@ -123,10 +90,6 @@ pub use crate::store::proto::{
 /// snapshot id.
 #[doc(hidden)]
 pub async fn head_stamp(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
-    if let Some(head) = writer_head(catalog)? {
-        return Ok(Some(head));
-    }
-
     let session = catalog.begin_read().await?;
     let head = session_head(catalog, &session).await;
     session.finish();
@@ -151,137 +114,49 @@ enum HistoryNeed {
     Never,
 }
 
-impl HistoryNeed {
-    fn wants_history(self) -> bool {
-        matches!(self, Self::Always)
-    }
-}
-
-/// The shared record set's two halves at the session head, each served
-/// from the projection cache when its stamp matches and scanned at most
-/// once otherwise.
-async fn entity_halves(
+/// Projects one entity range without retaining a decoded record cache.
+async fn dump_range<T>(
     catalog: &ReadOnlyCatalog,
-    history: HistoryNeed,
-) -> Result<(Option<HeadValue>, Arc<RecordSet>, Arc<RecordSet>)> {
-    // A read-write handle's held view is at head, so a read served wholly
-    // from the cache needs neither a session nor a head read.
-    if let Some(head) = writer_head(catalog)? {
-        let want_history = history.wants_history();
-        let projections = projections_read(catalog);
-        if let Some(current) = projections.current_entities_at(&head) {
-            let held_history = projections.history_entities_at(&head);
-            if !want_history {
-                return Ok((Some(head), current, Arc::default()));
-            }
-            if let Some(history) = held_history {
-                return Ok((Some(head), current, history));
-            }
-        }
-    }
-
+    kind: EntityRecordKind,
+    versions: Versions,
+    table: Option<u64>,
+    extract: impl Fn(&EntityRecord) -> Option<T>,
+) -> Result<Vec<T>> {
     let session = catalog.begin_read().await?;
-    let head = session_head(catalog, &session).await?;
-    let want_history = history.wants_history();
-
-    let (held_current, held_history) = match &head {
-        Some(head) => {
-            let projections = projections_read(catalog);
-            (
-                projections.current_entities_at(head),
-                projections.history_entities_at(head),
-            )
+    let result = read::consistent(session.handle(), || async {
+        crate::transaction::commit::refuse_mid_migration(session.handle()).await?;
+        let mut cursor = EntityCursor::open(session.handle(), kind, versions, table).await?;
+        let mut rows = Vec::new();
+        let mut memory = crate::MemoryReservation::reserve(0)?;
+        while let Some((record, _record_memory)) = cursor.next().await? {
+            memory.resize(memory.bytes().saturating_add(record.estimated_bytes()))?;
+            if let Some(row) = extract(&record) {
+                rows.push(row);
+            }
         }
-        None => (None, None),
-    };
-    let history_settled = !want_history || held_history.is_some();
-    if let Some(current) = &held_current
-        && history_settled
-    {
-        session.finish();
-        let history = held_history.unwrap_or_default();
-        return Ok((head, Arc::clone(current), history));
-    }
-
-    // Scan only the missing halves, under one consistent cut. The closure
-    // may re-run on a read-only handle, so it clones what it captures.
-    let handle = session.handle();
-    let current_held = held_current.clone();
-    let history_held = held_history.clone();
-    let scanned = crate::store::read::consistent(handle, || {
-        let current_held = current_held.clone();
-        let history_held = history_held.clone();
-        async move {
-            let current = async {
-                if let Some(records) = current_held {
-                    return Ok(records);
-                }
-                catalog.tally_current_scan();
-                Ok::<_, Error>(Arc::new(scan_current_records(handle).await?))
-            };
-            let history = async {
-                match (&history_held, want_history) {
-                    (Some(records), _) => Ok(Arc::clone(records)),
-                    (None, true) => {
-                        catalog.tally_history_scan();
-                        Ok::<_, Error>(Arc::new(scan_history_records(handle).await?))
-                    }
-                    (None, false) => Ok(Arc::default()),
-                }
-            };
-            futures::try_join!(current, history)
-        }
+        Ok(rows)
     })
     .await;
     session.finish();
-    let (current, history) = scanned?;
-
-    if let Some(head) = &head {
-        let mut projections = projections_write(catalog);
-        if held_current.is_none() {
-            projections.install_current_entities(*head, Arc::clone(&current));
-        }
-        if want_history && held_history.is_none() {
-            projections.install_history_entities(*head, Arc::clone(&history));
-        }
-    }
-
-    Ok((head, current, history))
+    result
 }
 
-/// Scans `current` then `history` through the shared record set, keeping
-/// only the records `extract` maps to `Some`. `extract` borrows and clones
-/// what it keeps, so a dump copies only the rows it returns.
 async fn dump_entities<T>(
     catalog: &ReadOnlyCatalog,
+    kind: EntityRecordKind,
     extract: impl Fn(&EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    let (_, current, history) = entity_halves(catalog, HistoryNeed::Always).await?;
-    Ok(current
-        .values()
-        .chain(history.values())
-        .map(Arc::as_ref)
-        .filter_map(extract)
-        .collect())
+    dump_range(catalog, kind, Versions::LiveAndEnded, None, extract).await
 }
 
-/// The records under `prefix`, in key order. One table's records of one
-/// kind are a contiguous key range, so a narrowed dump walks that range
-/// instead of every record the half holds.
-fn records_under(records: &RecordSet, prefix: Vec<u8>) -> impl Iterator<Item = &EntityRecord> {
-    let end = increment_prefix(prefix.clone());
-    let bounds = (
-        Bound::Included(Bytes::from(prefix)),
-        end.map_or(Bound::Unbounded, |end| Bound::Excluded(Bytes::from(end))),
-    );
-
-    records
-        .range::<_, Bytes>(bounds)
-        .map(|(_, record)| record.as_ref())
+async fn dump_current_entities<T>(
+    catalog: &ReadOnlyCatalog,
+    kind: EntityRecordKind,
+    extract: impl Fn(&EntityRecord) -> Option<T>,
+) -> Result<Vec<T>> {
+    dump_range(catalog, kind, Versions::Live, None, extract).await
 }
 
-/// As [`dump_entities`], narrowed to one table's records of `kind` in each
-/// half, in the order the unnarrowed dump emits them.
 async fn dump_table_entities<T>(
     catalog: &ReadOnlyCatalog,
     kind: TableScopedKind,
@@ -289,33 +164,27 @@ async fn dump_table_entities<T>(
     history: HistoryNeed,
     extract: impl Fn(&EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    let (_, current, ended) = entity_halves(catalog, history).await?;
-    Ok(
-        records_under(&current, current_table_prefix(kind, table_id))
-            .chain(records_under(&ended, history_table_prefix(kind, table_id)))
-            .filter_map(extract)
-            .collect(),
-    )
-}
-
-/// As [`dump_entities`], for the unversioned kinds (statistics, tags,
-/// mappings, scheduled deletions), which are never mirrored to `history`.
-async fn dump_current_entities<T>(
-    catalog: &ReadOnlyCatalog,
-    extract: impl Fn(&EntityRecord) -> Option<T>,
-) -> Result<Vec<T>> {
-    let (_, current, _) = entity_halves(catalog, HistoryNeed::Never).await?;
-    Ok(current
-        .values()
-        .map(Arc::as_ref)
-        .filter_map(extract)
-        .collect())
+    let kind = match kind {
+        TableScopedKind::File => EntityRecordKind::File,
+        TableScopedKind::DeleteFile => EntityRecordKind::DeleteFile,
+        TableScopedKind::FileColumnStats => EntityRecordKind::FileColumnStats,
+        _ => {
+            return Err(Error::Corruption(format!(
+                "unsupported dump scope: {kind:?}"
+            )));
+        }
+    };
+    let versions = match history {
+        HistoryNeed::Always => Versions::LiveAndEnded,
+        HistoryNeed::Never => Versions::Live,
+    };
+    dump_range(catalog, kind, versions, Some(table_id), extract).await
 }
 
 /// Every `ducklake_schema` row, current and history.
 #[doc(hidden)]
 pub async fn dump_schemas(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::Schema, |r| match r {
         EntityRecord::Schema(v) => Some((**v).clone()),
         _ => None,
     })
@@ -325,7 +194,7 @@ pub async fn dump_schemas(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaValue>>
 /// Every `ducklake_table` row, current and history.
 #[doc(hidden)]
 pub async fn dump_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<TableValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::Table, |r| match r {
         EntityRecord::Table(v) => Some((**v).clone()),
         _ => None,
     })
@@ -335,7 +204,7 @@ pub async fn dump_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<TableValue>> {
 /// Every `ducklake_view` row, current and history.
 #[doc(hidden)]
 pub async fn dump_views(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::View, |r| match r {
         EntityRecord::View(v) => Some((**v).clone()),
         _ => None,
     })
@@ -346,7 +215,7 @@ pub async fn dump_views(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewValue>> {
 /// their parameters embedded in `impl_id`/`column_id` order.
 #[doc(hidden)]
 pub async fn dump_macros(catalog: &ReadOnlyCatalog) -> Result<Vec<MacroValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::Macro, |r| match r {
         EntityRecord::Macro(m) => Some((**m).clone()),
         _ => None,
     })
@@ -358,7 +227,7 @@ pub async fn dump_macros(catalog: &ReadOnlyCatalog) -> Result<Vec<MacroValue>> {
 /// always exactly the live rows.
 #[doc(hidden)]
 pub async fn dump_mappings(catalog: &ReadOnlyCatalog) -> Result<Vec<MappingValue>> {
-    dump_current_entities(catalog, |r| match r {
+    dump_current_entities(catalog, EntityRecordKind::Mapping, |r| match r {
         EntityRecord::Mapping(m) => Some((**m).clone()),
         _ => None,
     })
@@ -368,7 +237,7 @@ pub async fn dump_mappings(catalog: &ReadOnlyCatalog) -> Result<Vec<MappingValue
 /// Every `ducklake_column` row, current and history.
 #[doc(hidden)]
 pub async fn dump_columns(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::Column, |r| match r {
         EntityRecord::Column(v) => Some((**v).clone()),
         _ => None,
     })
@@ -378,7 +247,7 @@ pub async fn dump_columns(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnValue>>
 /// Every `ducklake_data_file` row, current and history.
 #[doc(hidden)]
 pub async fn dump_data_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DataFileValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::File, |r| match r {
         EntityRecord::File(v) => Some((**v).clone()),
         _ => None,
     })
@@ -412,7 +281,7 @@ pub async fn dump_data_files_of(
 /// Every `ducklake_delete_file` row, current and history.
 #[doc(hidden)]
 pub async fn dump_delete_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DeleteFileValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::DeleteFile, |r| match r {
         EntityRecord::DeleteFile(v) => Some((**v).clone()),
         _ => None,
     })
@@ -447,7 +316,7 @@ pub async fn dump_delete_files_of(
 /// columns), current and history.
 #[doc(hidden)]
 pub async fn dump_partition_info(catalog: &ReadOnlyCatalog) -> Result<Vec<PartitionValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::Partition, |r| match r {
         EntityRecord::Partition(v) => Some((**v).clone()),
         _ => None,
     })
@@ -458,69 +327,21 @@ pub async fn dump_partition_info(catalog: &ReadOnlyCatalog) -> Result<Vec<Partit
 /// current and history.
 #[doc(hidden)]
 pub async fn dump_sort_info(catalog: &ReadOnlyCatalog) -> Result<Vec<SortValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_entities(catalog, EntityRecordKind::Sort, |r| match r {
         EntityRecord::Sort(v) => Some((**v).clone()),
         _ => None,
     })
     .await
 }
 
-/// Serves one unversioned kind from its maintained projection when the
-/// head matches; a miss derives the rows from the shared `current` half
-/// and installs them for the next call.
-async fn dump_projected_current<K: Ord, T: Clone>(
-    catalog: &ReadOnlyCatalog,
-    read: impl Fn(&ProjectionCache, &HeadValue) -> Option<Arc<BTreeMap<K, T>>>,
-    install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
-    extract: impl Fn(&EntityRecord) -> Option<T>,
-) -> Result<Vec<T>> {
-    // Each serve is bound in a statement of its own so the cache lock is
-    // released before the rows are copied out of it.
-    if let Some(head) = writer_head(catalog)? {
-        let served = read(&projections_read(catalog), &head);
-        if let Some(rows) = served {
-            return Ok(projection::materialize(&rows));
-        }
-    }
-
-    let session = catalog.begin_read().await?;
-    let head = session_head(catalog, &session).await?;
-    if let Some(head) = &head {
-        let served = read(&projections_read(catalog), head);
-        if let Some(rows) = served {
-            session.finish();
-            return Ok(projection::materialize(&rows));
-        }
-    }
-    session.finish();
-
-    // Installed at the stamp the halves were served at, which may be newer
-    // than the head read above but never mismatched with the rows.
-    let (served_at, current, _) = entity_halves(catalog, HistoryNeed::Never).await?;
-    let rows: Vec<T> = current
-        .values()
-        .map(Arc::as_ref)
-        .filter_map(extract)
-        .collect();
-    if let Some(head) = served_at {
-        install(&mut projections_write(catalog), head, rows.clone());
-    }
-    Ok(rows)
-}
-
 /// Every `ducklake_table_stats` row. Unversioned, so always exactly the
 /// live rows.
 #[doc(hidden)]
 pub async fn dump_table_stats(catalog: &ReadOnlyCatalog) -> Result<Vec<TableStatsValue>> {
-    dump_projected_current(
-        catalog,
-        ProjectionCache::table_stats_at,
-        ProjectionCache::install_table_stats,
-        |r| match r {
-            EntityRecord::TableStats(v) => Some(**v),
-            _ => None,
-        },
-    )
+    dump_current_entities(catalog, EntityRecordKind::TableStats, |r| match r {
+        EntityRecord::TableStats(v) => Some(**v),
+        _ => None,
+    })
     .await
 }
 
@@ -530,15 +351,10 @@ pub async fn dump_table_stats(catalog: &ReadOnlyCatalog) -> Result<Vec<TableStat
 pub async fn dump_table_column_stats(
     catalog: &ReadOnlyCatalog,
 ) -> Result<Vec<TableColumnStatsValue>> {
-    dump_projected_current(
-        catalog,
-        ProjectionCache::table_column_stats_at,
-        ProjectionCache::install_table_column_stats,
-        |r| match r {
-            EntityRecord::TableColumnStats(v) => Some((**v).clone()),
-            _ => None,
-        },
-    )
+    dump_current_entities(catalog, EntityRecordKind::TableColumnStats, |r| match r {
+        EntityRecord::TableColumnStats(v) => Some((**v).clone()),
+        _ => None,
+    })
     .await
 }
 
@@ -548,7 +364,7 @@ pub async fn dump_table_column_stats(
 pub async fn dump_file_column_stats(
     catalog: &ReadOnlyCatalog,
 ) -> Result<Vec<FileColumnStatsValue>> {
-    dump_current_entities(catalog, |r| match r {
+    dump_current_entities(catalog, EntityRecordKind::FileColumnStats, |r| match r {
         EntityRecord::FileColumnStats(v) => Some((**v).clone()),
         _ => None,
     })
@@ -579,29 +395,7 @@ pub async fn dump_file_column_stats_of(
 /// Snapshots are append-only, so this is the full history.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
-    // Bound in a statement of its own so the cache lock is released before
-    // the rows are copied out of it.
-    if let Some(head) = writer_head(catalog)? {
-        let served = projections_read(catalog).snapshots_at(&head);
-        if let Some(rows) = served {
-            return Ok(projection::materialize(&rows));
-        }
-    }
-
     let session = catalog.begin_read().await?;
-    let head = session_head(catalog, &session).await?;
-    if let Some(head) = head {
-        let served = projections_read(catalog).snapshots_at(&head);
-        if let Some(rows) = served {
-            session.finish();
-            return Ok(projection::materialize(&rows));
-        }
-        let result = scan_snapshots(session.handle()).await;
-        session.finish();
-        let rows = result?;
-        projections_write(catalog).install_snapshots(head, rows.clone());
-        return Ok(rows);
-    }
     let result = scan_snapshots(session.handle()).await;
     session.finish();
     result
@@ -635,7 +429,7 @@ pub async fn dump_schema_versions(catalog: &ReadOnlyCatalog) -> Result<Vec<Schem
         session.finish();
         records
     };
-    let file_snapshots = dump_entities(catalog, |r| match r {
+    let file_snapshots = dump_entities(catalog, EntityRecordKind::File, |r| match r {
         EntityRecord::File(v) => Some((v.table_id, v.begin_snapshot)),
         _ => None,
     });
@@ -733,7 +527,7 @@ fn schema_version_floors(
 /// awaiting physical deletion.
 #[doc(hidden)]
 pub async fn dump_scheduled_deletions(catalog: &ReadOnlyCatalog) -> Result<Vec<GcFileValue>> {
-    dump_current_entities(catalog, |r| match r {
+    dump_current_entities(catalog, EntityRecordKind::GcFile, |r| match r {
         EntityRecord::GcFile(v) => Some((**v).clone()),
         _ => None,
     })
@@ -761,7 +555,7 @@ pub struct TagRow {
 #[doc(hidden)]
 pub async fn dump_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<TagRow>> {
     Ok(tag_rows_from(
-        dump_current_entities(catalog, |r| match r {
+        dump_current_entities(catalog, EntityRecordKind::Tag, |r| match r {
             EntityRecord::Tag(v) => Some((**v).clone()),
             _ => None,
         })
@@ -808,7 +602,7 @@ pub struct OptionRow {
 #[doc(hidden)]
 pub async fn dump_options(catalog: &ReadOnlyCatalog) -> Result<Vec<OptionRow>> {
     Ok(option_rows_from(
-        dump_current_entities(catalog, |r| match r {
+        dump_current_entities(catalog, EntityRecordKind::Option, |r| match r {
             EntityRecord::Option {
                 scope_kind,
                 scope_id,
@@ -936,7 +730,7 @@ pub fn column_tag_rows_from(columns: impl IntoIterator<Item = ColumnTags>) -> Ve
 /// record only, which carries the authoritative entries.
 #[doc(hidden)]
 pub async fn dump_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnTagRow>> {
-    let columns = dump_entities(catalog, |r| match r {
+    let columns = dump_entities(catalog, EntityRecordKind::Column, |r| match r {
         EntityRecord::Column(v) => Some(ColumnTags::from(v.as_ref())),
         _ => None,
     })
@@ -1035,7 +829,7 @@ pub fn view_column_tag_rows_from(
 /// record only.
 #[doc(hidden)]
 pub async fn dump_view_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewColumnTagRow>> {
-    let views = dump_entities(catalog, |r| match r {
+    let views = dump_entities(catalog, EntityRecordKind::View, |r| match r {
         EntityRecord::View(v) => Some(ViewColumnTags::from(v.as_ref())),
         _ => None,
     })
@@ -1419,6 +1213,8 @@ pub async fn dump_sort_expression_rows(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use object_store::memory::InMemory;
 
     use super::*;
@@ -1426,6 +1222,58 @@ mod tests {
         Catalog, CatalogOptions, ColumnDef, ColumnStats, DataFile, DeleteFile, FileColumnStats,
         MacroImplementationDef, MacroParameterDef,
     };
+
+    /// Scoped reads never decode another table's records.
+    #[tokio::test]
+    async fn scoped_reads_do_not_load_unrelated_catalog_records() {
+        use crate::store::{
+            key::{EntityKey, Key},
+            read,
+        };
+
+        let catalog = seed().await;
+        let files = dump_data_files(&catalog).await.unwrap();
+        let table_id = files[0].table_id;
+        let transaction = catalog.begin_write_tx().unwrap();
+        transaction
+            .put(
+                Key::current(EntityKey::FileColumnStats {
+                    table_id: u64::MAX,
+                    data_file_id: 1,
+                    column_id: 1,
+                })
+                .encode(),
+                vec![0xff],
+            )
+            .unwrap();
+        let head = read::read_head(crate::store::handle::ReadHandle::Tx(&transaction))
+            .await
+            .unwrap()
+            .unwrap();
+        let (key, value) = crate::transaction::commit::head_stamp(head.snapshot_id, head.batch_seq);
+        transaction.put(key, value.unwrap()).unwrap();
+        crate::transaction::commit::commit_durable(
+            transaction,
+            "test",
+            crate::store::StagedBytes::default(),
+            &catalog.store().commit_durability(),
+        )
+        .await
+        .unwrap();
+        catalog.forget_head_view();
+
+        assert_eq!(dump_data_files_of(&catalog, table_id).await.unwrap(), files);
+        assert_eq!(
+            dump_file_column_stats_of(&catalog, table_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(dump_schemas(&catalog).await.unwrap().len(), 2);
+        assert!(dump_file_column_stats_of(&catalog, u64::MAX).await.is_err());
+        catalog.close().await.unwrap();
+    }
 
     /// Seeds a store whose second commit renames a table — the fixture
     /// every assertion below reads from, so a table, a schema, a view, a
@@ -1563,48 +1411,30 @@ mod tests {
         assert_eq!(reused.batch_seq, minted.batch_seq + 1);
     }
 
-    /// At one head stamp, `current` and `history` are each scanned at most
-    /// once across every logical cache: the head view and the full dump
-    /// spread all derive from one shared record set.
+    /// Entity projections do not populate catalog-wide decoded caches.
     #[tokio::test]
-    async fn one_scan_pair_serves_the_head_view_and_every_dump() {
+    async fn entity_dumps_do_not_materialize_catalog_halves() {
         let catalog = seed().await;
-
-        let before = catalog.entity_scan_tallies();
-        let _ = catalog.snapshot().await.unwrap();
-        dump_schemas(&catalog).await.unwrap();
-        dump_tables(&catalog).await.unwrap();
-        dump_columns(&catalog).await.unwrap();
-        dump_data_files(&catalog).await.unwrap();
-        dump_delete_files(&catalog).await.unwrap();
-        dump_views(&catalog).await.unwrap();
-        dump_table_stats(&catalog).await.unwrap();
-        dump_table_column_stats(&catalog).await.unwrap();
-        let after = catalog.entity_scan_tallies();
-
-        assert!(
-            after.0 - before.0 <= 1,
-            "current scanned {} times at one head",
-            after.0 - before.0
-        );
-        assert!(
-            after.1 - before.1 <= 1,
-            "history scanned {} times at one head",
-            after.1 - before.1
-        );
-
-        // A second pass at the same head scans nothing at all.
-        let _ = catalog.snapshot().await.unwrap();
-        dump_schemas(&catalog).await.unwrap();
-        dump_table_stats(&catalog).await.unwrap();
-        let again = catalog.entity_scan_tallies();
-        assert_eq!(again, after, "a warm pass re-scanned");
+        let before = catalog.full_entity_scans();
+        let retained = catalog.projection_bytes();
+        for _ in 0..2 {
+            dump_schemas(&catalog).await.unwrap();
+            dump_tables(&catalog).await.unwrap();
+            dump_columns(&catalog).await.unwrap();
+            dump_data_files(&catalog).await.unwrap();
+            dump_delete_files(&catalog).await.unwrap();
+            dump_views(&catalog).await.unwrap();
+            dump_table_stats(&catalog).await.unwrap();
+            dump_table_column_stats(&catalog).await.unwrap();
+        }
+        assert_eq!(catalog.full_entity_scans(), before);
+        assert_eq!(catalog.projection_bytes(), retained);
+        catalog.close().await.unwrap();
     }
 
-    /// A commit folds both halves of the shared record set forward, so the
-    /// dumps after it scan nothing and still show what it wrote and ended.
+    /// Entity dumps observe created and ended records after a commit.
     #[tokio::test]
-    async fn a_commit_folds_the_record_set_instead_of_dropping_it() {
+    async fn entity_dumps_observe_committed_changes() {
         let catalog = seed().await;
         let tables = dump_tables(&catalog).await.unwrap();
         let orders = tables
@@ -1613,7 +1443,7 @@ mod tests {
             .unwrap()
             .table_id;
         dump_schemas(&catalog).await.unwrap();
-        let warmed = catalog.entity_scan_tallies();
+        let warmed = catalog.full_entity_scans();
 
         let ended_at = catalog
             .commit(|tx| {
@@ -1640,17 +1470,15 @@ mod tests {
             "the dump missed the version the commit ended"
         );
         assert_eq!(
-            catalog.entity_scan_tallies(),
+            catalog.full_entity_scans(),
             warmed,
-            "a dump after a commit rescanned the store"
+            "a dump after a commit scanned the entire current subspace"
         );
     }
 
-    /// A read-only handle that replays another writer's commit folds the
-    /// `current` half forward with the view, so its next current-only dump
-    /// scans nothing.
+    /// Reader projections observe a refreshed head without full scans.
     #[tokio::test]
-    async fn a_reader_folds_a_replayed_gap_into_its_record_set() {
+    async fn reader_projections_observe_a_refreshed_head() {
         let store: Arc<InMemory> = Arc::new(InMemory::new());
         let writer = seed_on(Arc::clone(&store)).await;
         let options = CatalogOptions {
@@ -1660,7 +1488,7 @@ mod tests {
         let reader = Catalog::open_read_only(store, options).await.unwrap();
         reader.snapshot().await.unwrap();
         dump_table_stats(&reader).await.unwrap();
-        let warmed = reader.entity_scan_tallies();
+        let warmed = reader.full_entity_scans();
 
         let minted = writer
             .commit(|tx| tx.create_schema("more").map(|_| ()))
@@ -1681,8 +1509,8 @@ mod tests {
 
         dump_table_stats(&reader).await.unwrap();
         assert_eq!(
-            reader.entity_scan_tallies().0,
-            warmed.0,
+            reader.full_entity_scans(),
+            warmed,
             "a reader dump after a replayed gap rescanned `current`"
         );
         assert!(
@@ -1737,19 +1565,6 @@ mod tests {
             assert_eq!(view.live_records(kind), scanned, "{kind:?}");
         }
         session.finish();
-    }
-
-    /// A head-view materialization alone never scans `history` — the view
-    /// needs `current` only, and sharing must not grow it a scan.
-    #[tokio::test]
-    async fn a_head_view_alone_scans_no_history() {
-        let catalog = seed().await;
-
-        let before = catalog.entity_scan_tallies();
-        let _ = catalog.snapshot().await.unwrap();
-        let after = catalog.entity_scan_tallies();
-
-        assert_eq!(after.1, before.1, "a head view scanned history");
     }
 
     /// Unversioned kinds (statistics, tags, scheduled deletions) live only

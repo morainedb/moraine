@@ -74,7 +74,8 @@ pub enum SlotOffer {
 
 `write_at` is the whole commit path. It offers the commit as the slot at
 `sequence`, conditional on the log holding nothing there. On a win the
-library's store has applied the slot, or has been served it; on a loss it
+library's store has applied the slot, or has been served it, and a published
+durable checkpoint covers it; on a loss it
 has folded, or been served, everything that beat the offer, and `through`
 is how far it reaches. The catalog never commits a logged batch into
 SlateDB itself and never sees the slots it lost to: it re-prepares against
@@ -150,6 +151,7 @@ pub struct CatalogHooks {
 #[async_trait]
 pub trait TakeStore: Send + Sync + 'static {
     async fn take(&self) -> Result<Option<(slatedb::Db, Arc<dyn WriterSession>)>>;
+    async fn take_for_publication(&self) -> Result<(slatedb::Db, Arc<dyn WriterSession>)>;
 }
 ```
 
@@ -172,6 +174,19 @@ pub trait TakeStore: Send + Sync + 'static {
   the fold cadence, the flush count, the retention, the fold poll, and the
   committer's poll — as values the library reads. The catalog interprets
   none of them.
+
+`CatalogHooks::publish(&db)` flushes WAL durability and publishes the current
+read checkpoint using the catalog's path and object store. The library calls it
+before reporting a won slot; a publication failure after the slot lands is an
+unknown commit outcome, never permission to offer that mutation again. A holder
+publishes its applied state; a follower takes a temporary writer through
+`TakeStore::take_for_publication`, verifies replay covers its won slot, publishes,
+and closes without flushing an L0 file. The default publication take delegates
+to `take` and reports a refusal; the catalog's implementation bypasses the L0
+ceiling because publication does not write an L0 file. A subsequent flush must
+republish the flushed state before releasing the writer so new fixed readers do
+not replay an obsolete WAL. The library continues to own all offer, fold, and
+publication sequencing.
 
 The catalog also exposes two things for the enterprise maintenance crate,
 which today reaches the loop through catalog verbs:

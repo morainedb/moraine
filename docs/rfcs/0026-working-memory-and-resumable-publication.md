@@ -37,6 +37,15 @@ it; a release returns pages the allocator was holding, not reservations.
 
 ## Snapshots and results
 
+Demand-loaded metadata uses operation-owned decoded records and bounded
+batches under working-memory admission. Read-ahead and concurrent consumers
+must fit their working allowance. No decoded-object cache is added; reuse
+stays in Foyer's block cache. Explicit materialization and owned-result APIs
+still require memory proportional to their results. Catalog-wide loads in
+ordinary extension reads, commits, or maintenance prevent completion of the
+demand-loading transition.
+
+
 Cold head-view materialization is serialized per catalog. Snapshot generations
 reserve their estimated metadata storage; held readers retain their generation's
 reservation while a new generation is admitted independently. A head view's

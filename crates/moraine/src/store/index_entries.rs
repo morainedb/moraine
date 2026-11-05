@@ -2,12 +2,11 @@
 //! entry carries, and scans that hand back decoded entries.
 
 use bytes::Bytes;
-use slatedb::DbIterator;
 
 use crate::{
     error::{Error, Result},
     store::{
-        handle::{ReadHandle, ScanShape},
+        handle::{ReadHandle, ScanIterator, ScanShape},
         key::{IndexKey, IndexKind, Key, index_id_suffix, index_index_prefix, index_kind_prefix},
     },
 };
@@ -34,7 +33,7 @@ pub(crate) async fn scan_index_entries(
     kind: IndexKind,
     index_id: u64,
     shape: ScanShape,
-) -> Result<DbIterator> {
+) -> Result<ScanIterator> {
     Ok(handle
         .scan_prefix(index_index_prefix(kind, index_id), .., shape)
         .await?)
@@ -79,7 +78,7 @@ pub(crate) struct StoredIndexEntries<'a> {
     handle: ReadHandle<'a>,
     index_id: u64,
     kinds: std::array::IntoIter<IndexKind, 2>,
-    entries: Option<DbIterator>,
+    entries: Option<ScanIterator>,
 }
 
 /// Starts a walk over every entry of `index_id`.

@@ -12,8 +12,8 @@
 # reports the tear as "No snapshot found" and cannot re-resolve, because it
 # was handed an empty result rather than a typed error.
 #
-# So each table is materialized once per DuckDB transaction and every reader
-# of it in that transaction is served the same rows. That is what this pins:
+# Each DuckDB transaction holds one fixed store read scope. Independent scans
+# from that scope observe the same rows. That is what this pins:
 # a commit landing under an open reader does not change what the reader's
 # transaction sees, and the reader's next transaction sees it.
 #
@@ -383,11 +383,9 @@ SELECT (SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file WHERE
 ----
 true
 
-# The rows this attach holds are the shim's own allocation, outside
-# moraine's budgets and DuckDB's memory limit both, so the memory tally
-# names them. Non-zero here because the reads above left sets held.
+# Completed transactions do not leave decoded metadata rows on the attach.
 query I
-SELECT held_metadata_bytes > 0 FROM moraine_memory_tally('scoped');
+SELECT held_metadata_bytes = 0 FROM moraine_memory_tally('scoped');
 ----
 true
 

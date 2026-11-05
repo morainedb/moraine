@@ -8,9 +8,9 @@ use std::{
 use futures::{StreamExt, stream::FuturesUnordered};
 use tracing::info;
 
-use super::{ReadOnlyCatalog, cache_epoch, index_probe_cache::Probe};
+use super::{ReadOnlyCatalog, index_probe_cache::Probe};
 use crate::{
-    catalog::{CatalogSnapshot, IndexId, IndexInfo, IndexState, TableId},
+    catalog::{IndexId, IndexInfo, IndexState, TableId},
     error::{Error, Result},
     store::{
         handle::{ReadHandle, ReadSession, ScanOrder},
@@ -493,21 +493,22 @@ impl ReadOnlyCatalog {
         index: IndexId,
         lookup: impl AsyncFn(ReadHandle<'s>, IndexInfo) -> Result<T>,
     ) -> Result<T> {
-        if let Some((view, handle)) = self.warm_writer_read()? {
-            let outcome = match ready_index(&view, table, index) {
-                Ok(info) => lookup(handle, info).await,
-                Err(error) => Err(error),
-            };
-            if self.still_holds(&view) {
-                return outcome;
-            }
-        }
-
-        let epoch = cache_epoch(&self.projections);
         let handle = Option::insert(session, self.begin_read().await?).handle();
         read::consistent(handle, || async {
-            let view = self.head_view(handle, epoch).await?;
-            lookup(handle, ready_index(&view, table, index)?).await
+            let value: crate::store::proto::IndexValue = read::read_singleton(
+                handle,
+                crate::store::key::Key::current(crate::store::key::EntityKey::Index {
+                    table_id: table.get(),
+                    index_id: index.get(),
+                }),
+            )
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+            lookup(
+                handle,
+                ready_index(crate::catalog::snapshot::index_info(&value), index)?,
+            )
+            .await
         })
         .await
     }
@@ -550,12 +551,8 @@ fn encode_lookup_keys(
     Ok(encoded)
 }
 
-/// The index `index` of `table` in `view`, once it is ready to serve.
-fn ready_index(view: &CatalogSnapshot, table: TableId, index: IndexId) -> Result<IndexInfo> {
-    let info = view
-        .index_by_id(table, index)
-        .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
-
+/// Checks that the point-read definition is ready to serve.
+fn ready_index(info: IndexInfo, index: IndexId) -> Result<IndexInfo> {
     match info.state {
         IndexState::Ready => Ok(info),
         IndexState::Building | IndexState::Maintaining => Err(Error::IndexBuilding(format!(

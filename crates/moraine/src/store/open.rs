@@ -453,7 +453,7 @@ impl<'a> StoreBuilder<'a> {
 
     /// The admin surface over this store, which reaches the write-ahead
     /// log wherever it lives.
-    fn admin(&self) -> slatedb::admin::Admin {
+    pub(crate) fn admin(&self) -> slatedb::admin::Admin {
         let mut builder = AdminBuilder::new(self.path, Arc::clone(&self.object_store));
         if let Some(wal) = &self.wal_object_store {
             builder = builder.with_wal_object_store(Arc::clone(wal));
@@ -586,9 +586,7 @@ async fn warm(
 }
 
 /// Reads one entry of `subspace` in `shape`, or the whole range in probe
-/// shape when `deep`, so the touched blocks are admitted. A deep walk of
-/// `current` or `history` runs its data-scaled kinds as concurrent
-/// sub-ranges.
+/// shape when `deep`, admitting blocks without retaining the scanned rows.
 async fn warm_subspace(
     handle: ReadHandle<'_>,
     subspace: key::Subspace,
@@ -602,18 +600,14 @@ async fn warm_subspace(
         return Ok(());
     }
 
-    let split_kinds = match subspace {
-        key::Subspace::Current => key::SPLIT_SCAN_KINDS
-            .map(key::current_entity_kind_prefix)
-            .to_vec(),
-        key::Subspace::History => key::SPLIT_SCAN_KINDS
-            .map(key::history_entity_kind_prefix)
-            .to_vec(),
-        _ => Vec::new(),
-    };
-    handle
-        .scan_prefix_split(&prefix, &split_kinds, ScanShape::Probe)
-        .await?;
+    let mut iterator = handle.scan_prefix(&prefix, .., ScanShape::Metadata).await?;
+    let mut visited = 0_usize;
+    while iterator.next().await?.is_some() {
+        visited = visited.wrapping_add(1);
+        if visited.is_multiple_of(1024) {
+            tokio::task::yield_now().await;
+        }
+    }
 
     Ok(())
 }

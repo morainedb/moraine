@@ -146,21 +146,29 @@ publicly.
 
 ### Reads
 
+Ordinary reads use a stable read-point handle with fallible asynchronous
+lookups and bounded cursors. The handle retains the store revision, not a
+catalog-wide decoded map. Unversioned metadata and versioned entities must
+observe that same revision. Decoded values belong to the consuming operation;
+there is no decoded-object cache.
+
+`CatalogSnapshot` remains an explicit materialization API with its existing
+in-memory accessors. Its caller pays for the complete result. It must not be
+an implicit prerequisite for opening a read scope, querying one table, or
+committing a small mutation. Compatibility methods returning `Vec` retain
+their complete results; cursor consumers process and release bounded batches.
+
+
 ```rust
-let snaphot = catalog.snapshot().await?;                 // current catalog
+let snapshot = catalog.snapshot().await?;                 // current catalog
 let past = catalog.snapshot_at(snapshot_id).await?;   // time travel
 ```
 
-Both return `Arc<CatalogSnapshot>`. `snapshot()` serves the handle's cached
-view when it already stands at head (RFC 0009) and scans `current` when it
-does not; `snapshot_at(S)` always scans, additionally reading the relevant
-`history` ranges and filtering by begin/end per RFC 0002.
-
-The `Arc` is what makes a warm read genuinely cheap. The view is immutable
-and often large, so handing back a shared pointer lets the handle and every
-caller name the same materialization; returning it by value would copy the
-whole catalog on each read and give back most of what the cache saves.
-Callers who want an owned copy can still clone through the `Arc`.
+Both return caller-owned `Arc<CatalogSnapshot>` values. `snapshot()` scans
+`current`; `snapshot_at(S)` also reads the relevant `history` ranges and
+filters visibility. The handle retains neither result nor decoded scan rows.
+The `Arc` allows callers to share an explicitly materialized view. Ordinary
+operations should use fixed read scopes and demand-loaded projections.
 
 Accessors (all in-memory, name→id resolved internally):
 
@@ -193,7 +201,7 @@ asking. They are row
 data, not catalog metadata: an inlined chunk carries the table's actual values
 as an Arrow IPC body, so materializing them into every `CatalogSnapshot` would
 put unbounded row bytes behind an accessor the whole catalog shares and break
-the "the live catalog is small by design" premise the materialized view rests
+the complete-result memory cost the materialized compatibility view carries
 on. Rows of one chunk share one body and rows of one schema version share one
 schema, so each set of bytes is read and returned once however many rows
 reference it.
@@ -491,12 +499,6 @@ Per RFC 0001:
   closure already gives an inspectable, testable unit while keeping resolution
   in the core where the in-memory snapshot lives.
 
-- **Lazy read handle** (accessors issue store scans on demand, nothing
-  materialized): contradicts RFC 0002's "scan `current` at attach" model and
-  reintroduces the hot-path history-filtering cost the `current`/`history` split
-  exists to avoid. Rejected: `CatalogSnapshot` is materialized because the
-  live catalog is small by design.
-
 - **Caller provides a `slatedb::Db`**: exposes the substrate in the public
   API, ties moraine's semver to SlateDB's, and contradicts keeping `store`
   internal. Rejected: `object_store` is the right primitive to expose;
@@ -519,3 +521,14 @@ Per RFC 0001:
   semantics rather than in the extension contract, which was unresolved when
   this was written. The bet paid: the contract settled (RFC 0005) without
   moving a verb, and the surface was legible throughout.
+
+Staged-row translation resolves an operation-owned dependency projection:
+point reads for authored entity identities; the affected tables' descriptors,
+columns, index definitions and table statistics; referenced file mappings;
+and a scan of each affected table's delete-file directory retaining only
+records targeting referenced files. These partial projections are never
+installed as complete catalog snapshots. Rebase retains the caller's fixed
+authored read scope until its dependencies are resolved. The explicit public verb
+closure API still requires a complete working snapshot. Internal index build and
+certification commits instead declare their table dependencies and fold pending
+batch writes into that operation-owned projection.

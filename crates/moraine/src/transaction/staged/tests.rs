@@ -42,6 +42,68 @@ async fn open() -> Catalog {
     .unwrap()
 }
 
+#[tokio::test]
+async fn a_scoped_live_read_does_not_materialize_other_tables() {
+    let catalog = open().await;
+    let transaction = catalog.begin_write_tx().unwrap();
+    transaction
+        .put(
+            Key::current(EntityKey::File {
+                table_id: 99,
+                data_file_id: 1,
+            })
+            .encode(),
+            [0xff],
+        )
+        .unwrap();
+    let staged = StagedTransaction::begin_detached(&catalog, transaction);
+    assert!(
+        staged
+            .visible_data_files_of(1, Some(0))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(staged.visible_data_files_of(99, Some(0)).await.is_err());
+    staged.rollback();
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_staged_option_write_does_not_materialize_other_tables() {
+    let catalog = open().await;
+    let transaction = catalog.begin_write_tx().unwrap();
+    transaction
+        .put(
+            Key::current(EntityKey::File {
+                table_id: 99,
+                data_file_id: 1,
+            })
+            .encode(),
+            [0xff],
+        )
+        .unwrap();
+    let mut staged = StagedTransaction::begin_detached(&catalog, transaction);
+    staged.stage(RowOperation::Insert {
+        table: TableKind::Metadata,
+        cells: vec![
+            Cell::Str("probe".into()),
+            Cell::Str("set".into()),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    staged.commit().await.unwrap();
+    assert_eq!(
+        crate::ffi_support::catalog_read::global_option(&catalog, "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("set")
+    );
+    catalog.close().await.unwrap();
+}
+
 #[derive(Clone, Default)]
 struct CapturedCommitEvents(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
 
@@ -203,10 +265,10 @@ async fn staged_commit_diagnostics_join_scan_counts_and_commit_phases() {
     catalog.close().await.unwrap();
 }
 
-/// Repeated snapshot and schema-version projections scan the store once
-/// per transaction, however many times they are served.
+/// Repeated projections read their fixed scope again without retaining decoded
+/// rows.
 #[tokio::test]
-async fn repeated_snapshot_projections_scan_once_per_transaction() {
+async fn repeated_snapshot_projections_decode_per_operation() {
     let events = captured_commit_events();
 
     let catalog = open().await;
@@ -221,7 +283,7 @@ async fn repeated_snapshot_projections_scan_once_per_transaction() {
         vec![Cell::U64(1), Cell::U64(1), Cell::U64(5)],
     ));
 
-    // Three reads apiece: the scans the store sees must not follow.
+    // Repeated reads agree while each owns its decoded result.
     let snapshots = tx.visible_snapshots().await.unwrap();
     for _ in 0..3 {
         assert_eq!(tx.visible_snapshots().await.unwrap(), snapshots);
@@ -231,24 +293,28 @@ async fn repeated_snapshot_projections_scan_once_per_transaction() {
         );
     }
 
-    events.one(
-        "scanned committed snapshots for staged transaction",
-        &transaction_id,
+    assert_eq!(
+        events.count(
+            "scanned committed snapshots for staged transaction",
+            &transaction_id
+        ),
+        4
     );
-    events.one(
-        "scanned committed schema versions for staged transaction",
-        &transaction_id,
+    assert_eq!(
+        events.count(
+            "scanned committed schema versions for staged transaction",
+            &transaction_id
+        ),
+        3
     );
 
     tx.rollback();
     catalog.close().await.unwrap();
 }
 
-/// Every versioned kind narrows the same way as data files: bounded at
-/// the read point it is served from the head view without a scan, and
-/// bounded behind it the ended version is read and found.
+/// Head-bounded reads scan only current records; older bounds include history.
 #[tokio::test]
-async fn every_versioned_kind_bounded_at_the_read_point_scans_nothing() {
+async fn every_versioned_kind_bounded_at_the_read_point_scans_only_current() {
     let events = captured_commit_events();
 
     let catalog = open().await;
@@ -305,12 +371,12 @@ async fn every_versioned_kind_bounded_at_the_read_point_scans_nothing() {
             "scanned committed entities for staged transaction",
             &at_head
         ),
-        0,
-        "a read bounded at the read point scanned the store"
+        6,
+        "each kind must read only its own range"
     );
     assert_eq!(
         events.count("served committed entities from the head view", &at_head),
-        6
+        0
     );
     tx.rollback();
 
@@ -377,11 +443,16 @@ async fn a_data_file_bound_at_the_read_point_leaves_the_ended_half_unread() {
             "scanned committed entities for staged transaction",
             &at_head
         ),
-        0,
-        "a read bounded at the read point scanned the store"
+        1,
+        "the file read scans its current range"
     );
-    let served = events.one("served committed entities from the head view", &at_head);
+    let served = events.one(
+        "scanned committed entities for staged transaction",
+        &at_head,
+    );
     assert_eq!(served.get("kind").map(String::as_str), Some("File"));
+    assert_eq!(served.get("versions").map(String::as_str), Some("Live"));
+    assert_eq!(served.get("history_records").map(String::as_str), Some("0"));
     tx.rollback();
 
     // Bounded behind it — a time-travel read — keeps the full scan, and
@@ -914,7 +985,7 @@ async fn metadata_dumps(tx: &StagedTransaction) -> Vec<(&'static str, String)> {
         "table_column_stats" => tx.visible_table_column_stats(),
         "mappings" => tx.visible_mappings(),
         "tag_containers" => tx.visible_tag_containers(),
-        "option_scopes" => tx.visible_option_scopes(),
+        "option_scopes" => async { tx.visible_option_scopes().await.map(crate::ffi_support::option_rows_from) },
         "schema_version_records" => tx.visible_schema_version_records(),
         "scheduled_deletions" => tx.visible_scheduled_deletions(),
     ]

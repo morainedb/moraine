@@ -424,3 +424,42 @@ async fn resumed_build_still_detects_a_duplicate_of_a_committed_row() {
     assert!(matches!(result, Err(Error::Constraint(_))), "{result:?}");
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn index_lifecycle_avoids_unrelated_catalog_records() {
+    let (catalog, table, def) = fixture(&[chunk(vec![10, 20])]).await;
+    let tx = catalog.begin_write_tx().unwrap();
+    for entity in [
+        crate::store::key::EntityKey::View { view_id: 999 },
+        crate::store::key::EntityKey::FileColumnStats {
+            table_id: table.get(),
+            data_file_id: 999,
+            column_id: 999,
+        },
+    ] {
+        tx.put(crate::store::key::Key::current(entity).encode(), b"corrupt")
+            .unwrap();
+    }
+    catalog.commit_write_tx(tx).await.unwrap();
+    let projected =
+        crate::ffi_support::catalog_read::index_table(&catalog, "main", "inline_build", true)
+            .await
+            .unwrap();
+    assert_eq!(projected.columns_of(table).len(), 1);
+    catalog
+        .create_index_staged(table, &def, &[], None, "", None)
+        .await
+        .unwrap();
+    let report = catalog
+        .certify_index(table, &def.name, None, "")
+        .await
+        .unwrap();
+    assert!(report.is_clean());
+    assert_eq!(report.expected, 2);
+    let entries = catalog
+        .inline_backfill_entries(table, &def.columns)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    catalog.close().await.unwrap();
+}

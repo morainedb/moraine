@@ -31,10 +31,15 @@ pub unsafe extern "C" fn moraine_snapshot_scoped(
         let open = async {
             let scope = handle.catalog.reads().index_read_scope().await?;
             let snapshot = if let Some(scope) = scope {
-                let mut snapshot = MoraineSnapshotHandle::new(scope.reads().snapshot().await?);
-                snapshot.read_identity = Some(scope.identity().clone());
-                snapshot.read_alias = Some(Box::new(handle.read_alias(scope.reads().clone())));
-                snapshot
+                let head = moraine::ffi_support::head_stamp(scope.reads())
+                    .await?
+                    .ok_or_else(|| moraine::Error::Corruption("catalog has no head".to_owned()))?;
+                MoraineSnapshotHandle {
+                    snapshot: None,
+                    stamp: (head.snapshot_id, head.batch_seq),
+                    read_identity: Some(scope.identity().clone()),
+                    read_alias: Some(Box::new(handle.read_alias(scope.reads().clone()))),
+                }
             } else {
                 MoraineSnapshotHandle::new(handle.catalog.reads().snapshot().await?)
             };

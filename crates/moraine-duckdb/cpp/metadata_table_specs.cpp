@@ -166,6 +166,13 @@ MetadataRows DumpRows(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
 	});
 }
 
+template <auto Next, auto Free, auto Shape>
+MetadataRows ProvidePage(MoraineMetadataCursor *cursor, MoraineInterruptProbe probe, void *probe_ctx) {
+	return CollectRows(Free, Shape, [&](auto **out_items, size_t *out_len, MoraineError *err) {
+		return Next(cursor, out_items, out_len, probe, probe_ctx, err);
+	});
+}
+
 // Bind committed readers without per-table wrappers or runtime captures.
 template <auto Dump, auto Free, auto Shape>
 MetadataRows ProvideRows(MoraineCatalogHandle *handle, MoraineInterruptProbe probe, void *probe_ctx) {
@@ -1251,6 +1258,110 @@ std::vector<MetadataTableSpec> MetadataTableSpecsImpl() {
 		    /* end_snapshot col */ 3,
 		    /* delete key: view_id, column_name, key, begin_snapshot */ {0, 1, 4, 2},
 		});
+	}
+	for (auto &spec : specs) {
+		switch (spec.write_table_kind) {
+		case 18:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_column_tags, moraine_dump_column_tags_free, ColumnTagShape>;
+			break;
+		case 26:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_view_column_tags,
+			                                 moraine_dump_view_column_tags_free, ViewColumnTagShape>;
+			break;
+		case 0:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_snapshots, moraine_dump_snapshots_free, SnapshotShape>;
+			break;
+		case 1:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_snapshots, moraine_dump_snapshots_free, SnapshotChangesShape>;
+			break;
+		case 2:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_schemas, moraine_dump_schemas_free, SchemaShape<EXTENDED>>;
+			break;
+		case 3:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_tables, moraine_dump_tables_free, TableShape>;
+			break;
+		case 4:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_views, moraine_dump_views_free, ViewShape>;
+			break;
+		case 5:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_columns, moraine_dump_columns_free, ColumnShape>;
+			break;
+		case 6:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_data_files, moraine_dump_data_files_free, DataFileShape<EXTENDED>>;
+			break;
+		case 7:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_delete_files, moraine_dump_delete_files_free,
+			                                 DeleteFileShape<EXTENDED>>;
+			break;
+		case 8:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_table_stats, moraine_dump_table_stats_free, TableStatsShape>;
+			break;
+		case 9:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_table_column_stats,
+			                                 moraine_dump_table_column_stats_free, TableColumnStatsShape<EXTENDED>>;
+			break;
+		case 10:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_file_column_stats,
+			                                 moraine_dump_file_column_stats_free, FileColumnStatsShape<EXTENDED>>;
+			break;
+		case 12:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_partitions, moraine_dump_partition_info_free, PartitionInfoShape>;
+			break;
+		case 15:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_sorts, moraine_dump_sort_info_free, SortInfoShape>;
+			break;
+		case 19:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_scheduled_deletions,
+			                                 moraine_dump_scheduled_deletions_free, ScheduledDeletionShape>;
+			break;
+		case 20:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_macros, moraine_dump_macros_free, MacroShape>;
+			break;
+		case 23:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_mappings, moraine_dump_column_mappings_free, ColumnMappingShape>;
+			break;
+		case 17:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_tags, moraine_dump_tags_free, TagShape>;
+			break;
+		case 13:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_partition_columns,
+			                                 moraine_dump_partition_columns_free, PartitionColumnShape>;
+			break;
+		case 16:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_sort_expressions,
+			                                 moraine_dump_sort_expressions_free, SortExpressionShape>;
+			break;
+		case 14:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_file_partition_values,
+			                                 moraine_dump_file_partition_values_free, FilePartitionValueShape>;
+			break;
+		case 27:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_file_variant_stats,
+			                                 moraine_dump_file_variant_stats_free, FileVariantStatsShape>;
+			break;
+		case 21:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_macro_impls, moraine_dump_macro_impls_free, MacroImplShape>;
+			break;
+		case 22:
+			spec.page_provider = ProvidePage<moraine_metadata_cursor_macro_parameters,
+			                                 moraine_dump_macro_parameters_free, MacroParameterShape>;
+			break;
+		case 24:
+			spec.page_provider =
+			    ProvidePage<moraine_metadata_cursor_name_mappings, moraine_dump_name_mappings_free, NameMappingShape>;
+			break;
+		default:
+			break;
+		}
 	}
 	return specs;
 }

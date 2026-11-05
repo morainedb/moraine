@@ -29,6 +29,64 @@ fn options_at(path: &str) -> CatalogOptions {
     }
 }
 
+#[tokio::test]
+async fn acknowledged_slots_are_available_in_fixed_read_scopes() {
+    let objects = Arc::new(InMemory::new());
+    bootstrapped(objects.clone(), "published").await;
+    let provider = Arc::new(TestProvider::default());
+    let options = CatalogOptions {
+        commit_log: Some(provider),
+        commit_log_fold_slots: 10_000,
+        ..options_at("published")
+    };
+    let writer = Catalog::open(objects.clone(), options.clone())
+        .await
+        .unwrap();
+    let reader = Catalog::open_read_only(objects, options).await.unwrap();
+    writer
+        .commit(|tx| tx.set_option(crate::OptionScope::Global, "probe", "first"))
+        .await
+        .unwrap();
+    let first = reader
+        .index_read_scope()
+        .await
+        .unwrap()
+        .expect("fixed scope");
+    assert_eq!(
+        crate::ffi_support::catalog_read::global_option(first.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("first")
+    );
+    writer
+        .commit(|tx| tx.set_option(crate::OptionScope::Global, "probe", "second"))
+        .await
+        .unwrap();
+    let second = reader
+        .index_read_scope()
+        .await
+        .unwrap()
+        .expect("new fixed scope");
+    assert_ne!(first.identity(), second.identity());
+    assert_eq!(
+        crate::ffi_support::catalog_read::global_option(first.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        crate::ffi_support::catalog_read::global_option(second.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("second")
+    );
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
 /// Bootstraps a catalog at `path` and releases the writer.
 async fn bootstrapped(object_store: Arc<InMemory>, path: &str) {
     let writer = Catalog::open(object_store, options_at(path)).await.unwrap();
@@ -194,8 +252,8 @@ async fn a_committer_adopts_the_log_and_commits_through_it() {
     );
     assert_eq!(
         provider.folded_sequence(),
-        1,
-        "the commit waits for a slot the cadence names"
+        2,
+        "publication replays the acknowledged slot without requiring an L0 flush"
     );
 
     let reader = Catalog::open_read_only(
@@ -256,8 +314,8 @@ async fn a_lost_race_is_served_the_winner_before_the_retry_lands() {
     );
     assert_eq!(
         provider.folded_sequence(),
-        1,
-        "a follower is served, and folds nothing"
+        3,
+        "publication covers the winner and the acknowledged retry"
     );
     committer.close().await.unwrap();
 
@@ -343,8 +401,8 @@ async fn two_committers_commit_through_one_log() {
     assert_eq!(sequences(&provider), vec![1, 2, 3, 4]);
     assert_eq!(
         provider.folded_sequence(),
-        1,
-        "no process holds the store; nothing folds until the cadence"
+        4,
+        "publication replays through the acknowledged retry"
     );
 
     // And the second is served the first's slot in turn: a read asks, and
@@ -855,9 +913,17 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     committer.close().await.unwrap();
 }
 
-/// The catalog's taker opens the store as its writer with no live catalog,
-/// and the open's replay is the fold: a lake whose committers fold nothing
-/// is folded once by a process that holds nothing else.
+async fn replay_point(objects: Arc<dyn object_store::ObjectStore>) -> u64 {
+    slatedb::admin::AdminBuilder::new("lake", objects)
+        .build()
+        .read_manifest(None)
+        .await
+        .unwrap()
+        .unwrap()
+        .replay_after_wal_id()
+}
+
+/// A taker replays and flushes published WAL without a live catalog.
 #[tokio::test]
 async fn the_taker_folds_the_tail_without_a_live_catalog() {
     let object_store = Arc::new(InMemory::new());
@@ -871,6 +937,7 @@ async fn the_taker_folds_the_tail_without_a_live_catalog() {
     let committer = Catalog::open(object_store.clone(), options.clone())
         .await
         .unwrap();
+    let before = replay_point(object_store.clone()).await;
     for name in ["a", "b", "c"] {
         committer
             .commit(|tx| tx.create_schema(name).map(|_| ()))
@@ -879,9 +946,10 @@ async fn the_taker_folds_the_tail_without_a_live_catalog() {
     }
     assert_eq!(
         provider.folded_sequence(),
-        1,
-        "three commits, three slots the store lacks"
+        4,
+        "publication replays the slots without flushing them"
     );
+    assert_eq!(replay_point(object_store.clone()).await, before);
     committer.close().await.unwrap();
 
     let object_store: Arc<dyn object_store::ObjectStore> = object_store;
@@ -897,6 +965,7 @@ async fn the_taker_folds_the_tail_without_a_live_catalog() {
         "the take's replay folded exactly what was behind"
     );
     db.close().await.unwrap();
+    assert!(replay_point(object_store.clone()).await > before);
 
     let folded_only = Catalog::open_read_only(
         object_store,
@@ -1036,13 +1105,15 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
             .unwrap();
     }
     assert_eq!(provider.folded_sequence(), 4, "slot 4 folded");
+    let after_four = replay_point(object_store.clone()).await;
     for index in 3..6 {
         committer
             .commit(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
             .await
             .unwrap();
     }
-    assert_eq!(provider.folded_sequence(), 4, "slots 5..7 wait for slot 8");
+    assert_eq!(provider.folded_sequence(), 7, "slots 5..7 are published");
+    assert_eq!(replay_point(object_store.clone()).await, after_four);
     committer
         .commit(|tx| tx.create_schema("s6").map(|_| ()))
         .await
@@ -1052,6 +1123,7 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
         8,
         "the slot that landed last was a multiple, so nothing is behind"
     );
+    assert!(replay_point(object_store.clone()).await > after_four);
     committer.close().await.unwrap();
 
     // The fold wrote out and let go: a reader of the folded store alone
@@ -1194,4 +1266,32 @@ async fn demoting_needs_the_provider() {
         Box::pin(Catalog::demote(object_store, options_at("lake"))).await,
         Err(crate::Error::Configuration(_))
     ));
+}
+
+/// An acknowledged log commit is visible to a new fixed checkpoint reader.
+#[tokio::test]
+async fn acknowledged_log_commits_are_visible_to_fixed_readers() {
+    let objects = Arc::new(InMemory::new());
+    bootstrapped(objects.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let catalog = Catalog::open(
+        objects,
+        CatalogOptions {
+            commit_log: Some(provider),
+            commit_log_fold_slots: 0,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    catalog
+        .commit(|transaction| transaction.create_schema("published").map(|_| ()))
+        .await
+        .unwrap();
+    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let snapshot = scope.reads().snapshot().await.unwrap();
+    assert!(snapshot.schema_by_name("published").is_some());
+    drop(snapshot);
+    drop(scope);
+    catalog.close().await.unwrap();
 }

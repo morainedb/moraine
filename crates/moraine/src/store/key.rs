@@ -256,6 +256,8 @@ impl EntityKey {
 /// every entity in `current` or `history`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EntityKind {
+    /// Equality-index definitions.
+    Index,
     /// `ducklake_schema`.
     Schema,
     /// `ducklake_table`.
@@ -292,6 +294,10 @@ impl EntityKind {
     /// A minimal key of this kind for prefix derivation.
     const fn sample(self) -> EntityKey {
         match self {
+            Self::Index => EntityKey::Index {
+                table_id: 0,
+                index_id: 0,
+            },
             Self::Schema => EntityKey::Schema { schema_id: 0 },
             Self::Table => EntityKey::Table { table_id: 0 },
             Self::View => EntityKey::View { view_id: 0 },
@@ -1135,6 +1141,13 @@ pub(crate) fn current_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
 /// Byte prefix of every ended entity version of `kind`.
 pub(crate) fn history_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
     prefix_of(&Key::history(kind.sample(), 0), HISTORY_KIND_PREFIX_LEN)
+}
+
+/// The ended versions of one entity, excluding the final fixed-width end id.
+pub(crate) fn history_entity_prefix(entity: EntityKey) -> Vec<u8> {
+    let mut encoded = Key::history(entity, 0).encode();
+    encoded.truncate(encoded.len() - size_of::<u64>());
+    encoded
 }
 
 /// Byte prefix of every scheduled-file record in `current`.
@@ -2059,6 +2072,21 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn entity_history_prefix_covers_exactly_one_identity(
+            table_id in any::<u64>(), data_file_id in any::<u64>(), end_snapshot in any::<u64>(),
+        ) {
+            let entity = EntityKey::File { table_id, data_file_id };
+            let key = Key::history(entity, end_snapshot);
+            let encoded = key.encode();
+            prop_assert_eq!(Key::decode(&encoded).unwrap(), key);
+            prop_assert!(encoded.starts_with(&history_entity_prefix(entity)));
+            let other = history_entity_prefix(EntityKey::File {
+                table_id, data_file_id: data_file_id.wrapping_add(1),
+            });
+            prop_assert!(!encoded.starts_with(&other));
+        }
+
         #[test]
         fn inline_tombstone_roundtrip_and_table_prefix(
             table_id in any::<u64>(), row_id in any::<u64>(), end_snapshot in any::<u64>(),
