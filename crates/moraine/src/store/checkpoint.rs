@@ -41,7 +41,7 @@ impl CheckpointReader {
             && Instant::now() >= *expires.lock().unwrap_or_else(PoisonError::into_inner)
         {
             return Err(slatedb::Error::unavailable(
-                "read checkpoint lease expired".to_owned(),
+                "read checkpoint lease expired; restart the transaction to acquire a new read scope".to_owned(),
             ));
         }
         Ok(&self.reader)

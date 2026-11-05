@@ -97,7 +97,9 @@ impl ReaderScopes {
                 .generations
                 .retain(|reader| reader.strong_count() != 0);
             if readers.generations.len() >= MAX_READER_GENERATIONS {
-                return Err(Error::Constraint("too many live catalog read generations; finish an older transaction before opening another".into()));
+                return Err(Error::Constraint(format!(
+                    "catalog read generation limit ({MAX_READER_GENERATIONS}) reached; finish an older transaction before opening another"
+                )));
             }
             let created = Instant::now();
             let lease = match admin

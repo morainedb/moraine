@@ -80,18 +80,13 @@ pub(crate) enum EntityRecord {
     GcFile(Arc<GcFileValue>),
 }
 
-/// Decodes a value the record set and the catalog view both hold, so a
-/// view built from a scan shares the scan's allocation instead of copying
-/// it.
+/// Shares decoded values between a record set and its catalog view.
 fn decode_shared<M: prost::Message + Default>(bytes: &[u8]) -> Result<Arc<M>> {
     Ok(Arc::new(value::decode_value(bytes)?))
 }
 
-/// What one retained record costs resident beyond its encoded length and
-/// its enum: the decoded value's own allocation, the `Arc` headers the
-/// record set and the view share, the store key, and the record set's node
-/// share. Measured over 420,000 records at 20,000 files x 20 columns: 370
-/// bytes for a 62-byte stats record.
+/// Per-record allocation, key, and tree overhead, excluding encoded length.
+/// Measured at 370 bytes per 62-byte stats record over 420,000 records.
 const RECORD_BYTES: u64 = 400;
 
 impl EntityRecord {
@@ -383,15 +378,7 @@ pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue
 /// reported.
 const STABLE_READ_ATTEMPTS: usize = 8;
 
-/// Runs `read` so that everything it observes belongs to one store state.
-/// A transaction handle runs it once; a manifest-following reader compares
-/// the head record before and after the pass (every batch moves it) and
-/// re-runs a pass that straddled a commit.
-///
-/// Retrying only helps while a pass fits inside the interval between
-/// commits: a pass that outlasts it straddles every attempt, and no
-/// budget saves it. Shortening the pass is the lever, so each straddle is
-/// logged with what it cost and the exhausted error reports the same.
+/// Runs once for isolated handles; otherwise retries passes whose head changes.
 ///
 /// # Errors
 ///

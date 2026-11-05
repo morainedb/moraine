@@ -33,10 +33,7 @@ bool MoraineTransaction::SnapshotStamp(uint64_t &snapshot_id, uint64_t &batch_se
 }
 
 MoraineTransaction::~MoraineTransaction() {
-	// Defensive fallback: normal teardown releases the snapshot via
-	// CommitTransaction/RollbackTransaction's call to ReleaseSnapshot, and
-	// the staged tx via TakeStagedTx (commit) or a direct rollback
-	// (RollbackTransaction) — see both below.
+	// Release resources if normal transaction teardown did not.
 	if (snapshot_ != nullptr) {
 		moraine_snapshot_free(snapshot_);
 		snapshot_ = nullptr;
@@ -51,8 +48,7 @@ MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 	if (staged_tx_ == nullptr) {
 		MoraineTxHandle *tx = nullptr;
 		MoraineError err {};
-		// The owning client context, when still alive, makes the head read
-		// cancellable; a gone context degrades to a non-cancellable call.
+		// Cancellation requires a live client context.
 		auto client = context.lock();
 		auto code = moraine_tx_begin(catalog_handle_, snapshot_, &tx, client ? moraine_shim_is_interrupted : nullptr,
 		                             client.get(), &err);
@@ -64,15 +60,9 @@ MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 	return staged_tx_;
 }
 
-MoraineTxHandle *MoraineTransaction::StagedTxForInline() {
+MoraineTxHandle *MoraineTransaction::StagedTx() {
 	std::lock_guard<std::mutex> guard(staged_state_lock_);
 	return OpenStagedTx();
-}
-
-MoraineTxHandle *MoraineTransaction::StagedTxFor(const MetadataTableSpec &) {
-	std::lock_guard<std::mutex> guard(staged_state_lock_);
-	auto *tx = OpenStagedTx();
-	return tx;
 }
 
 MoraineTxHandle *MoraineTransaction::StagedTxIfOpen() const {
@@ -87,8 +77,7 @@ MoraineTxHandle *MoraineTransaction::TakeStagedTx() {
 		result = staged_tx_;
 		staged_tx_ = nullptr;
 	}
-	// No statement of this attempt can still resolve a row id, and the
-	// retry's own scans register runs of their own.
+	// Retried statements register new runs.
 	{
 		std::lock_guard<std::mutex> guard(scanned_runs_lock_);
 		scanned_runs_.clear();
@@ -176,10 +165,7 @@ duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientC
 	MoraineSnapshotHandle *snapshot = nullptr;
 	MoraineError err {};
 	auto code = moraine_snapshot_scoped(catalog_.Handle(), &snapshot, moraine_shim_is_interrupted, &context, &err);
-	// The commit-time drain only runs on writes; this one surfaces events a
-	// read-only workload produced — this resolve's own (it may be about to
-	// throw), and whatever the previous statement stranded — at the next
-	// statement instead of never.
+	// Drain diagnostics for read-only workloads too.
 	DrainMoraineLogs(context);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -194,16 +180,11 @@ duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientC
 
 duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientContext &context,
                                                                duckdb::Transaction &transaction) {
-	// Whatever the commit below does — succeed, conflict, or spend its
-	// retry budget — its diagnostics reach DuckDB's logger on the way out.
+	// Drain diagnostics even when the commit fails.
 	auto drain = [&context]() noexcept {
 		DrainMoraineLogs(context);
 	};
-	// A staged tx (opened lazily by the first write this DuckDB
-	// transaction made) is taken out from under the lock and committed
-	// after releasing it — moraine_tx_commit blocks on store I/O, which
-	// must not happen while holding `lock_` and blocking every other
-	// transaction on this catalog.
+	// Release the catalog lock before blocking on commit I/O.
 	MoraineTxHandle *staged = nullptr;
 	{
 		std::lock_guard<std::mutex> guard(lock_);
@@ -218,9 +199,6 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 		}
 	}
 	if (staged == nullptr) {
-		// A read-only transaction (or one whose writes never reached a
-		// writable metadata table) never opened a staged tx: nothing to
-		// commit, always a clean success.
 		drain();
 		return duckdb::ErrorData();
 	}
@@ -272,7 +250,7 @@ void MoraineTransactionManager::RollbackTransaction(duckdb::Transaction &transac
 }
 
 void MoraineTransactionManager::Checkpoint(duckdb::ClientContext &, bool) {
-	// Nothing to checkpoint: this slice makes no writes.
+	// Commits publish durable checkpoints through the core.
 }
 
 } // namespace moraine_duckdb
