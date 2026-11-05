@@ -664,8 +664,10 @@ The cursor ABI visits at most 64 contributing parent records and emits at most
 64 output rows per page for entity metadata,
 partition columns and values, sort expressions, tags, variant statistics,
 macro implementations and parameters, name mappings, snapshot headers and
-changes, and column/view-column tags. Empty parents do not
-signal EOF or accumulate reservations across pages. A parent with more than
+changes, and column/view-column tags. A page also stops when its retained decode
+allowance reaches 1 MiB. One indivisible parent may cross that threshold and
+remains subject to working-memory admission; this is not a hard byte or RSS cap.
+Empty parents do not signal EOF or accumulate reservations across pages. A parent with more than
 64 children remains operation-owned while its children drain across pages. The
 C++ scan also caps each output batch at DuckDB's vector capacity. Each page owns its working
 memory through ABI conversion and uses its existing dump free function.

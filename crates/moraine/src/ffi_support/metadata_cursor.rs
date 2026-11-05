@@ -15,6 +15,8 @@ use crate::{
 mod schema_versions;
 
 const PAGE_RECORDS: usize = 64;
+// Stop after the parent crossing this allowance; one parent is indivisible.
+const PAGE_BYTES: u64 = 1024 * 1024;
 
 /// One metadata page and its working-memory allowance.
 pub struct MetadataPage<T> {
@@ -215,6 +217,7 @@ impl MetadataCursor {
         };
         let mut records = Vec::new();
         let mut memory = Vec::new();
+        let mut bytes = 0_u64;
         while records.len() < PAGE_RECORDS {
             let Some((record, allowance)) = cursor.next().await? else {
                 break;
@@ -227,7 +230,11 @@ impl MetadataCursor {
                 continue;
             }
             records.push(record);
+            bytes = bytes.saturating_add(allowance.bytes());
             memory.push(Arc::new(allowance));
+            if bytes >= PAGE_BYTES {
+                break;
+            }
         }
         Ok(MetadataPage {
             records,
@@ -274,6 +281,7 @@ impl MetadataCursor {
         let mut memory = Vec::new();
         // Embedded children may produce no rows. Only EOF returns an empty page.
         while records.is_empty() {
+            let mut bytes = 0_u64;
             for _ in 0..PAGE_RECORDS {
                 let mut pending = if let Some(pending) = self.pending.take() {
                     *pending.downcast::<PendingRows<T>>().map_err(|_| {
@@ -295,11 +303,12 @@ impl MetadataCursor {
                     continue;
                 }
                 records.extend(pending.records.by_ref().take(PAGE_RECORDS - records.len()));
+                bytes = bytes.saturating_add(pending.memory.bytes());
                 memory.push(pending.memory.clone());
                 if pending.records.len() != 0 {
                     self.pending = Some(Box::new(pending));
                 }
-                if records.len() == PAGE_RECORDS {
+                if records.len() == PAGE_RECORDS || bytes >= PAGE_BYTES {
                     break;
                 }
             }
@@ -321,7 +330,7 @@ macro_rules! pages {
                 /// Returns an error if the store read or record decoding fails.
                 pub async fn $method(&mut self) -> Result<MetadataPage<$record>> {
                     self.page(TableKind::$table, |record| match record {
-                        EntityRecord::$variant(value) => Ok(vec![(*value).clone()]),
+                        EntityRecord::$variant(value) => Ok(vec![Arc::unwrap_or_clone(value)]),
                         _ => Err(Error::Corruption("metadata cursor returned an unexpected record".into())),
                     }).await
                 }
@@ -532,6 +541,95 @@ mod tests {
         Catalog, CatalogOptions,
         store::key::{EntityKey, Key},
     };
+
+    #[tokio::test]
+    async fn large_records_bound_page_bytes_without_losing_rows() {
+        let catalog = Catalog::open(
+            Arc::new(object_store::memory::InMemory::new()),
+            CatalogOptions::default(),
+        )
+        .await
+        .unwrap();
+        let write = catalog.begin_write_tx().unwrap();
+        for id in 1..=20 {
+            let payload = "x".repeat(128 * 1024);
+            write
+                .put(
+                    Key::current(EntityKey::File {
+                        table_id: 1,
+                        data_file_id: id,
+                    })
+                    .encode(),
+                    crate::store::value::encode_value(&DataFileRecord {
+                        table_id: 1,
+                        data_file_id: id,
+                        path: payload.clone(),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            write
+                .put(
+                    Key::Snapshot { snapshot_id: id }.encode(),
+                    crate::store::value::encode_value(&super::super::SnapshotRecord {
+                        snapshot_id: id,
+                        changes_made: payload,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+        }
+        catalog.commit_write_tx(write).await.unwrap();
+        for table in [TableKind::DataFile, TableKind::SnapshotChanges] {
+            let mut cursor = MetadataCursor::open(&catalog, table, None, None)
+                .await
+                .unwrap();
+            for fork in [false, true] {
+                if fork {
+                    cursor = cursor.fork().await.unwrap();
+                }
+                let mut ids = Vec::new();
+                loop {
+                    let (page_ids, memory) = if table == TableKind::DataFile {
+                        let page = cursor.data_files().await.unwrap();
+                        (
+                            page.records
+                                .iter()
+                                .map(|row| row.data_file_id)
+                                .collect::<Vec<_>>(),
+                            page._memory,
+                        )
+                    } else {
+                        let page = cursor.snapshots().await.unwrap();
+                        (
+                            page.records
+                                .iter()
+                                .map(|row| row.snapshot_id)
+                                .collect::<Vec<_>>(),
+                            page._memory,
+                        )
+                    };
+                    if page_ids.is_empty() {
+                        break;
+                    }
+                    let bytes: u64 = memory.iter().map(|reservation| reservation.bytes()).sum();
+                    let largest = memory
+                        .iter()
+                        .map(|reservation| reservation.bytes())
+                        .max()
+                        .unwrap();
+                    assert!(
+                        bytes <= 1024 * 1024 + largest,
+                        "page retained {bytes} bytes"
+                    );
+                    ids.extend(page_ids);
+                }
+                let first = u64::from(table == TableKind::DataFile);
+                assert_eq!(ids, (first..=20).collect::<Vec<_>>());
+            }
+        }
+        catalog.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn snapshot_pages_keep_the_original_read_point() {

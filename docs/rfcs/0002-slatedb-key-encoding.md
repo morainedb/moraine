@@ -261,6 +261,9 @@ format 12 uses the directory for file planning and selected-file reads. Both
 native and commit-log stores use this layout and preserve their commit-log
 origin through migration.
 
+Selected-file reads on formats 9–11 scan the table's delete records once and
+filter against sorted, deduplicated file IDs, rather than rescanning for each ID.
+
 ### Atomicity invariant
 
 One DuckLake catalog commit — snapshot record, head-pointer update, every

@@ -10,6 +10,9 @@ use crate::{
     transaction::commit,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// The dependencies an internal table operation may inspect.
 #[derive(Clone, Copy)]
 pub(crate) enum TableRead {
@@ -118,6 +121,9 @@ pub(crate) async fn load_sources_for(
     let mut files = files.to_vec();
     files.sort_unstable();
     files.dedup();
+    if files.is_empty() {
+        return Ok(());
+    }
     for file in &files {
         point(
             handle,
@@ -128,6 +134,29 @@ pub(crate) async fn load_sources_for(
             },
         )
         .await?;
+    }
+    if read::read_format(handle)
+        .await?
+        .is_none_or(|stamp| stamp.format_version < commit::FORMAT_WITH_DELETE_TARGETS)
+    {
+        let mut cursor = EntityCursor::open(
+            handle,
+            EntityRecordKind::DeleteFile,
+            Versions::Live,
+            Some(table.get()),
+        )
+        .await?;
+        while let Some((record, _memory)) = cursor.next().await? {
+            if let EntityRecord::DeleteFile(row) = record
+                && row.end_snapshot.is_none()
+                && files
+                    .binary_search(&crate::DataFileId::new(row.data_file_id))
+                    .is_ok()
+            {
+                retain(view, EntityRecord::DeleteFile(row))?;
+            }
+        }
+        return Ok(());
     }
     for file in files {
         let mut cursor =
