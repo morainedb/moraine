@@ -22,7 +22,16 @@ const PAGE_BYTES: u64 = 1024 * 1024;
 pub struct MetadataPage<T> {
     /// Decoded records in deterministic cursor order.
     pub records: Vec<T>,
-    _memory: Vec<Arc<MemoryReservation>>,
+    memory: Vec<Arc<MemoryReservation>>,
+}
+
+impl<T> MetadataPage<T> {
+    /// Working-memory reservations the page holds until it is dropped, one per
+    /// decoded parent record.
+    #[must_use]
+    pub fn retained_memory(&self) -> &[Arc<MemoryReservation>] {
+        &self.memory
+    }
 }
 
 /// A metadata scan retaining one immutable read point, without a decoded cache.
@@ -236,10 +245,7 @@ impl MetadataCursor {
                 break;
             }
         }
-        Ok(MetadataPage {
-            records,
-            _memory: memory,
-        })
+        Ok(MetadataPage { records, memory })
     }
 
     /// Reads stored and legacy schema versions followed by file floor rows.
@@ -261,10 +267,7 @@ impl MetadataCursor {
             records.push(row);
             memory.push(Arc::new(allowance));
         }
-        Ok(MetadataPage {
-            records,
-            _memory: memory,
-        })
+        Ok(MetadataPage { records, memory })
     }
 
     async fn page<T: Send + 'static>(
@@ -289,10 +292,7 @@ impl MetadataCursor {
                     })?
                 } else {
                     let Some((record, allowance)) = self.next_entity().await? else {
-                        return Ok(MetadataPage {
-                            records,
-                            _memory: memory,
-                        });
+                        return Ok(MetadataPage { records, memory });
                     };
                     PendingRows {
                         records: project(record)?.into_iter(),
@@ -313,10 +313,7 @@ impl MetadataCursor {
                 }
             }
         }
-        Ok(MetadataPage {
-            records,
-            _memory: memory,
-        })
+        Ok(MetadataPage { records, memory })
     }
 }
 
@@ -597,7 +594,7 @@ mod tests {
                                 .iter()
                                 .map(|row| row.data_file_id)
                                 .collect::<Vec<_>>(),
-                            page._memory,
+                            page.retained_memory().to_vec(),
                         )
                     } else {
                         let page = cursor.snapshots().await.unwrap();
@@ -606,7 +603,7 @@ mod tests {
                                 .iter()
                                 .map(|row| row.snapshot_id)
                                 .collect::<Vec<_>>(),
-                            page._memory,
+                            page.retained_memory().to_vec(),
                         )
                     };
                     if page_ids.is_empty() {
@@ -935,8 +932,7 @@ mod tests {
                 .unwrap();
         let first = cursor.file_partition_values().await.unwrap();
         assert_eq!(first.records.len(), 2);
-        #[allow(clippy::used_underscore_binding)]
-        let retained_parents = first._memory.len();
+        let retained_parents = first.retained_memory().len();
         assert_eq!(retained_parents, 2);
         assert_eq!(first.records[0].partition_value, "190");
         let second = cursor.file_partition_values().await.unwrap();
