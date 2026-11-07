@@ -375,6 +375,13 @@ pub enum RowOperation {
         /// Owning table.
         table_id: u64,
     },
+    /// Removes every `inline/file_delete` record for `table_id` and the
+    /// existence marker with them, so `ducklake_inlined_delete_<table_id>`
+    /// stops resolving. Staged by that table's drop.
+    InlineFileDeleteTableDrop {
+        /// Owning table.
+        table_id: u64,
+    },
     /// Removes exactly the named inline row versions, preserving other
     /// rows in their chunks. Repeated identities are removed once.
     InlineRowsDelete {
@@ -2013,7 +2020,9 @@ const MAX_HEAD_PRESERVING_ATTEMPTS: usize = 10;
 /// leaves every later flush larger than the one refused. Its own
 /// operations are table-scoped and few, so this does not fire in practice;
 /// it is here so that a change making a flush expensive again degrades to
-/// a slow commit rather than to a backlog nothing can drain.
+/// a slow commit rather than to a backlog nothing can drain. An
+/// inlined-delete table's drop is unsplittable the same way: the table
+/// sets how many records go, not the caller's snapshot batch.
 ///
 /// The per-record
 /// [`InlineFileDeleteRemove`](RowOperation::InlineFileDeleteRemove)
@@ -2024,7 +2033,9 @@ fn exempt_from_staged_cost(ops: &[RowOperation]) -> bool {
     ops.iter().any(|op| {
         matches!(
             op,
-            RowOperation::InlineFlushDelete { .. } | RowOperation::InlineFileDeleteClear { .. }
+            RowOperation::InlineFlushDelete { .. }
+                | RowOperation::InlineFileDeleteClear { .. }
+                | RowOperation::InlineFileDeleteTableDrop { .. }
         )
     })
 }

@@ -287,6 +287,27 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_clear(
     unsafe { stage_operation(tx, err, || RowOperation::InlineFileDeleteClear { table_id }) }
 }
 
+/// Stages the drop of `ducklake_inlined_delete_<table_id>`: removes every
+/// `inline/file_delete` record for the table and the existence marker with
+/// them, so the name stops resolving rather than resolving empty.
+///
+/// # Safety
+///
+/// Same contract as [`moraine_tx_stage_inline_inline_delete`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_table_drop(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: `tx` and `err` follow this entry point's caller contract.
+    unsafe {
+        stage_operation(tx, err, || RowOperation::InlineFileDeleteTableDrop {
+            table_id,
+        })
+    }
+}
+
 /// Stages a schema-version-scoped deregistration: removes only the
 /// `inline/schema` record for `(table_id, schema_version)`, leaving any
 /// other schema version's `inline/*` records untouched.
