@@ -360,8 +360,6 @@ async fn translate_pruned_file_delete_cascade(
     .await
 }
 
-/// Removes every `inline/*` record for `table_id`: schema, chunks, and
-/// tombstones, read from `db_tx`'s current (pre-commit) state.
 /// Removes every `inline/file_delete` record for `table_id`, the way a
 /// clear that matched all of them would one at a time.
 pub(super) async fn translate_inline_file_delete_clear(
@@ -385,6 +383,24 @@ pub(super) async fn translate_inline_file_delete_clear(
     Ok(())
 }
 
+/// Removes `table_id`'s `inline/file_delete` records and the existence
+/// marker with them, so the name resolves to nothing rather than to an
+/// empty table. Its other `inline/*` records are the sweep's.
+pub(super) async fn translate_inline_file_delete_table_drop(
+    db_tx: &CommitSession,
+    table_id: u64,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    translate_inline_file_delete_clear(db_tx, table_id, writes).await?;
+    writes.push((
+        Key::Inline(InlineKey::FileDeleteTable { table_id }).encode(),
+        None,
+    ));
+    Ok(())
+}
+
+/// Removes every `inline/*` record for `table_id`: schema, chunks, and
+/// tombstones, read from `db_tx`'s current (pre-commit) state.
 pub(super) async fn translate_inline_drop(
     db_tx: &CommitSession,
     table_id: u64,
@@ -810,6 +826,7 @@ pub(super) async fn translate_inline(
                     | RowOperation::InlineDrop { .. }
                     | RowOperation::InlineSchemaDrop { .. }
                     | RowOperation::InlineFileDeleteClear { .. }
+                    | RowOperation::InlineFileDeleteTableDrop { .. }
             )
         })
         .collect();
@@ -838,6 +855,9 @@ pub(super) async fn translate_inline(
             }
             RowOperation::InlineFileDeleteClear { table_id } => {
                 translate_inline_file_delete_clear(db_tx, *table_id, &mut writes).await?;
+            }
+            RowOperation::InlineFileDeleteTableDrop { table_id } => {
+                translate_inline_file_delete_table_drop(db_tx, *table_id, &mut writes).await?;
             }
             RowOperation::InlineSchemaDrop {
                 table_id,
@@ -937,6 +957,7 @@ pub(super) async fn translate_inline(
             | RowOperation::InlineDrop { .. }
             | RowOperation::InlineFileDeleteRemove { .. }
             | RowOperation::InlineFileDeleteClear { .. }
+            | RowOperation::InlineFileDeleteTableDrop { .. }
             | RowOperation::Insert { .. }
             | RowOperation::Delete { .. }
             | RowOperation::UpdateSetEnd { .. }

@@ -113,7 +113,10 @@ survivors form a suffix.
    `ducklake_table`, both stats tables, partition/sort tables,
    `ducklake_column`, `ducklake_column_tag`, `ducklake_schema_versions`,
    `ducklake_inlined_data_tables`, `ducklake_column_mapping`, plus `DROP
-   TABLE IF EXISTS ducklake_inlined_data_<t>_<v>`.
+   TABLE IF EXISTS ducklake_inlined_data_<t>_<v>` for every version the
+   registry listed and `DROP TABLE IF EXISTS ducklake_inlined_delete_<t>`.
+   Both drops reach moraine's catalog and translate into the inline
+   keyspace.
 6. The dead-row rule over `ducklake_schema` / `ducklake_view` /
    `ducklake_tag` / `ducklake_macro`.
 7. The dead-row rule over each registered inlined data table deletes ended

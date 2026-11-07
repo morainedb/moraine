@@ -8293,11 +8293,68 @@ fn a_clear_costs_one_against_the_ceiling() {
     );
 }
 
-/// The ceiling is lifted for the operations a flush stages and for nothing
-/// else. A flush cannot be split by its caller; a filtered delete can, and
-/// the per-record removal is now reachable only from one.
+/// Dropping `ducklake_inlined_delete_<t>` takes its records and the
+/// existence marker, so the name stops resolving — unlike a clear, which
+/// empties a table that still exists.
+#[tokio::test]
+async fn dropping_the_inlined_deletion_table_takes_its_records_and_marker() {
+    let catalog = open().await;
+    let stage = |snapshot_id: u64, op: RowOperation| {
+        let catalog = &catalog;
+        async move {
+            let db_tx = catalog.begin_write_tx()?;
+            let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
+            tx.stage(op);
+            tx.stage(insert_row(
+                TableKind::Snapshot,
+                snapshot_row(snapshot_id, 1, 2),
+            ));
+            tx.stage(insert_row(
+                TableKind::SnapshotChanges,
+                snapshot_changes_row(snapshot_id, "inlined_delete:1"),
+            ));
+            tx.commit().await.map(|_| ())
+        }
+    };
+
+    stage(
+        1,
+        RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 7,
+            row_id: 3,
+            begin_snapshot: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    stage(2, RowOperation::InlineFileDeleteTableDrop { table_id: 1 })
+        .await
+        .unwrap();
+
+    assert!(
+        crate::ffi_support::inline::inline_file_deletes(&catalog, 1)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the drop removes every record the table projects"
+    );
+    assert!(
+        !crate::ffi_support::inline::inline_file_delete_table_exists(&catalog, 1)
+            .await
+            .unwrap(),
+        "and the marker with them, so the name no longer binds"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// The ceiling is lifted only for callers that cannot split their
+/// transaction: a flush, and an inlined-deletion table's drop. A filtered
+/// delete is splittable, and the per-record removal is reachable only
+/// from one.
 #[test]
-fn only_a_flush_s_own_operations_may_exceed_the_ceiling() {
+fn only_unsplittable_callers_operations_may_exceed_the_ceiling() {
     use super::exempt_from_staged_cost;
 
     let clear = [RowOperation::InlineFileDeleteClear { table_id: 1 }];
@@ -8306,6 +8363,7 @@ fn only_a_flush_s_own_operations_may_exceed_the_ceiling() {
         schema_version: 0,
         flush_snapshot: 1,
     }];
+    let table_drop = [RowOperation::InlineFileDeleteTableDrop { table_id: 1 }];
     let per_record = [RowOperation::InlineFileDeleteRemove {
         table_id: 1,
         data_file_id: 1,
@@ -8314,6 +8372,7 @@ fn only_a_flush_s_own_operations_may_exceed_the_ceiling() {
 
     assert!(exempt_from_staged_cost(&clear));
     assert!(exempt_from_staged_cost(&drain));
+    assert!(exempt_from_staged_cost(&table_drop));
     assert!(
         !exempt_from_staged_cost(&per_record),
         "a filtered delete is the caller's to split"

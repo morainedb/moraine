@@ -88,6 +88,7 @@ impl Needed {
             | RowOperation::InlineInsert { table_id, .. }
             | RowOperation::InlineInlineDelete { table_id, .. }
             | RowOperation::InlineFileDeleteClear { table_id }
+            | RowOperation::InlineFileDeleteTableDrop { table_id }
             | RowOperation::InlineRowsDelete { table_id, .. }
             | RowOperation::InlineFlushDelete { table_id, .. }
             | RowOperation::InlineDrop { table_id }

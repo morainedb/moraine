@@ -685,19 +685,18 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateType(duckdb
 }
 
 void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropInfo &info) {
-	// The flush cleanup's `DROP TABLE ducklake_inlined_data_<t>_<v>` is the
-	// only DROP reaching here: deregister just this schema version, leaving
-	// other schema versions' inline/* records untouched. The version's Arrow
-	// schema survives the deregistration, so a session still holding the
-	// pre-flush registry binds the name and scans it empty.
+	// Only the two synthesized inline families reach here. An inlined-data
+	// drop deregisters that schema version alone, retaining its Arrow
+	// schema so the name still binds and scans empty. An inlined-delete
+	// drop, which only the expiry cleanup of a departed table issues, takes
+	// the table's inline/file_delete records and existence marker together.
 	//
-	// Dropping the user table it belongs to reaches neither this function
-	// nor any other moraine entry point — DuckLake ends the `ducklake_table`
-	// row itself. Those inline/* records are reclaimed by the maintenance
-	// sweep once the table is absent from live state and history, which is
-	// also what keeps a read below the drop able to resolve them.
+	// Dropping the user table reaches no moraine entry point — DuckLake ends
+	// the `ducklake_table` row itself, and the maintenance sweep reclaims
+	// those inline/* records once the table leaves live state and history.
 	if (info.type == duckdb::CatalogType::TABLE_ENTRY) {
-		if (auto parsed = ParseInlinedDataTableName(info.GetQualifiedName().Name().GetIdentifierName())) {
+		auto name = info.GetQualifiedName().Name().GetIdentifierName();
+		if (auto parsed = ParseInlinedDataTableName(name)) {
 			auto catalog_transaction = catalog.GetCatalogTransaction(context);
 			auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
 			MoraineError err {};
@@ -706,7 +705,18 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
 			}
-			tables_.erase(info.GetQualifiedName().Name().GetIdentifierName());
+			tables_.erase(name);
+			return;
+		}
+		if (auto delete_table_id = ParseInlinedDeleteTableName(name)) {
+			auto catalog_transaction = catalog.GetCatalogTransaction(context);
+			auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
+			MoraineError err {};
+			auto code = moraine_tx_stage_inline_file_delete_table_drop(moraine_tx.StagedTx(), *delete_table_id, &err);
+			if (code != MORAINE_OK) {
+				ThrowMoraineError(err);
+			}
+			tables_.erase(name);
 			return;
 		}
 	}

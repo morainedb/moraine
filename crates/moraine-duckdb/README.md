@@ -712,7 +712,9 @@ caches the table's existence for the life of the catalog and never
 re-probes, so anything it runs afterwards in the same session still binds
 against it. Existence is therefore recorded in the store
 (`inline/file_delete_table`) rather than derived from whether any
-deletion is currently held. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
+deletion is currently held. What removes it is the `DROP TABLE` the
+expiry cleanup issues once the table has left live state and history,
+which takes marker and deletions together. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
 (as implemented)" for the exact operation → keyspace mapping.
 
 Chunk bodies (`inline/schema`, `inline/insert`) are Arrow IPC. DuckDB's C++

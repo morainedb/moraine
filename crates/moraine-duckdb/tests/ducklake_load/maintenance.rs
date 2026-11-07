@@ -2151,3 +2151,68 @@ fn expiry_of_an_interior_snapshot_preserves_inline_time_travel() {
     );
     assert_eq!(read("SELECT * FROM lake.main.t ORDER BY id;"), head);
 }
+
+/// Expiry takes the `ducklake_inlined_delete_<t>` of a dropped table with
+/// it: the cleanup drops that name alongside the inlined-data tables, so
+/// it has to reach the inline keyspace rather than the catalog's refusal.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn expiring_a_dropped_table_drops_its_inlined_delete_table() {
+    let store = TempDir::new("expiry-inline-delete-store");
+    let data = TempDir::new("expiry-inline-delete-data");
+    let reference_meta = TempDir::new("expiry-inline-delete-ref-meta");
+    let reference_data = TempDir::new("expiry-inline-delete-ref-data");
+
+    let apply = |sql: &str| {
+        run_ducklake_sql(store.path(), data.path(), sql);
+        run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+    };
+    let probe = |sql: &str| -> Vec<Vec<String>> {
+        let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+        let reference_rows = csv_rows(&run_reference_ducklake_sql(
+            reference_meta.path(),
+            reference_data.path(),
+            sql,
+        ));
+        assert_eq!(
+            moraine_rows, reference_rows,
+            "moraine diverges from stock DuckLake for `{sql}`"
+        );
+        moraine_rows
+    };
+
+    // The flush puts the rows in a file; a three-row delete against it
+    // stays under the inlining limit, so it inlines its tombstones.
+    apply(
+        "CREATE TABLE lake.main.t (a BIGINT, b BIGINT);\
+         INSERT INTO lake.main.t SELECT range, range FROM range(0,32);\
+         CALL ducklake_flush_inlined_data('lake');\
+         DELETE FROM lake.main.t WHERE a < 3;",
+    );
+    assert_eq!(
+        probe(
+            "SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1), \
+                    (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file), \
+                    (SELECT count(*) FROM lake.main.t);"
+        ),
+        vec![vec!["3".to_string(), "0".to_string(), "29".to_string()]],
+        "the delete inlined rather than writing a delete file"
+    );
+
+    apply(
+        "DROP TABLE lake.main.t;\
+         CALL ducklake_expire_snapshots('lake', older_than => now());\
+         CALL ducklake_cleanup_old_files('lake', cleanup_all => true);",
+    );
+
+    // The name no longer resolves, exactly as it no longer does in stock.
+    let gone = run_ducklake_sql_expect_err(
+        store.path(),
+        data.path(),
+        "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_inlined_delete_1;",
+    );
+    assert!(
+        gone.contains("ducklake_inlined_delete_1"),
+        "the dropped inlined-delete table must stop resolving: {gone}"
+    );
+}
