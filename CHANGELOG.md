@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/morainedb/moraine/compare/v0.8.1...v0.9.0) - 2026-11-07
+
+### Added
+
+- *(commit-log)* [**breaking**] move the loop behind the seam ([#382](https://github.com/morainedb/moraine/pull/382))
+
+### Fixed
+
+- *(duckdb)* drop the inlined-delete table expiry names ([#398](https://github.com/morainedb/moraine/pull/398))
+- *(memory)* charge metadata exports for selected descriptors ([#384](https://github.com/morainedb/moraine/pull/384))
+- *(maintenance)* bound transactions and unblock fold shutdown ([#378](https://github.com/morainedb/moraine/pull/378))
+- *(duckdb)* prune exact inline versions during snapshot expiry ([#375](https://github.com/morainedb/moraine/pull/375))
+- *(maintenance)* cap compaction inputs and batch tables ([#377](https://github.com/morainedb/moraine/pull/377))
+
+### Other
+
+- *(catalog)* [**breaking**] replace eager snapshots with demand-loaded scopes ([#397](https://github.com/morainedb/moraine/pull/397))
+- *(catalog)* bound metadata reads and stream file inventories ([#386](https://github.com/morainedb/moraine/pull/386))
+- *(catalog)* demand-load metadata through fixed read scopes ([#387](https://github.com/morainedb/moraine/pull/387))
+
 ## [0.8.1](https://github.com/morainedb/moraine/compare/v0.8.0...v0.8.1) - 2026-10-27
 
 ### Fixed
