@@ -22,7 +22,7 @@ use object_store::ObjectStore;
 use slatedb::{
     Db, DbReader, RowEntry, ValueDeletable,
     wal::{
-        FlushResultFuture, WalError, WalEvent, WalFileRange, WalGc, WalIterator, WalObserver,
+        WalError, WalEvent, WalFileRange, WalFlushResult, WalGc, WalIterator, WalObserver,
         WalReader, WalRows, WalStatus, WalStatusListener, WalWriter, WriterInit, WriterInitResult,
         WriterManifest,
     },
@@ -947,8 +947,17 @@ impl WalWriter for TestWriter {
         Ok(())
     }
 
-    async fn flush(&mut self) -> std::result::Result<FlushResultFuture, WalError> {
-        Ok(Box::pin(std::future::ready(Ok(()))))
+    async fn flush(&mut self) -> std::result::Result<WalFlushResult, WalError> {
+        // Nothing is buffered: a slot is durable when its put returns, so the
+        // flush covers the fold cursor and completes at once.
+        let wal_id = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            self.cursor.status(&self.log, &state).last_flushed_wal_id
+        };
+        Ok(WalFlushResult {
+            wal_id,
+            completion: Box::pin(std::future::ready(Ok(()))),
+        })
     }
 
     fn observer(&self) -> Box<dyn WalObserver> {
