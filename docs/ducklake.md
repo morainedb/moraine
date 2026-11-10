@@ -96,10 +96,11 @@ Owner: [RFC 0005](rfcs/0005-ducklake-feature-mapping.md).
 ### Provide supported native-index extension points
 
 DuckLake rejects `CREATE INDEX`, `PRIMARY KEY`, and `UNIQUE` in its binder and
-has no native index metadata. Moraine supplies `CREATE INDEX` / `CREATE UNIQUE
-INDEX` and `DROP INDEX` through DuckDB's existing operator and planner extension
-hooks, without patching DuckLake. Moraine owns index metadata and maintenance;
-introspection, verification, and explicit lookup functions remain available. Native DDL requires autocommit.
+has no native index metadata. Moraine supplies `CREATE INDEX` /
+`CREATE UNIQUE INDEX` and `DROP INDEX` through DuckDB's existing operator and
+planner extension hooks, without patching DuckLake. Moraine owns index metadata
+and maintenance; introspection, verification, and explicit lookup functions
+remain available. Native DDL requires autocommit.
 
 The upstream request is a supported index contract covering:
 
@@ -111,12 +112,12 @@ The upstream request is a supported index contract covering:
   scan direction and declared NULL ordering.
 
 Once DuckLake defines that contract, moraine can map the upstream identifier
-through its reserved `ducklake_index_id` field and serve the same physical
-index through upstream metadata and optimizer pushdown. Native index DDL
-already routes to Moraine's implementation. Ordinary equality, `IN`, range, NULL,
-and composite-key predicates can already use Moraine indexes through its
-optimizer extension. Explicit lookup functions remain available, but application
-queries need not name the index.
+through its reserved `ducklake_index_id` field and serve the same physical index
+through upstream metadata and optimizer pushdown. Native index DDL already
+routes to Moraine's implementation. Ordinary equality, `IN`, range, NULL, and
+composite-key predicates can already use Moraine indexes through its optimizer
+extension. Explicit lookup functions remain available, but application queries
+need not name the index.
 
 DuckLake currently documents indexes and enforced key constraints as
 unsupported features that are unlikely to be added. This request should

@@ -20,9 +20,9 @@ the detached durable commit and SlateDB background work run on other threads.
 The complete raw profile includes those threads and setup/shutdown too.
 
 Collected September 8, 2026, with Rust 1.96.1, SlateDB 0.15.0, imbl 5.0.0, and
-Valgrind 3.19.0 on the Linux x86-64 VM, using the optimized release test executable.
-The workload passed all result checks under Valgrind. Timing from that run is
-not a performance measurement.
+Valgrind 3.19.0 on the Linux x86-64 VM, using the optimized release test
+executable. The workload passed all result checks under Valgrind. Timing from
+that run is not a performance measurement.
 
 Before the probe optimizations, across the 20,480 inserted entries, the
 `stats_alloc` commit intervals counted
@@ -45,24 +45,24 @@ The filtered DHAT preparation stacks contained
 
 Categories are exclusive and classified by stack ancestry. The remaining
 approximately 8.5 calls per entry in the commit intervals include work outside
-the preparation frame; they are not all attributed to one function. Whole-process
-DHAT totals also include seeding, validation, and closing, so dividing those
-totals by the inserted entry count would overstate commit cost.
+the preparation frame; they are not all attributed to one function.
+Whole-process DHAT totals also include seeding, validation, and closing, so
+dividing those totals by the inserted entry count would overstate commit cost.
 
 DHAT's byte totals count each successful reallocation's full new size;
 `stats_alloc` counts its growth. Their byte totals are not interchangeable.
-[Baseline allocation-site counts](index-maintenance-profile-before-probe-optimizations.csv) retain the top two stack
-frames for each grouped site. The complete local profile is saved as
-`.context/index-maintenance.dhat.json`.
+[Baseline allocation-site counts](index-maintenance-profile-before-probe-optimizations.csv)
+retain the top two stack frames for each grouped site. The complete local
+profile is saved as `.context/index-maintenance.dhat.json`.
 
 ## What the baseline stacks show
 
-- `resolve_probe → ReadHandle::get → Reader::get_key_value_with_options` accounts
-  for exactly 49 events per inserted entry in this fixture. SlateDB constructs
-  its point read from write-batch, memory-table, and segment iterators, then
-  layers filtering and merge handling around them. The stacks include boxed
-  iterator futures, iterator/source vectors, and key copies even when the key
-  is absent and no object GET is needed.
+- `resolve_probe → ReadHandle::get → Reader::get_key_value_with_options`
+  accounts for exactly 49 events per inserted entry in this fixture. SlateDB
+  constructs its point read from write-batch, memory-table, and segment
+  iterators, then layers filtering and merge handling around them. The stacks
+  include boxed iterator futures, iterator/source vectors, and key copies even
+  when the key is absent and no object GET is needed.
 - `CanonicalKeyBuilder::append` grows the encoded-key buffer three times per
   entry in this integer fixture. The initial flag, framed value, and escaped
   bytes trigger buffer growth.
@@ -120,8 +120,9 @@ assigned to a function without evidence. Category boundaries therefore do not
 all match the baseline, while filtered totals use the same enclosing frame.
 
 [Updated allocation sites](index-maintenance-profile.csv) retain the grouped
-stacks; the raw local output is `.context/index-maintenance-optimized.dhat.json`.
-See the [benchmark comparison](allocation-benchmarks.md#probe-optimization-measurements)
+stacks; the raw local output is
+`.context/index-maintenance-optimized.dhat.json`. See the
+[benchmark comparison](allocation-benchmarks.md#probe-optimization-measurements)
 for normal CPU, latency, durability, sparse-key, and input-order results.
 
 These improvements apply most strongly to dense append batches. The fallback

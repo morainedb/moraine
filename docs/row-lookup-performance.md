@@ -20,11 +20,11 @@ with the number of arbitrary files. File directories require the same shared
 file map, data-store identity, and resolved path prefixes. Changed file metadata
 rebuilds the directory; unrelated catalog commits can reuse it.
 
-An inline directory indexes chunk ranges, including overlapping versions.
-Only requested offsets are materialized, only those IDs' tombstones are scanned,
-and only selected live chunks and their schemas are fetched. The directory
-requires the read session's full head stamp, including maintenance batch sequence.
-An UPDATE's tombstone ends earlier versions without killing its same-snapshot
+An inline directory indexes chunk ranges, including overlapping versions. Only
+requested offsets are materialized, only those IDs' tombstones are scanned, and
+only selected live chunks and their schemas are fetched. The directory requires
+the read session's full head stamp, including maintenance batch sequence. An
+UPDATE's tombstone ends earlier versions without killing its same-snapshot
 replacement. Full scans and time-travel scans retain their existing behavior.
 
 Manifest-following read-only handles validate the full head stamp before and
@@ -36,9 +36,9 @@ its directory just like a writer. The measurements below predate that hardening.
 
 Each handle caches at most 64 table directories per source kind, with arbitrary
 entry eviction on admission at capacity. Directory memory follows file/chunk
-counts and is included in `projection_bytes`; shared file metadata can be counted
-there again beside the materialized view. The directory does not pin arbitrary
-row-ID summaries outside their existing bounded auxiliary cache.
+counts and is included in `projection_bytes`; shared file metadata can be
+counted there again beside the materialized view. The directory does not pin
+arbitrary row-ID summaries outside their existing bounded auxiliary cache.
 
 ## Cold-read limits
 
@@ -63,24 +63,26 @@ target/release/examples/row_lookup_bench recent 1024
 ```
 
 Run each mode at 16, 128, and 1,024 sources in a separate process, with no other
-benchmarks or builds running. Each source contains 128 rows. Every lookup requests
-one ID in the middle source. The fixture uses real SlateDB and in-memory object
-stores; files are valid dense Parquet, while inline chunks carry 1,024 opaque
-body bytes (these APIs return bytes without decoding Arrow).
+benchmarks or builds running. Each source contains 128 rows. Every lookup
+requests one ID in the middle source. The fixture uses real SlateDB and
+in-memory object stores; files are valid dense Parquet, while inline chunks
+carry 1,024 opaque body bytes (these APIs return bytes without decoding Arrow).
 
 Fixture preparation is excluded. Closing and reopening the catalog before the
-first lookup makes the catalog/directory caches cold; a fresh `DataStore` identity
-also isolates file caches. The cold sample includes catalog materialization.
-The warm result averages 32 subsequent calls on the same handles. Process CPU,
-wall-clock latency, allocation count/bytes (`stats_alloc`), and physical data-store
-GETs are measured separately. Allocations include background store activity.
-There are no measured commits or WAL waits. This is an in-memory workload, so
-cold remote-store latency will depend on network service times.
+first lookup makes the catalog/directory caches cold; a fresh `DataStore`
+identity also isolates file caches. The cold sample includes catalog
+materialization. The warm result averages 32 subsequent calls on the same
+handles. Process CPU, wall-clock latency, allocation count/bytes
+(`stats_alloc`), and physical data-store GETs are measured separately.
+Allocations include background store activity. There are no measured commits or
+WAL waits. This is an in-memory workload, so cold remote-store latency will
+depend on network service times.
 
 Collected September 8, 2026 on the Linux x86-64 workspace, Rust 1.96.1 and
-SlateDB 0.15.0. The baseline is commit `f49a4d0` with the same harness. These are
-single cold samples and warm sample means, not statistical latency guarantees.
-Raw data: [before](row-lookup-before.csv), [after](row-lookup-after.csv).
+SlateDB 0.15.0. The baseline is commit `f49a4d0` with the same harness. These
+are single cold samples and warm sample means, not statistical latency
+guarantees. Raw data: [before](row-lookup-before.csv),
+[after](row-lookup-after.csv).
 
 ## Warm results
 
@@ -117,11 +119,11 @@ before and after; the improvement removes CPU and allocation work on cache hits.
 | recent | 128 | 4,101.3 → 1,173.4 | 4,068.9 → 1,156.0 | 0.0 → 0.0 |
 | recent | 1024 | 30,807.7 → 6,589.7 | 30,748.4 → 6,570.1 | 0.0 → 0.0 |
 
-Cold file lookups still issue one footer read per dense file. Building a directory
-adds overhead, visible especially in the smallest file case; at 1,024 files,
-measured cold CPU and latency increased by about 12%. Larger cold
-inline cases improve by avoiding construction of every row, but still scale with
-chunk count. Warm `recent_row` allocations vary somewhat with store/cache activity;
+Cold file lookups still issue one footer read per dense file. Building a
+directory adds overhead, visible especially in the smallest file case; at 1,024
+files, measured cold CPU and latency increased by about 12%. Larger cold inline
+cases improve by avoiding construction of every row, but still scale with chunk
+count. Warm `recent_row` allocations vary somewhat with store/cache activity;
 the source-count growth from the baseline is removed.
 
 ## Read-only handles
@@ -153,9 +155,10 @@ in [the read-only CSV](row-lookup-read-only.csv). Warm one-hit means:
 The selective-body regression failed first: the old `recent_row` fetched an
 unrequested live chunk. Real-store tests also cover overlapping inline updates,
 wider chunks after warming, tombstones, file replacement, request order and
-deduplication, switching data-store identities, and a manifest reader retrying a chunk
-removed by a maintenance batch without changing the snapshot ID. Interval lookup has exhaustive
-membership property tests and explicit nested-range/domain-boundary coverage.
+deduplication, switching data-store identities, and a manifest reader retrying a
+chunk removed by a maintenance batch without changing the snapshot ID. Interval
+lookup has exhaustive membership property tests and explicit
+nested-range/domain-boundary coverage.
 
 The final local gate passed: pinned-nightly formatting, workspace Clippy,
 workspace tests (including 700 core and 208 integration tests), warning-free

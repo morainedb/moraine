@@ -1,0 +1,35 @@
+# Markdown lint and format. Zed formats on save through rumdl's language
+# server; the pre-commit hook and CI run `rumdl check .`.
+[global]
+line-length = 80
+exclude = [
+  "duckdb",
+  "extension-ci-tools",
+  "vendor",
+  "target",
+  "build",
+  "site/node_modules",
+  "site/dist",
+  "site/.astro",
+  # Generated at build time or by release-plz.
+  "site/src/content/docs/rfcs",
+  "site/src/content/docs/releases.md",
+  "site/src/content/docs/roadmap.md",
+  "CHANGELOG.md",
+  # Uncommitted working notes.
+  "docs/plans",
+  ".superpowers",
+]
+
+[MD013]
+# Prose rewraps at the limit; code, tables, and headings are left alone.
+reflow = true
+code-blocks = false
+headings = false
+
+[per-file-ignores]
+# Issue and PR templates open with a form, not a heading.
+".github/**/*.md" = ["MD036", "MD041"]
+"site/AGENTS.md" = ["MD041"]
+# Site links name Starlight routes, not files on disk.
+"site/src/content/docs/**" = ["MD057"]

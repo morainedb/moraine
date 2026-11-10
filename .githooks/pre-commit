@@ -13,3 +13,10 @@ fi
 "$cargo" +nightly-2026-08-29 fmt --check
 "$cargo" xtask fmt-cpp --check
 "$cargo" clippy --workspace --all-targets -- -D warnings
+
+# Markdown, from the tools venv when it is there, else from PATH.
+rumdl=rumdl
+if [ -x target/clang-tools/bin/rumdl ]; then
+  rumdl=target/clang-tools/bin/rumdl
+fi
+"$rumdl" check .

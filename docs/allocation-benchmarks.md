@@ -17,8 +17,8 @@ CARGO_INCREMENTAL=0 cargo test -p moraine --lib --release --locked transaction::
 ```
 
 The tests emit CSV rows prefixed with `ALLOC,`. Compilation and fixture setup
-precede measurement. Each test checks the resulting snapshot, row IDs, or inserted
-batch. Normal test runs skip these measurements.
+precede measurement. Each test checks the resulting snapshot, row IDs, or
+inserted batch. Normal test runs skip these measurements.
 
 The `stats_alloc` global allocator is confined to the Rust library's unit-test
 executable; it also instruments ordinary tests in that executable. Production
@@ -44,36 +44,38 @@ Read-only measurements have zero durability time. These in-memory-store results
 do not predict remote object-store latency. Allocator instrumentation changes
 absolute timing; use these numbers to compare scaling.
 
-- **Snapshot refresh:** 16, 128, or 1,024 tables, each with four columns and eight
-  registered files. Hold the base snapshot, update one table's statistics, and
-  compare a full materialization with incremental refresh from that same base at
-  the same pinned store head. Warm both paths, then measure nine constructions
-  each. Result checks and destruction occur outside the measured intervals. Both
-  results coexist until checked. The comparison covers actual refresh selection,
-  including its catalog-size heuristic.
-- **Warm snapshots:** after seeding 16, 128, or 1,024 four-column tables, retain a
-  snapshot and read it 2,000 times. Every read must return that same shared view.
+- **Snapshot refresh:** 16, 128, or 1,024 tables, each with four columns and
+  eight registered files. Hold the base snapshot, update one table's statistics,
+  and compare a full materialization with incremental refresh from that same
+  base at the same pinned store head. Warm both paths, then measure nine
+  constructions each. Result checks and destruction occur outside the measured
+  intervals. Both results coexist until checked. The comparison covers actual
+  refresh selection, including its catalog-size heuristic.
+- **Warm snapshots:** after seeding 16, 128, or 1,024 four-column tables, retain
+  a snapshot and read it 2,000 times. Every read must return that same shared
+  view.
 - **Index lookups:** seed a unique integer index with 1,024, 16,384, or 65,536
   entries, close durably, and reopen before querying. Run 32 spread-out point
-  hits, 32 point misses, and 32 ranges returning 32 rows each. For each operation,
-  repeat the same queries once to measure the warm pass. Operations share the
-  reopened catalog, so “first” means that operation's first pass, not an empty
-  cache. Query construction, result checks, and result destruction are included;
-  initial key preparation is excluded. Object GET counts help distinguish
-  cache activity from allocation work.
+  hits, 32 point misses, and 32 ranges returning 32 rows each. For each
+  operation, repeat the same queries once to measure the warm pass. Operations
+  share the reopened catalog, so “first” means that operation's first pass, not
+  an empty cache. Query construction, result checks, and result destruction are
+  included; initial key preparation is excluded. Object GET counts help
+  distinguish cache activity from allocation work.
 - **Index maintenance:** seed the same index sizes and append batches of 1, 64,
   or 1,024 entries by registering one data file per commit. Input entries are
   prepared outside measurement. Run three warmup commits and five measured
   commits, checking the complete inserted batch after each interval. `size` is
   the initial index size; it grows by eight batches per case. Measurements are
-  per commit, not per inserted entry, and include catalog metadata and durability.
-  These are ascending inserts; deletes, random insert positions, staged builds,
-  and C++ allocations are outside this benchmark.
+  per commit, not per inserted entry, and include catalog metadata and
+  durability. These are ascending inserts; deletes, random insert positions,
+  staged builds, and C++ allocations are outside this benchmark.
 
 ## Baseline before read optimizations
 
 Results below were collected on September 8, 2026, on the workspace's Linux
-x86-64 VM with Rust 1.96.1 release builds and imbl 5.0.0. Baseline raw output is in
+x86-64 VM with Rust 1.96.1 release builds and imbl 5.0.0. Baseline raw output is
+in
 [allocation-benchmarks-before-read-optimizations.csv](allocation-benchmarks-before-read-optimizations.csv).
 The [latest output](allocation-benchmarks.csv) and the comparison below include
 catalog-view reuse and the maintained entity count.
@@ -89,14 +91,15 @@ statistical latency guarantees.
 | Incremental refresh | 1,024 | 0.201 ms | 0.198 ms | 187 | 44.0 KB |
 
 At 1,024 tables, replay allocated about 1,488 times fewer bytes and took about
-252 times less elapsed time than rebuilding. At this point refresh was not constant in
-catalog size: its selection heuristic called `live_entity_count`, which walked
-the outer maps of nested entities. Copying shared tree paths also had
-size-dependent costs. The baseline did not attribute all growth to either cause.
+252 times less elapsed time than rebuilding. At this point refresh was not
+constant in catalog size: its selection heuristic called `live_entity_count`,
+which walked the outer maps of nested entities. Copying shared tree paths also
+had size-dependent costs. The baseline did not attribute all growth to either
+cause.
 
-Warm snapshot reads returned the same shared view, with zero observed allocations
-and zero GETs at every size. Their measured latency was approximately 0.06 µs
-per call, including the pointer check and result drop.
+Warm snapshot reads returned the same shared view, with zero observed
+allocations and zero GETs at every size. Their measured latency was
+approximately 0.06 µs per call, including the pointer check and result drop.
 
 | Warm query, 65,536 index entries | CPU | Latency | Allocation calls | Allocated | GETs |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -104,11 +107,12 @@ per call, including the pointer check and result drop.
 | Point miss | 245 µs | 229 µs | 617 | 191.9 KB | 0 |
 | Range returning 32 rows | 419 µs | 396 µs | 1,425 | 374.4 KB | 0 |
 
-Warm query allocation totals were nearly identical at all three index sizes.
-The first point-hit passes made 53, 74, and 76 GETs respectively across their
-32 queries; every warm pass made zero GETs. This identified repeated cached index queries as an optimization
-candidate. Code inspection subsequently found that query-only workloads did not
-retain their materialized catalog view; the next section measures that fix.
+Warm query allocation totals were nearly identical at all three index sizes. The
+first point-hit passes made 53, 74, and 76 GETs respectively across their 32
+queries; every warm pass made zero GETs. This identified repeated cached index
+queries as an optimization candidate. Code inspection subsequently found that
+query-only workloads did not retain their materialized catalog view; the next
+section measures that fix.
 
 | Initial index entries | Inserted per commit | CPU | Total latency | Durability interval | Allocated |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -123,21 +127,21 @@ Maintenance allocations scale with the inserted batch and remain nearly flat as
 the existing index grows 64-fold. CPU still rises with existing index size, so
 this does not establish constant CPU cost. At 65,536 existing entries, the
 1,024-entry commit uses about 67,367 allocation calls (66 per inserted entry).
-Measured commits made no GETs and one PUT each; observed PUT service time averaged
-only 3–6 µs, much smaller than the complete durability interval. This fixture
-keeps the seeded index in the writer's memory tables; it measures warm append
-maintenance, not probes against an uncached remote index.
+Measured commits made no GETs and one PUT each; observed PUT service time
+averaged only 3–6 µs, much smaller than the complete durability interval. This
+fixture keeps the seeded index in the writer's memory tables; it measures warm
+append maintenance, not probes against an uncached remote index.
 
 All four isolated measurement tests and the complete local gate passed,
 including 154 DuckLake integration tests and 173 SQL assertions.
 
 ## After catalog-view reuse and incremental entity counting
 
-Index queries now install their materialized catalog view using the same
-head stamp and invalidation epoch as snapshot reads. The epoch is captured
-before opening the read session, so a late reader cannot replace a view installed
-by an intervening commit. Equality, batched equality, range, and NULL lookups
-reuse metadata while resolving index entries afresh in their read session.
+Index queries now install their materialized catalog view using the same head
+stamp and invalidation epoch as snapshot reads. The epoch is captured before
+opening the read session, so a late reader cannot replace a view installed by an
+intervening commit. Equality, batched equality, range, and NULL lookups reuse
+metadata while resolving index entries afresh in their read session.
 
 The refresh heuristic now reads a maintained count for nested records plus
 the flat maps' constant-time lengths. Snapshot mutators maintain the count
@@ -200,8 +204,8 @@ CARGO_INCREMENTAL=0 cargo test -p moraine --lib --release --locked transaction::
 at one transaction snapshot over 32,768 persisted keys, after closing and
 reopening the store. Dense and sparse hit/miss patterns each run one warmup and
 five measured batches, with identical results checked. CSV costs are **per key**
-(`samples = 5 × 128`); GET/PUT counts still cover all measured batches. The point
-path runs first, and both paths are warm after the discarded pass.
+(`samples = 5 × 128`); GET/PUT counts still cover all measured batches. The
+point path runs first, and both paths are warm after the discarded pass.
 
 `index_maintenance_input_order` commits 4,096 entries in ascending, descending,
 and scattered order, starting with 1,024 existing entries. It discards one
@@ -211,9 +215,10 @@ it tests overlapping local-write spans, not remote sparse-key performance.
 Neither benchmark measures cold remote-store latency.
 
 The latest [main results](allocation-benchmarks.csv) and
-[probe/order results](index-probe-benchmarks.csv) were collected without competing
-builds or tests on the same VM. The comparison is against the immediately
-preceding read-optimized run; timings remain single-run observations.
+[probe/order results](index-probe-benchmarks.csv) were collected without
+competing builds or tests on the same VM. The comparison is against the
+immediately preceding read-optimized run; timings remain single-run
+observations.
 
 | Append into 65,536-entry index | Before | After |
 | --- | ---: | ---: |

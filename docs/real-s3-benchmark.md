@@ -20,8 +20,8 @@ Moraine metadata path. It builds and loads the repository's patched DuckLake,
 then reports total UPDATE latency, DuckLake metadata statement time, the one
 committed-entity scan, Moraine commit time and staged bytes, the durable-write
 wait, and physical GET/PUT counts and latency. AWS credentials resolve through
-the normal credential chain. For a local S3 server, also set `MORAINE_S3_ENDPOINT`,
-`AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`.
+the normal credential chain. For a local S3 server, also set
+`MORAINE_S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`.
 
 For the read-only side, the same environment drives a cold-attach sweep:
 

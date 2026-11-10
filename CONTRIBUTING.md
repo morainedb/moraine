@@ -9,7 +9,8 @@ cargo install cargo-deny
 python3 -m venv target/clang-tools
 target/clang-tools/bin/python -m pip install \
   "clang-format==$(cat .clang-tools-version)" \
-  "clang-tidy==$(cat .clang-tools-version)"
+  "clang-tidy==$(cat .clang-tools-version)" \
+  "rumdl==$(cat .rumdl-version)"
 ```
 
 Formatting uses a dated nightly so CI and local hooks produce the same output.
@@ -23,6 +24,12 @@ use `target/clang-tools/bin` when installed there, or the same version on
 Run `cargo xtask fmt-cpp` to format handwritten C/C++ sources and headers.
 The pre-commit hook and CI run `cargo xtask fmt-cpp --check`. Dependencies
 and the generated `moraine_abi.h` are excluded.
+
+Markdown is linted and formatted by [rumdl](https://rumdl.dev), pinned in
+`.rumdl-version` and configured in `.rumdl.toml`. `rumdl fmt .` rewraps
+prose at 80 columns and fixes what it can; the pre-commit hook and CI run
+`rumdl check .`. Zed formats on save through rumdl's language server (the
+project settings install its extension).
 
 `cargo xtask tidy-cpp` prepares the patched DuckLake sources and configures
 the release build without compiling DuckDB or the Rust core. It needs the
@@ -55,6 +62,7 @@ Everything CI enforces, runnable locally:
 ```bash
 cargo +nightly-2026-08-29 fmt --check
 cargo xtask fmt-cpp --check
+rumdl check .
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

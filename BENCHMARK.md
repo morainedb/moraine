@@ -232,8 +232,8 @@ The same data lands in `target/bench/report.json` for diffing across
 checkouts.
 
 Not covered: concurrent writers sharing one process, remote object stores,
-cross-machine reproducibility, or statistical rigor beyond median/min/max. It's a local
-tool; CI runs `e2e`, not this.
+cross-machine reproducibility, or statistical rigor beyond median/min/max. It's
+a local tool; CI runs `e2e`, not this.
 
 ## Located lookups
 
@@ -282,7 +282,7 @@ the same answer a constant-id predicate gets, without knowing the file. Real
 endpoint numbers for the summary build live in the located-lookup measurement
 below.
 
-# ClickBench
+## ClickBench
 
 [ClickBench](https://benchmark.clickhouse.com) ranks analytical databases on
 43 queries over one 100-million-row table. `benchmark/clickbench` is a
@@ -314,7 +314,7 @@ commit path, which is what the rest of this file measures. See
 methodology and the two timing choices it inherits from the other embedded
 entries.
 
-# Core measurements
+## Core measurements
 
 `cargo xtask bench` times the whole stack through the DuckDB CLI. A second,
 finer harness times moraine's core directly, for questions the end-to-end
@@ -349,7 +349,7 @@ regardless of backend, and swamping the ~2 ms of compute underneath. Every
 durable-commit-bound cost inherits this. Concurrency is the way out, not a
 faster commit: K concurrent commits share one flush.
 
-## Cold read-only attaches
+### Cold read-only attaches
 
 `cargo xtask reader-bench` measures what a fresh read-only process pays over
 a catalog with thousands of data files: the attach, the first listing of
@@ -397,7 +397,7 @@ read from moraine's own log events rather than timed from outside:
 per SST — and `view_ms` is the first materialization of the catalog. What
 the attach costs beyond their sum is DuckLake's own work over the rows.
 
-### Durable-commit latency vs. flush interval
+#### Durable-commit latency vs. flush interval
 
 60 sequential `await_durable` commits, per interval:
 
@@ -416,7 +416,7 @@ spacing clear skips the wait and costs the flush alone — on a real object
 store, the WAL PUT round-trip, which the next two sections measure rather
 than assume.
 
-### Durable-commit latency vs. write round-trip
+#### Durable-commit latency vs. write round-trip
 
 The composition of the two terms, measured by wrapping the in-memory store in
 a `ThrottledStore` that sleeps before every PUT and sweeping that delay
@@ -436,7 +436,7 @@ whichever of the tick and the PUT is slower. So the model is
 practical reading: lowering the flush interval below the store's write RTT
 buys nothing, and a fast store cannot make up for a slow flush cadence.
 
-### Durable-commit latency against a real endpoint
+#### Durable-commit latency against a real endpoint
 
 The same sweep against a live S3-compatible endpoint, where the PUT is the
 endpoint's own round trip (`cargo xtask s3`, which runs
@@ -470,7 +470,7 @@ this deployment: lowering the cadence from 25 ms to 1 ms buys nothing, while
 the 100 ms cadence still binds. This is the real-endpoint row the injected-RTT
 model predicted, not a new term in the composition.
 
-### Index lookup latency against a real endpoint
+#### Index lookup latency against a real endpoint
 
 The in-memory probe measurement further down prices what an index probe
 *fetches*; this prices what it *waits*. `object_storage.rs`'s
@@ -533,23 +533,23 @@ fan-out cannot shorten it — so the lever is *when* it is paid: with
 first lookup on every table costs ~3 ms instead of ~400. That is why the
 extension preloads `L0` by default.
 
-### Located lookup latency against a real endpoint
+#### Located lookup latency against a real endpoint
 
-The index measurement above prices `locate_row_ids` with no data store, so
-it sees the catalog side only. `measure_located_lookup_latency_against_the_endpoint`
-in the same file prices the other half: the row-summary path that reads a
-Parquet file's row-id column once and answers from the resident summary
-afterwards. It writes 64 real Parquet objects x 2 000 rows under the run
-prefix's data path and registers them with their true `file_size_bytes` and
-`footer_size`: 32 dense files carry no row-id column and answer from the
-range the commit allocated, 32 embed `_ducklake_internal_row_id` with gaps
-(24 stepping by 2, 8 striding past a Roaring container per id), so their
-summaries must be built from the object. Each of five repetitions attaches
-fresh and hands the lookup a fresh data-store handle, since the summary
-cache is keyed by the handle; every `locate_row_ids` asks for 50 present
-ids, half dense and half sparse. Rows report median/min/max and the median
-GET count against the catalog store (`main_gets`) and the data store
-(`data_gets`):
+The index measurement above prices `locate_row_ids` with no data store, so it
+sees the catalog side only.
+`measure_located_lookup_latency_against_the_endpoint` in the same file prices
+the other half: the row-summary path that reads a Parquet file's row-id column
+once and answers from the resident summary afterwards. It writes 64 real Parquet
+objects x 2 000 rows under the run prefix's data path and registers them with
+their true `file_size_bytes` and `footer_size`: 32 dense files carry no row-id
+column and answer from the range the commit allocated, 32 embed
+`_ducklake_internal_row_id` with gaps (24 stepping by 2, 8 striding past a
+Roaring container per id), so their summaries must be built from the object.
+Each of five repetitions attaches fresh and hands the lookup a fresh data-store
+handle, since the summary cache is keyed by the handle; every `locate_row_ids`
+asks for 50 present ids, half dense and half sparse. Rows report median/min/max
+and the median GET count against the catalog store (`main_gets`) and the data
+store (`data_gets`):
 
 | phase | what it times |
 |---|---|
@@ -583,7 +583,7 @@ that is eight waves, which is where the ~460 ms comes from; one wave is the
 target of the wider fan-out. Warm, and after `warm_row_summaries`, a locate
 touches neither store.
 
-### Commit throughput vs. concurrency
+#### Commit throughput vs. concurrency
 
 The sequential number above is one commit per flush by construction. This is
 the concurrent one, now that concurrent commits coalesce into a shared batch:
@@ -615,7 +615,7 @@ multiply.
 This is what makes the single-writer topology's funnel affordable: routing a
 fleet's commits through one process costs them a shared flush, not a queue.
 
-### Reclaim throughput vs. maintenance batch size
+#### Reclaim throughput vs. maintenance batch size
 
 50 000 dead index entries swept at the 100 ms default; each batch is one
 durable commit, so `commits = ceil(entries / batch)`:
@@ -637,7 +637,7 @@ batch — the entries are tombstoned idempotently, so only the last batch needs
 to be durable. The second lever makes batch size almost irrelevant and is the
 better fix.
 
-### Cold attach cost vs. the physical bytes a read touches
+#### Cold attach cost vs. the physical bytes a read touches
 
 The claim the store census and the store merge rest on: a cold attach reads
 through every superseded version the store still holds, so it costs what the
@@ -678,7 +678,7 @@ above were produced, but those SSTs are all tiny: the harness can vary SST
 real bloated store or an `l0_sst_size` knob on `CatalogOptions`, which is
 not exposed today.
 
-### What a store merge is worth once a GET costs what S3 charges
+#### What a store merge is worth once a GET costs what S3 charges
 
 The table above runs in memory, so it prices decode. The production
 incident did not: ~5.3 MB/s effective, a read pulling the store across the
@@ -725,7 +725,7 @@ merge asked for straight after an attach found every tree already being
 merged by the writer's own compactor and skipped them all; adopting the
 in-flight merge instead is what makes this column mean anything.
 
-### Cold attach against AWS S3
+#### Cold attach against AWS S3
 
 The main-only real-S3 workflow ran that same catalog shape from an ARM
 CodeBuild worker against a bucket in the worker's `us-west-2` region: 40
@@ -758,7 +758,7 @@ larger than the materialization. It does make the operational rule concrete:
 use the census before merging, and do not treat a fall in total SST count as a
 promise of lower attach latency.
 
-### Does a cold attach pay for the `index` subspace?
+#### Does a cold attach pay for the `index` subspace?
 
 A production store measured 3.364 GB in `index` — 75.6M live entries, 99.6%
 of the store — against ~13 MB across every subspace a reader touches, and
@@ -813,7 +813,7 @@ was configured to read it — which no measurement of the store could have
 found, and which the attach named in one run once it was asked to report on
 itself.
 
-### Materialization cost vs. catalog size
+#### Materialization cost vs. catalog size
 
 This is the cost of a *cold* read — one whose handle holds no cached view.
 A warm read serves from the projection cache and pays none of it. Median of
@@ -833,7 +833,7 @@ independent, since it is a read. A 20 000-entity catalog costs ~150 ms; a
 the cache rather than paying this per read; lazy materialization to bound
 the cold cost on a large catalog stays open.
 
-### Changelog replay vs. rematerialization
+#### Changelog replay vs. rematerialization
 
 A cache that has fallen behind head can replay the `current` keys each
 commit in the gap recorded, or rescan `current` outright. Both build the
@@ -874,7 +874,7 @@ keys, which the previous cap of 256 silently declined — stays on the
 replay side; the churn share above still declines the replays that would
 not pay.
 
-### What the changelog costs the read path
+#### What the changelog costs the read path
 
 The changelog first rode in the snapshot record. Measured there — one data
 file per commit over an 8-column table, stats for every column — it grew
@@ -895,7 +895,7 @@ the changelog, and the changelog subspace is flat: each commit deletes the
 record 64 snapshots back, so a sliding window bounds it whatever the commit
 count and nothing else has to reclaim it.
 
-### What a warm read on a read-write handle has left
+#### What a warm read on a read-write handle has left
 
 A read-write handle holds the writer epoch, so it resolves the head from
 the view it already holds rather than reading `sys/head`, and skips the
@@ -949,7 +949,7 @@ warm read measured in the hundreds of milliseconds is therefore neither of
 these — it is IO the warm path no longer issues, or serialization above
 moraine (DuckLake's own metadata connection is serialized; see RFC 0006).
 
-### How many round trips a read-only read costs
+#### How many round trips a read-only read costs
 
 The section above measures a read-only read at ~6 µs and attributes it to a
 session and two point reads. That says nothing about *round trips*, and a
@@ -976,7 +976,7 @@ not the point reads. So a reader's two point reads are worth no round trip
 warm and at most one of four cold. Overlapping them was implemented against
 this measurement and reverted by it: there was nothing there to save.
 
-### Read concurrency under IO latency
+#### Read concurrency under IO latency
 
 Does slow object-store IO starve the worker pool, so concurrent scans
 serialize instead of overlapping? The in-memory store is wrapped in a
@@ -1000,7 +1000,7 @@ latency does not starve the pool, and a separate IO-dedicated runtime is
 unnecessary on that axis. This isolates IO latency only; the next section
 takes the compute axis.
 
-### CPU-bound decode under worker pressure
+#### CPU-bound decode under worker pressure
 
 The other half of the same question: a cold materialization decodes every
 live record, and decode does not wait on anything — so does it hold its
@@ -1038,7 +1038,7 @@ axis. Both halves of the worker-pool question are now answered the same
 way: the pool does not need protecting from either IO latency or decode
 compute.
 
-### What an index probe fetches, cold and warm
+#### What an index probe fetches, cold and warm
 
 The design replaced a part-grained object cache (4 MiB parts) with a
 block-grained one, and argued the swap from grain arithmetic alone. This
