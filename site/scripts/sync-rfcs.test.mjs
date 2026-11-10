@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { isPublishedRfc, isRfcFile, transformReadme, transformRfc, transformRoadmap } from './sync-rfcs.mjs';
+import {
+  isPublishedRfc,
+  isRfcFile,
+  transformBenchmarks,
+  transformReadme,
+  transformRfc,
+  transformRoadmap,
+} from './sync-rfcs.mjs';
 
 const source = [
   '# RFC 0009: Equality and range indexes',
@@ -162,4 +169,27 @@ test('the roadmap becomes a page with RFC links resolved from the repository roo
   );
   assert.ok(!page.includes('Multi-process'));
   assert.ok(!page.includes('# Roadmap'));
+});
+
+test('the benchmarks page resolves its links from docs/', () => {
+  const page = transformBenchmarks(
+    [
+      '# Benchmarks',
+      '',
+      'Setup is in [CONTRIBUTING.md](../CONTRIBUTING.md#the-real-s3-benchmark); the',
+      'entry has a [README](../benchmark/clickbench/README.md) and the design a',
+      '[format](rfcs/0001-storage-format.md).',
+    ].join('\n'),
+  );
+  assert.match(page, /^---\ntitle: "Benchmarks"\n---\n/);
+  assert.ok(!page.includes('# Benchmarks'));
+  assert.ok(
+    page.includes(
+      '](https://github.com/morainedb/moraine/blob/main/CONTRIBUTING.md#the-real-s3-benchmark)',
+    ),
+  );
+  assert.ok(
+    page.includes('](https://github.com/morainedb/moraine/blob/main/benchmark/clickbench/README.md)'),
+  );
+  assert.ok(page.includes('](/rfcs/0001-storage-format/)'));
 });

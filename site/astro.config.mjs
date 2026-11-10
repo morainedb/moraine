@@ -33,6 +33,7 @@ export default defineConfig({
 					label: 'Design',
 					items: [{ autogenerate: { directory: 'rfcs' } }],
 				},
+				{ label: 'Benchmarks', slug: 'benchmarks' },
 				{ label: 'Releases', slug: 'releases' },
 				{ label: 'Roadmap', slug: 'roadmap' },
 			],
