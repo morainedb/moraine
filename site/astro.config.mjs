@@ -29,6 +29,7 @@ export default defineConfig({
 						{ slug: 'guide/operating' },
 					],
 				},
+				{ label: 'Releases', slug: 'releases' },
 				{
 					label: 'Design',
 					items: [{ autogenerate: { directory: 'rfcs' } }],
