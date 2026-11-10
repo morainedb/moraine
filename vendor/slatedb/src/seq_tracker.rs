@@ -98,27 +98,22 @@ impl SequenceTracker {
             }
         }
 
-        // The tracker is an index from sequence to time, and the writer is
-        // its authority: sequences only grow, so a stored entry ahead of the
-        // sequence being recorded is wrong, not the write. Such entries come
-        // from a manifest a version-1 writer truncated, or from a clock that
-        // ran ahead of this one's. The stored tail yields to the writer rather
-        // than the writer being taken down.
-        let keep = self
-            .sequence_numbers
-            .iter()
-            .zip(self.timestamps.iter())
-            .take_while(|(&stored_seq, &stored_ts)| stored_seq <= seq.seq && stored_ts <= ts_secs)
-            .count();
-        if keep < self.sequence_numbers.len() {
-            log::warn!(
-                "sequence tracker: dropping {} stored entries ahead of the write being recorded (seq {}, ts {}); a version-1 manifest truncated a wide delta, or a clock ran ahead",
-                self.sequence_numbers.len() - keep,
+        // Ensure monotonic ordering
+        if let Some(last_seq) = self.sequence_numbers.last() {
+            assert!(
+                seq.seq >= *last_seq,
+                "Sequence numbers must be monotonic. seq: {}, last_seq: {}",
                 seq.seq,
-                ts_secs
+                *last_seq
             );
-            self.sequence_numbers.truncate(keep);
-            self.timestamps.truncate(keep);
+        }
+        if let Some(last_ts) = self.timestamps.last() {
+            assert!(
+                ts_secs >= *last_ts,
+                "Timestamps must be monotonic. ts_secs: {}, last_ts: {}",
+                ts_secs,
+                *last_ts
+            );
         }
 
         self.sequence_numbers.push(seq.seq);
@@ -1211,125 +1206,5 @@ mod tests {
         })?;
 
         Ok(())
-    }
-
-    /// A stored entry ahead of the write being recorded yields to the write,
-    /// not the other way round: the writer's sequences are the authority,
-    /// and a tracker that found damaged entries keeps recording.
-    #[test]
-    fn stored_entries_ahead_of_a_write_yield_to_it() {
-        use chrono::TimeZone;
-        let mut tracker = SequenceTracker::with_config(16, 1);
-        let at = |secs: i64| Utc.timestamp_opt(secs, 0).single().unwrap();
-        tracker.insert(TrackedSeq {
-            seq: 10,
-            ts: at(100),
-        });
-        tracker.insert(TrackedSeq {
-            seq: 20,
-            ts: at(200),
-        });
-        tracker.insert(TrackedSeq {
-            seq: 15,
-            ts: at(300),
-        });
-        assert_eq!(tracker.sequence_numbers, vec![10, 15]);
-        assert_eq!(tracker.timestamps, vec![100, 300]);
-        tracker.insert(TrackedSeq {
-            seq: 30,
-            ts: at(400),
-        });
-        assert_eq!(tracker.sequence_numbers, vec![10, 15, 30]);
-        assert_eq!(tracker.timestamps, vec![100, 300, 400]);
-    }
-
-    /// A version-1 encoding of a sequence jump wider than 32 bits decodes to
-    /// garbage from that entry on. The next write recorded sweeps the garbage
-    /// out, so the writer that inherits such a manifest keeps going.
-    #[test]
-    fn a_truncated_version_one_tracker_heals_on_the_next_write() {
-        use chrono::TimeZone;
-        let at = |secs: i64| Utc.timestamp_opt(secs, 0).single().unwrap();
-        let mut tracker = SequenceTracker::with_config(16, 1);
-        tracker.insert(TrackedSeq {
-            seq: 100,
-            ts: at(1_000),
-        });
-        tracker.insert(TrackedSeq {
-            seq: 200,
-            ts: at(2_000),
-        });
-        // A multiwriter row sequence: 2^32 past the store's own, which a
-        // 32-bit delta-of-deltas bucket cannot hold.
-        tracker.insert(TrackedSeq {
-            seq: (1 << 32) + (3463 << 20) + 1,
-            ts: at(3_000),
-        });
-        tracker.insert(TrackedSeq {
-            seq: (1 << 32) + (3523 << 20) + 1,
-            ts: at(4_000),
-        });
-
-        // Encoded as version 1 did: a delta-of-deltas wider than 32 bits went
-        // into the 32-bit slot truncated. The release's encoder refuses to,
-        // so the old behaviour is reproduced here.
-        fn truncating_v1(values: &[i64]) -> Vec<u8> {
-            let mut w = BitWriter::new();
-            w.push32(values.len() as u32, 32);
-            w.push64(values[0] as u64, 64);
-            let mut prev_val = values[0];
-            let mut prev_delta = 0i64;
-            for &val in &values[1..] {
-                let delta = val - prev_val;
-                let dod = delta - prev_delta;
-                match dod {
-                    0 => w.push(false),
-                    -63..=63 => {
-                        w.push32(0b10, 2);
-                        w.push32((dod as u32) & 0x7F, 7);
-                    }
-                    -255..=255 => {
-                        w.push32(0b110, 3);
-                        w.push32((dod as u32) & 0x1FF, 9);
-                    }
-                    -2047..=2047 => {
-                        w.push32(0b1110, 4);
-                        w.push32((dod as u32) & 0xFFF, 12);
-                    }
-                    _ => {
-                        w.push32(0b1111, 4);
-                        w.push32(dod as u32, 32);
-                    }
-                }
-                prev_val = val;
-                prev_delta = delta;
-            }
-            w.finish()
-        }
-        let mut bytes = vec![SERIALIZATION_VERSION_V1];
-        bytes.extend_from_slice(&(tracker.sequence_numbers.len() as u32).to_le_bytes());
-        let sequences: Vec<i64> = tracker.sequence_numbers.iter().map(|&s| s as i64).collect();
-        bytes.extend_from_slice(&truncating_v1(&sequences));
-        bytes.extend_from_slice(&truncating_v1(&tracker.timestamps));
-
-        let mut decoded = SequenceTracker::from_bytes(&bytes).unwrap();
-        assert_eq!(&decoded.sequence_numbers[..2], &[100, 200]);
-        assert!(
-            decoded.sequence_numbers[2] > 1 << 63,
-            "the truncated delta sign-extends into a sequence no writer reaches: {}",
-            decoded.sequence_numbers[2]
-        );
-
-        // The next write recorded, slot 3523's first row, sweeps it out.
-        decoded.insert(TrackedSeq {
-            seq: 7_989_100_545,
-            ts: at(5_000),
-        });
-        assert_eq!(decoded.sequence_numbers.last(), Some(&7_989_100_545));
-        assert!(decoded
-            .sequence_numbers
-            .windows(2)
-            .all(|pair| pair[0] <= pair[1]));
-        assert!(decoded.timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 }
