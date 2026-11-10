@@ -4,9 +4,6 @@
 //! - `tidy-cpp` configures the extension and runs clang-tidy on handwritten
 //!   sources.
 //!
-//! `session-bench` compares the pinned pre-review, post-review, and SlateDB
-//! upgrade revisions with shared core and SQL workloads.
-//!
 //! - `e2e` packages the extension and drives it through a real DuckDB CLI (see
 //!   `e2e.rs`).
 //! - `bench` compares DuckLake metadata catalogs — moraine's SlateDB store, a
@@ -34,9 +31,6 @@
 //!   what the build and validation matrices are generated from.
 //! - `bump-duckdb <version>` moves the primary pin to a new DuckDB release,
 //!   writing every place `check-pins` checks (see `bump.rs`).
-//! - `ducklake-patch` builds the repository's DuckLake patch series as a
-//!   standalone loadable, which only `session-bench`'s pre-bundling revisions
-//!   need (see `ducklake_patch.rs`).
 
 use anyhow::bail;
 
@@ -55,7 +49,6 @@ mod pins;
 mod reader_bench;
 mod release;
 mod s3;
-mod session_bench;
 
 fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(2).collect();
@@ -71,9 +64,7 @@ fn main() -> anyhow::Result<()> {
         Some("locate-bench") => locate_bench::run(&arguments),
         Some("filter-bench") => filter_bench::run(&arguments),
         Some("reader-bench") => reader_bench::run(&arguments),
-        Some("session-bench") => session_bench::run(&arguments),
         Some("s3") => s3::s3(),
-        Some("ducklake-patch") => ducklake_patch::build(&arguments),
         Some("check-pins") => pins::check_pins(),
         Some("check-patch-pins") => ducklake_patch::check_pins(),
         Some("check-release-assets") => release::check_release_assets(&arguments),
@@ -86,17 +77,17 @@ fn main() -> anyhow::Result<()> {
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+                "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
                  check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
              version-matrix, \
                  version-matrix, \
-                 bump-duckdb, ducklake-patch"
+                 bump-duckdb"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
              check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
-             bump-duckdb, ducklake-patch"
+             bump-duckdb"
         ),
     }
 }

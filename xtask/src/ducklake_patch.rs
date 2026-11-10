@@ -1,6 +1,5 @@
 //! Prepares the repository's DuckLake patch series for bundling into the
-//! moraine extension, and builds it standalone for the session benchmark's
-//! pre-bundling revisions.
+//! moraine extension.
 
 use std::{
     fs,
@@ -45,12 +44,6 @@ const REGRESSION_TEST_PATHS: [&str; 2] = [
     "test/sql/rowid/ducklake_data_file_id.test",
 ];
 
-#[derive(Debug, PartialEq, Eq)]
-struct Options {
-    root: PathBuf,
-    duckdb_static: PathBuf,
-}
-
 /// The patched DuckLake checkout the moraine build bundles, and the vcpkg
 /// it resolves DuckLake's `roaring` dependency through.
 #[derive(Debug)]
@@ -73,15 +66,6 @@ impl PatchedDuckLake {
     /// The toolchain file the build resolves `roaring` through.
     pub fn vcpkg_toolchain(&self) -> PathBuf {
         self.vcpkg.join("scripts/buildsystems/vcpkg.cmake")
-    }
-
-    fn standalone_build(&self) -> PathBuf {
-        self.root.join("build-extension-static")
-    }
-
-    fn standalone_artifact(&self) -> PathBuf {
-        self.standalone_build()
-            .join("extension/ducklake/ducklake.duckdb_extension")
     }
 }
 
@@ -137,132 +121,6 @@ fn prepare_at(workspace: &Path, root: PathBuf) -> anyhow::Result<PatchedDuckLake
     prepare_checkout(&patched.vcpkg, VCPKG_URL, VCPKG_REVISION, SHALLOW, "vcpkg")?;
     bootstrap_vcpkg(&patched.vcpkg)?;
     Ok(patched)
-}
-
-/// Builds the patch series as a standalone loadable DuckLake, which the
-/// session benchmark's pre-bundling revisions load beside their moraine.
-pub fn build(arguments: &[String]) -> anyhow::Result<()> {
-    let artifact = build_artifact(arguments)?;
-    println!("ok: standalone patched DuckLake at {}", artifact.display());
-    println!(
-        "load it into DuckDB {} with `duckdb -unsigned`, then `LOAD '{}';`",
-        duckdb::duckdb_pin(),
-        artifact.display()
-    );
-    Ok(())
-}
-
-fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
-    let workspace = duckdb::workspace_root();
-    let options = parse_arguments(&workspace, arguments)?;
-
-    validate_duckdb_checkout(&workspace)?;
-    ensure!(
-        options.duckdb_static.exists(),
-        "DuckDB's static library is missing at {}; build moraine once with `cargo xtask e2e` or \
-         pass `--duckdb-static PATH`",
-        options.duckdb_static.display(),
-    );
-    let patched = prepare_at(&workspace, options.root)?;
-
-    let compilers = duckdb::cpp_compilers()?;
-    let build = patched.standalone_build();
-    reset_build_for_compiler_change(&build, compilers.as_ref())?;
-    let cmake_args = cmake_arguments(
-        &workspace,
-        &patched,
-        &options.duckdb_static,
-        duckdb::duckdb_pin(),
-        compilers.as_ref(),
-    );
-    let mut configure = Command::new("cmake");
-    configure.args(&cmake_args);
-    duckdb::run(&mut configure)?;
-
-    duckdb::run(Command::new("cmake").args(["--build"]).arg(&build).args([
-        "--target",
-        "ducklake_loadable_extension",
-        "--config",
-        "Release",
-    ]))?;
-
-    let artifact = patched.standalone_artifact();
-    ensure!(
-        artifact.exists(),
-        "DuckLake build completed but {} is missing",
-        artifact.display()
-    );
-    verify_loadable(&artifact)?;
-    run_row_id_regression(&patched, &artifact)?;
-    Ok(artifact)
-}
-
-fn parse_arguments(workspace: &Path, arguments: &[String]) -> anyhow::Result<Options> {
-    let mut root = workspace.join("target/patched-ducklake");
-    let mut duckdb_static = workspace.join("build/release/src/libduckdb_static.a");
-    let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--root" => {
-                index += 1;
-                let value = arguments
-                    .get(index)
-                    .context("`--root` requires a directory")?;
-                let requested = PathBuf::from(value);
-                root = if requested.is_absolute() {
-                    requested
-                } else {
-                    workspace.join(requested)
-                };
-            }
-            "--duckdb-static" => {
-                index += 1;
-                let value = arguments
-                    .get(index)
-                    .context("`--duckdb-static` requires a file")?;
-                let requested = PathBuf::from(value);
-                duckdb_static = if requested.is_absolute() {
-                    requested
-                } else {
-                    workspace.join(requested)
-                };
-            }
-            unknown => bail!(
-                "unknown argument `{unknown}`; usage: ducklake-patch \
-                 [--root DIRECTORY] [--duckdb-static FILE]"
-            ),
-        }
-        index += 1;
-    }
-    Ok(Options {
-        root,
-        duckdb_static,
-    })
-}
-
-fn validate_duckdb_checkout(workspace: &Path) -> anyhow::Result<()> {
-    let expected = duckdb::primary_submodule_pins()
-        .into_iter()
-        .find_map(|(path, revision)| (path == "duckdb").then_some(revision))
-        .context("the primary DuckDB manifest entry has no `duckdb` submodule pin")?;
-    let source = workspace.join("duckdb");
-    ensure!(
-        source.join("CMakeLists.txt").exists(),
-        "the DuckDB submodule is missing; run `git submodule update --init duckdb`"
-    );
-    let actual = command_output(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&source),
-    )?;
-    ensure!(
-        actual.trim() == expected,
-        "DuckDB submodule is {}, expected {}; run `git submodule update --init duckdb`",
-        actual.trim(),
-        expected
-    );
-    ensure_clean_checkout(&source, "DuckDB submodule")?;
-    Ok(())
 }
 
 fn prepare_checkout(
@@ -643,97 +501,6 @@ fn bootstrap_vcpkg(vcpkg: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn cmake_arguments(
-    workspace: &Path,
-    patched: &PatchedDuckLake,
-    duckdb_static: &Path,
-    duckdb_pin: &str,
-    compilers: Option<&duckdb::CppCompilers>,
-) -> Vec<String> {
-    let mut arguments = vec![
-        "-G".to_string(),
-        "Ninja".to_string(),
-        "-S".to_string(),
-        workspace.join("duckdb").display().to_string(),
-        "-B".to_string(),
-        patched.standalone_build().display().to_string(),
-        "-DCMAKE_BUILD_TYPE=Release".to_string(),
-        "-DBUILD_EXTENSIONS_ONLY=TRUE".to_string(),
-        "-DEXTENSION_STATIC_BUILD=TRUE".to_string(),
-        format!("-DPREBUILT_BINARY={}", duckdb_static.display()),
-        format!(
-            "-DDUCKDB_EXTENSION_CONFIGS={}",
-            workspace.join(CONFIG_PATH).display()
-        ),
-        format!("-DDUCKLAKE_PATCH_SOURCE={}", patched.source.display()),
-        format!(
-            "-DCMAKE_TOOLCHAIN_FILE={}",
-            patched.vcpkg_toolchain().display()
-        ),
-        format!("-DVCPKG_MANIFEST_DIR={}", patched.source.display()),
-        format!("-DOVERRIDE_GIT_DESCRIBE={duckdb_pin}"),
-    ];
-    if let Some(compilers) = compilers {
-        arguments.push(format!("-DCMAKE_C_COMPILER={}", compilers.c));
-        arguments.push(format!("-DCMAKE_CXX_COMPILER={}", compilers.cxx));
-    }
-    arguments
-}
-
-fn reset_build_for_compiler_change(
-    build: &Path,
-    compilers: Option<&duckdb::CppCompilers>,
-) -> anyhow::Result<()> {
-    let (Some(compilers), cache) = (compilers, build.join("CMakeCache.txt")) else {
-        return Ok(());
-    };
-    if !cache.exists() {
-        return Ok(());
-    }
-    let contents = fs::read_to_string(&cache)
-        .with_context(|| format!("reading CMake cache {}", cache.display()))?;
-    if cmake_cache_uses_compilers(&contents, compilers) {
-        return Ok(());
-    }
-
-    let metadata = fs::symlink_metadata(build)
-        .with_context(|| format!("inspecting generated build tree {}", build.display()))?;
-    ensure!(
-        !metadata.file_type().is_symlink(),
-        "refusing to remove compiler-stale build tree symlink {}",
-        build.display()
-    );
-    fs::remove_dir_all(build)
-        .with_context(|| format!("removing compiler-stale build tree {}", build.display()))?;
-    Ok(())
-}
-
-fn cmake_cache_uses_compilers(cache: &str, compilers: &duckdb::CppCompilers) -> bool {
-    cached_compiler_name(cache, "CMAKE_C_COMPILER:") == Some(compilers.c)
-        && cached_compiler_name(cache, "CMAKE_CXX_COMPILER:") == Some(compilers.cxx)
-}
-
-fn cached_compiler_name<'a>(cache: &'a str, key: &str) -> Option<&'a str> {
-    let value = cache
-        .lines()
-        .find(|line| line.starts_with(key))?
-        .split_once('=')?
-        .1;
-    Path::new(value).file_name()?.to_str()
-}
-
-fn verify_loadable(artifact: &Path) -> anyhow::Result<()> {
-    let cli = duckdb::ensure_duckdb_cli()?;
-    let artifact_literal = artifact.display().to_string().replace('\'', "''");
-    duckdb::run(
-        Command::new(cli)
-            .arg("-unsigned")
-            .arg("-c")
-            .arg(format!("LOAD '{artifact_literal}';")),
-    )
-    .context("the patched DuckLake artifact compiled but did not load in the pinned DuckDB CLI")
-}
-
 fn preload_ducklake_test(test_path: &str, script: &str) -> anyhow::Result<String> {
     const REQUIREMENT: &str = "require ducklake\n";
     ensure!(
@@ -824,7 +591,7 @@ impl Drop for TemporaryDirectory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
 
@@ -882,51 +649,6 @@ mod tests {
         .expect("fixture revision")
         .trim()
         .to_owned()
-    }
-
-    #[test]
-    fn default_output_stays_under_target() {
-        let workspace = Path::new("/repo");
-        let options = parse_arguments(workspace, &[]).expect("default arguments");
-
-        assert_eq!(options.root, PathBuf::from("/repo/target/patched-ducklake"));
-        assert_eq!(
-            options.duckdb_static,
-            PathBuf::from("/repo/build/release/src/libduckdb_static.a")
-        );
-    }
-
-    #[test]
-    fn output_override_may_live_elsewhere() {
-        let workspace = Path::new("/repo");
-        let arguments = vec!["--root".to_string(), "/tmp/ducklake".to_string()];
-        let options = parse_arguments(workspace, &arguments).expect("explicit root");
-
-        assert_eq!(options.root, PathBuf::from("/tmp/ducklake"));
-    }
-
-    #[test]
-    fn static_library_override_is_resolved_from_the_workspace() {
-        let workspace = Path::new("/repo");
-        let arguments = vec![
-            "--duckdb-static".to_string(),
-            "artifacts/libduckdb.a".to_string(),
-        ];
-        let options = parse_arguments(workspace, &arguments).expect("static archive override");
-
-        assert_eq!(
-            options.duckdb_static,
-            PathBuf::from("/repo/artifacts/libduckdb.a")
-        );
-    }
-
-    #[test]
-    fn unknown_arguments_are_rejected() {
-        let workspace = Path::new("/repo");
-        let error = parse_arguments(workspace, &["--mystery".to_string()])
-            .expect_err("unknown argument must fail");
-
-        assert!(error.to_string().contains("unknown argument `--mystery`"));
     }
 
     #[test]
@@ -1091,66 +813,5 @@ mod tests {
         assert!(!transformed.contains("require ducklake"));
         assert!(transformed.contains("require parquet"));
         assert!(transformed.contains("statement ok\nSELECT 1"));
-    }
-
-    #[test]
-    fn cmake_cache_compilers_must_match_the_selected_pair() {
-        let selected = duckdb::CppCompilers {
-            c: "gcc14-gcc",
-            cxx: "gcc14-g++",
-        };
-        let gcc14 = "CMAKE_C_COMPILER:FILEPATH=/usr/bin/gcc14-gcc\n\
-                     CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/gcc14-g++\n";
-        let gcc11 = "CMAKE_C_COMPILER:FILEPATH=/usr/bin/gcc\n\
-                     CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++\n";
-
-        assert!(cmake_cache_uses_compilers(gcc14, &selected));
-        assert!(!cmake_cache_uses_compilers(gcc11, &selected));
-    }
-
-    #[test]
-    fn extension_only_configuration_reuses_the_prebuilt_duckdb_core() {
-        let patched = PatchedDuckLake::at(PathBuf::from("/work"));
-        let arguments = cmake_arguments(
-            Path::new("/repo"),
-            &patched,
-            Path::new("/repo/build/libduckdb_static.a"),
-            "v1.2.3",
-            Some(&duckdb::CppCompilers {
-                c: "gcc-14",
-                cxx: "g++-14",
-            }),
-        );
-
-        assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "-DBUILD_EXTENSIONS_ONLY=TRUE")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "-DEXTENSION_STATIC_BUILD=TRUE")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "-DPREBUILT_BINARY=/repo/build/libduckdb_static.a")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "-DOVERRIDE_GIT_DESCRIBE=v1.2.3")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "-DCMAKE_C_COMPILER=gcc-14")
-        );
-        assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "-DCMAKE_CXX_COMPILER=g++-14")
-        );
     }
 }

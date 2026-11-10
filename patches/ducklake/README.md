@@ -135,14 +135,6 @@ the build workflows run the same row-ID statistics and pruning smoke
 against what they build, in the container that built it
 (`cargo xtask validate-release-artifact`).
 
-`cargo xtask ducklake-patch` builds the series as a standalone loadable under
-`target/patched-ducklake/build-extension-static/`, against moraine's DuckDB
-submodule and prebuilt static library. Only `cargo xtask session-bench`
-needs it: its pinned revisions predate the bundle and load DuckLake beside
-their own moraine. Use `--root DIRECTORY` to move the gitignored cache, or
-`--duckdb-static FILE` to select another static archive built from moraine's
-exact DuckDB pin.
-
 ## Load in DuckDB
 
 A locally built artifact is unsigned, so start DuckDB with `-unsigned`. One
