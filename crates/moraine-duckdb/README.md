@@ -257,21 +257,19 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 Unset, SlateDB's 16 GiB cap stands; without a `META_CACHE_DIR` there is no
 object cache to bound.
 
-**`CACHE_PUTS` — fill the cache as you write, not just as you read.** By
-default the cache is filled by reads alone, so an object the store just wrote
-is fetched back from S3 the first time it is read. `META_CACHE_PUTS true`
-caches it at write time instead — one local write, no fetch — and because store
-objects are immutable and land atomically, read-only sessions sharing the same
-`META_CACHE_DIR` on that host read what the writer cached:
+**`CACHE_PUTS` — fill the cache as you write as well as you read.** On by
+default: an object the store writes is admitted to the cache at write time,
+so it is not fetched back from S3 the first time it is read, and because
+store objects are immutable and land atomically, read-only sessions sharing
+the same `META_CACHE_DIR` on that host read what the writer cached.
+Compaction output is admitted the same way under `META_CACHE_COMPACTION_PUTS`.
+Turn either off when a large merge evicts what reads had warmed:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
-   META_CACHE_DIR '/var/cache/moraine', META_CACHE_PUTS true);
+   META_CACHE_DIR '/var/cache/moraine', META_CACHE_COMPACTION_PUTS false);
 ```
-
-Opt-in, because compaction output is cached the same way and a large merge can
-evict what reads had warmed.
 
 **`CACHE_PRELOAD` — warm the cache during ATTACH, not during the first query.**
 Both of the above still leave a fresh process cold. `META_CACHE_PRELOAD 'l0'`
@@ -714,7 +712,7 @@ against it. Existence is therefore recorded in the store
 (`inline/file_delete_table`) rather than derived from whether any
 deletion is currently held. What removes it is the `DROP TABLE` the
 expiry cleanup issues once the table has left live state and history,
-which takes marker and deletions together. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
+which takes marker and deletions together. See `docs/rfcs/0004-data-inlining.md`'s "Extension surface
 (as implemented)" for the exact operation → keyspace mapping.
 
 Chunk bodies (`inline/schema`, `inline/insert`) are Arrow IPC. DuckDB's C++

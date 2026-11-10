@@ -28,7 +28,7 @@ Until that exists, moraine keeps a bounded window of `DbTransaction::get`
 futures in flight for uniqueness enforcement. This hides remote latency but
 does not reduce the underlying lookup amplification.
 
-Owner: [RFC 0016](rfcs/0016-equality-indexes.md).
+Owner: [RFC 0009](rfcs/0009-equality-indexes.md).
 
 ## Transaction commit memory
 
@@ -49,7 +49,7 @@ Until upstream provides both operations, Moraine accepts SlateDB's default
 all-write-key behavior and bounds commit peaks with equality-index entry and
 encoded-byte limits.
 
-Owner: [RFC 0016](rfcs/0016-equality-indexes.md).
+Owner: [RFC 0009](rfcs/0009-equality-indexes.md).
 
 ## Cache identity
 
@@ -72,7 +72,7 @@ can only be that store's, and a re-attach hits only when the store takes the
 same scope as before — the same attach order. A stable scope would let every
 store share one device and hit regardless of order.
 
-Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+Owner: [RFC 0007](rfcs/0007-read-path-and-caching.md).
 
 ## Cache management
 
@@ -87,7 +87,7 @@ preload—subspace reads warm less data and match the catalog's access shape—b
 the export would permit precise per-SST warming and eviction when an operator
 needs them.
 
-Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+Owner: [RFC 0007](rfcs/0007-read-path-and-caching.md).
 
 ### Name a cached entry's kind, and the level it came from
 
@@ -118,7 +118,7 @@ is the one class worth pinning above all others. Nothing reaches moraine that
 distinguishes them. (Acting on it would also need a third priority level from
 foyer, whose `Hint` is `Normal` or `Low` and nothing else.)
 
-Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+Owner: [RFC 0007](rfcs/0007-read-path-and-caching.md).
 
 ### Size the disk evictor's queue, and keep recency in process
 
@@ -142,4 +142,4 @@ access recency in process — an in-memory timestamp updated on the read path,
 rather than one recovered from `atime` — so a full queue costs accounting
 accuracy and not eviction order.
 
-Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+Owner: [RFC 0007](rfcs/0007-read-path-and-caching.md).

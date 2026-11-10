@@ -1,8 +1,7 @@
 # Working in moraine
 
-Moraine brings a SlateDB backend to DuckLake. Structure and conventions are
-specified in [RFC 0001](docs/rfcs/0001-repository-structure-and-conventions.md);
-this file is the operational summary.
+Moraine brings a SlateDB backend to DuckLake. This file is the operational
+summary; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
 
 ## Layout
 

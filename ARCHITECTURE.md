@@ -1,260 +1,195 @@
 # Architecture
 
-This is the map of moraine: what the pieces are, how they fit, and where each
-decision is specified in full. It is a reading guide, not a specification —
-every claim here has an authoritative RFC in [`docs/rfcs/`](docs/rfcs/), linked
-inline. For *what* moraine is and *why*, start with the [README](README.md);
-for *where it's going*, the [ROADMAP](ROADMAP.md); for *how to work in it*,
-[CONTRIBUTING.md](CONTRIBUTING.md).
+This is the map of moraine: what the pieces are, how they fit, and where
+each decision is specified. Every design decision has a document in
+[`docs/rfcs/`](docs/rfcs/README.md), linked inline. For what moraine is,
+start with the [README](README.md); for where it is going, the
+[ROADMAP](ROADMAP.md); for how to work in it, [CONTRIBUTING.md](CONTRIBUTING.md).
 
-> **Status: pre-1.0, actively developed.** The architecture below is
-> implemented and exercised end-to-end through real DuckDB; a few features
-> remain (see the [ROADMAP](ROADMAP.md)).
+Status: pre-1.0, under active development. Everything below is implemented
+and exercised end to end through real DuckDB.
 
 ## What moraine is
 
-DuckLake keeps table data in object storage but stores its catalog — the
-transactional source of truth — in a SQL database (DuckDB, Postgres, MySQL).
-Moraine replaces that database with [SlateDB](https://slatedb.io), a
-transactional KV store whose entire state lives in object storage. The catalog
-then sits in the bucket next to the Parquet files: nothing to operate,
-durability for free, the bucket is the whole lake. The trade-off and the
-motivation are in the [README](README.md#why).
+DuckLake keeps table data in object storage and its catalog, the
+transactional source of truth, in a SQL database. Moraine replaces that
+database with [SlateDB](https://slatedb.io), a transactional KV store whose
+state lives in object storage, so the catalog sits in the bucket next to
+the Parquet files.
 
-Architecturally, moraine is **DuckLake's catalog backend** — it occupies
-exactly the slot a Postgres/SQLite/DuckDB catalog database occupies, and
-implements DuckLake's contract rather than inventing its own semantics
-([RFC 0006](docs/rfcs/0006-extension-surface.md)).
+Moraine is DuckLake's catalog backend. It occupies the slot a Postgres,
+SQLite, or DuckDB catalog database occupies and implements DuckLake's
+contract rather than its own semantics.
 
 ## The stack
 
 ```
 DuckDB engine
   └─ ducklake extension        planner, transactions, query execution
-       └─ moraine catalog       DuckDB StorageExtension  (the extension surface)
-            └─ moraine core      DuckLake catalog semantics on SlateDB  (Rust)
+       └─ moraine extension    DuckDB StorageExtension, a thin C++ shim
+            └─ moraine core    DuckLake catalog semantics on SlateDB (Rust)
                  └─ SlateDB → object store
 ```
 
-DuckLake stays the query/planner/transaction layer. Moraine serves the
-`ducklake_*` metadata tables **row-faithfully** — the tables *are* the catalog
-state, not a re-modeled projection — out of SlateDB.
+DuckLake stays the planner and transaction layer. Moraine serves the
+`ducklake_*` metadata tables row for row out of SlateDB: the tables are the
+catalog state, not a projection of it.
 
 ## Crates
 
-A Cargo workspace with a virtual root (no root crate). The full rationale is
-[RFC 0001](docs/rfcs/0001-repository-structure-and-conventions.md).
+A Cargo workspace with a virtual root.
 
 | Crate | Type | Role |
 |---|---|---|
-| [`moraine`](crates/moraine) | lib | **The core.** DuckLake catalog semantics on SlateDB. Pure Rust, async, embeddable in any tokio host. The flagship crate — all the hard problems live here. |
-| [`moraine-duckdb`](crates/moraine-duckdb) | cdylib + C++ shim | The DuckDB extension wrapping the core. **Thin by policy**: no domain logic, only `StorageExtension` registration, C-ABI marshalling, and the sync↔async bridge. If logic accumulates here, it belongs in the core. |
-| [`xtask`](xtask) | bin (unpublished) | Automation (`cargo xtask e2e`): build/package the extension, orchestrate the e2e suite. Rust instead of shell scripts — cross-platform and type-checked. |
+| [`moraine`](crates/moraine) | lib | The core. DuckLake catalog semantics on SlateDB. Pure Rust, async, embeddable in any tokio host. |
+| [`moraine-duckdb`](crates/moraine-duckdb) | cdylib + C++ shim | The DuckDB extension. No domain logic: `StorageExtension` registration, the C ABI, and the sync-to-async bridge. Logic that accumulates here moves to the core. |
+| [`xtask`](xtask) | bin, unpublished | Automation: build and package the extension, run the e2e suite, check pins. |
 
-**Library-first.** The catalog logic lives in `moraine`, free of the FFI/build
-tax and testable as plain Rust against a real in-memory store. The extension is
-one consumer of it, not the center of gravity.
+The catalog logic lives in `moraine`, free of the FFI and build tax and
+testable as plain Rust against a real in-memory store. The extension is one
+consumer of it.
 
 ## Inside the core
 
-`crates/moraine/src` is three modules with a deliberate one-way dependency, so
-each decision has one home:
+`crates/moraine/src` is a small set of modules with one-way dependencies:
 
-```
-lib.rs      # crate docs + re-exports only; no logic
-error.rs    # one thiserror Error enum, one variant per failure domain
-catalog.rs  # DuckLake domain: snapshots, schemas, tables, data-file metadata
-store.rs    # SlateDB layer: key layout + value codec
-transaction.rs      # commit protocol: catalog transaction → one atomic SlateDB write
-```
+| Module | Owns |
+|---|---|
+| `lib.rs` | Crate docs and re-exports. No logic. |
+| `error.rs` | One `Error` enum, one variant per failure domain. |
+| `catalog` | The DuckLake domain: snapshots, schemas, tables, data-file metadata, read scopes, maintenance verbs. Holds the store handle but knows no keys or values. |
+| `store` | The SlateDB layer: key layout, value codecs, opening, caching, checkpoints. Knows nothing about DuckLake. |
+| `transaction` | The commit protocol. Turns a catalog transaction into one atomic SlateDB write. Bridges `catalog` and `store`. |
+| `data_file` | The only module that reads Parquet: scoped reads of registered files. |
+| `commit_log` | The boundary an external commit log plugs into. |
+| `memory` | Working-memory reservations and host budgets. |
+| `fault` | Crash and stall injection points used by the tests. |
+| `telemetry` | Counters and log records. |
+| `ffi_support` | Helpers shared with the extension's C ABI. |
+| `fuzz` | Entry points for the fuzz targets under `fuzz/`. |
 
-The load-bearing rule: **`catalog` never touches SlateDB directly; `store`
-knows nothing about DuckLake semantics; `transaction` bridges them.** This keeps
-catalog logic testable against an in-memory store and concentrates every
-key-encoding decision in one reviewable place.
+`catalog` never touches SlateDB directly, `store` knows nothing about
+DuckLake, and `transaction` bridges them. This keeps catalog logic testable
+against an in-memory store and concentrates every key-encoding decision in
+one place.
 
-The public surface ([RFC 0003](docs/rfcs/0003-public-api-shape.md)) is three
-types over that error taxonomy — SlateDB never appears in a public signature:
+The [public API](docs/rfcs/0002-public-api.md) is a few types over that
+error enum. SlateDB never appears in a public signature.
 
-- **`Catalog`** — the handle. `Catalog::open(object_store, options)`; cheap to
-  clone; drives reads and commits.
-- **`CatalogSnapshot`** — an immutable, materialized read view. Built by
-  scanning live state once, then answered entirely in memory — a value, not a
-  cursor.
-- **`Transaction`** — the mutation handle passed to a commit closure. `Deref`s to
-  `CatalogSnapshot` (reads available inside a commit) and adds DuckLake-shaped
-  mutators (`create_table`, `register_data_file`, …).
+- `Catalog` is the handle: `Catalog::open(object_store, options)`, cheap to
+  clone, drives reads and commits. It derefs to `ReadOnlyCatalog`, which
+  `open_read_only` returns, so the mode is in the type.
+- `ReadScope` is a read pinned to one store revision. It loads catalog
+  rows on demand through bounded cursors rather than materializing the
+  catalog.
+- `Transaction` is the mutation handle passed to a commit closure. It adds
+  DuckLake-shaped mutators such as `create_table` and `register_data_file`.
 
-Writes go through a **closure-with-retry** model, so the single-`WriteBatch`
-atomicity invariant and the conflict-retry loop live in the core — never
-duplicated in a host:
-
-```rust
-let new_snapshot = catalog.commit(|tx| {
-    let s = tx.create_schema("sales")?;
-    let t = tx.create_table(s, "orders", columns)?;
-    tx.register_data_file(t, data_file)?;
-    Ok(())
-}).await?;
-```
-
-The closure may run more than once (benign-race retry), so it must be pure and
-idempotent — the single most important contract of the API.
+Writes go through a closure with retry. The closure may run more than once
+when a benign race is retried, so it must be pure and idempotent. That is
+the one contract every embedder has to respect.
 
 ## Storage model
 
-How DuckLake catalog state is laid out in SlateDB is the single
-most expensive-to-reverse decision in the project; it is
-[RFC 0002](docs/rfcs/0002-slatedb-key-encoding.md).
+How catalog state is laid out in SlateDB is the most expensive decision to
+reverse. It is the [storage format](docs/rfcs/0001-storage-format.md).
 
-- **Keyspace partitioned by a leading tag byte** into subspaces: `system` (format
-  version, head pointer), `snapshot` (one immutable record per snapshot), `current`
-  (live catalog entities), `history` (ended entity versions), `inline` (inlined
-  data, [RFC 0005](docs/rfcs/0005-data-inlining.md)).
-- **The `current`/`history` split is the load-bearing decision.** DuckLake versions
-  entities temporally (`begin_snapshot`/`end_snapshot`). Rather than store one
-  history stream and filter it on every read, moraine keeps *live* versions in
-  `current` and moves *ended* versions to `history` atomically as part of the same
-  commit. Loading the current catalog — the hot path, every attach — scans
-  `current` only, at a cost proportional to the live catalog, never its history.
-  Time travel scans the relevant `history` ranges too.
-- **Keys are `tag · kind · u64 components`**, big-endian fixed-width so byte
-  order equals numeric order. No strings in keys; entities are keyed by
-  DuckLake-allocated ids, names live in values. Per-table collections are
-  keyed `table_id`-first so "everything about table T" is one contiguous range.
-- **Values are protobuf** (`prost`) behind a 5-byte framing header (`MRNE` magic
-  + encoding version), so a corrupt/wrong-kind value fails loudly and fields can
-  evolve without rewriting the store.
-- **Property tests are mandatory** for anything in `store` that encodes/decodes:
-  key roundtrips, byte-order-equals-component-order, value roundtrips, and
-  framing rejection.
+- The keyspace is partitioned by a leading tag byte into subspaces:
+  `system` (format version, head pointer), `snapshot`, `current` (live
+  entities), `history` (ended versions), `inline` (inlined rows), `index`
+  (equality-index entries), and a few smaller ones.
+- The `current`/`history` split is the central decision. DuckLake versions
+  entities with begin and end snapshots. Moraine keeps live versions in
+  `current` and moves ended versions to `history` in the same commit, so
+  loading the live catalog scans `current` only, at a cost proportional to
+  the live catalog rather than its history. Time travel reads `history`
+  too.
+- Keys are an enum tree with fixed-width big-endian numeric components, so
+  byte order equals numeric order and per-table collections are contiguous
+  ranges. Values are protobuf behind a magic-plus-version framing header.
+- A format version in `system` gates key-structure changes. Migration is an
+  explicit verb, never automatic on open.
+- Property tests are mandatory for anything that encodes or decodes.
 
 ## Commit protocol
 
-Turning a catalog mutation into a durable, atomic commit is
-[RFC 0004](docs/rfcs/0004-commit-protocol.md), built on RFC 0002's invariant
-that **one commit = exactly one SlateDB `WriteBatch`**.
+Turning a mutation into a durable, atomic commit is the
+[commit protocol](docs/rfcs/0003-commit-protocol.md). One commit is exactly
+one SlateDB write batch.
 
-- **Topology: single writer, many readers.** Uncoordinated readers resolve
-  snapshots from object storage; a deployment needing commit concurrency
-  funnels commits through one long-lived committer process. A reader
-  following the latest state still writes a manifest checkpoint of its own;
-  one opened against an existing checkpoint id writes nothing at all, and
-  sees the cut that checkpoint named.
-- **Optimistic, head-CAS.** A commit loads the head snapshot, allocates ids
-  locally, stages one batch, and writes it conditional on `sys/head` being
-  unchanged. Nothing spans two batches; the write floor is one durable WAL
-  flush.
-- **Table-level conflict detection**, with one file-grain exception. On a
-  failed CAS, the committer compares the `table_id`s it touched against the
-  intervening commits' — except delete-versus-delete, which compares the
-  data files each targeted, matching the one place DuckLake goes finer.
-  Disjoint sets are
-  a benign race, retried internally; overlapping sets are a true `Conflict`
-  aborted with a typed error — the core is DuckLake-agnostic and cannot replay
-  the originating SQL, so re-driving belongs to whoever authored the operation.
-- **Group commit** batches several pending commits into one flush, each still
-  minting its own snapshot. `commit_group` batches what one caller hands it;
-  concurrent `commit` callers are batched without asking, using the flush
-  already in the air as the window. A batch of one stays the normal path and
-  waits for nobody.
-- **The log may live on its own object store.** A commit's floor is one PUT
-  of the write-ahead log, so that log — and nothing else — can sit on an S3
-  Express One Zone bucket beside the standard one holding the catalog. Which
-  store a catalog's log is on is recorded in the catalog, so every open is
-  held to it rather than silently replaying an empty log; `move_wal_store`
-  changes it, draining the old log before recording the new store.
+- Topology: one writer, many readers. The newest writer fences the
+  previous one. A deployment that needs concurrent commits funnels them
+  through one writer process.
+- Optimistic, head compare-and-set. A commit reads the head, allocates ids
+  locally, stages one batch, and writes it conditional on the head being
+  unchanged. The durable floor is one write-ahead-log flush.
+- Table-level conflict detection over DuckLake's own change grammar, with
+  delete-versus-delete compared at data-file grain. Disjoint sets are a
+  benign race and retry internally; overlapping sets return a typed
+  conflict for DuckLake to re-drive.
+- Group commit batches concurrent commits into one flush, each minting its
+  own snapshot.
+- The write-ahead log may live on its own object store, so the one
+  latency-critical PUT can land on S3 Express One Zone while the rest of
+  the catalog stays on standard storage.
+- A commit whose outcome could not be observed returns
+  `CommitOutcomeUnknown` and is never replayed automatically.
 
-The commit point remains SlateDB's durable WAL. Moraine has no conditional-PUT
-commit log, log folder, or automatic multi-writer migration. The replacement
-topology is designed and implemented in a separate commit-log library;
-[ROADMAP](ROADMAP.md) tracks independent writers as unimplemented here.
-
-Unacknowledged submissions return `CommitOutcomeUnknown` without automatic
-replay. Cancellation after a C commit call starts has the same conservative
-outcome: its external files must be retained until the operation is reconciled.
-Manifest readers guard multi-read operations with the full head stamp, retrying
-changed passes, including errors, within a bounded budget. This prevents mixed
-states within a call; it does not make a manifest reader immediately current
-with the writer's WAL.
+The [commit-log seam](docs/rfcs/0011-commit-log-seam.md) is the boundary a
+bucket-resident commit log, maintained in a separate library, plugs into for
+multi-process writers. The single-writer path is complete without it.
 
 ## Extension surface
 
-The Rust ABI groups attachment, snapshot descriptors, index lifecycle, lookups,
-maintenance, and located deletion under `crates/moraine-duckdb/src/abi/`.
-`abi.rs` owns shared error and array helpers and re-exports the C surface.
-Domain validation remains in the core; the modules handle C representation,
-ownership, cancellation, and error translation.
-
 `moraine-duckdb` makes the core reachable from DuckDB
-([RFC 0006](docs/rfcs/0006-extension-surface.md)).
+([extension surface](docs/rfcs/0006-extension-surface.md)).
 
-- DuckDB's *stable C extension API cannot register a catalog*, and a writable
-  DuckLake catalog requires a `StorageExtension`. So the extension is a **thin
-  C++ shim** linking DuckDB's internals, calling a **minimal C ABI** into the
-  Rust core (compiled as a staticlib): open/attach, begin/commit/rollback,
-  `scan(table, projection, filters) -> Arrow`, `apply(mutations)`.
-- Interception is at the **catalog / table-scan / DML layer** (the
-  `postgres_scanner` pattern), never by parsing SQL — DuckDB's own executor
-  plans DuckLake's statements and calls moraine per table.
-- The ABI boundary is the **Arrow C Data Interface** — stable, language-neutral,
-  near-zero-copy.
-- The **sync↔async bridge** lives in the Rust C-ABI layer: it owns a tokio
-  runtime and `block_on`s core futures, so the C++ shim only ever calls
-  synchronous functions. The mechanism, runtime shape, cancellation, and
-  panic-containment are [RFC 0010](docs/rfcs/0010-async-sync-bridge.md).
-- Linking DuckDB's C++ internals pins the extension to a single supported DuckDB
-  release — the "FFI/build/version-pinning tax" RFC 0001 deliberately deferred
-  to this boundary and pays only here.
+- DuckDB's stable C extension API cannot register a catalog, and a writable
+  DuckLake catalog needs a `StorageExtension`. So the extension is a thin
+  C++ shim linking DuckDB's internals, calling a C ABI into the Rust core.
+  That pins the extension to one DuckDB release; `cargo xtask check-pins`
+  keeps every place that names the version in agreement.
+- Interception is at the catalog, table-scan, and DML layer, never by
+  parsing SQL. DuckDB's executor plans DuckLake's statements and calls
+  moraine per table. Rows cross the ABI as row structs.
+- The sync-to-async bridge lives in the Rust ABI layer. It owns a tokio
+  runtime per attached catalog and blocks on core futures, so the shim only
+  calls synchronous functions. Cancellation polls DuckDB's interrupt flag;
+  a commit already submitted completes and reports its outcome.
 
 ## Beyond the core loop
 
-The RFCs also specify the operations a catalog needs past open/read/commit:
-
-- **Data inlining** ([RFC 0005](docs/rfcs/0005-data-inlining.md)) — small
-  inserts land as rows in the catalog and flush to Parquet later, skipping the
-  tiny-Parquet-file tax. A launch feature: the workload an LSM is built for, and
-  where a KV catalog beats a SQL one rather than merely matching it.
-- **Snapshot expiry & GC** ([RFC 0007](docs/rfcs/0007-snapshot-expiry-and-gc.md))
-  — reclaiming `history`/`snapshot`/flushed-inline records and cleaning up orphaned
-  object-store files, as ordinary commits guarded by a retention horizon and a
-  grace window.
-- **Compaction** ([RFC 0008](docs/rfcs/0008-compaction.md)) — merging small data
-  files and materializing merge-on-read deletes, while preserving DuckLake
-  row-id lineage (compaction never allocates row ids).
-- **Reader consistency & caching**
-  ([RFC 0009](docs/rfcs/0009-reader-consistency-and-caching.md)) — pinning a
-  `CatalogSnapshot` to one SlateDB read-snapshot, refreshing it incrementally
-  from the `snapshot_changes` changelog, and observing snapshot isolation.
+- [Data inlining](docs/rfcs/0004-data-inlining.md): small inserts land as
+  rows in the catalog and flush to Parquet later.
+- [DuckLake feature mapping](docs/rfcs/0005-ducklake-feature-mapping.md):
+  how schema evolution, partitioning, name mapping, macros, encryption, and
+  the change feed map onto the keyspace.
+- [Read path, caching, and memory](docs/rfcs/0007-read-path-and-caching.md):
+  reads pinned to a revision, checkpoint readers, the block cache, row
+  summaries, and working-memory budgets.
+- [Equality and range indexes](docs/rfcs/0009-equality-indexes.md): index
+  entries keyed by canonical value encoding, uniqueness by key collision,
+  staged builds, and index-driven row lookup.
+- [Maintenance](docs/rfcs/0010-maintenance.md): how DuckLake's expiry,
+  cleanup, and compaction translate onto the keyspace, and the scheduled
+  pass that runs them.
 
 ## Testing strategy
 
-Testing is a first-class part of the architecture, because a catalog's worst
-failure mode is silent corruption. Tiers, per
-[RFC 0001](docs/rfcs/0001-repository-structure-and-conventions.md#testing-strategy):
+A catalog's worst failure is silent corruption, so testing is part of the
+architecture.
 
 | Tier | Home | What |
 |---|---|---|
-| **Unit** | colocated `#[cfg(test)]` | Tricky internals: key encoding, codecs, conflict resolution. **Proptest roundtrips mandatory** in `store`. |
-| **Integration** | `crates/moraine/tests/` | Public API against **real SlateDB on in-memory `object_store` — no mocks of the store layer.** Snapshot visibility, concurrent-commit conflicts, crash-shaped sequences. |
-| **E2E** | `crates/moraine-duckdb/tests/`, via `cargo xtask e2e` | Build the cdylib, load into real DuckDB, run actual DuckLake SQL — validating assumptions about what DuckLake demands, not just that the code does what we think. |
-| **Fuzzing** (future) | `fuzz/` | `cargo-fuzz` on `store` codecs and the commit read-path once codecs stabilize. |
+| Unit | colocated `#[cfg(test)]` | Key encoding, codecs, conflict resolution. Proptest roundtrips are mandatory in `store`. |
+| Integration | `crates/moraine/tests/` | The public API against real SlateDB on an in-memory `object_store`. No mocks of the store layer. |
+| E2E | `crates/moraine-duckdb/tests/`, `test/sql`, via `cargo xtask e2e` | Build the extension, load it into real DuckDB, run DuckLake SQL. |
+| Fuzzing | `fuzz/` | Store codecs, the commit read path, and crash recovery. |
 
-Crash coverage is not left to prose: [RFC 0011](docs/rfcs/0011-crash-recovery.md)
-names every place a process can die during a state-changing operation — commit,
-flush, cleanup, takeover, genesis — and pins each to what must hold after
-reopen. Each case is survivable for one of two reasons, and which one follows
-from the path: a single-batch path is safe by *atomicity* (one commit is one
-batch, so there is no torn intermediate to find), a multi-step path by
-*ordering* (bytes before the record that references them, bytes after the
-record that referenced them). The suite drives the cases as data.
+[Crash recovery](docs/rfcs/0008-crash-recovery.md) names every point where
+a process can die during a state-changing operation and what must hold
+after reopen. A single-batch path is safe by atomicity; a multi-step path by
+ordering. The suite drives the cases as data.
 
-Process is **TDD** — test first, watch it fail, implement — and every bugfix
-lands with a regression test. The full local gate (fmt, clippy, test, doc, deny,
-e2e) is in [CONTRIBUTING.md](CONTRIBUTING.md#the-local-gate).
-
-## Where decisions live
-
-RFCs are the source of truth for anything expensive to reverse — the KV key
-layout, the commit protocol, and the public API shape *require* one. The full
-index is [`docs/rfcs/README.md`](docs/rfcs/README.md).
+Process is test first, and every bug fix lands with a regression test. The
+local gate is in [CONTRIBUTING.md](CONTRIBUTING.md#the-local-gate).

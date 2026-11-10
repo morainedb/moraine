@@ -1,11 +1,11 @@
 ---
 title: moraine
-description: A DuckLake catalog that lives in your bucket — SlateDB-backed, serverless, nothing to operate.
-template: splash
+description: A DuckLake catalog backend that stores the catalog in object storage on SlateDB.
+tableOfContents: false
 hero:
-  tagline: A DuckLake catalog that lives in your bucket. SlateDB-backed, serverless, nothing to operate.
+  tagline: A DuckLake catalog backend that stores the catalog in object storage on SlateDB.
   image:
-    alt: Three stacked strata forming a ridge — the moraine mark
+    alt: Three stacked strata forming a ridge, the moraine mark
     light: ../../assets/moraine.svg
     dark: ../../assets/moraine-dark.svg
   actions:
@@ -18,8 +18,6 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
-
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (DATA_PATH 's3://bucket/prefix-data/',
@@ -29,27 +27,13 @@ CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
 INSERT INTO lake.events VALUES (1, 'hello, bucket');
 ```
 
-<CardGrid>
-  <Card title="Nothing to operate" icon="setting">
-    No catalog endpoint to deploy, monitor, or upgrade. A deployment is a
-    bucket and credentials.
-  </Card>
-  <Card title="Durability for free" icon="approve-check">
-    Catalog durability *is* object-store durability. No backup schedule, no
-    WAL shipping — the only way to lose the catalog is to lose the bucket
-    itself.
-  </Card>
-  <Card title="The bucket is the whole lake" icon="seti:db">
-    Copying the bucket copies data *and* catalog together. Environments,
-    migration, and disaster recovery become object-storage operations.
-  </Card>
-  <Card title="Scale to zero, embed anywhere" icon="rocket">
-    An idle lake costs storage, not a 24/7 instance. The core is a plain
-    Rust library any tokio host can commit against directly.
-  </Card>
-</CardGrid>
+DuckLake keeps table data in object storage and its catalog in a SQL
+database. Moraine replaces that database with [SlateDB](https://slatedb.io),
+a key-value store whose state also lives in object storage. The catalog
+sits in the bucket next to the Parquet files, so there is no catalog server
+to run, and copying the bucket copies the whole lake.
 
-The trade-off is commit latency: a commit is durable once an object-store
-PUT lands (~5–10 ms on S3 Express One Zone, ~50–100 ms on S3 Standard).
-For workloads that write Parquet for seconds before committing, that is
-noise. [The full pitch →](guide/what-is-moraine/)
+- The [overview](guide/overview/) explains what moraine is and what it costs.
+- [Getting started](guide/getting-started/) installs the extension and attaches a lake.
+- [Configuration](guide/configuration/) lists every attach option and function.
+- The [design documents](rfcs/) record how it works.

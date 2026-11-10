@@ -635,7 +635,7 @@ of the 5.08 s waiting on flush ticks. Two independent levers cut that: a much
 larger batch (16k–64k here), or not awaiting durability on every intermediate
 batch — the entries are tombstoned idempotently, so only the last batch needs
 to be durable. The second lever makes batch size almost irrelevant and is the
-better fix; recorded as a follow-up in `docs/rfcs/tasks.md` under 0021.
+better fix.
 
 ### Cold attach cost vs. the physical bytes a read touches
 
@@ -940,7 +940,7 @@ premise, so it opens a session and issues two point reads before it can
 serve a cache hit. Folding the migration state onto `sys/head` would halve
 that and is rejected on cost — it would put the store behind a format stamp
 older binaries cannot open, by default, on the first commit after an upgrade
-(RFC 0009). The next section measures what those two reads are worth in
+(RFC 0007). The next section measures what those two reads are worth in
 round trips, which is the other half of why.
 
 The absolute figures matter for reading a production trace. Even a

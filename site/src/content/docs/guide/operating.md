@@ -1,113 +1,107 @@
 ---
 title: Operating a lake
-description: The retention and cleanup safety contract, and the at-rest encryption posture.
+description: Retention, scheduled maintenance, and encryption.
 sidebar:
-  order: 5
+  order: 4
 ---
 
-Two things about a moraine-backed lake are the operator's to get right,
-because no setting inside moraine can compensate for either: how long
-expired state survives before its bytes are reclaimed, and how the bucket
-holding the catalog is encrypted.
-
-## The retention safety contract
+## Retention
 
 Expiry and cleanup are DuckLake's, driven by `ducklake_expire_snapshots`
 and `ducklake_cleanup_old_files`. Moraine reclaims what they schedule and
-adds no policy of its own, so DuckLake's safety contract is the whole
-contract — and it is two inequalities:
+adds no policy of its own. Two windows are the operator's to size:
 
-- **The retention window must exceed the maximum read and attach
-  duration.** A read that outlives the window finds the snapshot it was
-  resolved against gone.
-- **The cleanup grace period must exceed the maximum reader and scan
-  duration.** That is `ducklake_cleanup_old_files`' `older_than`, and it
-  governs bytes rather than catalog rows.
+- The retention window must exceed the longest read or attach. A read
+  that outlives it finds its snapshot gone.
+- The cleanup grace period, the `older_than` argument of
+  `ducklake_cleanup_old_files`, must exceed the longest scan. It governs
+  the bytes.
 
-The two are separate because expiry and cleanup do different things.
-Expiry is *logical*: it deletes snapshot records and prunes the history
-rows only those snapshots could see, and it deletes no data. A reader
-holding a view of an expired snapshot keeps scanning happily, because the
-Parquet it names is still there — scheduled for deletion, but not yet
-deleted. Cleanup is what removes the bytes, and the grace period is the
-only thing standing between a running scan and the files under it.
+They differ because expiry and cleanup do different things. Expiry deletes
+snapshot records and the history rows only those snapshots could see. It
+deletes no data, so a reader holding an expired snapshot keeps scanning
+Parquet that is scheduled for deletion but still present. Cleanup removes
+the bytes.
 
-Size both windows from *observed* durations, not intended ones. The
-duration that matters is the longest a reader actually holds a view: an
-attach that stays open across an idle session still holds one, and a scan
-over a large table is bounded by the data, not by the query's timeout.
+Size both from observed durations. An attach left open across an idle
+session still holds a snapshot, and a scan over a large table is bounded
+by the data, not by a query timeout.
 
-### When a reader outlives the window
+A reader whose snapshot has been expired gets a `SnapshotExpired` error,
+never a partial view. The response is to re-resolve from head and retry.
+Time travel to an expired snapshot fails the same way and permanently. A
+workload that reaches back a fixed distance needs a retention window at
+least that long.
 
-A reader whose snapshot has been expired gets `SnapshotExpired` rather than
-wrong answers or a partial view. The contract there is to re-resolve from
-head and retry — the failure is a signal to re-read, not corruption, and
-moraine classifies it that way everywhere it can arise, including a commit
-whose base predates a concurrent expiry.
+## Scheduled maintenance
 
-Time travel to an expired snapshot fails the same way and permanently:
-below the horizon, the snapshot is gone. If a workload needs to reach back
-a fixed distance, that distance *is* the retention window.
+The writer can run DuckLake's maintenance functions on a schedule. Enable
+the pass and the steps at attach:
 
-## At-rest encryption
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (READ_WRITE,
+   META_MAINTENANCE_INTERVAL INTERVAL 10 MINUTE,
+   META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL 7 DAY,
+   META_MAINTENANCE_FLUSH_INLINED_DATA true,
+   META_MAINTENANCE_MERGE_ADJACENT_FILES true,
+   META_MAINTENANCE_CLEANUP_OLD_FILES_OLDER_THAN INTERVAL 7 DAY);
+```
 
-There are two independent layers, and they are configured in different
-places by different people.
+Each option is `MAINTENANCE_` plus a DuckLake maintenance function minus
+its `ducklake_` prefix. A bare step name set to `true` enables the step
+with DuckLake's defaults. A step name followed by one of that function's
+parameters passes the parameter through and enables the step. An interval
+given as `older_than` is evaluated each pass as a rolling window. The
+steps, in the order they run:
 
-**Data files** are DuckLake's. When a lake is attached `ENCRYPTED`,
-DuckLake generates a key per Parquet file and stores it in the catalog;
-moraine carries those keys verbatim, as a faithful conduit. No key
-material is moraine's to manage, and there is no KMS indirection in that
-path.
+| Step | Parameters |
+|---|---|
+| `EXPIRE_SNAPSHOTS` | `OLDER_THAN`, `VERSIONS` |
+| `FLUSH_INLINED_DATA` | |
+| `MERGE_ADJACENT_FILES` | `MAX_COMPACTED_FILES` |
+| `REWRITE_DATA_FILES` | `DELETE_THRESHOLD`, `MAX_COMPACTED_FILES` |
+| `CLEANUP_OLD_FILES` | `OLDER_THAN`, `CLEANUP_ALL` |
+| `DELETE_ORPHANED_FILES` | `OLDER_THAN`, `CLEANUP_ALL` |
 
-**The catalog** is the bucket's. Moraine's catalog is SlateDB objects —
-SSTs and WAL — in object storage, and protecting them at rest means
-configuring server-side encryption with KMS-managed keys (SSE-KMS) on that
-bucket. Moraine reads and writes plaintext through the object-store
-client; the object store encrypts on the way down. The entire cost is
-bucket configuration, and no key material enters moraine at all.
+After the DuckLake steps, the pass sweeps orphaned index entries, file
+statistics, inline tables, and row summaries. `MAINTENANCE_COMPACT_STORE
+true` adds a SlateDB compaction of the catalog store. Nothing runs unless
+enabled at attach.
 
-This is the same trust model a Postgres-backed DuckLake has. There, the
-catalog is protected by the database's authentication and its host's
-at-rest encryption. Moraine's catalog database *is* the bucket, so the
-bucket's access control and SSE are the exact equivalent.
+`moraine_maintenance('lake')` runs one pass on demand, and
+`moraine_maintenance_status('lake')` reports the recent passes with each
+step's outcome.
 
-### Key policy, grants, and rotation
+## Encryption
 
-- **Key policy.** A writer needs to mint data keys and decrypt them —
-  `kms:GenerateDataKey` plus `kms:Decrypt`, in AWS terms — while a
-  read-only attach needs only `kms:Decrypt`. Scope the grant to the
-  principals that attach the lake, and prefer a key dedicated to the
-  catalog bucket over a shared account-wide one — the blast radius of the
-  grant is every object in the bucket.
-- **Grants.** Bucket read access alone buys an adversary nothing without
-  the KMS grant: SSE ciphertext is inert. That is what makes the grant,
-  rather than the bucket policy, the thing to audit. A mis-scoped IAM
-  read, a leaked backup, or a stolen storage credential is covered; a
-  compromised writer process is not, since it legitimately holds what it
-  uses.
-- **Rotation.** Rotate on whatever schedule your compliance posture
-  requires; it is transparent to moraine, which never sees key material.
-  Note what rotation does *not* do: existing objects are not re-encrypted.
-  New writes use the current key material and old objects stay readable
-  only while the material that wrote them is retained — automatic KMS
-  rotation keeps prior versions for exactly this reason. Rotating by
-  switching to a *different* key is the case that bites: the old key must
-  stay enabled as long as any object written under it survives, including
-  objects an unexpired snapshot or a checkpoint still pins. Disabling or
-  deleting key material whose objects are still live makes the catalog
-  unreadable, and no moraine-side setting recovers from it.
+Two independent layers are configured in different places.
 
-### What encryption does not hide
+Data files are DuckLake's. A lake attached `ENCRYPTED` gets a key per
+Parquet file, generated by DuckLake and stored in the catalog. Moraine
+stores those keys as given and performs no cryptography.
 
-A party that can read the catalog plaintext can read the statistics.
-Column min/max values are stored verbatim, because DuckLake reads them to
-prune files — so the shape of your data is visible to anyone holding the
-catalog grant, however the files themselves are encrypted. That is the
-price of usable pruning, and no at-rest scheme changes it.
+The catalog is the bucket's. Moraine's catalog is SlateDB objects in
+object storage, and protecting them at rest means enabling server-side
+encryption with KMS-managed keys on that bucket. Moraine reads and writes
+plaintext through the object-store client; the object store encrypts.
+This is the same trust model as a Postgres-backed DuckLake, where the
+catalog is protected by the database's authentication and the host's
+at-rest encryption.
 
-Inlined rows live inside catalog values rather than as Parquet, so they
-are protected exactly as well as the catalog is, and *not* by DuckLake's
-data-file encryption — there is no separate file to encrypt. A deployment
-that relies on data-file encryption and also inlines data should size its
-catalog protection accordingly.
+Grants follow the attach mode. A writer needs to generate data keys and
+decrypt them, `kms:GenerateDataKey` and `kms:Decrypt` in AWS terms. A
+read-only attach needs `kms:Decrypt`. Prefer a key dedicated to the
+catalog bucket, since the grant covers every object in it.
+
+Key rotation is invisible to moraine. Rotation does not re-encrypt
+existing objects, so a key that wrote any surviving object must stay
+enabled, including objects pinned by an unexpired snapshot or a
+checkpoint. Disabling such a key makes the catalog unreadable, and no
+moraine setting recovers from it.
+
+Two things encryption does not hide. Column statistics are stored in the
+catalog as plaintext because DuckLake reads them to prune files, so anyone
+with the catalog grant can see the shape of the data. Inlined rows live in
+catalog values rather than Parquet files, so they are protected only as
+well as the catalog is, and not by DuckLake's data-file encryption.

@@ -60,8 +60,7 @@ correctness bug in 7.0.1: its diff can omit an updated record, which would omit
 that record's write from a successful commit. This matches upstream
 [issue #161](https://github.com/jneem/imbl/issues/161); proposed
 [fix #166](https://github.com/jneem/imbl/pull/166) remains unmerged as of
-2026-09-07. The [commit protocol notes](rfcs/0004-commit-protocol.md#mutation-sized-verb-preparation)
-record the reproduction and upgrade constraint.
+2026-09-07.
 
 Environment: Amazon Linux 2023 x86_64 cloud VM, eight logical CPUs (Intel Xeon
 2.50 GHz), Rust 1.96.1, release optimization, two Tokio worker threads. Baseline:

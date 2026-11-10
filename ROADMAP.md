@@ -12,8 +12,8 @@ implementation gaps, not supported attach modes.
 ## Foundations
 
 ### Catalog core on SlateDB
-- [x] SlateDB key encoding for DuckLake catalog state (RFC 0002)
-- [x] Commit/transaction protocol (RFC 0004)
+- [x] SlateDB key encoding for DuckLake catalog state (RFC 0001)
+- [x] Commit/transaction protocol (RFC 0003)
 - [x] Key layout and codecs with proptest roundtrips
 - [x] Snapshots, schemas, tables, and data-file metadata
 - [x] Atomic commit with conflict detection
@@ -23,7 +23,7 @@ implementation gaps, not supported attach modes.
 - [x] Extension surface: moraine as a DuckLake catalog via a DuckDB `StorageExtension` (RFC 0006)
 - [x] C++ shim registering the catalog and transaction manager over a C ABI to the Rust core
 - [x] Extension entry points and loading into a real DuckDB
-- [x] Read-write and read-only attach; read-only never fences the live writer (RFC 0017)
+- [x] Read-write and read-only attach; read-only never fences the live writer (RFC 0006)
 - [x] Full DuckLake SQL against moraine as the catalog: `ATTACH`, `CREATE`/`INSERT`/`UPDATE`/`DELETE`/rename/`DROP`, `SELECT`/`COUNT`/time travel
 - [x] Query interruption: Ctrl-C aborts a blocked read; submitted commits survive cancellation, which reports an unknown outcome (RFC 0006)
 
@@ -37,7 +37,7 @@ build stays complete on the single-writer path without it.
 
 - [x] The provider boundary: SlateDB write-ahead-log plugs, the committer,
   the log's garbage-collection plug, a process registry plus a per-open
-  override, and the format stamp a provider-less binary refuses (RFC 0024)
+  override, and the format stamp a provider-less binary refuses (RFC 0011)
 - [x] The folder path: adoption at open, staged writes offered to the log
   before they commit locally, a lost race folded before the retry lands
 - [x] Committers over a tailing reader: every read-write open past the one
@@ -51,30 +51,30 @@ build stays complete on the single-writer path without it.
 
 ## Catalog & schema
 - [x] Schemas, tables, and views
-- [x] Schema evolution: `ADD`/`RENAME`/`DROP COLUMN` and `ALTER COLUMN … TYPE` promotion, over inlined and flushed data (RFC 0012)
-- [x] All DuckLake scalar and nested `LIST`/`STRUCT`/`MAP` types, inline and post-flush, `VARIANT` included (RFC 0005)
-- [x] Column and name mapping for externally written Parquet, including hive-partitioned foreign files (RFC 0018)
-- [x] Scalar and table macros with parameters, overloads, defaults, and `CREATE OR REPLACE`/`DROP` (RFC 0019)
+- [x] Schema evolution: `ADD`/`RENAME`/`DROP COLUMN` and `ALTER COLUMN … TYPE` promotion, over inlined and flushed data (RFC 0005)
+- [x] All DuckLake scalar and nested `LIST`/`STRUCT`/`MAP` types, inline and post-flush, `VARIANT` included (RFC 0004)
+- [x] Column and name mapping for externally written Parquet, including hive-partitioned foreign files (RFC 0005)
+- [x] Scalar and table macros with parameters, overloads, defaults, and `CREATE OR REPLACE`/`DROP` (RFC 0005)
 
 ## Data, deletes & layout
 - [x] Parquet data files on object storage (`data_file`)
 - [x] Row-level deletes via delete files / merge-on-read (`delete_file`)
-- [x] Data inlining: inlined inserts/deletes plus flush, on by default (RFC 0005)
-- [x] Partitioning: definitions, per-file values, and partition-pruned reads (RFC 0013)
-- [x] Sort orders, set/changed/reset, with history (RFC 0013)
+- [x] Data inlining: inlined inserts/deletes plus flush, on by default (RFC 0004)
+- [x] Partitioning: definitions, per-file values, and partition-pruned reads (RFC 0005)
+- [x] Sort orders, set/changed/reset, with history (RFC 0005)
 - [x] Statistics for pruning: table, column, and per-file (`table_stats`, `table_column_stats`, `file_column_stats`), with a variant column's per-path statistics folded into its column's record
 
 ## Transactions & time travel
-- [x] Multi-statement, cross-table ACID transactions with conflict detection; lost races surface as conflicts for DuckLake's retry (RFC 0004)
+- [x] Multi-statement, cross-table ACID transactions with conflict detection; lost races surface as conflicts for DuckLake's retry (RFC 0003)
 - [x] Snapshots and time travel to any snapshot, reading past data and schema across inline, evolution, and flush (`snapshot`)
-- [x] Change data feed between snapshots, verified differentially against a stock DuckLake catalog (`snapshot_changes`, RFC 0020)
+- [x] Change data feed between snapshots, verified differentially against a stock DuckLake catalog (`snapshot_changes`, RFC 0005)
 
 ## Maintenance & operations
-- [x] Compaction and data-file rewriting: `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`, preserving row ids and pre-op time travel (RFC 0008)
-- [x] Snapshot expiry and orphaned-file cleanup / deletion scheduling; expired snapshots resolve cleanly (RFC 0007, `files_scheduled_for_deletion`)
-- [x] Data-file encryption: `ENCRYPTED` attaches, encrypted Parquet at rest, per-file keys round-tripped; moraine holds no crypto (RFC 0014)
+- [x] Compaction and data-file rewriting: `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`, preserving row ids and pre-op time travel (RFC 0010)
+- [x] Snapshot expiry and orphaned-file cleanup / deletion scheduling; expired snapshots resolve cleanly (RFC 0010, `files_scheduled_for_deletion`)
+- [x] Data-file encryption: `ENCRYPTED` attaches, encrypted Parquet at rest, per-file keys round-tripped; moraine holds no crypto (RFC 0005)
 - [x] Table/column tags and catalog options via `COMMENT ON` and options (`tag`, `column_tag`, `metadata`)
-- [x] Maintenance orchestration: a scheduled in-writer pass runs DuckLake's own maintenance functions in a fixed order, then reclaims orphaned equality-index entries; `moraine_maintenance` triggers one on demand and `moraine_maintenance_status` reports the retained passes (RFC 0021)
+- [x] Maintenance orchestration: a scheduled in-writer pass runs DuckLake's own maintenance functions in a fixed order, then reclaims orphaned equality-index entries; `moraine_maintenance` triggers one on demand and `moraine_maintenance_status` reports the retained passes (RFC 0010)
 
 ## Performance
 - [x] Commit-served projections: `snapshot`, `table_stats`, and `table_column_stats` are folded forward from each commit and served from an in-memory cache when current, removing per-commit latency growth with snapshot history. Attach-tunable WAL flush cadence bounds the per-commit durable wait.
@@ -83,14 +83,14 @@ build stays complete on the single-writer path without it.
 - [x] The write-ahead log on an object store of its own, so a commit's one PUT
   can land on an S3 Express One Zone bucket while the rest of the catalog
   stays on standard storage (`META_WAL_PATH`); `moraine_move_wal` moves an
-  existing lake's log either way (RFC 0004).
+  existing lake's log either way (RFC 0003).
 - [x] Staged index derivation streams inline sources with resumable cursors and
   whole-operation peak-memory measurement.
 - [x] Small row lookups select requested inline ranges and use cached file
   intervals, retaining conservative handling for arbitrary row-ID files.
 - [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Measured: DuckLake's
   metadata SQL is 14.5 ms of a 23-25 ms one-row commit, against 3.3 ms of
-  moraine's own commit work ([measurement](metadata-query-overhead.md)). It is
+  moraine's own commit work ([measurement](docs/metadata-query-overhead.md)). It is
   SQL front-end cost, not storage: parse, bind and optimize are 2.5 ms of a
   2.7 ms statement, execution 0.2 ms, and a prepared statement saves only the
   parse because DuckDB re-binds per execution. Native metadata tables would
@@ -104,7 +104,7 @@ build stays complete on the single-writer path without it.
   measurable gain yet — DuckDB re-plans a prepared statement on every
   execution whenever it reads any catalog, its own included — so this only
   stops moraine being the reason plan reuse cannot happen
-  ([measurement](metadata-query-overhead.md)).
+  ([measurement](docs/metadata-query-overhead.md)).
 
 
 ## Hardening & release

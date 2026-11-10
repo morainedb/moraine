@@ -1,4 +1,4 @@
-//! Measurement harnesses for the `MEASURE` items in `docs/rfcs/tasks.md`.
+//! Measurement harnesses behind the numbers in `BENCHMARK.md` and `docs/*.md`.
 //! These are not assertions — they print timings, and are `#[ignore]`d so
 //! the ordinary suite stays fast. Run one explicitly and read its output:
 //!

@@ -1,40 +1,36 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { isRfcFile, transformRfc } from './sync-rfcs.mjs';
+import { isRfcFile, transformReadme, transformRfc } from './sync-rfcs.mjs';
 
 const source = [
-  '# RFC 0016: Equality and range indexes',
-  '',
-  '- **Date:** 2026-07-10',
+  '# RFC 0009: Equality and range indexes',
   '',
   '## Summary',
   '',
-  'Verbs live on the [RFC 0003](0003-public-api-shape.md) surface, retried',
-  'under [RFC 0004](0004-commit-protocol.md#retry). Encoding details are in',
-  '[RFC 0002](0002-slatedb-key-encoding.md). Start from the',
+  'Verbs live on the [public API](0002-public-api.md) surface, retried',
+  'under [the commit protocol](0003-commit-protocol.md#retry). Encoding is in',
+  '[the storage format](0001-storage-format.md). Start from the',
   '[template](0000-template.md) or the [core crate](../../crates/moraine).',
   'See [SlateDB](https://slatedb.io) and [below](#summary).',
 ].join('\n');
 
-const result = transformRfc('0016-equality-and-range-indexes.md', source);
+const result = transformRfc('0009-equality-indexes.md', source);
 
-test('frontmatter carries the H1 title, sidebar label, and numeric order', () => {
-  assert.match(result, /^---\ntitle: "RFC 0016: Equality and range indexes"\n/);
-  assert.match(
-    result,
-    /sidebar: \{ label: "0016: Equality and range indexes", order: 16 \}\n---\n/,
-  );
+test('frontmatter carries the H1 title, a topic label, and numeric order', () => {
+  assert.match(result, /^---\ntitle: "RFC 0009: Equality and range indexes"\n/);
+  assert.match(result, /sidebar: \{ label: "Equality and range indexes", order: 9 \}\n---\n/);
 });
 
 test('the H1 is stripped from the body', () => {
-  assert.ok(!result.includes('# RFC 0016:'));
-  assert.ok(result.includes('- **Date:** 2026-07-10'));
+  assert.ok(!result.includes('# RFC 0009:'));
+  assert.ok(result.startsWith('---\n'));
+  assert.ok(result.includes('\n## Summary\n'));
 });
 
-test('sibling RFC links become relative page links, anchors preserved', () => {
-  assert.ok(result.includes('](../0003-public-api-shape/)'));
-  assert.ok(result.includes('](../0004-commit-protocol/#retry)'));
-  assert.ok(result.includes('](../0002-slatedb-key-encoding/)'));
+test('sibling RFC links become site links, anchors preserved', () => {
+  assert.ok(result.includes('](/rfcs/0002-public-api/)'));
+  assert.ok(result.includes('](/rfcs/0003-commit-protocol/#retry)'));
+  assert.ok(result.includes('](/rfcs/0001-storage-format/)'));
 });
 
 test('excluded and out-of-dir targets fall back to GitHub URLs', () => {
@@ -58,8 +54,17 @@ test('a source with no H1 is an error', () => {
 });
 
 test('only numbered RFC files are synced', () => {
-  assert.ok(isRfcFile('0022-commit-log-and-leader-role.md'));
+  assert.ok(isRfcFile('0011-commit-log-seam.md'));
   assert.ok(!isRfcFile('tasks.md'));
   assert.ok(!isRfcFile('README.md'));
   assert.ok(!isRfcFile('0000-template.md'));
+});
+
+test('the README becomes the section index with its links rewritten', () => {
+  const index = transformReadme(
+    '# RFCs\n\n| RFC | Topic |\n|---|---|\n| [0001](0001-storage-format.md) | Storage format |\n',
+  );
+  assert.match(index, /^---\ntitle: "Design documents"\nsidebar: \{ label: "About", order: 0 \}\n---\n/);
+  assert.ok(index.includes('](/rfcs/0001-storage-format/)'));
+  assert.ok(!index.includes('# RFCs'));
 });

@@ -259,7 +259,7 @@ fn ducklakes_catalog_access_set_is_pinned() {
     ];
     assert_eq!(
         observed, expected,
-        "DuckLake's catalog access set changed. Reconcile RFC 0006 before moving this pin: a \
+        "DuckLake's catalog access set changed. Before moving this pin: a \
          new table must be one moraine serves, and a table that gained writes must have a \
          staged-row translation."
     );

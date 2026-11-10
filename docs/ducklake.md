@@ -25,7 +25,7 @@ reliably with `threads > 1`. Once that holds, moraine can remove its
 currently guards the known failure.
 
 Owner: [RFC 0006](rfcs/0006-extension-surface.md), with the cache-consistency
-boundary also recorded in [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+boundary also recorded in [RFC 0007](rfcs/0007-read-path-and-caching.md).
 
 ### Admit concurrent metadata committers
 
@@ -38,7 +38,7 @@ Once available, moraine can revisit allowing a staged-row transaction to lead
 a batch containing compatible commits. This is an optimization; correctness
 does not depend on it.
 
-Owner: [RFC 0004](rfcs/0004-commit-protocol.md).
+Owner: [RFC 0003](rfcs/0003-commit-protocol.md).
 
 ## Scan pushdown
 
@@ -77,7 +77,7 @@ before the series was installed carries no row-ID statistics, which reads as
 "unknown" and keeps the file in every row-ID-filtered scan, so such a lake
 stays correct without being pruned.
 
-Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
+Owner: [RFC 0005](rfcs/0005-ducklake-feature-mapping.md).
 
 ### Push filters into every scan mode
 
@@ -89,7 +89,7 @@ The upstream request is to pass applicable filters through all scan modes and
 let their file lists prune with the same semantics as an equivalent table
 scan. This would let change-feed reads and flushes avoid unrelated files.
 
-Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
+Owner: [RFC 0005](rfcs/0005-ducklake-feature-mapping.md).
 
 ## Index integration
 
@@ -123,7 +123,7 @@ unsupported features that are unlikely to be added. This request should
 therefore be revisited only if DuckLake changes that position or offers a
 general external access-method API.
 
-Owner: [RFC 0016](rfcs/0016-equality-indexes.md). See also DuckLake's
+Owner: [RFC 0009](rfcs/0009-equality-indexes.md). See also DuckLake's
 [unsupported-features documentation](https://ducklake.select/docs/stable/duckdb/unsupported_features).
 
 ## Requests owned by other projects
