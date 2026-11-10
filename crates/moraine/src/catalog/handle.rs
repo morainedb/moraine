@@ -368,13 +368,14 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
-    /// How often a **read-only** catalog polls object storage for state a
-    /// writer has committed since it last looked.
+    /// How stale a **read-only** catalog may be: a transaction keeps the
+    /// writer's publication its predecessor pinned for up to this long
+    /// before listing for a newer one, and the catalog's own reader polls
+    /// the manifest at this interval.
     ///
-    /// This is a reader's freshness bound: nothing pushes a commit to it,
-    /// so a read-only catalog can be one poll interval behind the writer,
-    /// and its cached view is served for exactly that long. Shorter means
-    /// fresher reads and more (on S3, billed) manifest and log reads.
+    /// Nothing pushes a commit to a reader, so a read-only catalog can be
+    /// one interval behind the writer. Shorter means fresher reads and more
+    /// (on S3, billed) manifest reads; zero lists on every transaction.
     /// Defaults to 10 seconds.
     ///
     /// A committer's reads do not wait on it at all: each refreshes the
@@ -391,11 +392,9 @@ pub struct CatalogOptions {
     /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
     /// as reported by [`Catalog::create_checkpoint`].
     ///
-    /// The default (`None`) follows the latest state, which writes a
-    /// checkpoint of its own into the manifest on open and refreshes it for
-    /// the catalog's lifetime. Set it for a reader whose credentials cannot
-    /// write at all: the open then reads a fixed cut and writes nothing —
-    /// at the cost of never seeing a later commit. Refused by
+    /// The default (`None`) follows the writer by pinning the checkpoints
+    /// it publishes, and writes nothing. Set it for a fixed cut that never
+    /// sees a later commit, however long the catalog stays open. Refused by
     /// [`Catalog::open`], which is a writer.
     pub checkpoint: Option<String>,
 }

@@ -73,12 +73,12 @@ fencing error. Nothing is corrupted, but the first writer must re-attach.
 A deployment that needs concurrent commits funnels them through one
 writer process, where they share a flush.
 
-To follow the writer, a read-only attach writes a checkpoint into the
-store's manifest, so its credentials need write access to the catalog
-bucket. It polls for new commits every `READER_POLL_INTERVAL_MS`, ten
-seconds by default, which is a billed request each time. Readers with
-strictly read-only credentials pin a checkpoint created ahead of time; see
-`CHECKPOINT` in [Configuration](../configuration/#read-only-attaches).
+A read-only attach follows the writer by pinning the checkpoints the writer
+publishes, and writes nothing to the bucket. It looks for new commits at most
+every `READER_POLL_INTERVAL_MS`, ten seconds by default, which is a billed
+request each time. A reader that should never move pins a checkpoint created
+ahead of time; see `CHECKPOINT` in
+[Configuration](../configuration/#read-only-attaches).
 
 ## Index a column
 

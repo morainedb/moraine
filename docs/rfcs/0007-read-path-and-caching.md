@@ -3,8 +3,8 @@
 ## Summary
 
 Every read runs at one fixed store revision and decodes only the records it
-asks for. Writers read through a SlateDB snapshot. Independent readers share
-leased checkpoint readers that the writer publishes at durable boundaries.
+asks for. Writers read through a SlateDB snapshot. Independent readers pin
+checkpoints the writer publishes at durable boundaries, and write nothing.
 Reuse lives in one foyer block cache per store under one process budget, with
 SST metadata protected by eviction priority. Row summaries are published as
 immutable sidecars beside embedded-row-id data files. Live allocations are
@@ -27,9 +27,12 @@ read it.
 
 **Reader scopes.** An independent reader cannot take a `DbSnapshot`, so it
 reads through a `DbReader` fixed at a checkpoint. The writer publishes that
-checkpoint and readers lease it. `crates/moraine/src/store/checkpoint.rs`
-publishes and leases. `crates/moraine/src/catalog/handle/reader_scopes.rs`
-shares the fixed readers across transactions.
+checkpoint and readers pin it. `crates/moraine/src/store/checkpoint.rs`
+publishes and pins. `crates/moraine/src/catalog/handle/reader_scopes.rs`
+shares the fixed readers across transactions. The handle's own `DbReader`
+follows the latest manifest without a checkpoint of its own, polling at
+`reader_poll_interval`; it serves head reads only, and the collector's age
+threshold protects what it references between polls.
 
 Publication works as follows.
 
@@ -41,9 +44,13 @@ Publication works as follows.
    durable. One publication may cover several groups whose writes are already
    durable. Each acknowledgement waits for a checkpoint covering its own
    group.
-3. Published checkpoints with an older manifest are retired after the new one
-   exists. Readers already leased against an older one are unaffected, because
-   a lease is the reader's own checkpoint.
+3. Publications with an older manifest are retired after the new one exists.
+   Retirement gives a publication an expiry of `READ_GRACE`, fifteen minutes,
+   and deletes one already past its expiry. The current publication never
+   carries an expiry, so readers acquire it while the writer is idle or
+   offline. `READ_GRACE` must exceed the longest explicit transaction, as the
+   retention window must. Files and log slots a retired publication
+   references stay until it expires.
 4. A WAL-durable write whose publication fails is potentially committed. The
    outcome is reported as unknown under [the commit
    protocol](0003-commit-protocol.md). It is never treated as a conflict that
@@ -70,38 +77,42 @@ Each component owns one layer of state and nothing above it.
 | Owner | Holds |
 |---|---|
 | The block cache | SST metadata and blocks, shared across handles and reader generations |
-| A read scope | its `DbSnapshot` or leased checkpoint reader |
+| A read scope | its `DbSnapshot` or pinned checkpoint reader |
 | One operation | its decoded records and output page |
 | DuckDB | native catalog entries and query execution state |
 | Lookup facilities | bounded row directories and probe memos under the lookup allowance |
 
 Reader acquisition works as follows.
 
-1. The reader lists published checkpoints and takes the one with the highest
-   manifest id. If none exists, acquisition fails with `SnapshotExpired`,
-   which tells the caller to reopen the writer so it publishes recovered
-   progress.
-2. If the handle's latest shared reader is at that manifest and its lease is
-   valid, the new transaction shares it.
-3. Otherwise the reader creates its own detached checkpoint with `source` set
-   to the published checkpoint and a lifetime of `LEASE_LIFETIME`, five
-   minutes, and opens a `DbReader` on it. If the published checkpoint was
-   retired during that step, acquisition retries discovery, up to
-   `MAX_COMMIT_ATTEMPTS` times, ten, then fails with `RetryBudgetExhausted`.
-4. A renewal task refreshes the lease every `LEASE_REFRESH`, one minute, with
-   a `LEASE_TIMEOUT` of thirty seconds per renewal. A renewal that fails is
-   retried at the next interval while the lease remains valid. Once the lease
-   has lapsed the reader is closed and its checkpoint deleted.
-5. Every point read and every scan yield checks expiry through
-   `CheckpointReader::reader`, which refuses a lapsed lease with an error
-   telling the caller to restart the transaction.
+1. A new transaction shares the handle's latest reader without a store
+   request when the publications were listed less than `reader_poll_interval`
+   ago, the reader has at least half of `READ_GRACE` left, and its deadline
+   has not passed. The interval is therefore how stale a reader may be; zero
+   lists on every transaction.
+2. Otherwise the reader lists published checkpoints and takes the one with
+   the highest manifest id. If none exists, acquisition fails with
+   `SnapshotExpired`, which tells the caller to reopen the writer so it
+   publishes recovered progress.
+3. If the latest reader is at that manifest, the listing confirms it: the
+   deadline moves to the listing time plus `READ_GRACE`, or to the
+   publication's own expiry when it carries one, less a one-minute allowance
+   for clock skew. The transaction shares the reader.
+4. Otherwise the reader opens a `DbReader` pinned to the published checkpoint
+   id, with its deadline set the same way. The open writes nothing. If the
+   publication expired during that step, acquisition retries discovery, up
+   to `MAX_COMMIT_ATTEMPTS` times, ten, then fails with
+   `RetryBudgetExhausted`.
+5. Every point read and every scan yield checks the deadline through
+   `CheckpointReader::reader`, which refuses a reader past it with an error
+   telling the caller to restart the transaction. A transaction therefore
+   cannot outlive `READ_GRACE`.
 
 At most `MAX_READER_GENERATIONS` reader generations, eight, may be live in one
 handle. Acquiring another is refused with `Constraint` until an older
 transaction or cursor finishes. An unshared older generation is retired before
 its replacement reserves replay memory. A new generation never changes what an
 existing transaction sees. An explicit checkpoint attach, named through the
-`checkpoint` attach option, uses an external reader that no lease governs.
+`checkpoint` attach option, uses an external reader that no deadline governs.
 
 SlateDB checkpoints protect store files only. DuckLake's external Parquet
 files are retained under [maintenance](0010-maintenance.md), which is a
@@ -116,14 +127,14 @@ path. A `CatalogSnapshot` is an explicit materialization a caller asks for and
 pays for under working memory.
 
 A `CatalogCursor` streams records of one entity kind in encoded-key order,
-current records followed by ended ones, applying begin and end visibility at
-the selected snapshot. Across the C ABI a metadata cursor holds one page of at
-most `PAGE_RECORDS` records, sixty-four, or `PAGE_BYTES`, one mebibyte,
-whichever fills first. Freeing the page releases its rows and their
-working-memory reservation. Cancellation or a failed read invalidates the
-cursor, and a lapsed lease rejects its prefetched entries. The DuckDB metadata
-tables all stream through this cursor, so two scans of one table inside one
-transaction agree even when another connection commits between them.
+current records followed by ended ones, applying begin and end visibility at the
+selected snapshot. Across the C ABI a metadata cursor holds one page of at most
+`PAGE_RECORDS` records, sixty-four, or `PAGE_BYTES`, one mebibyte, whichever
+fills first. Freeing the page releases its rows and their working-memory
+reservation. Cancellation or a failed read invalidates the cursor, and a reader
+past its deadline rejects its prefetched entries. The DuckDB metadata tables all
+stream through this cursor, so two scans of one table inside one transaction
+agree even when another connection commits between them.
 
 ## Snapshot expiry and consistent operations
 
@@ -505,8 +516,14 @@ container ceiling remains the final boundary.
 - A reader scope opened after acknowledgement sees the commit, and an open
   scope keeps its revision across later commits.
 - Publication fails when the covered sequence is not yet WAL-durable.
-- A lapsed lease rejects point reads and scan yields, and renewal keeps a live
-  scope valid.
+- A reader past its deadline rejects point reads and scan yields, and a
+  listing that still shows its publication extends the deadline.
+- A read-only attach writes nothing to the object store across open, several
+  transactions, and a writer commit between them.
+- A shared reader keeps its publication inside `reader_poll_interval` and
+  moves to a newer one after it.
+- A superseded publication carries an expiry and the newest carries none; an
+  expired one is deleted at the next publication.
 - A head change under a lookup rerun reaches `RetryBudgetExhausted` after
   eight passes without an unguarded fallback.
 - A corrupt sidecar header, wrong identity, or unknown version falls through
@@ -518,6 +535,10 @@ container ceiling remains the final boundary.
 
 - **Writer publication by detached checkpoint of the latest manifest.**
   Rejected: it omits WAL-durable commits a following reader already sees.
+- **Reader-owned leases on the published checkpoint.** Rejected: a manifest
+  write per reader generation and one per renewal, forced only by deleting
+  the superseded publication at once. A grace on retirement lets readers pin
+  the publication itself.
 - **A fixed metadata slot.** Rejected: a fixed fifth of the budget was both
   floor and ceiling, so holding a large store's filters meant inflating the
   whole budget. Eviction priority lets idle metadata space go to blocks.

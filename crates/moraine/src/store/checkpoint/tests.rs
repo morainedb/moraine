@@ -186,57 +186,141 @@ async fn publication_waits_for_the_manifest_after_wal_durability() {
     db.close().await.unwrap();
 }
 
+async fn durable_write(db: &Db, key: &[u8], value: &[u8]) -> u64 {
+    let write = db.put(key, value).await.unwrap();
+    db.flush().await.unwrap();
+    write.await_durable().await.unwrap();
+    write.seqnum()
+}
+
+async fn published(admin: &Admin) -> Vec<slatedb::Checkpoint> {
+    let mut checkpoints = admin.list_checkpoints(Some(PUBLISHED_NAME)).await.unwrap();
+    checkpoints.sort_by_key(|checkpoint| checkpoint.manifest_id);
+    checkpoints
+}
+
 #[tokio::test]
-async fn reader_lease_is_released_after_the_last_reference() {
+async fn superseded_publications_expire_and_the_newest_does_not() {
+    let objects = Arc::new(InMemory::new());
+    let db = Db::open("", objects.clone()).await.unwrap();
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    let publisher = Publisher::new(
+        db.clone(),
+        slatedb::admin::AdminBuilder::new("", objects.clone()).build(),
+    );
+
+    let first = durable_write(&db, b"key", b"one").await;
+    publisher.through(first).await.unwrap();
+    let second = durable_write(&db, b"key", b"two").await;
+    publisher.through(second).await.unwrap();
+
+    let checkpoints = published(&admin).await;
+    assert_eq!(checkpoints.len(), 2);
+    let expires = checkpoints[0].expire_time.unwrap();
+    let left = remaining_until(expires.timestamp_millis());
+    assert!(left > READ_GRACE / 2 && left <= READ_GRACE);
+    assert!(checkpoints[1].expire_time.is_none());
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pinned_reader_outlives_later_publications_within_the_grace() {
+    let objects = Arc::new(InMemory::new());
+    let db = Db::open("", objects.clone()).await.unwrap();
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    let publisher = Publisher::new(
+        db.clone(),
+        slatedb::admin::AdminBuilder::new("", objects.clone()).build(),
+    );
+
+    let first = durable_write(&db, b"key", b"one").await;
+    publisher.through(first).await.unwrap();
+    let pinned = published(&admin).await.pop().unwrap();
+    let reader = DbReader::open(
+        "",
+        objects.clone(),
+        slatedb::DbReaderMode::Checkpoint(pinned.id),
+        slatedb::config::DbReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    for value in [b"two".as_slice(), b"three".as_slice()] {
+        let sequence = durable_write(&db, b"key", value).await;
+        publisher.through(sequence).await.unwrap();
+    }
+
+    assert!(
+        published(&admin)
+            .await
+            .iter()
+            .any(|checkpoint| checkpoint.id == pinned.id)
+    );
+    assert_eq!(
+        reader.get(b"key").await.unwrap().as_deref(),
+        Some(b"one".as_slice())
+    );
+    reader.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_publications_are_deleted_on_the_next_publication() {
+    let objects = Arc::new(InMemory::new());
+    let db = Db::open("", objects.clone()).await.unwrap();
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    let publisher = Publisher::with_grace(
+        db.clone(),
+        slatedb::admin::AdminBuilder::new("", objects.clone()).build(),
+        Duration::from_millis(1),
+    );
+
+    let first = durable_write(&db, b"key", b"one").await;
+    publisher.through(first).await.unwrap();
+    let second = durable_write(&db, b"key", b"two").await;
+    publisher.through(second).await.unwrap();
+    assert_eq!(published(&admin).await.len(), 2);
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let third = durable_write(&db, b"key", b"three").await;
+    publisher.through(third).await.unwrap();
+
+    let checkpoints = published(&admin).await;
+    assert_eq!(checkpoints.len(), 2, "the expired publication is deleted");
+    assert!(checkpoints[0].expire_time.is_some());
+    assert!(checkpoints[1].expire_time.is_none());
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pinned_reader_refuses_reads_past_its_deadline() {
     let objects = Arc::new(InMemory::new());
     let db = Db::open("", objects.clone()).await.unwrap();
     db.put(b"key", b"value").await.unwrap();
     db.flush().await.unwrap();
-    let admin = Arc::new(slatedb::admin::AdminBuilder::new("", objects.clone()).build());
     let published = db
         .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
-        .await
-        .unwrap();
-    let created = Instant::now();
-    let lease = admin
-        .create_detached_checkpoint(&CheckpointOptions {
-            source: Some(published.id),
-            lifetime: Some(LEASE_LIFETIME),
-            ..CheckpointOptions::default()
-        })
         .await
         .unwrap();
     let reader = DbReader::open(
         "",
         objects,
-        slatedb::DbReaderMode::Checkpoint(lease.id),
+        slatedb::DbReaderMode::Checkpoint(published.id),
         slatedb::config::DbReaderOptions::default(),
     )
     .await
     .unwrap();
-    let scope = CheckpointReader::leased(
-        reader,
-        published.manifest_id,
-        lease.id,
-        admin.clone(),
-        created,
-    );
-    let cursor = scope.clone();
-    let mut entries = crate::store::handle::ReadHandle::Checkpoint(&cursor)
+    let listed = Instant::now();
+    let scope = CheckpointReader::pinned(reader, published.manifest_id, listed, None);
+    let left = scope.remaining().unwrap();
+    assert!(left > READ_GRACE / 2 && left < READ_GRACE);
+
+    let mut entries = crate::store::handle::ReadHandle::Checkpoint(&scope)
         .scan_prefix(b"", .., crate::store::handle::ScanShape::Metadata)
         .await
         .unwrap();
-    drop(scope);
-    assert!(
-        admin
-            .list_checkpoints(None)
-            .await
-            .unwrap()
-            .iter()
-            .any(|checkpoint| checkpoint.id == lease.id)
-    );
     assert_eq!(
-        cursor
+        scope
             .reader()
             .unwrap()
             .get(b"key")
@@ -245,26 +329,21 @@ async fn reader_lease_is_released_after_the_last_reference() {
             .as_deref(),
         Some(b"value".as_slice())
     );
-    *cursor.expires.as_ref().unwrap().lock().unwrap() = Instant::now();
+
+    scope.confirm(listed, Some(Duration::ZERO));
+    assert!(scope.reader().is_err());
     assert!(
         entries.next().await.is_err(),
-        "buffered scans must refuse an expired lease"
+        "buffered scans must refuse an expired publication"
     );
     drop(entries);
-    drop(cursor);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while admin
-            .list_checkpoints(None)
-            .await
-            .unwrap()
-            .iter()
-            .any(|checkpoint| checkpoint.id == lease.id)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+
+    scope.confirm(Instant::now(), None);
+    assert!(
+        scope.reader().is_ok(),
+        "a later listing extends the deadline"
+    );
+    drop(scope);
     db.close().await.unwrap();
 }
 

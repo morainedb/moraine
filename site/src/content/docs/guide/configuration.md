@@ -22,8 +22,8 @@ so on. The second table omits the prefix.
 | Moraine option | Default | Meaning |
 |---|---|---|
 | `DATA_PATH` | required once | Same value as `DATA_PATH`. Recorded in the catalog at creation; later attaches may omit both, and a different value is refused. |
-| `CHECKPOINT` | unset | Pin a read-only attach to a SlateDB checkpoint id. No manifest writes; a fixed cut. Requires `READ_ONLY`. |
-| `READER_POLL_INTERVAL_MS` | 10000 | How often a read-only attach looks for new commits. |
+| `CHECKPOINT` | unset | Pin a read-only attach to a SlateDB checkpoint id: a fixed cut that never sees later commits. Requires `READ_ONLY`. |
+| `READER_POLL_INTERVAL_MS` | 10000 | How stale a read-only attach may be before it looks for new commits. |
 | `FLUSH_INTERVAL_MS` | 100 | Minimum spacing between two write-ahead-log flushes. |
 | `FLUSH_ON_COMMIT` | false | Flush on every commit, one PUT each, whatever the interval. |
 | `WAL_PATH` | the catalog store | A separate object store for the write-ahead log. Recorded in the lake; every attach must name the same one. |
@@ -91,13 +91,15 @@ It drains the old log before recording the new store. Pass
 
 ## Read-only attaches
 
-A read-only attach follows the writer by polling the manifest every
-`READER_POLL_INTERVAL_MS`. To do so it writes a checkpoint into the
-manifest and refreshes it while attached, so its credentials need write
-access to the catalog bucket.
+A read-only attach follows the writer by pinning the checkpoint the writer
+publishes with each commit, and writes nothing, so read-only credentials
+suffice. Each transaction keeps the publication the previous one pinned for
+up to `READER_POLL_INTERVAL_MS` before looking for a newer one, so that is
+how far behind the writer a reader may be. A transaction may run for up to
+fifteen minutes; a longer one fails and must be restarted.
 
-For credentials that are strictly read-only, create a checkpoint on the
-writer and pin readers to it:
+For a fixed view that never moves, create a checkpoint on the writer and pin
+readers to it:
 
 ```sql
 -- On the writer.

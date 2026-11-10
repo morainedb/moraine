@@ -369,7 +369,8 @@ impl<'a> StoreBuilder<'a> {
     /// Opens the store read-only as a [`DbReader`], which never fences a
     /// live writer; the flush cadence is ignored. Without a
     /// [`checkpoint`](Self::checkpoint) the reader follows the latest
-    /// manifest, which costs a manifest write on open.
+    /// manifest, writing a checkpoint of its own only when it follows a
+    /// commit log.
     pub(crate) async fn open_reader(&self) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
         let options = DbReaderOptions {
             manifest_poll_interval: self.poll_interval,
@@ -393,9 +394,16 @@ impl<'a> StoreBuilder<'a> {
         {
             builder = builder.with_db_cache(cache, cache_id);
         }
-        if let Some(checkpoint) = self.checkpoint {
-            builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
-        }
+        // A reader with no log to follow writes no checkpoint of its own:
+        // its transactions pin the writer's publications, and this reader
+        // serves head reads from the latest manifest between polls. A
+        // reader over a log keeps SlateDB's managed checkpoint.
+        let mode = match self.checkpoint {
+            Some(checkpoint) => DbReaderMode::Checkpoint(checkpoint),
+            None if self.reader_session.is_none() => DbReaderMode::FollowLatest,
+            None => DbReaderMode::ManagedCheckpoint,
+        };
+        builder = builder.with_reader_mode(mode);
         let wal: Arc<dyn slatedb::wal::WalReader> = if let Some(session) = &self.reader_session {
             let reader = session.reader();
             match &self.read_asked {

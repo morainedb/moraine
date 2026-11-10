@@ -98,21 +98,28 @@ async fn a_pinned_reader_opens_against_a_store_that_refuses_writes() {
     );
 }
 
-/// The contrast that makes the mode worth having: a reader following the
-/// latest state writes its own checkpoint into the manifest, so the same
-/// open costs writes where a pinned one costs none.
+/// A reader following the latest state pins the writer's publications, so
+/// it writes no more than a pinned one: nothing.
 #[tokio::test]
 #[allow(clippy::unwrap_used)]
-async fn a_latest_following_reader_writes_where_a_pinned_one_does_not() {
+async fn a_latest_following_reader_writes_nothing_either() {
     let (store, checkpoint) = seeded_with_checkpoint().await;
 
     let before = store.writes_attempted();
-    Catalog::open_read_only(store.clone(), CatalogOptions::default())
-        .await
-        .unwrap()
-        .close()
+    let latest = Catalog::open_read_only(store.clone(), CatalogOptions::default())
         .await
         .unwrap();
+    assert!(
+        latest
+            .read_scope()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    latest.close().await.unwrap();
     let latest_writes = store.writes_attempted() - before;
 
     let before = store.writes_attempted();
@@ -124,10 +131,7 @@ async fn a_latest_following_reader_writes_where_a_pinned_one_does_not() {
         .unwrap();
     let pinned_writes = store.writes_attempted() - before;
 
-    assert!(
-        latest_writes > 0,
-        "a latest-following reader is expected to write its own checkpoint"
-    );
+    assert_eq!(latest_writes, 0, "a following reader must write nothing");
     assert_eq!(pinned_writes, 0, "a pinned reader must write nothing");
 }
 
