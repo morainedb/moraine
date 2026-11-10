@@ -249,3 +249,11 @@ test('the page opens with the compatibility table', () => {
   assert.ok(page.includes('| Moraine | DuckDB | Catalog store format | DuckLake catalog version |'));
   assert.ok(page.includes('| 0.8.1 | v2.0.0 | 9 | 1.0 – 1.1 |'));
 });
+
+test('without release assets, DuckDB versions come from the tag manifest', () => {
+  const manifest = '# comment\nv1.5.5 duckdb=abc\nv1.5.4\n';
+  const rows = compatibilityRows([{ version: '0.6.4' }], new Map(), () => constants, () => manifest);
+  assert.equal(rows[0].duckdb, 'v1.5.4, v1.5.5');
+  const none = compatibilityRows([{ version: '0.4.0' }], new Map(), () => constants, () => '');
+  assert.equal(none[0].duckdb, '—');
+});

@@ -145,11 +145,22 @@ function range(low, high) {
   return low === high ? `${low}` : `${low} – ${high}`;
 }
 
+// The DuckDB versions a tag's `.github/duckdb-versions` manifest lists.
+function manifestVersions(text) {
+  return text
+    .split('\n')
+    .filter((line) => line.trim() && !line.startsWith('#'))
+    .map((line) => line.trim().split(/\s+/)[0]);
+}
+
 // One row per run of consecutive releases with the same DuckDB builds,
 // store-format range, and catalog versions. `entries` are newest first.
-export function compatibilityRows(entries, downloads, constantsFor) {
+// DuckDB versions come from the release assets, or from the tag's manifest
+// when no assets were fetched.
+export function compatibilityRows(entries, downloads, constantsFor, manifestFor = () => '') {
   const cells = entries.map(({ version }) => {
-    const duckdb = [...(downloads.get(version)?.keys() ?? [])]
+    const fromAssets = [...(downloads.get(version)?.keys() ?? [])];
+    const duckdb = (fromAssets.length ? fromAssets : manifestVersions(manifestFor(`v${version}`) ?? ''))
       .sort(compareVersionsDescending)
       .reverse();
     const constants = parseVersionConstants(constantsFor(`v${version}`) ?? '');
@@ -224,19 +235,23 @@ export function renderReleases(entries, downloads, compatibility = []) {
 
 const repositoryRoot = path.resolve(scriptDir, '../..');
 
-// The version constants a release tag's source declares, or an empty string
-// when the tag is unavailable (a shallow clone, or a version never tagged).
-function constantsAtTag(tag) {
+// Git output at a release tag, or an empty string when the tag is
+// unavailable (a shallow clone, or a version never tagged).
+function git(args) {
   try {
-    return execFileSync(
-      'git',
-      ['grep', '-h', '-E', 'const [A-Z_]+: (u64|&str) =', tag, '--', 'crates/moraine/src'],
-      { cwd: repositoryRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-    );
+    return execFileSync('git', args, {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
   } catch {
     return '';
   }
 }
+
+const constantsAtTag = (tag) =>
+  git(['grep', '-h', '-E', 'const [A-Z_]+: (u64|&str) =', tag, '--', 'crates/moraine/src']);
+const manifestAtTag = (tag) => git(['show', `${tag}:.github/duckdb-versions`]);
 
 const releasesUrl = 'https://api.github.com/repos/morainedb/moraine/releases?per_page=100';
 
@@ -282,7 +297,7 @@ export async function syncReleases({ fetchImpl = fetch, offline = false } = {}) 
   const entries = parseChangelog(await readFile(changelogPath, 'utf8'));
   const downloads = offline ? new Map() : downloadsByVersion(await fetchReleases(fetchImpl));
 
-  const compatibility = compatibilityRows(entries, downloads, constantsAtTag);
+  const compatibility = compatibilityRows(entries, downloads, constantsAtTag, manifestAtTag);
   await writeFile(outputPath, renderReleases(entries, downloads, compatibility));
   return {
     versions: entries.length,
