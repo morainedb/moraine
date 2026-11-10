@@ -8,9 +8,10 @@ sidebar:
 ## Install the extension
 
 Moraine is not yet in DuckDB's community extension repository, so it loads
-unsigned. Download `moraine.<duckdb-version>.<platform>.duckdb_extension`
-for your DuckDB version from the [Releases](/releases/) page, start DuckDB
-with `-unsigned`, and load it:
+unsigned. From the [Releases](/releases/) page, download the
+`moraine.<duckdb-version>.<platform>.duckdb_extension` whose DuckDB version
+matches yours exactly (any other is refused), start DuckDB with
+`-unsigned`, and load it:
 
 ```sh
 duckdb -unsigned
@@ -18,8 +19,9 @@ duckdb -unsigned
 
 ```sql
 LOAD 'path/to/moraine.v2.0.0.osx_arm64.duckdb_extension';
-INSTALL ducklake;
 ```
+
+DuckLake is bundled with the extension; there is nothing else to install.
 
 ## Attach a local lake
 
@@ -28,15 +30,14 @@ ATTACH 'ducklake:moraine:/tmp/demo-lake' AS lake
   (DATA_PATH '/tmp/demo-lake-data/', META_DATA_PATH '/tmp/demo-lake-data/');
 
 CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
-INSERT INTO lake.events VALUES (1, 'hello, bucket');
+INSERT INTO lake.events VALUES (1, 'hello, lake');
 SELECT * FROM lake.events;
 ```
 
-Pass both path options with the same value. `DATA_PATH` tells DuckLake
-where Parquet files go. `META_DATA_PATH` is forwarded to moraine and
-recorded in the catalog when the lake is created. After that, attaches
-may omit `DATA_PATH`, and an attach that supplies a different
-`META_DATA_PATH` is refused.
+Moraine records the data root in the catalog, so give it the same path
+DuckLake gets: `DATA_PATH` for DuckLake, `META_DATA_PATH` for Moraine.
+After the lake exists, attaches may omit both; an attach that supplies a
+different `META_DATA_PATH` is refused.
 
 ## Attach a lake on S3
 
@@ -69,16 +70,59 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_ONLY);
 A second read-write attach does not fail. SlateDB gives the writer role to
 the newest writer, and the previous writer's next commit fails with a
 fencing error. Nothing is corrupted, but the first writer must re-attach.
+A deployment that needs concurrent commits funnels them through one
+writer process, where they share a flush.
 
-A read-only attach writes a checkpoint into the store's manifest so it can
-follow the writer's commits, so its credentials still need write access to
-the catalog bucket. Readers with strictly read-only credentials pin a
-checkpoint created ahead of time; see `CHECKPOINT` in
-[Configuration](../configuration/#read-only-attaches).
+To follow the writer, a read-only attach writes a checkpoint into the
+store's manifest, so its credentials need write access to the catalog
+bucket. It polls for new commits every `READER_POLL_INTERVAL_MS`, ten
+seconds by default, which is a billed request each time. Readers with
+strictly read-only credentials pin a checkpoint created ahead of time; see
+`CHECKPOINT` in [Configuration](../configuration/#read-only-attaches).
+
+## Index a column
+
+A DuckLake table is a set of Parquet files, so a lookup by key reads every
+file that statistics cannot rule out. Moraine adds ordered indexes over
+table columns, created with DuckDB's own DDL and maintained in the same
+commit as the rows they cover:
+
+```sql
+CREATE UNIQUE INDEX events_by_id ON lake.events (id);
+
+SELECT * FROM lake.events WHERE id = 1;
+SELECT * FROM lake.events WHERE id BETWEEN 100 AND 200;
+SELECT index_name, is_unique, state
+FROM moraine_indexes('lake', 'main', 'events');
+```
+
+Equality, `IN`, range, and `IS NULL` predicates probe the index instead of
+scanning; nothing in the query changes. A unique index rejects a duplicate
+even from concurrent transactions, and an index checked with
+`moraine_index_verify` lets `DELETE … WHERE id = 1` skip the scan. Run
+index DDL on the writer, outside an explicit transaction.
+
+Options go in a `WITH` clause:
+
+| Option | Meaning |
+|---|---|
+| `staged = true` | Build in bounded steps that resume if interrupted. Use for a table that already holds many files. |
+| `step_entries`, `step_bytes` | Size of one staged step; both must be positive. |
+| `maintenance = 'deferred'` | Add entries for new rows in a later repair pass instead of the data commit. Non-unique indexes only. |
+| `directions = ['desc', 'asc']`, `nulls = ['first', 'last']` | Per-column order; DuckDB discards the standard `ASC`/`DESC` clauses. |
+
+`moraine_index_verify('lake', 'main', 'events', 'events_by_id')` checks the
+index against its table; a clean check lets a `DELETE` by key skip the scan.
+Rebuilding is `DROP INDEX` then `CREATE INDEX`; in between, the index
+neither accelerates queries nor enforces uniqueness. The
+[design document](/rfcs/0009-equality-indexes/) has the lookup functions
+and limits.
 
 ## Next
 
 - [Configuration](../configuration/) lists every attach option, with
   sections on commit latency and caching.
-- [Operating a lake](../operating/) covers retention, scheduled
-  maintenance, and encryption.
+- [Operating manual](../operating/) covers retention, maintenance,
+  encryption, backups, and upgrades.
+- [Architecture](../architecture/) explains how the catalog is laid out
+  and how commits and reads work.

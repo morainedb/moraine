@@ -9,7 +9,7 @@ export default defineConfig({
 		starlight({
 			plugins: [starlightThemeNova()],
 			customCss: ['./src/styles/custom.css'],
-			title: 'moraine',
+			title: 'Moraine',
 			description:
 				'A DuckLake catalog backend that stores the catalog in object storage on SlateDB.',
 			logo: {
@@ -23,17 +23,18 @@ export default defineConfig({
 				{
 					label: 'Guide',
 					items: [
-						{ slug: 'guide/overview' },
 						{ slug: 'guide/getting-started' },
 						{ slug: 'guide/configuration' },
 						{ slug: 'guide/operating' },
+						{ slug: 'guide/architecture' },
 					],
 				},
-				{ label: 'Releases', slug: 'releases' },
 				{
 					label: 'Design',
 					items: [{ autogenerate: { directory: 'rfcs' } }],
 				},
+				{ label: 'Releases', slug: 'releases' },
+				{ label: 'Roadmap', slug: 'roadmap' },
 			],
 		}),
 	],

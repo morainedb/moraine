@@ -1,11 +1,11 @@
 ---
-title: moraine
-description: A DuckLake catalog backend that stores the catalog in object storage on SlateDB.
+title: Moraine
+description: Run DuckLake entirely in object storage, no server required.
 tableOfContents: false
 hero:
-  tagline: A DuckLake catalog backend that stores the catalog in object storage on SlateDB.
+  tagline: Run DuckLake entirely in object storage, no server required.
   image:
-    alt: Three stacked strata forming a ridge, the moraine mark
+    alt: Three stacked strata forming a ridge, the Moraine mark
     light: ../../assets/moraine.svg
     dark: ../../assets/moraine-dark.svg
   actions:
@@ -18,22 +18,74 @@ hero:
       variant: minimal
 ---
 
-```sql
+import { Card } from '@astrojs/starlight/components';
+
+```sql title="attach.sql"
+-- duckdb -unsigned, then LOAD the extension; see Getting started.
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (DATA_PATH 's3://bucket/prefix-data/',
+   -- Moraine records the data root in the catalog; same value as DATA_PATH.
    META_DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
 
 CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
 INSERT INTO lake.events VALUES (1, 'hello, bucket');
 ```
 
-DuckLake keeps table data in object storage and its catalog in a SQL
-database. Moraine replaces that database with [SlateDB](https://slatedb.io),
-a key-value store whose state also lives in object storage. The catalog
-sits in the bucket next to the Parquet files, so there is no catalog server
-to run, and copying the bucket copies the whole lake.
+[DuckLake](https://ducklake.select) currently stores table data as Parquet files
+in object storage and keeps its catalog and inlined rows in a SQL database: a
+DuckDB or SQLite file for one process; Postgres, or DuckDB served over
+[Quack](https://duckdb.org/quack/), its new client-server protocol, for several.
+Moraine is a DuckLake catalog backend that replaces the database with
+[SlateDB](https://slatedb.io), a transactional key-value store whose state also
+lives in object storage. The catalog sits in the bucket beside the data files,
+and DuckLake's SQL runs against it unchanged.
 
-- The [overview](guide/overview/) explains what moraine is and what it costs.
-- [Getting started](guide/getting-started/) installs the extension and attaches a lake.
-- [Configuration](guide/configuration/) lists every attach option and function.
-- The [design documents](rfcs/) record how it works.
+## What you get
+
+- **No catalog server:** Nothing to deploy, monitor, or back up. A deployment
+  is a storage bucket.
+- **Bucket durablilty:** A copy of the bucket taken while no writer is
+  attached is a complete lake; see
+  [Backups and copies](guide/operating/#backups-and-copies).
+- **Nothing to pay for while idle:** An idle lake costs only storage, no
+  compute or database hosting fees.
+- **Indexed lookups:** Ordered indexes over table columns, maintained in the
+  same commit as the rows, so a query by key probes the index instead of
+  scanning every file; see
+  [Index a column](guide/getting-started/#index-a-column).
+
+## When not to use Moraine
+
+- **For sub-5 ms commits:** A commit is durable once one write-ahead-log
+  PUT lands: 50 to 100 ms on S3 Standard, 5 to 10 ms with the log on S3
+  Express One Zone via
+  [`WAL_PATH`](guide/configuration/#the-write-ahead-log-on-a-faster-bucket).
+- **With many independent writers:** One process writes; the rest attach
+  `READ_ONLY`. Concurrent commits go through that one writer. See
+  [one writer, many readers](guide/getting-started/#one-writer-many-readers).
+- **Not yet in DuckDB's community repository:** it loads with `-unsigned`, one
+  build per DuckDB version.
+
+## Status
+
+Moraine is under active development and in production use at
+[contour.app](https://contour.app). DuckLake SQL, including `CREATE`,
+`INSERT`, `UPDATE`, `DELETE`, time travel, and maintenance, runs against
+Moraine as its catalog and is validated against real DuckDB in CI. The
+[roadmap](roadmap/) lists
+what is done and what is next.
+
+<Card title="More details">
+
+- [Getting started](guide/getting-started/) installs the extension and
+  attaches a lake.
+- [Configuration](guide/configuration/) lists every attach option and
+  function.
+- [Operating manual](guide/operating/) covers retention, maintenance,
+  encryption, backups, and upgrades.
+- [Architecture](guide/architecture/) explains how the catalog is laid out
+  and how commits and reads work; the [design documents](rfcs/) specify
+  each decision.
+- [Releases](releases/) has the changelog and extension downloads.
+
+</Card>
