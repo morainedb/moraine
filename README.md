@@ -76,6 +76,8 @@ what is done and what is next.
 - [Architecture](https://morainedb.github.io/guide/architecture/) explains how
   the catalog is laid out and how commits and reads work; the
   [design documents](https://morainedb.github.io/rfcs/) specify each decision.
+- [Benchmarks](https://morainedb.github.io/benchmarks/) measures the metadata
+  path and compares moraine with the other DuckLake catalogs.
 - [Releases](https://morainedb.github.io/releases/) has the changelog and
   extension downloads.
 

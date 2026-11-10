@@ -14,6 +14,8 @@ const sourceDir = path.resolve(scriptDir, '../../docs/rfcs');
 const outputDir = path.resolve(scriptDir, '../src/content/docs/rfcs');
 const roadmapSource = path.resolve(scriptDir, '../../ROADMAP.md');
 const roadmapOutput = path.resolve(scriptDir, '../src/content/docs/roadmap.md');
+const benchmarksSource = path.resolve(scriptDir, '../../docs/benchmarks.md');
+const benchmarksOutput = path.resolve(scriptDir, '../src/content/docs/benchmarks.md');
 const githubBlobBase = 'https://github.com/morainedb/moraine/blob/main';
 
 // An RFC is a numbered kebab-title file; the template stays out.
@@ -156,6 +158,16 @@ export function transformRoadmap(source) {
   );
 }
 
+// The benchmark page lives in docs/, so its relative links resolve from there.
+export function transformBenchmarks(source) {
+  const { body } = splitTitle('benchmarks.md', source);
+  return (
+    ['---', 'title: "Benchmarks"', '---', ''].join('\n') +
+    rewriteLinks(stripOmitted(body), 'docs') +
+    '\n'
+  );
+}
+
 export async function syncRfcs() {
   const entries = await readdir(sourceDir);
   const rfcs = entries.filter(isPublishedRfc).sort();
@@ -172,10 +184,14 @@ export async function syncRfcs() {
   }
 
   await writeFile(roadmapOutput, transformRoadmap(await readFile(roadmapSource, 'utf8')));
+  await writeFile(
+    benchmarksOutput,
+    transformBenchmarks(await readFile(benchmarksSource, 'utf8')),
+  );
   return rfcs.length;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const count = await syncRfcs();
-  console.log(`synced ${count} RFCs to src/content/docs/rfcs/ and the roadmap`);
+  console.log(`synced ${count} RFCs to src/content/docs/rfcs/, the roadmap, and the benchmarks`);
 }

@@ -15,6 +15,7 @@ exclude = [
   "site/src/content/docs/rfcs",
   "site/src/content/docs/releases.md",
   "site/src/content/docs/roadmap.md",
+  "site/src/content/docs/benchmarks.md",
   "CHANGELOG.md",
   # Uncommitted working notes.
   "docs/plans",
