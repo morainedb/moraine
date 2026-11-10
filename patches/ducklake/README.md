@@ -30,9 +30,10 @@ applies them) and then the series below, in file-name order:
    `INSERT ... VALUES` list, whose cost is per row and dominated by binding
    it; a subclass cache would never be cleared, since the invalidation hook
    is public but not virtual. Re-measured at DuckDB 2.0, where DuckLake's
-   own path stopped formatting per-row SQL: the Appender is still ~2 ms a
-   commit faster, so both it and this patch stay
-   ([measurement](../../docs/inlined-write-appender.md)).
+   own path stopped formatting per-row SQL, over 200 commits of 100 inlined
+   rows with the two builds alternated round by round: the Appender is
+   still ~2 ms a commit faster, the bind of one more statement per table,
+   so both it and this patch stay.
 4. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
    metadata backend's structured `commit_outcome=unknown` error field, with
    Moraine's fixed message as a fallback when DuckDB's COMMIT wrapper drops

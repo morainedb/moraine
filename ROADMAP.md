@@ -23,7 +23,7 @@ not configuration.
   commit, DuckLake's metadata SQL is 14.5 ms against 3.3 ms of Moraine's own
   work, and nearly all of it is parsing, binding, and optimizing the
   generated SQL, which DuckDB re-plans on every execution
-  ([measurement](docs/metadata-query-overhead.md)). Moraine reports a
+  ([measurement](BENCHMARK.md#commit-time-breakdown)). Moraine reports a
   catalog version so that plan reuse is possible once DuckDB stops
   re-planning; the rest of the gain is upstream.
 

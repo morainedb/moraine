@@ -34,7 +34,7 @@ jobs:
           fi
           for name in AWS_REGION CODEBUILD_PROJECT MORAINE_S3_BUCKET ROLE_ARN; do
             if [ -z "${!name}" ]; then
-              echo "Benchmark repository variables are incomplete; see docs/real-s3-benchmark.md." >&2
+              echo "Benchmark repository variables are incomplete; see CONTRIBUTING.md." >&2
               exit 1
             fi
           done
