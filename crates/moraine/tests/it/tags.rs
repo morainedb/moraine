@@ -177,7 +177,7 @@ async fn an_empty_key_is_refused() {
 }
 
 /// Tagging is an alteration: it bumps the catalog schema version, the
-/// boundary case RFC 0004 pins ("comments and tags bump").
+/// boundary case the commit protocol pins: comments and tags bump.
 #[tokio::test]
 async fn a_tag_change_bumps_the_schema_version() {
     let (catalog, _, table, _) = seeded().await;

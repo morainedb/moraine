@@ -209,9 +209,8 @@ fn ducklake_forwards_read_only_into_the_metadata_attach() {
     assert!(
         output.status.success(),
         "DuckLake did not forward the outer READ_ONLY: the read-only chain \
-         opened moraine's writer and fenced the live one. Promote RFC 0017's \
-         deferred entry — document READ_ONLY on the `moraine:` attach itself \
-         as the escape hatch.\nstdout+stderr: {combined}"
+         opened moraine's writer and fenced the live one. If this holds, document READ_ONLY on the \
+         `moraine:` attach itself as the escape hatch.\nstdout+stderr: {combined}"
     );
     assert_eq!(
         csv_rows(&run_ducklake_sql(

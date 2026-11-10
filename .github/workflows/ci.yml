@@ -46,8 +46,11 @@ jobs:
           python-version: '3.13'
       - run: |
           python3 -m venv --clear target/clang-tools
-          target/clang-tools/bin/python -m pip install "clang-format==$(cat .clang-tools-version)"
+          target/clang-tools/bin/python -m pip install \
+            "clang-format==$(cat .clang-tools-version)" \
+            "rumdl==$(cat .rumdl-version)"
       - run: mbx xtask fmt-cpp --check
+      - run: target/clang-tools/bin/rumdl check .
 
   # moraine-duckdb is a pure Rust static library (the C++ shim and DuckDB
   # link are owned by the extension toolchain, exercised only by the e2e

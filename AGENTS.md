@@ -1,8 +1,7 @@
 # Working in moraine
 
-Moraine brings a SlateDB backend to DuckLake. Structure and conventions are
-specified in [RFC 0001](docs/rfcs/0001-repository-structure-and-conventions.md);
-this file is the operational summary.
+Moraine brings a SlateDB backend to DuckLake. This file is the operational
+summary; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
 
 ## Layout
 
@@ -76,7 +75,7 @@ this file is the operational summary.
 
 ```bash
 cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
-  && cargo xtask fmt-cpp --check && cargo xtask tidy-cpp \
+  && cargo xtask fmt-cpp --check && cargo xtask tidy-cpp && rumdl check . \
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
   && cargo deny check -D advisory-not-detected \
@@ -95,14 +94,16 @@ command, as `mbx test --workspace`. It also moves `target/` into that store
 and collects it when the disk runs short, which takes `target/clang-tools`
 with it — `CONTRIBUTING.md` has the one command that puts it back.
 
-The Rust/C/C++ formatting and Clippy checks also run as a pre-commit hook from `.githooks/`,
-and a commit-msg hook there rejects non-conventional commit subjects (the
-changelog is generated from them; CI validates PR titles the same way).
-Conductor workspaces enable those hooks from `.conductor/settings.toml`,
-which also installs the toolchain a cloud workspace starts without. A plain
-clone needs it once: `git config core.hooksPath .githooks`.
+The Rust/C/C++ formatting, Markdown (`rumdl`), and Clippy checks also run as a
+pre-commit hook from `.githooks/`, and a commit-msg hook there rejects
+non-conventional commit subjects (the changelog is generated from them; CI
+validates PR titles the same way). Conductor workspaces enable those hooks from
+`.conductor/settings.toml`, which also installs the toolchain a cloud workspace
+starts without. A plain clone needs it once:
+`git config core.hooksPath .githooks`.
 
-C/C++ tools are pinned in `.clang-tools-version`; installation is documented
-in `CONTRIBUTING.md`. `cargo xtask fmt-cpp` applies the formatting.
-`cargo xtask tidy-cpp` configures the C++ build and checks handwritten sources;
-it runs in CI and the full local gate, outside the commit hook.
+C/C++ tools are pinned in `.clang-tools-version` and rumdl in `.rumdl-version`;
+installation is documented in `CONTRIBUTING.md`. `cargo xtask fmt-cpp` applies
+the formatting. `cargo xtask tidy-cpp` configures the C++ build and checks
+handwritten sources; it runs in CI and the full local gate, outside the commit
+hook.

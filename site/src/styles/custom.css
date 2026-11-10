@@ -1,8 +1,8 @@
 /* Unlayered, so these win over Starlight's and Nova's layered hero rules. */
 
-/* The hero mark is an accent beside the title, not a poster image, so the
-   hero keeps neither the display-sized type nor the tall padding both
-   themes scale to at wide viewports. */
+/* The hero mark sits beside the title like a wordmark rather than as a
+   poster image on the far side, so the hero keeps neither the display-sized
+   type nor the tall padding both themes scale to at wide viewports. */
 .hero h1 {
 	font-size: clamp(var(--sl-text-2xl), calc(0.25rem + 2.5vw), var(--sl-text-4xl));
 }
@@ -12,12 +12,38 @@
 }
 
 .hero img {
-	width: clamp(5.5rem, 4rem + 6vw, 9rem);
+	width: clamp(3.5rem, 2.5rem + 3vw, 5rem);
 	height: auto;
+	margin: 0;
 }
 
 @media (min-width: 50rem) {
 	.hero {
-		padding-block: clamp(1rem, calc(0.5rem + 3vmin), 3rem);
+		grid-template-columns: auto 1fr;
+		align-items: start;
+		gap: 1.5rem;
+		padding-block: clamp(1rem, calc(0.5rem + 3vmin), 3rem) 0.5rem;
 	}
+
+	.hero > img {
+		order: 0;
+		margin-top: 0.35rem;
+	}
+}
+
+/* The opening code block belongs to the hero; close the panel seam. */
+[data-has-hero] .content-panel + .content-panel {
+	border-top: 0;
+	padding-block-start: 0.5rem;
+}
+
+/* The landing page's closing card: set apart from the status text, tighter
+   inside. */
+[data-has-hero] .sl-markdown-content > .card {
+	margin-top: 3rem;
+	padding: 1.5rem 1.5rem;
+}
+
+[data-has-hero] .sl-markdown-content > .card .body > :first-child {
+	margin-top: 0.5rem;
 }

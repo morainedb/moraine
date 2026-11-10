@@ -1,120 +1,128 @@
 # Roadmap
 
-Moraine is in the **v0.7 release series**. This checklist records implemented
-DuckLake catalog coverage and remaining work. Catalog features are validated
-against real DuckLake SQL in the e2e suite. Unchecked items are
-implementation gaps, not supported attach modes.
+Moraine is at 0.8, built for DuckDB 2.0.0. Everything listed as done runs
+against real DuckLake SQL in the end-to-end suite. Unchecked items are gaps,
+not configuration.
 
-## Next capabilities
+## Next
 
-- [ ] Signed community-extension distribution.
+- [ ] Signed distribution through DuckDB's community extension repository,
+  so `INSTALL moraine FROM community` works without `-unsigned`.
+- [ ] Publishing to crates.io again. Held while the workspace patches
+  SlateDB; a registry build would resolve the published SlateDB, which lacks
+  the reader refresh Moraine needs. Tags, the changelog, and the extension
+  binaries are unaffected, and 0.7.0 stays the newest version on the registry
+  until the patch ships upstream.
+- [ ] Online index rebuild. Today a rebuild is `DROP INDEX` then
+  `CREATE INDEX`, and the index serves neither lookups nor uniqueness in
+  between.
+- [ ] Windows builds. The extension is built and proven for Linux and macOS
+  on x86-64 and arm64; Windows is unverified and WebAssembly is out of scope,
+  since the Rust core's dependencies do not target it.
+- [ ] Lower per-commit overhead on DuckLake's side. Of a 23 to 25 ms one-row
+  commit, DuckLake's metadata SQL is 14.5 ms against 3.3 ms of Moraine's own
+  work, and nearly all of it is parsing, binding, and optimizing the
+  generated SQL, which DuckDB re-plans on every execution
+  ([measurement](docs/metadata-query-overhead.md)). Moraine reports a
+  catalog version so that plan reuse is possible once DuckDB stops
+  re-planning; the rest of the gain is upstream.
 
-## Foundations
+## Done
 
-### Catalog core on SlateDB
-- [x] SlateDB key encoding for DuckLake catalog state (RFC 0002)
-- [x] Commit/transaction protocol (RFC 0004)
-- [x] Key layout and codecs with proptest roundtrips
-- [x] Snapshots, schemas, tables, and data-file metadata
-- [x] Atomic commit with conflict detection
-- [x] First runnable example
+### Catalog
+
+- [x] DuckLake catalog state on SlateDB: snapshots, schemas, tables, views,
+  data-file metadata ([storage format](docs/rfcs/0001-storage-format.md)).
+- [x] Atomic, multi-statement, cross-table transactions with DuckLake's
+  conflict rules; lost races surface as conflicts for DuckLake's retry
+  ([commit protocol](docs/rfcs/0003-commit-protocol.md)).
+- [x] Time travel to any snapshot and the change data feed between
+  snapshots, verified differentially against a stock DuckLake catalog.
+- [x] Schema evolution (`ADD`, `RENAME`, `DROP COLUMN`, `ALTER COLUMN … TYPE`)
+  over inlined and flushed data; every DuckLake scalar and nested type,
+  `VARIANT` included; column and name mapping for externally written
+  Parquet; macros; tags and comments; catalog options
+  ([DuckLake feature mapping](docs/rfcs/0005-ducklake-feature-mapping.md)).
+- [x] Partitioning with pruned reads, sort orders, and table, column, and
+  per-file statistics.
+- [x] Data inlining, on by default, with flush to Parquet
+  ([data inlining](docs/rfcs/0004-data-inlining.md)).
+- [x] Data-file encryption: `ENCRYPTED` lakes with per-file keys held in the
+  catalog.
+
+### Indexes
+
+- [x] Ordered, optionally unique indexes over table columns, maintained in
+  the same commit as the rows; `CREATE INDEX` and `DROP INDEX` from DuckDB;
+  equality, `IN`, range, and `IS NULL` lookups chosen by the planner; staged
+  builds for large tables; verification and scan-free `DELETE` on a
+  verified index
+  ([equality and range indexes](docs/rfcs/0009-equality-indexes.md)).
 
 ### DuckDB extension
-- [x] Extension surface: moraine as a DuckLake catalog via a DuckDB `StorageExtension` (RFC 0006)
-- [x] C++ shim registering the catalog and transaction manager over a C ABI to the Rust core
-- [x] Extension entry points and loading into a real DuckDB
-- [x] Read-write and read-only attach; read-only never fences the live writer (RFC 0017)
-- [x] Full DuckLake SQL against moraine as the catalog: `ATTACH`, `CREATE`/`INSERT`/`UPDATE`/`DELETE`/rename/`DROP`, `SELECT`/`COUNT`/time travel
-- [x] Query interruption: Ctrl-C aborts a blocked read; submitted commits survive cancellation, which reports an unknown outcome (RFC 0006)
 
+- [x] Moraine as DuckLake's catalog through a DuckDB `StorageExtension`, with
+      the full DuckLake SQL surface
+      ([extension surface](docs/rfcs/0006-extension-surface.md)).
+- [x] Read-write and read-only attaches; a reader never fences the writer;
+  checkpoint-pinned readers for strictly read-only credentials.
+- [x] Query interruption: Ctrl-C aborts a blocked read, and a submitted
+  commit completes and reports its outcome.
+- [x] Bundled, patched DuckLake, so one `LOAD` is the whole setup.
+
+### Operations
+
+- [x] DuckLake's compaction, rewrite, snapshot expiry, and file cleanup, with
+  row ids and pre-operation time travel preserved; a scheduled in-writer
+  maintenance pass that runs them in order and then reclaims what only
+  Moraine can see ([maintenance](docs/rfcs/0010-maintenance.md)).
+- [x] Explicit, resumable, one-way on-disk format migration; the DuckLake
+  catalog version raised on request.
+- [x] Crash recovery: every state-changing path is one atomic batch or a
+  resumable sequence ([crash recovery](docs/rfcs/0008-crash-recovery.md)).
+
+### Performance
+
+- [x] The write-ahead log on an object store of its own, so a commit's one
+  PUT can land on S3 Express One Zone while the catalog stays on standard
+  storage; `moraine_move_wal` moves an existing lake's log either way.
+- [x] Attach-tunable flush cadence; group commit, so concurrent commits
+  share one flush.
+- [x] One block cache per process with a disk tier, metadata protected in
+  memory, and a preload at attach; row summaries published beside data
+  files so pruning skips Parquet footers
+  ([read path](docs/rfcs/0007-read-path-and-caching.md)).
+- [x] Commit-served projections and shared commit preparation, so commit
+  latency does not grow with snapshot history.
+- [x] Working-memory budgets per process, transaction, commit, and summary
+  build, refusing instead of growing.
+
+<!-- site:omit -->
 ### Multi-process writers
+
 Moraine's own topology is one fenced SlateDB writer with many readers. A
-bucket-resident commit log — slot objects written with create-if-absent
-conditional puts, folded into the store — replaces it. The log lives in a
+bucket-resident commit log, slot objects written with create-if-absent
+conditional puts and folded into the store, replaces it. The log lives in a
 separate library under its own license and is never a dependency of this
-repository; what moraine owns is the boundary it plugs into, and the open
-build stays complete on the single-writer path without it.
+repository; what Moraine owns is the boundary it plugs into
+([commit-log seam](docs/rfcs/0011-commit-log-seam.md)), and the open build
+stays complete on the single-writer path without it.
 
-- [x] The provider boundary: SlateDB write-ahead-log plugs, the committer,
-  the log's garbage-collection plug, a process registry plus a per-open
-  override, and the format stamp a provider-less binary refuses (RFC 0024)
-- [x] The folder path: adoption at open, staged writes offered to the log
-  before they commit locally, a lost race folded before the retry lands
-- [x] Committers over a tailing reader: every read-write open past the one
-  holding the store commits through the log, taking the store when the tail
-  grows long
-- [x] Folding on a cadence, a maintenance pass from any committer, and
-  `demote` to take a lake back off its log
-- [x] Attach options reaching all of it from the extension
-  (`COMMIT_LOG_TAIL`, `COMMIT_LOG_POLL_INTERVAL_MS`), ignored with no
-  provider registered
+- [x] The provider boundary, the committer, the garbage-collection plug, a
+  process registry with a per-open override, and the format stamp a
+  provider-less binary refuses.
+- [x] Adoption at open, staged writes offered to the log before they commit
+  locally, a lost race folded before the retry lands.
+- [x] Committers over a tailing reader, folding on a cadence, a maintenance
+  pass from any committer, and `demote` to take a lake back off its log.
+- [x] `COMMIT_LOG_TAIL` and `COMMIT_LOG_POLL_INTERVAL_MS` reaching all of it
+  from the extension, ignored with no provider registered.
+<!-- /site:omit -->
 
-## Catalog & schema
-- [x] Schemas, tables, and views
-- [x] Schema evolution: `ADD`/`RENAME`/`DROP COLUMN` and `ALTER COLUMN … TYPE` promotion, over inlined and flushed data (RFC 0012)
-- [x] All DuckLake scalar and nested `LIST`/`STRUCT`/`MAP` types, inline and post-flush, `VARIANT` included (RFC 0005)
-- [x] Column and name mapping for externally written Parquet, including hive-partitioned foreign files (RFC 0018)
-- [x] Scalar and table macros with parameters, overloads, defaults, and `CREATE OR REPLACE`/`DROP` (RFC 0019)
+### Hardening and release
 
-## Data, deletes & layout
-- [x] Parquet data files on object storage (`data_file`)
-- [x] Row-level deletes via delete files / merge-on-read (`delete_file`)
-- [x] Data inlining: inlined inserts/deletes plus flush, on by default (RFC 0005)
-- [x] Partitioning: definitions, per-file values, and partition-pruned reads (RFC 0013)
-- [x] Sort orders, set/changed/reset, with history (RFC 0013)
-- [x] Statistics for pruning: table, column, and per-file (`table_stats`, `table_column_stats`, `file_column_stats`), with a variant column's per-path statistics folded into its column's record
-
-## Transactions & time travel
-- [x] Multi-statement, cross-table ACID transactions with conflict detection; lost races surface as conflicts for DuckLake's retry (RFC 0004)
-- [x] Snapshots and time travel to any snapshot, reading past data and schema across inline, evolution, and flush (`snapshot`)
-- [x] Change data feed between snapshots, verified differentially against a stock DuckLake catalog (`snapshot_changes`, RFC 0020)
-
-## Maintenance & operations
-- [x] Compaction and data-file rewriting: `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`, preserving row ids and pre-op time travel (RFC 0008)
-- [x] Snapshot expiry and orphaned-file cleanup / deletion scheduling; expired snapshots resolve cleanly (RFC 0007, `files_scheduled_for_deletion`)
-- [x] Data-file encryption: `ENCRYPTED` attaches, encrypted Parquet at rest, per-file keys round-tripped; moraine holds no crypto (RFC 0014)
-- [x] Table/column tags and catalog options via `COMMENT ON` and options (`tag`, `column_tag`, `metadata`)
-- [x] Maintenance orchestration: a scheduled in-writer pass runs DuckLake's own maintenance functions in a fixed order, then reclaims orphaned equality-index entries; `moraine_maintenance` triggers one on demand and `moraine_maintenance_status` reports the retained passes (RFC 0021)
-
-## Performance
-- [x] Commit-served projections: `snapshot`, `table_stats`, and `table_column_stats` are folded forward from each commit and served from an in-memory cache when current, removing per-commit latency growth with snapshot history. Attach-tunable WAL flush cadence bounds the per-commit durable wait.
-- [x] Catalog commit preparation shares unchanged maps and derives writes from
-  changed entities; allocation and CPU benchmarks separate preparation from WAL latency.
-- [x] The write-ahead log on an object store of its own, so a commit's one PUT
-  can land on an S3 Express One Zone bucket while the rest of the catalog
-  stays on standard storage (`META_WAL_PATH`); `moraine_move_wal` moves an
-  existing lake's log either way (RFC 0004).
-- [x] Staged index derivation streams inline sources with resumable cursors and
-  whole-operation peak-memory measurement.
-- [x] Small row lookups select requested inline ranges and use cached file
-  intervals, retaining conservative handling for arbitrary row-ID files.
-- [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Measured: DuckLake's
-  metadata SQL is 14.5 ms of a 23-25 ms one-row commit, against 3.3 ms of
-  moraine's own commit work ([measurement](metadata-query-overhead.md)). It is
-  SQL front-end cost, not storage: parse, bind and optimize are 2.5 ms of a
-  2.7 ms statement, execution 0.2 ms, and a prepared statement saves only the
-  parse because DuckDB re-binds per execution. Native metadata tables would
-  move the 0.2 ms; the leverage is in not re-planning generated SQL every
-  commit, on DuckLake's side of the boundary. That holds for small lakes:
-  the front-end is flat at ~2 ms while execution grows with file count, and
-  the two meet at roughly five thousand files.
-- [x] Report a catalog version DuckDB can compare: the transaction's pinned
-  store revision, where the index path has no narrower answer, and nothing
-  where the revision would not describe what the transaction sees. No
-  measurable gain yet — DuckDB re-plans a prepared statement on every
-  execution whenever it reads any catalog, its own included — so this only
-  stops moraine being the reason plan reuse cannot happen
-  ([measurement](metadata-query-overhead.md)).
-
-
-## Hardening & release
-- [x] Real object storage tests (RustFS)
-- [x] Arbitrary-bytes decode proptests for store codecs (never panic on garbage)
-- [x] Release pipeline: versioned tags drive crate publishing and extension artifacts
-- [x] Extension distribution: per-DuckDB-version, per-platform builds attached to GitHub releases (unsigned)
-- [ ] Signed distribution via a duckdb/community-extensions submission
-- [ ] Resume crates.io publishing, held while the workspace patches slatedb:
-  a registry build resolves the published slatedb, which has no
-  `DbReader::refresh()`. Tags, the changelog and the extension binaries are
-  unaffected, and 0.7.0 stays the newest version on the registry until the
-  patch is released upstream.
+- [x] Tests against real object storage; arbitrary-bytes decode proptests
+  for every store codec; fuzzing of codecs, the commit read path, and crash
+  recovery.
+- [x] Versioned tags drive the changelog and per-DuckDB-version,
+  per-platform extension builds attached to GitHub releases.

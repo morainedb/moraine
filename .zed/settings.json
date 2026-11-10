@@ -34,6 +34,15 @@
     },
     "C": {
       "format_on_save": "on"
+    },
+    // rumdl reads .rumdl.toml from the worktree root. Install the rumdl
+    // extension for inline diagnostics; formatting works without it.
+    "Markdown": {
+      "format_on_save": "on",
+      "formatter": {
+        "external": { "command": "rumdl", "arguments": ["fmt", "-"] }
+      },
+      "preferred_line_length": 80
     }
   },
   "lsp": {

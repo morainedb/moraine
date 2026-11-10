@@ -25,7 +25,7 @@ reliably with `threads > 1`. Once that holds, moraine can remove its
 currently guards the known failure.
 
 Owner: [RFC 0006](rfcs/0006-extension-surface.md), with the cache-consistency
-boundary also recorded in [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+boundary also recorded in [RFC 0007](rfcs/0007-read-path-and-caching.md).
 
 ### Admit concurrent metadata committers
 
@@ -38,7 +38,7 @@ Once available, moraine can revisit allowing a staged-row transaction to lead
 a batch containing compatible commits. This is an optimization; correctness
 does not depend on it.
 
-Owner: [RFC 0004](rfcs/0004-commit-protocol.md).
+Owner: [RFC 0003](rfcs/0003-commit-protocol.md).
 
 ## Scan pushdown
 
@@ -77,7 +77,7 @@ before the series was installed carries no row-ID statistics, which reads as
 "unknown" and keeps the file in every row-ID-filtered scan, so such a lake
 stays correct without being pruned.
 
-Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
+Owner: [RFC 0005](rfcs/0005-ducklake-feature-mapping.md).
 
 ### Push filters into every scan mode
 
@@ -89,17 +89,18 @@ The upstream request is to pass applicable filters through all scan modes and
 let their file lists prune with the same semantics as an equivalent table
 scan. This would let change-feed reads and flushes avoid unrelated files.
 
-Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
+Owner: [RFC 0005](rfcs/0005-ducklake-feature-mapping.md).
 
 ## Index integration
 
 ### Provide supported native-index extension points
 
 DuckLake rejects `CREATE INDEX`, `PRIMARY KEY`, and `UNIQUE` in its binder and
-has no native index metadata. Moraine supplies `CREATE INDEX` / `CREATE UNIQUE
-INDEX` and `DROP INDEX` through DuckDB's existing operator and planner extension
-hooks, without patching DuckLake. Moraine owns index metadata and maintenance;
-introspection, verification, and explicit lookup functions remain available. Native DDL requires autocommit.
+has no native index metadata. Moraine supplies `CREATE INDEX` /
+`CREATE UNIQUE INDEX` and `DROP INDEX` through DuckDB's existing operator and
+planner extension hooks, without patching DuckLake. Moraine owns index metadata
+and maintenance; introspection, verification, and explicit lookup functions
+remain available. Native DDL requires autocommit.
 
 The upstream request is a supported index contract covering:
 
@@ -111,19 +112,19 @@ The upstream request is a supported index contract covering:
   scan direction and declared NULL ordering.
 
 Once DuckLake defines that contract, moraine can map the upstream identifier
-through its reserved `ducklake_index_id` field and serve the same physical
-index through upstream metadata and optimizer pushdown. Native index DDL
-already routes to Moraine's implementation. Ordinary equality, `IN`, range, NULL,
-and composite-key predicates can already use Moraine indexes through its
-optimizer extension. Explicit lookup functions remain available, but application
-queries need not name the index.
+through its reserved `ducklake_index_id` field and serve the same physical index
+through upstream metadata and optimizer pushdown. Native index DDL already
+routes to Moraine's implementation. Ordinary equality, `IN`, range, NULL, and
+composite-key predicates can already use Moraine indexes through its optimizer
+extension. Explicit lookup functions remain available, but application queries
+need not name the index.
 
 DuckLake currently documents indexes and enforced key constraints as
 unsupported features that are unlikely to be added. This request should
 therefore be revisited only if DuckLake changes that position or offers a
 general external access-method API.
 
-Owner: [RFC 0016](rfcs/0016-equality-indexes.md). See also DuckLake's
+Owner: [RFC 0009](rfcs/0009-equality-indexes.md). See also DuckLake's
 [unsupported-features documentation](https://ducklake.select/docs/stable/duckdb/unsupported_features).
 
 ## Requests owned by other projects

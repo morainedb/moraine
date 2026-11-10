@@ -32,10 +32,11 @@ commit closure. An interrupted build therefore resumes after committed work.
 
 Inline steps do not advance the older row-ID watermark until the inline leg is
 complete. An older binary ignores the new field and safely replays inline data
-in its original row order; older definitions still resume by their row watermark.
-No store-format bump or data rewrite is needed. Deferred maintenance reuses an
-inline checkpoint only at its recorded head; after another writer advances the
-head, it streams the live inline sources again to include preserved-ID updates.
+in its original row order; older definitions still resume by their row
+watermark. No store-format bump or data rewrite is needed. Deferred maintenance
+reuses an inline checkpoint only at its recorded head; after another writer
+advances the head, it streams the live inline sources again to include
+preserved-ID updates.
 
 ## Telemetry
 
@@ -82,10 +83,10 @@ instrumentation still affects timing, so elapsed times are diagnostic.
 ## Results
 
 Collected September 8, 2026, on the Linux x86-64 workspace with Rust 1.96.1,
-SlateDB 0.15.0, and dhat 0.3.3, using isolated release runs and 1,024-byte unique
-string values. The baseline is the implementation in PR #196 with this same
-measurement harness; fixture preparation and result verification are excluded
-in both runs. Raw results: [before](staged-build-memory-before.csv) and
+SlateDB 0.15.0, and dhat 0.3.3, using isolated release runs and 1,024-byte
+unique string values. The baseline is the implementation in PR #196 with this
+same measurement harness; fixture preparation and result verification are
+excluded in both runs. Raw results: [before](staged-build-memory-before.csv) and
 [after](staged-build-memory-after.csv). MB are decimal.
 
 | Chunks × rows | Step entries | Inline bodies | Peak heap before → after | Heap retained at return, after |
@@ -103,9 +104,9 @@ step size alone is not a total-heap ceiling. Most measured allocations live
 past the build's return, including the resulting index and store buffers;
 removing a full-table derivation vector does not remove that cost.
 
-Cumulative allocations for the 128-chunk/128-entry-step case changed from
-163.3 MB to 164.8 MB, while measured elapsed time changed from 1,069 to 1,091 ms.
-The change shortens allocation lifetimes rather than eliminating all allocation
+Cumulative allocations for the 128-chunk/128-entry-step case changed from 163.3
+MB to 164.8 MB, while measured elapsed time changed from 1,069 to 1,091 ms. The
+change shortens allocation lifetimes rather than eliminating all allocation
 traffic; additional source/checkpoint work has a cost. These are single-run
 observations with allocator instrumentation, not latency guarantees.
 

@@ -20,5 +20,8 @@ pnpm-debug.log*
 # macOS-specific files
 .DS_Store
 
-# synced from docs/rfcs/ at build time
+# synced from docs/rfcs/ and ROADMAP.md at build time
 src/content/docs/rfcs/
+src/content/docs/roadmap.md
+# synced from CHANGELOG.md and GitHub releases at build time
+src/content/docs/releases.md

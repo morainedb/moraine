@@ -1,50 +1,63 @@
 # RFCs
 
-Design records for moraine. An RFC is **required** for decisions that are
-expensive to reverse — KV key layout, commit/transaction protocol, public API
-shape — and optional for everything else. RFCs double as an ADR log: they
-record *why* the project is the way it is.
+Design documents for Moraine. Each one specifies one part of the design as
+it stands and is kept current with the code; where the two disagree, that
+is a bug.
 
 ## Process
 
-1. Copy `0000-template.md` to `NNNN-kebab-title.md` (next free number).
-2. RFCs carry no status field. Every RFC in this directory is the current
-   design and is binding: if implementation reveals a better design, update
-   the RFC (or replace it with a successor that points back) — don't
-   silently diverge.
-3. An RFC states the design, not what is left to do about it. Undecided
-   questions and deferred work are tracked outside the RFC.
+An RFC is required for decisions that are expensive to reverse: the key
+layout, the commit protocol, the public API.
 
-Design documents produced in brainstorming/design sessions are written
-directly here as RFCs; there is no separate specs directory.
+1. Copy `0000-template.md` to `NNNN-kebab-title.md` using the next free
+   number.
+2. There is no status field. Every RFC here is the current design and is
+   binding. When implementation finds a better design, update the RFC.
+3. An RFC states the design, not what is left to do. Open questions and
+   deferred work live outside it.
+4. Code never cites an RFC. RFCs name the code they describe.
+
+Design sessions write their output directly here as RFCs.
 
 ## Index
 
-| RFC | Topic |
-|---|---|
-| [0001](0001-repository-structure-and-conventions.md) | Repository structure and conventions |
-| [0002](0002-slatedb-key-encoding.md) | SlateDB key encoding for catalog state |
-| [0003](0003-public-api-shape.md) | Public API shape of the core |
-| [0004](0004-commit-protocol.md) | Commit and transaction protocol |
-| [0005](0005-data-inlining.md) | Data inlining on SlateDB |
-| [0006](0006-extension-surface.md) | Extension surface (DuckDB) |
-| [0007](0007-snapshot-expiry-and-gc.md) | Snapshot expiry and garbage collection |
-| [0008](0008-compaction.md) | Compaction and delete-file consolidation |
-| [0009](0009-reader-consistency-and-caching.md) | Reader consistency and snapshot caching |
-| [0010](0010-async-sync-bridge.md) | Async↔sync bridge |
-| [0011](0011-crash-recovery.md) | Crash recovery |
-| [0012](0012-schema-evolution-and-versioning.md) | Schema evolution and versioning |
-| [0013](0013-partitioning-sorting-and-pruning.md) | Partitioning, sorting, and pruning |
-| [0014](0014-encryption.md) | Catalog and data encryption |
-| [0015](0015-format-migration.md) | On-disk format migration |
-| [0016](0016-equality-indexes.md) | Equality indexes |
-| [0017](0017-read-write-and-read-only-attach.md) | Read-write and read-only attach paths |
-| [0018](0018-column-and-name-mapping.md) | Column and name mapping for external Parquet |
-| [0019](0019-macros.md) | Scalar and table macros |
-| [0020](0020-change-data-feed.md) | Change data feed |
-| [0021](0021-maintenance-model.md) | Maintenance orchestration |
-| [0023](0023-published-row-summaries.md) | Published file row summaries |
-| [0024](0024-commit-log-plug-boundary.md) | Commit-log plug boundary |
-| [0025](0025-launch-footprint-budget-and-removal-review.md) | Launch footprint budget and removal review |
-| [0026](0026-working-memory-and-resumable-publication.md) | Working memory and resumable publication |
-| [0027](0027-commit-log-seam.md) | The commit-log seam |
+Start with the storage format, the commit protocol, the read path, and the
+extension surface; the rest builds on those. The public API matters to
+Rust embedders.
+
+### Core
+
+- [Storage format](0001-storage-format.md) — key layout, value framing,
+  format versions, migration
+- [Public API](0002-public-api.md) — the core crate's types, operations,
+  and errors
+- [Commit protocol](0003-commit-protocol.md) — atomic commits, conflicts,
+  retry, group commit, the write-ahead log
+
+### Catalog features
+
+- [DuckLake feature mapping](0005-ducklake-feature-mapping.md) — schema
+  evolution, partitioning, name mapping, macros, encryption, change feed
+- [Data inlining](0004-data-inlining.md) — small writes stored in the
+  catalog and flushed to Parquet
+- [Equality and range indexes](0009-equality-indexes.md) — index entries,
+  canonical encoding, builds, lookups
+
+### Reads and durability
+
+- [Read path, caching, and memory](0007-read-path-and-caching.md) — read
+  revisions, the block cache, row summaries, working memory
+- [Crash recovery](0008-crash-recovery.md) — what must hold after a
+  process dies mid-operation
+
+### Integration and operation
+
+- [Extension surface](0006-extension-surface.md) — the DuckDB extension:
+  attach, options, functions, the C ABI, runtime
+- [Maintenance](0010-maintenance.md) — expiry and compaction translation,
+  the scheduled pass, sweeps
+
+### Internal
+
+- [Commit-log seam](0011-commit-log-seam.md) — the boundary an external
+  commit log plugs into; not published on the site

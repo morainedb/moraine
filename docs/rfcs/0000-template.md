@@ -1,20 +1,20 @@
 # RFC NNNN: Title
 
-- **Date:** YYYY-MM-DD
-
 ## Summary
 
-One paragraph: what this decides and why it matters.
-
-## Goals
-
-What must be true for this design to succeed. Include explicit non-goals.
+One paragraph: what this decides.
 
 ## Design
 
-The decision itself, in enough detail to implement from. Include concrete
-formats (key layouts, wire formats, signatures) where applicable.
+The decision, in enough detail to implement from: key layouts, formats,
+signatures, constants. Name the code that implements it. Use headings
+named by topic.
 
-## Alternatives considered
+## Tests
 
-Each rejected option and the reason it lost.
+The properties the tests pin, one line each. Optional.
+
+## Alternatives
+
+The real options that were considered and why each lost, one or two
+sentences each.

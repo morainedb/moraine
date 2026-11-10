@@ -33,16 +33,13 @@ applies them) and then the series below, in file-name order:
    own path stopped formatting per-row SQL: the Appender is still ~2 ms a
    commit faster, so both it and this patch stay
    ([measurement](../../docs/inlined-write-appender.md)).
-
 4. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
    metadata backend's structured `commit_outcome=unknown` error field, with
    Moraine's fixed message as a fallback when DuckDB's COMMIT wrapper drops
-   extra fields. It
-   stops retries and releases the transaction's file-cleanup ownership before
-   rollback, so an unacknowledged commit cannot lose files it registered.
-   Unregistered files remain eligible for orphan cleanup. Ordinary SQL deletion and
-   unknown commit outcomes are tested by `cargo xtask e2e`.
-
+   extra fields. It stops retries and releases the transaction's file-cleanup
+   ownership before rollback, so an unacknowledged commit cannot lose files it
+   registered. Unregistered files remain eligible for orphan cleanup. Ordinary
+   SQL deletion and unknown commit outcomes are tested by `cargo xtask e2e`.
 5. `0005-feat-change-DuckLake-rows-by-position.patch` adds
    `ducklake_delete_positions(catalog, schema, table, files, snapshot := NULL)`,
    which stages deletes of already-located rows in the current DuckLake
@@ -98,10 +95,10 @@ index-derived scan filters.
 A later patch edits files an earlier one creates, so the series is applied in
 one `git apply` invocation rather than one per file.
 
-The series is pinned to the DuckLake revision selected by the DuckDB
-release moraine supports, as patched by that DuckDB. The patched DuckLake is built alongside
-moraine and linked into its loadable, so `LOAD moraine` registers both and
-no separate DuckLake extension is installed or loaded.
+The series is pinned to the DuckLake revision selected by the DuckDB release
+moraine supports, as patched by that DuckDB. The patched DuckLake is built
+alongside moraine and linked into its loadable, so `LOAD moraine` registers both
+and no separate DuckLake extension is installed or loaded.
 
 Every hunk carries context, so `git apply` locates it by content in each
 pinned source rather than by line number, and a hunk whose region moved fails

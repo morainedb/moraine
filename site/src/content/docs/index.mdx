@@ -1,11 +1,11 @@
 ---
-title: moraine
-description: A DuckLake catalog that lives in your bucket — SlateDB-backed, serverless, nothing to operate.
-template: splash
+title: Moraine
+description: Run DuckLake entirely in object storage, no server required.
+tableOfContents: false
 hero:
-  tagline: A DuckLake catalog that lives in your bucket. SlateDB-backed, serverless, nothing to operate.
+  tagline: Run DuckLake entirely in object storage, no server required.
   image:
-    alt: Three stacked strata forming a ridge — the moraine mark
+    alt: Three stacked strata forming a ridge, the Moraine mark
     light: ../../assets/moraine.svg
     dark: ../../assets/moraine-dark.svg
   actions:
@@ -18,38 +18,74 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+import { Card } from '@astrojs/starlight/components';
 
-```sql
+```sql title="attach.sql"
+-- duckdb -unsigned, then LOAD the extension; see Getting started.
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (DATA_PATH 's3://bucket/prefix-data/',
+   -- Moraine records the data root in the catalog; same value as DATA_PATH.
    META_DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
 
 CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
 INSERT INTO lake.events VALUES (1, 'hello, bucket');
 ```
 
-<CardGrid>
-  <Card title="Nothing to operate" icon="setting">
-    No catalog endpoint to deploy, monitor, or upgrade. A deployment is a
-    bucket and credentials.
-  </Card>
-  <Card title="Durability for free" icon="approve-check">
-    Catalog durability *is* object-store durability. No backup schedule, no
-    WAL shipping — the only way to lose the catalog is to lose the bucket
-    itself.
-  </Card>
-  <Card title="The bucket is the whole lake" icon="seti:db">
-    Copying the bucket copies data *and* catalog together. Environments,
-    migration, and disaster recovery become object-storage operations.
-  </Card>
-  <Card title="Scale to zero, embed anywhere" icon="rocket">
-    An idle lake costs storage, not a 24/7 instance. The core is a plain
-    Rust library any tokio host can commit against directly.
-  </Card>
-</CardGrid>
+[DuckLake](https://ducklake.select) currently stores table data as Parquet files
+in object storage and keeps its catalog and inlined rows in a SQL database: a
+DuckDB or SQLite file for one process; Postgres, or DuckDB served over
+[Quack](https://duckdb.org/quack/), its new client-server protocol, for several.
+Moraine is a DuckLake catalog backend that replaces the database with
+[SlateDB](https://slatedb.io), a transactional key-value store whose state also
+lives in object storage. The catalog sits in the bucket beside the data files,
+and DuckLake's SQL runs against it unchanged.
 
-The trade-off is commit latency: a commit is durable once an object-store
-PUT lands (~5–10 ms on S3 Express One Zone, ~50–100 ms on S3 Standard).
-For workloads that write Parquet for seconds before committing, that is
-noise. [The full pitch →](guide/what-is-moraine/)
+## What that gives you
+
+- **No catalog server:** Nothing to deploy, monitor, or back up. A deployment
+  is a storage bucket.
+- **Bucket durablilty:** A copy of the bucket taken while no writer is
+  attached is a complete lake; see
+  [Backups and copies](guide/operating/#backups-and-copies).
+- **Nothing to pay for while idle:** An idle lake costs only storage, no
+  compute or database hosting fees.
+- **Indexed lookups:** Ordered indexes over table columns, maintained in the
+  same commit as the rows, so a query by key probes the index instead of
+  scanning every file; see
+  [Index a column](guide/getting-started/#index-a-column).
+
+## When not to use Moraine
+
+- **For sub-5 ms commits:** A commit is durable once one write-ahead-log
+  PUT lands: 50 to 100 ms on S3 Standard, 5 to 10 ms with the log on S3
+  Express One Zone via
+  [`WAL_PATH`](guide/configuration/#the-write-ahead-log-on-a-faster-bucket).
+- **With many independent writers:** One process writes; the rest attach
+  `READ_ONLY`. Concurrent commits go through that one writer. See
+  [one writer, many readers](guide/getting-started/#one-writer-many-readers).
+- **Not yet in DuckDB's community repository:** it loads with `-unsigned`, one
+  build per DuckDB version.
+
+## Status
+
+Moraine is under active development and in production use at
+[contour.app](https://contour.app). DuckLake SQL, including `CREATE`,
+`INSERT`, `UPDATE`, `DELETE`, time travel, and maintenance, runs against
+Moraine as its catalog and is validated against real DuckDB in CI. The
+[roadmap](roadmap/) lists
+what is done and what is next.
+
+<Card title="More details">
+
+- [Getting started](guide/getting-started/) installs the extension and
+  attaches a lake.
+- [Configuration](guide/configuration/) lists every attach option and
+  function.
+- [Operating manual](guide/operating/) covers retention, maintenance,
+  encryption, backups, and upgrades.
+- [Architecture](guide/architecture/) explains how the catalog is laid out
+  and how commits and reads work; the [design documents](rfcs/) specify
+  each decision.
+- [Releases](releases/) has the changelog and extension downloads.
+
+</Card>

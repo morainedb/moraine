@@ -4,10 +4,12 @@
   "version": "0.0.1",
   "scripts": {
     "sync-rfcs": "node scripts/sync-rfcs.mjs",
+    "sync-releases": "node scripts/sync-releases.mjs",
+    "sync": "npm run sync-rfcs && npm run sync-releases",
     "test": "node --test scripts/*.test.mjs",
-    "dev": "npm run sync-rfcs && astro dev",
+    "dev": "npm run sync && astro dev",
     "start": "npm run dev",
-    "build": "npm run sync-rfcs && astro build",
+    "build": "npm run sync && astro build",
     "preview": "astro preview",
     "astro": "astro"
   },

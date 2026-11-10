@@ -1,1412 +1,394 @@
 # RFC 0006: Extension surface
 
-- **Date:** 2026-07-09
-
 ## Summary
 
-Defines how the `moraine-duckdb` extension exposes the moraine core to DuckDB.
-moraine is a **DuckLake metadata-catalog backend**: the extension registers a
-DuckDB `StorageExtension` so DuckLake `ATTACH`es moraine as its catalog and
-drives it with ordinary SQL, exactly as it drives a PostgreSQL or SQLite
-catalog. moraine serves the `ducklake_*` metadata tables **row-faithfully**
-from SlateDB — the tables *are* the catalog state (RFC 0002 encodes their
-rows), not a re-modeled projection. Because DuckDB's stable C extension API
-cannot register a catalog, the extension is a thin **C++ shim** linking
-DuckDB's internals over a **C ABI** to the Rust core; all catalog logic stays
-in `moraine`.
+`moraine-duckdb` exposes the moraine core to DuckDB as a DuckLake metadata
+catalog. A thin C++ shim registers a `StorageExtension` and calls a C ABI
+exported by the Rust core as a static library. DuckLake attaches moraine as its
+catalog and drives it with ordinary SQL against the `ducklake_*` tables, which
+moraine serves row for row from the store. This document fixes the attach
+surface, the catalog contract, the ABI error mapping, the runtime and
+cancellation bridge, and the logging seam.
 
-## Goals
+## Composition
 
-- **DuckLake drives moraine unmodified.** moraine implements DuckLake's
-  catalog contract and invents nothing (consistent with RFC 0004: moraine
-  implements DuckLake's conflict model, it does not impose its own). Whatever
-  SQL DuckLake issues against `ducklake_*`, moraine serves.
-- **Thin extension, language-agnostic.** No DuckLake domain logic lives in
-  `moraine-duckdb` — only `StorageExtension` registration, C-ABI marshalling,
-  the sync↔async bridge, and (RFC 0021) sequencing calls to DuckLake's own
-  maintenance SQL. Everything else is in the Rust core, testable without
-  DuckDB (RFC 0001 Unit/Integration tests). The maintenance carve-out exists
-  because the core cannot issue SQL at all, so no other layer can compose
-  those calls; it is bounded to sequencing — the shim decides nothing from
-  the results — and it is the one part of the shim that only e2e can cover.
-- **Faithful catalog state.** The `ducklake_*` rows are the source of truth;
-  moraine stores and returns those rows (B1). No semantic re-modeling that
-  could drift from DuckLake's own reading of its tables.
+DuckDB's stable C extension API registers scalar and table functions and cannot
+register a catalog. A writable DuckLake catalog needs a `StorageExtension`, a
+`Catalog`, and a `TransactionManager`, and registering those means linking
+DuckDB's internal C++ headers. The extension is therefore two layers in one
+loadable:
 
-### Non-goals
+1. **The C++ shim** in `crates/moraine-duckdb/cpp/` links DuckDB's internals,
+   registers the storage extension under the attach type `moraine`, and
+   translates DuckDB catalog callbacks into C calls. It holds no DuckLake domain
+   logic. Its one carve-out is sequencing calls to DuckLake's own maintenance
+   SQL, which the core cannot issue.
+2. **The Rust C ABI** in `crates/moraine-duckdb/src/` is the moraine core
+   compiled as a staticlib with an `extern "C"` surface. `build.rs` generates
+   `cpp/moraine_abi.h` from it with cbindgen, so the header cannot drift from
+   the Rust declarations.
 
-- **A standalone moraine attach as an end in itself.** `ATTACH '<path>' AS
-  m (TYPE moraine)` ships and serves attach, listings, and every
-  `ducklake_*` projection — it is the smallest real end-to-end proof of
-  the shim/ABI/core stack, and every layer it exercises is on the DuckLake
-  path anyway — but it is a verification surface, not a query surface: it
-  refuses user-table data scans outright (below). The `moraine` core
-  remains a standalone Rust library regardless.
-- **Semantic projection of the catalog** (storing a re-modeled form and
-  projecting it into `ducklake_*` on read). Rejected, not merely deferred;
-  see Alternatives for the evidence and the one condition that would
-  revive it.
-- **The data-file read/write path.** DuckLake and DuckDB own object-store
-  reads/writes of Parquet data files. moraine serves catalog *metadata* and
-  the inlined-data tables (RFC 0005) only.
+Because the shim links DuckDB internals, a build is bound to one DuckDB release
+string, patch level included, and the loadable carries a statically linked
+DuckDB. Metadata scan results cross the ABI as owned arrays of `#[repr(C)]` row
+structs with one `_free` function per array, while inline chunk bodies and
+indexed row scans use the Arrow C Data Interface (`src/arrow_ipc.rs`,
+`moraine_row_scan_next_arrow`). The bundled, patched DuckLake is linked into the
+same loadable and registered from the same entry point, so `LOAD moraine` is the
+whole setup. Loading stock DuckLake first is refused.
 
-## Design
+## Attach forms
 
-### Positioning: moraine is DuckLake's catalog
-
-```
-DuckDB engine
-  └─ ducklake extension        planner, transactions, query execution
-       └─ moraine catalog      DuckDB StorageExtension  (the extension surface)
-            └─ moraine core     DuckLake catalog semantics on SlateDB  (Rust)
-                 └─ SlateDB → object store
-```
-
-DuckLake stays the query/planner/transaction layer. moraine occupies exactly
-the slot a PostgreSQL/SQLite/DuckDB catalog database occupies today: an
-`ATTACH`-able catalog whose tables are the `ducklake_*` metadata tables. The
-DuckLake specification requires the catalog to be a transactional SQL store
-with primary-key constraints; moraine satisfies that contract over SlateDB.
-
-### How DuckLake reaches moraine
-
-moraine registers a `StorageExtension` under a catalog attach type so DuckLake
-can point its metadata connection at it. The intended user surface:
+The primary form is DuckLake's:
 
 ```sql
-ATTACH 'ducklake:moraine:<slatedb-uri>' AS lake (DATA_PATH '<object-store-uri>');
+ATTACH 'ducklake:moraine:<store-uri>' AS lake (DATA_PATH '<object-store-uri>');
 ```
 
-DuckLake connects to its metadata catalog by executing a literal nested
-DuckDB `ATTACH` of everything after its `ducklake:` prefix
-(`DuckLakeInitializer::Initialize` builds and runs the statement text;
-backend dialects are a six-entry map keyed by the path's extension
-prefix). So `ducklake:moraine:<slatedb-uri>` nests
-`ATTACH 'moraine:<slatedb-uri>'`, resolved by DuckDB's ordinary attach
-dispatch to moraine's registered storage extension — the same mechanism
-`postgres:`/`sqlite:` ride, no DuckLake-side hook. moraine therefore
-accepts the `moraine:` path-prefix form alongside `TYPE moraine`. Absent
-from DuckLake's dialect map, moraine is spoken to in the **default
-dialect**: plain DuckDB SQL, native types, no wrapper calls.
-
-**How the prefix names and nests the attach** is settled, and settled by
-observation rather than by reading DuckLake's source: DuckDB's `QueryLog`
-records every statement executed on the instance, DuckLake's internal
-metadata connection included, so the generated text is captured from a
-running session and pinned (`tests/ducklake_load/wire_contract.rs`). For
-`ATTACH 'ducklake:moraine:<uri>' AS warehouse`:
-
-```sql
-ATTACH OR REPLACE 'moraine:<uri>' AS "__ducklake_metadata_warehouse" (HIDDEN true)
-SELECT NULL FROM "__ducklake_metadata_warehouse"."main".ducklake_metadata LIMIT 1
-```
-
-Three consequences. The nested catalog's **name derives from the outer
-alias** (`__ducklake_metadata_` + alias), so it collides with nothing and
-moves with a rename of the lake. It is **addressable**: `SELECT * FROM
-__ducklake_metadata_warehouse.main.ducklake_snapshot` works, which is how
-the e2e suite inspects what DuckLake wrote without going through
-DuckLake's reader. And `HIDDEN true` keeps it **out of
-`duckdb_databases()`**, which lists only the outer catalog — whose `path`
-column is exactly the nested attach string. The pin is re-verified on
-every DuckDB/DuckLake bump; nothing in moraine depends on the naming
-scheme, but the e2e suite's whole verification surface does.
-
-### Store URIs and credentials
-
-The `<slatedb-uri>` selects moraine's object-store backend:
-
-- **Local filesystem** — a path (`/var/lib/lake`): the catalog is a directory,
-  created if absent.
-- **In-memory** — `memory://`: an ephemeral store, for tests and scratch work.
-- **S3 / S3-compatible** — `s3://<bucket>[/<prefix>]`: the catalog lives in
-  `<bucket>` under the optional key `<prefix>` (empty places it at the bucket
-  root). The bucket must already exist; moraine writes keys into it and never
-  creates the bucket.
-
-For an `s3://` store, credentials resolve through DuckDB's secret manager:
-moraine looks up the `s3`-type secret whose scope matches the `s3://` path —
-one created with `CREATE SECRET (TYPE s3, KEY_ID …, SECRET …, REGION …[,
-ENDPOINT …, URL_STYLE 'path', USE_SSL false])`, the same secret DuckLake and
-httpfs consult for `DATA_PATH`. A matching secret supplies its own settings;
-only an absent or entirely unset configuration uses the `AWS_*` environment.
-Credentials are not ATTACH options.
-
-Secrets with `REFRESH 'auto'` carry provider refresh information. The shim
-captures that recipe and supplies a retained `MoraineS3CredentialSource` in
-`MoraineS3Config`. Rust uses it as the S3 signing provider, refreshing on first
-use and at 80% of the returned credential lifetime, capped at five minutes.
-Unknown expiry is checked every minute. Concurrent requests share one refresh;
-provider failures and expired results fail the request instead of reusing stale
-credentials. Blocking refresh calls retain their state and lock through cancellation.
-
-The shim invokes the registered secret provider in a fresh client context,
-independently of the attaching connection. It holds only a weak database
-reference between refreshes, and releases each refresh's database reference on
-a separate cleanup thread so shutdown cannot wait on its own credential call.
-Callbacks contain exceptions and copy credential strings before returning.
-Refresh changes credentials only: endpoint, region, scope, and the provider
-recipe remain those captured at attach. Changing those settings, or rotating
-explicit keys without refresh information, requires detach/reattach.
-
-**The standalone attach is a metadata-only surface.** Table *data* is
-served through DuckLake, which owns delete-file merging, row lineage, and
-pushdown; a standalone data scan re-implementing that read path would
-silently return deleted rows once merge-on-read exists. Standalone
-`TYPE moraine` therefore serves listings, `DESCRIBE`, and the `ducklake_*`
-projections (below), while user-table scans bind normally (so `DESCRIBE`
-and `EXPLAIN` work) and raise a redirect error naming the
-`ducklake:moraine:` attach at execution time. No opt-out option exists.
-
-**Metadata projections.** Every `ducklake_*` table the keyed store models
-is queryable through the attached catalog, served row-faithfully — `current`
-and `history` rows both, since DuckLake filters lifecycles in SQL; unversioned
-kinds serve current values. DuckDB's executor plans joins over per-table
-scans. This row-faithfulness is what makes **time travel** work with no
-time-travel logic in moraine: `AT (VERSION => N)` is DuckLake filtering the
-served rows by begin/end snapshot — reconstructing past *schema* from the
-`ducklake_column` versions as readily as past data — and it is verified live
-across inline inserts, schema evolution, and flush (`ducklake_load.rs`). `ducklake_metadata` is synthesized from store facts (format
-version, options) so DuckLake's exists-probe and version reads succeed on
-any initialized moraine store: a moraine store is a valid DuckLake catalog
-from birth, and DuckLake's bootstrap DDL batch never runs against one.
-
-**Attach modes and the single writer.** The RFC 0004 topology is enforced at
-the attach surface. An attach is either **read-write** — opening the one
-SlateDB `Db` writer — or **read-only** (`READ_ONLY`, mapped to SlateDB's
-`DbReader`), which never becomes a writer and never participates in
-fencing. The plumbing that carries the `READ_ONLY` flag from `ATTACH`
-through the shim to the store open is specified and implemented in RFC 0017. This distinction is not cosmetic: SlateDB fencing means *the
-newest writer wins* — a second read-write attach from another process
-fences the incumbent's committer rather than failing itself, so two
-processes attaching read-write take turns breaking each other. A
-deployment therefore designates exactly one read-write process; every
-other DuckDB process attaches `READ_ONLY`. This is a real limitation
-relative to the multi-client SQL catalogs DuckLake otherwise targets, and
-it is documented at the user surface (ATTACH docs, README), not only here.
-
-`READ_ONLY` is read-only at the *catalog* level, not at the IAM level:
-SlateDB's `DbReader` in its default follow-latest mode writes a checkpoint
-into the manifest on open and refreshes it for the attach's lifetime
-(RFC 0004, Topology), so reader credentials need manifest write access.
-
-**`CHECKPOINT` — the truly-zero-write attach.** Given the id of a
-checkpoint minted ahead of time, the reader opens against it instead of
-establishing its own: SlateDB records nothing, spawns no manifest poller,
-refreshes nothing, and deletes nothing on close, so the attach issues
-object-store reads and no writes at all. The core half is RFC 0004's
-(`CatalogOptions::checkpoint`, `Catalog::create_checkpoint`); what this
-RFC owns is carrying an id from `ATTACH` through the shim into that open,
-spelled `META_CHECKPOINT` through a DuckLake attach or `CHECKPOINT`
-directly on a standalone one. That the attach writes nothing is asserted
-end to end by comparing the store's whole object set across it — an
-absence is only worth claiming if something would break were it false.
-
-The cost is a **fixed cut**: SlateDB stops polling the manifest entirely,
-so the attach never observes a commit made after the checkpoint —
-advancing means minting a new one and re-attaching. Three refusals keep
-that from surprising anyone: a checkpoint id on a read-write attach (a
-writer commits at head; a checkpoint is a past cut), an id the manifest no
-longer carries (a reader told to serve a fixed cut must never quietly
-serve a different one), and a malformed id.
-
-The lifecycle is three table functions, and they do not all take the same
-argument. `moraine_create_checkpoint('<attached catalog>')` names a
-catalog because the core mints through the writer that attach already
-opened — a second read-write open would fence it — and takes an optional
-lifetime, since a checkpoint given none pins its objects until released by
-hand. `moraine_checkpoints('<store>')` and
-`moraine_delete_checkpoint('<store>', '<id>')` name a store path instead,
-for the same reason `moraine_migrate` does: neither opens the writer, so
-both run against a live catalog without fencing it, and the processes that
-attach against the id hold no write credentials, so those calls happen
-wherever the credentials are. Listing exists so a checkpoint whose id was
-lost can still be found and released; it reports the `manifest_id` each
-checkpoint pins and its `created_at`/`expires_at`, which is what separates
-a reader's refreshed lease from a mint that holds until someone releases
-it, and what says how far behind the live state the pinned objects are.
-
-**Creating an S3 lake needs `READ_WRITE`.** DuckDB bumps any attach whose
-path begins with a remote prefix (`s3://`, `gcs://`, `azure://`, `http(s)://`,
-…) from `AUTOMATIC` to `READ_ONLY` before the storage extension is reached
-(`DatabaseManager::AttachDatabase`, on the premise that remote DB *files* are
-not writable). moraine honors that flag, so an `s3://` attach with no explicit
-mode opens read-only — and a read-only open never bootstraps, so *creating* a
-new S3 lake fails with the SlateDB "no manifest" error. The premise is wrong
-for moraine (SlateDB is object-store-native and writes S3 happily), but the
-heuristic is a blanket path-prefix rule with no per-extension opt-out. The user
-contract is therefore: **creating or writing an S3-backed lake requires
-`READ_WRITE` on the ATTACH** — `ATTACH 'ducklake:moraine:s3://bucket/prefix' AS
-lake (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE)` — the same opt-in any
-writable remote DuckDB database needs. Local and `memory://` stores default to
-read-write and need no flag. When a read-only attach targets an uninitialized
-store the shim rewrites the terse store error to name this fix (add
-`READ_WRITE`). Other DuckLake metadata backends sidestep this because their
-paths are not remote-file URIs — a Postgres/MySQL connection string never
-matches the prefix rule, and local DuckDB/SQLite files default read-write.
-
-**`WAL_PATH` — the write-ahead log on a store of its own.** A commit waits
-on one PUT of the log, so the log is the one object a latency-sensitive
-deployment wants on faster storage than the rest of the catalog.
-`META_WAL_PATH 's3://lake-wal--usw2-az1--x-s3'` through the DuckLake attach
-— or `WAL_PATH` directly on a standalone `moraine:` attach — puts it in an
-S3 Express One Zone directory bucket while everything else stays in a
-standard one. The URI takes the same forms an attach path does (a local
-directory, `memory://`, `s3://<bucket>[/<prefix>]`) and resolves its own
-`s3` secret, since a directory bucket is a different endpoint, and usually a
-different secret, from the catalog's. A bucket whose name carries the suffix
-AWS reserves for directory buckets (`--x-s3`, `--xa-s3`) is opened as S3
-Express without being told to: the name is what says the request is zonal
-and signed with a session token, so there is no option for it — on this
-path or on the catalog's own, which may equally be a directory bucket.
-
-Within that store the log keeps the catalog's own key prefix, under whatever
-prefix the URI carries: a catalog at `s3://lake/warehouse` with
-`WAL_PATH 's3://lake-wal--usw2-az1--x-s3/logs'` writes it under
-`logs/warehouse/wal/`. A log store nested in `DATA_PATH` is refused for the
-reason the catalog store is — DuckLake's orphaned-file cleanup lists that
-root, and would delete log objects holding commits no sorted-string table
-carries yet.
-
-Where a lake's log lives is recorded in the lake (RFC 0004), so **every
-attach of that lake names the same store**, readers included; one naming a
-different store, or none, is refused with a message naming the store the
-lake records. That refusal doubles as the discovery path: an operator who
-has lost track attaches without the option and reads the answer out of the
-error.
-
-**`moraine_move_wal` — moving an existing lake's log.** The option above
-settles where a *new* lake's log goes; this verb moves an existing one,
-either way:
-
-```sql
-SELECT from_wal_path, to_wal_path, moved
-FROM moraine_move_wal('s3://lake/warehouse',
-                      wal_path => 's3://lake-wal--usw2-az1--x-s3');
-```
-
-It takes a store path rather than an attached catalog for the reason
-`moraine_migrate` does: it takes the store's writer twice, so nothing may
-hold the lake while it runs, and it refuses an explicit transaction.
-`from_wal_path` names the log store as it stands — omitted when the log is
-in the catalog store — and must be the one the lake records, because
-draining that log is what makes the move lossless; `wal_path => NULL` moves
-the log back into the catalog store. A destination nested in the lake's
-recorded `DATA_PATH` is refused here too, so the verb cannot record a
-layout the attach would then reject. A move to where the log already is
-writes nothing and reports `moved = false`. The protocol, and what each
-crash point leaves behind, is RFC 0004's.
-
-**`CACHE_DIR` — the block cache's disk tier, for S3 stores.** Every query
-rebinds the catalog by reading its metadata (snapshot → tables → columns →
-files → stats) from the store; on an `s3://`-backed catalog those reads are
-S3 round-trips, and the in-memory tier starts empty in each new process. The
-`CACHE_DIR` attach option — `ATTACH 'ducklake:moraine:s3://…' AS lake
-(DATA_PATH '…', READ_WRITE, META_CACHE_DIR '/var/cache/moraine')`, or
-`CACHE_DIR` directly on a standalone `moraine:` attach — gives each
-store's block cache (RFC 0009) a disk device under that directory: blocks
-are written there at block grain as they are read, so repeat reads skip
-the GETs, and a new process recovers what the last one left, so a
-re-attach in the same order starts warm without a preload. It threads
-through the shim (`moraine_attach_with_wal_store`'s `cache_dir`) into
-`CatalogOptions::cache_dir` and `StoreBuilder`, applying to both the
-writer and the reader; unset (the default), only the memory tier applies.
-Redundant for local/`memory://` stores.
-
-There is one budget, shared by every store the process attaches, and one
-cache per store under it (RFC 0009). The first attach to open settles the
-sizing and later ones are sized by it, so these options are the process's
-rather than the attach's. SST indexes and filters are held at a higher
-eviction priority than data blocks, so a scan cannot push them out, while
-metadata a store does not need is space blocks take; each store's blocks
-spill at block grain to its own device under `CACHE_DIR`, capped by
-`CACHE_SIZE`, with `CACHE_MEMORY` budgeting the memory every store's cache
-and the parsed-footer cache share, re-split across the stores attached.
-There is no separate object-part cache beneath — a byte is cached decoded,
-once.
-
-**`CACHE_SIZE` — how much disk the cache may take.** A byte count —
-`META_CACHE_SIZE 2147483648` through the DuckLake attach or `CACHE_SIZE`
-directly on a standalone `moraine:` attach — capping each store's disk
-device: the first attach to name a `CACHE_DIR` settles it, and every
-store's device opens with that cap as a ceiling, filled only by what the
-store reads. Zero on the ABI means "not given", leaving the default
-cap (16 GiB); the option is inert without a `CACHE_DIR`, since there is no
-disk tier to bound. It threads through the shim (`moraine_attach_with_wal_store`'s
-`cache_size_bytes`, and `moraine_migrate_with_wal_store`'s) into
-`CatalogOptions::cache_size` and `StoreBuilder`.
-
-**`CACHE_MEMORY` — how much memory the cache may take.** The same shape for
-the memory side — `META_CACHE_MEMORY` through the DuckLake attach,
-`CACHE_MEMORY` standalone — and the one cache option that is never inert,
-because the memory tiers exist with or without a disk device. It is one
-budget across SlateDB blocks/metadata, auxiliary parsed metadata, and lookup
-retention. Lookup caches receive one eighth; auxiliary metadata keeps its
-configured share; the rest holds SlateDB blocks and metadata, separated by
-eviction priority; `moraine_store_census` reports a
-store's index and filter bytes, and the attach warns when the budget cannot
-hold them. Unset, the budget is what SlateDB would give a *single*
-store by default — now for the whole process, so a multi-store host is
-bounded by one configured allowance. Lookup retention no longer adds independent
-per-catalog budgets. This
-is the number to weigh against DuckDB's `memory_limit` when sizing a
-host: DuckDB's budget covers its own buffers and the data-file cache, and
-this cache is the process-wide memory consumer beside it. A handle's
-decoded catalog is not in it: that is bounded by the catalog's size rather
-than by an option, and is reported rather than budgeted.
-
-**`CACHE_PUTS` — cache flushed blocks by default.** `CACHE_PUTS` defaults to
-`true` and inserts flushed SST metadata and data blocks into the decoded
-cache. `false` disables flush admission. `CACHE_COMPACTION_PUTS` independently
-controls admission of compaction-output metadata and data blocks and also
-defaults to `true`: a store compaction rewrites the index SSTs, and a writer
-whose probes depend on them must not find them cold until the next round of
-probes reads them back. Both work with or without `CACHE_DIR` and remain
-subject to the same byte budget and eviction policy.
-Within the process the effect reaches every handle: a reader session served
-by the shared cache reads what the writer just flushed with no round trip
-at all.
-
-Keeping compaction admission separate lets a host whose merges would
-displace read-hot blocks turn it off alone. Disable both for read-only cache
-filling. Through DuckLake the names are `META_CACHE_PUTS` and
-`META_CACHE_COMPACTION_PUTS`.
-
-The core exposes `CatalogOptions::cache_puts` (default `true`) and
-`cache_compaction_puts` (default `true`). The shim attaches through
-`moraine_attach_with_wal_store`, whose cache flags and log store are
-explicit, and migrates through `moraine_migrate_with_wal_store`. The shim
-is the ABI's only caller, so an entry point it stops calling is removed
-rather than kept as a forwarder.
-
-**`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
-the above leave a fresh process cold: the cache fills as queries ask for
-blocks, so the first query of an attach pays every first touch itself.
-`CACHE_PRELOAD` warms the store into the cache while the attach opens, by
-reading it (RFC 0009) — `'l0'` (the default) touches every subspace far
-enough to pull its SST metadata, `'all'` additionally walks the scan-shaped
-subspaces whole, `'none'` (or `'off'`) warms nothing. Neither pulls the `index`
-subspace's data bulk, so a store whose weight is a multi-GiB `index` run
-preloads in metadata-sized bytes rather than store-sized ones; a table's
-`index` and `inline` ranges are warmed per table instead, in the
-background, the first time a query touches it and after each commit that
-writes data files against it; at any level but `'none'`, the extension also
-warms every table's probe ranges in the background after the open, so the
-first lookup on any table finds them cached (RFC 0009). The shim's option
-parsing owns the default; the level crosses the ABI as a code (`0`, `1`,
-`2`) on the attach and migrate entry points, and any other code is
-refused rather than treated as "none", so a misspelled level surfaces as an
-error instead of an attach that merely feels slow.
-
-The cost lands entirely on the attach. The warm runs inside the open — the
-handle is returned only once it finishes — with bounded parallelism, and
-the cache's caps govern the load: what exceeds them is admitted and evicted
-by the cache's own policy, newest-first enumeration putting the levelled
-tail last in line. Nothing in that path says it happened, which would leave
-a half-warmed attach looking exactly like a warm one, so moraine compares
-the bytes the warm would fetch against the governing cap as it opens and
-warns with both numbers. A subspace that fails to warm is skipped rather
-than fatal: a preload is an optimization, and no attach should die
-because one read did not land. Subspace-awareness keeps the `'l0'`
-default's cost small — on S3 it adds about 120 ms to the attach and takes
-a table's first index lookup from roughly 400 ms to 3 ms — and `'all'` the
-choice for an attach that can wait: it fetches metadata plus the
-scan-shaped subspaces, not the store, trading a slower ATTACH for a first
-query that touches object storage not at all. `'none'` suits an attach that
-must return as fast as the open allows.
-
-**`moraine_cache_tally()` — what the cache has served.** One row:
-`metadata_hits`/`metadata_misses` and `block_hits`/`block_misses` with a
-rate beside each, plus `errors` for lookups the cache itself failed and
-read through. `preload_metadata_hits`/`misses`, `preload_block_hits`/`misses`,
-and `preload_failures` attribute the attach-time warm subset.
-`metadata_disk_hits` and `block_disk_hits` are the hits the disk tier served
-after the memory tier missed — a hit rate near one with most hits on disk is
-a memory budget too small for the working set, not a warm cache. Without
-arguments the numbers are the host's — a process
-keeps one cache and every attached store reads through it — which is the
-scope the budget is set at.
-
-`moraine_cache_tally('lake')` narrows the same row to one attach. The
-cache and its budget stay the process's; what the lake name adds is which
-attach is spending them, which is the question a host with several
-catalogs on one cache has and the process-wide numbers cannot answer. A
-detached catalog's counts leave with it, while the process's keep them,
-so the two forms do not have to agree on totals.
-
-The two slots are reported apart because they are budgeted apart: a
-healthy stack keeps metadata near fully served — that is the slot being
-sized to hold the store's filters and indexes — while blocks land
-wherever the working set does. A metadata rate that is not near 1 says
-`CACHE_MEMORY` is too small for the store's SST metadata, which
-`moraine_store_census` measures directly; a low block rate with a healthy
-metadata rate says the working set exceeds the block slot, which is a
-`CACHE_MEMORY` or `CACHE_DIR` decision rather than a correctness one.
-
-The metadata case does not wait to be noticed: the attach itself compares
-the store's filter and index bytes against the share of the cache metadata
-holds under eviction protection, and warns when that share cannot hold
-them, so a rate read later confirms a sizing problem rather than
-discovering one.
-
-A rate is NULL, not zero, before anything has been looked up: zero would
-read as a cold cache to a monitoring query, and "nothing asked" is not
-the same fact.
-
-**`moraine_cache_status()` — what the process-wide caches occupy.** One row
-reports capacity, current occupancy, and cumulative evictions for SlateDB
-metadata, SlateDB data-block memory, and parsed Parquet metadata. It also
-reports the configured data-block disk capacity, NULL without a disk tier.
-`lookup_capacity_bytes` and `lookup_occupancy_bytes` report the shared directory
-and revision-result allowance and its estimated usage, including admitted values
-still held by readers after eviction.
-Disk occupancy is omitted because Foyer does not expose a reliable live
-value through the cache interface; configured capacity is not mislabeled as
-usage. `moraine_store_census` adds `filter_bytes`, `index_bytes`, and
-`stats_bytes` per subspace from the manifest, which is the store-side demand
-to compare with metadata capacity.
-
-`CACHE_MEMORY` is only the shared cache budget. It is not a process-memory
-limit and excludes SlateDB's WAL and memtables, decoded catalog projections,
-commit staging, DuckDB allocations, and allocator retention.
-
-**`moraine_memory_tally('lake')` — what live memory can be attributed.** One
-row reports this catalog's SlateDB WAL-plus-memtable gauge, its decoded
-projection estimate, and its last staged-row commit's equality-entry count
-and encoded batch bytes. The same row includes process-wide occupancy for
-SlateDB metadata, data blocks, and parsed Parquet metadata. The scopes are
-spelled out in the column meanings: cache residents are shared, while write
-buffers and projections belong to the named attach. This is logical
-accounting rather than RSS; the gap includes allocator overhead and retention,
-DuckDB, extension glue, and any dependency memory with no exported gauge.
-
-**`moraine_object_store_tally('lake')` — what SlateDB sent to storage.**
-One cumulative row per attach reports `main_gets`, `main_puts`, and
-`main_deletes`, the same three counts for a separately configured WAL store,
-and summed request time beside every count in milliseconds. Moraine currently
-uses one physical store, so WAL-object traffic appears in the `main_*` fields;
-the `wal_*` fields are reserved for an explicit second store. A GET includes
-the read-shaped APIs such as range, head, and list, and a PUT includes multipart
-operations. The instrumentation is inside SlateDB's retry loop, so attempts and
-their durations, not only logical calls, are counted.
-
-`errors` counts failed attempts, including errors SlateDB handles internally
-such as an expected missing-object probe; it is diagnostic, not a statement
-that the catalog operation failed. Durations are sums and can exceed wall time
-when requests overlap. The core surface is
-`ReadOnlyCatalog::object_store_tally`, carrying an `ObjectStoreTally`; the C ABI
-copies it through `moraine_catalog_object_store_tally` without exposing the
-metrics recorder. There is deliberately no process-wide SQL form: unlike the
-one shared cache budget, physical requests belong to the catalog handle that
-issued them.
-
-`data_gets` and `data_bytes` count the data store separately: the byte
-ranges moraine itself reads from Parquet — footers, row-id columns, delete
-files, and scoped reads — and the bytes they returned. They are apart from
-`main_*` on purpose, because they are a different store reached over a
-different path, and a statement can be dominated by data reads while showing
-no main-store request at all. A located delete positions rows against file
-summaries and reads back existing delete files, so it is exactly that shape;
-without these two columns its cost is invisible to a caller sampling the
-tally around a statement. There is no duration beside them: the reads are
-issued concurrently and a sum of overlapping latencies would not divide into
-the wall time it is meant to explain.
-
-An ordinary lake scan still needs none of this and gets none of it. Those
-Parquet reads are DuckDB's, not moraine's, and DuckDB caches them itself: a
-lake read goes through its caching file system, so data bytes sit under
-`memory_limit` rather than in a budget of moraine's (RFC 0009). What the
-embedding host should set beside a moraine attach — `validate_external_file_cache =
-'NO_VALIDATION'` (safe: DuckLake data files are immutable),
-`parquet_metadata_cache = true`, `enable_http_metadata_cache = true` —
-is embedding guidance, documented with the attach options; the shim
-never sets a global for the user.
-
-### Interception level: catalog-entry, row-faithful (B1)
-
-moraine intercepts at DuckDB's **Catalog / table-scan / DML layer** — the
-`postgres_scanner` pattern — never by parsing raw SQL. Parsing DuckLake's SQL
-would mean reimplementing a query engine; instead DuckDB's own executor plans
-DuckLake's statements and calls moraine per table.
-
-moraine's catalog exposes the fixed set of `ducklake_*` tables (and the
-per-schema-version inlined-data tables) as catalog entries with the DuckLake
-schema, and implements:
-
-- **Scan** — produce rows from SlateDB in operation-owned pages. Recognized
-  table-id and lifecycle predicates narrow the store range; DuckDB still
-  evaluates every predicate. Projection selects output columns. Staged
-  overlays and the remaining array providers have operation-owned results,
-  never attachment or transaction caches.
-- **Insert / Update / Delete** — apply row mutations to the store.
-- **Transactions** — `begin`/`commit`/`rollback` mapped onto RFC 0004's
-  **staged-row commit path**: a transaction stages row mutations; commit
-  drives them through the shared batch under head conflict detection. A
-  **data-only** commit takes DuckLake's **server-side commit** route
-  (below): moraine joins the batch, rebases the head-derived values
-  DuckLake stamped, re-drives a benign lost race itself, and reports the
-  snapshot id it landed, which DuckLake adopts. Every other commit — not
-  data-only, the shape RFC 0004's rebase refuses — stays on DuckLake's
-  **client-side** route: moraine performs no internal retry, a lost race
-  aborts with the typed `CommitConflict`, and DuckLake's `RunCommitLoop`
-  (source-verified) re-drives it with bounded jittered backoff after
-  re-checking its own conflict matrix. Two wire-contract consequences hold
-  on that route, both load-bearing: **(a) the error message matters** —
-  DuckLake's `RetryOnError` decides retryability by substring match on the
-  lowercased message (`"primary key"`, `"unique"`, `"conflict"`,
-  `"concurrent"`), so the text moraine surfaces for a lost commit must
-  contain `"conflict"` or DuckLake will abort instead of retrying; **(b)
-  moraine must serve conflict-resolution reads mid-retry** — between
-  attempts DuckLake queries `ducklake_snapshot` /
-  `ducklake_snapshot_changes` for everything after its transaction
-  snapshot, through the ordinary scan hook.
-- **Constraints** — the primary keys DuckLake's spec relies on. Its schema
-  declares exactly five, on `ducklake_snapshot`, `ducklake_snapshot_changes`,
-  `ducklake_schema`, `ducklake_data_file`, and `ducklake_delete_file`, and
-  moraine refuses an insert that would displace a live row under one of them
-  with a typed `Constraint`. The two snapshot kinds need no lookup: a snapshot
-  record exists only at or below head, so the head-advance check that already
-  guards every staged commit covers them by construction — surfacing there as
-  the lost race it is, which DuckLake re-drives, rather than as a constraint
-  it would abandon. **No name
-  uniqueness is enforced anywhere**, deliberately — DuckLake's schema declares
-  no `UNIQUE` constraint on any name column and polices naming in its binder,
-  so inventing one here would refuse rows its other backends accept. Both
-  halves are pinned.
-
-Because the `ducklake_*` rows are the catalog state (B1), RFC 0002 keys are an
-efficient encoding of those rows and RFC 0005's inlined chunks are the storage
-of specific `ducklake_*` tables — not a separate model that must be
-reconciled. This keeps moraine robust to DuckLake evolving its SQL: the same scan/DML
-hooks serve new access patterns over the same tables.
-
-**The access set is known, not assumed.** DuckDB's `QueryLog` records the
-statements DuckLake issues on its metadata connection, so a workload
-reaching every modelled feature — DDL, bulk and inlined writes, updates,
-deletes, schema evolution, views, comments, compaction, expiry, cleanup,
-time travel — yields the exact set of tables read and written, pinned as
-a set equality (`wire_contract.rs`). Thirty tables, of which twenty are
-both read and written; the reads are the metadata-projection scans, and
-the writes are the staged-row translations. Two findings fall out of it
-directly. `ducklake_file_variant_stats` never appears, because DuckLake
-writes it only for a column whose extra stats are VARIANT and moraine
-refuses a VARIANT column at creation (its inline encoding is Arrow, which
-has no VARIANT representation) — so the always-empty stand-in is exactly
-right, and modelling the table is downstream of VARIANT support, not
-independently owed. And nothing in the set is a pattern the row-faithful
-layout serves badly, which is the evidence semantic projection (B2, below)
-was waiting on.
-
-"No semantic re-modeling" comes with **exactly one interpreted
-convention**, stated so its scope is bounded. The RFC 0002 `current`/`history`
-split physically encodes the begin/end-snapshot lifecycle columns, so
-moraine must *recognize* the lifecycle in DuckLake's DML — an `UPDATE` that
-sets a row's `end_snapshot` translates to end-version bookkeeping (delete
-the `current` key, write the `history` key), not a blind value overwrite. That is
-a semantic mapping, and it is where the residual drift risk concentrates:
-if DuckLake ever mutates those columns in a shape moraine does not
-recognize (un-ending a row, say), the translation would misfile it. The
-convention is deliberately minimal — lifecycle columns only, everything
-else opaque — and the e2e suite pins it against every lifecycle transition
-real DuckLake SQL produces. The contract is not zero interpretation; it is
-exactly one, tested.
-
-### Server-side commit: the catalog re-drives and assigns the id
-
-DuckLake defines two ways a metadata catalog may finish a commit, chosen in
-`DuckLakeTransaction::FlushChanges` (source-verified). On the **client-side**
-route, `RunCommitLoop` generates the commit's rows against the snapshot it
-read, executes them, and on a retryable failure sleeps a jittered
-`ducklake_retry_wait_ms` × `ducklake_retry_backoff`ⁱ — 100 ms × 1.5ⁱ by
-default — before generating them again against a fresh snapshot. On the
-**server-side** route, taken when the metadata manager reports
-`ExecuteRetrialsServerSide()`, DuckLake hands the commit to the manager's
-`FlushChangesServerSide` and adopts what comes back: the manager calls
-`SetCommittedSnapshotId` with the snapshot id the catalog landed and
-`ApplyServerSideCommit` with the schema version; a backend that finishes
-the commit itself never enters the loop. Only on this route does DuckLake
-adopt an id the catalog assigned; on the client-side route it keeps the one
-it minted.
-
-moraine's metadata manager takes the server-side route for **data-only**
-commits — no created, altered or dropped schema, table, view or macro, the
-gate DuckLake's own server-side backend applies — and the client-side route
-for everything else. The split is RFC 0004's, and the two gates are one
-predicate: a data-only commit is the shape whose head-derived values the
-batch rebases exactly, so it can be re-driven inside the catalog; the rest
-cannot be, and DuckLake's loop is the right re-driver for them. A commit
-the shim routes server-side is never one the rebase refuses. Inside
-`FlushChangesServerSide` the shim runs DuckLake's own generation of the
-commit's rows through the ordinary DML hooks — the rows the client-side
-route stages — under DuckLake's own retry budget, then reports the id the
-catalog landed. The budget is kept as the safety net, not the mechanism: a
-data-only commit never spends it, because the batch re-drives its benign
-races inside, and what still reaches the loop is a true conflict, which
-DuckLake's own re-check throws on the first retry without sleeping again.
-The landed id may exceed the one DuckLake stamped when it generated the
-rows, because the batch rebased it; `SetCommittedSnapshotId` is the
-contract by which DuckLake learns the difference, called after the loop,
-which would otherwise have recorded the stamped id.
-
-This is why the staged path's commit returns a snapshot id at all
-(`moraine_tx_commit(tx) -> snapshot_id`, below), and why the shim treats
-that value as authoritative over anything DuckLake computed before commit.
-
-### Metadata scan ranges, pages, and row identity
-
-A scan opens at execution time against its transaction's fixed read scope.
-Recognized table-id equality narrows a table-major key range, and lifecycle
-bounds can omit history only when the core proves it cannot contribute.
-`pushdown_complex_filter` consumes no predicate: DuckDB continues to evaluate
-all filters. An unrecognized expression causes a wider scan.
-
-The cursor ABI visits at most 64 contributing parent records and emits at most
-64 output rows per page for entity metadata,
-partition columns and values, sort expressions, tags, variant statistics,
-macro implementations and parameters, name mappings, snapshot headers and
-changes, and column/view-column tags. A page also stops when its retained decode
-allowance reaches 1 MiB. One indivisible parent may cross that threshold and
-remains subject to working-memory admission; this is not a hard byte or RSS cap.
-Empty parents do not signal EOF or accumulate reservations across pages. A parent with more than
-64 children remains operation-owned while its children drain across pages. The
-C++ scan also caps each output batch at DuckDB's vector capacity. Each page owns its working
-memory through ABI conversion and uses its existing dump free function.
-Cancellation or a failed read invalidates the cursor.
-
-Column and view-column tags come only from each parent's authoritative version:
-its current record, or its last ended record if the parent has been dropped.
-The cursor checks current-record presence and seeks the last ended key once per
-historical parent. It skips superseded parent values without decoding them and
-retains no catalog-wide set of visited identities.
-
-A scan supplying UPDATE/DELETE identities reserves a row-id range and registers
-a resolver at the same immutable read point. The resolver retains one page;
-a backward request restarts its cursor. Sequential mutations traverse the
-metadata once more; arbitrary row order can cause repeated scans. Array-based
-providers retain their operation-owned rows for identity resolution.
-
-All 28 committed and staged metadata kinds use bounded output pages.
-Neither attachment nor transaction retains a decoded metadata-row cache.
-DuckDB's planning and result memory remains separate from the core cursor budget.
-
-A staged cursor freezes relevant authored operations at open. It streams committed
-parents through those edits, then emits surviving authored rows. The frozen plan
-is charged to working memory and shared with cursor forks. Forks restart at the
-same fixed read point and authored state, so later edits cannot change UPDATE or
-DELETE row identities. Table inserts inherit field-ID counters only from prior
-versions surviving at that operation. Embedded child projections retain only
-operation-sized owner maps, not committed parent directories. Tag scans suppress
-committed parents touched by staged operations and seek each touched parent's
-versions separately, retaining one surviving candidate. They select the
-current or newest ended version after lifecycle edits, then apply authored tag
-edits. Deleting the current parent can therefore expose an older version's tags
-without loading the column or view directory.
-
-Schema-version scans emit stored rows, then legacy snapshot-derived rows absent
-from the stored keyspace, then missing file floor rows. Two ordered file cursors
-reduce current and ended files to one minimum begin snapshot per table. A floor
-uses the first stored schema-version key; when legacy-only rows exist and that
-key does not cover the oldest file, the cursor scans snapshots for that table's
-earliest legacy row. This compatibility path trades repeated snapshot reads for
-bounded memory. No catalog-wide schema-version or file map is retained.
-
-Option scans emit fixed global facts as a bounded first page and stream stored
-options afterward. Stored global version, writer, encryption, and data-path
-entries are suppressed; table-scoped entries with those names remain visible.
-Row-ID replay includes the same fixed prefix.
-
-Index and row-position ABI calls load table-specific descriptor projections.
-Until persistent name indexes land, resolving their schema and table names
-streams the corresponding directories; index creation also checks the schema's
-index namespace. These calls do not materialize file-column statistics.
-
-### Composition: C++ shim over the Rust core (forced)
-
-DuckDB's stable C extension API (`duckdb_ext_api_v1`) exposes scalar
-functions, table functions, and a handful of other hooks — **not**
-storage/catalog registration. A writable DuckLake catalog requires a
-`StorageExtension` (DuckLake issues `CREATE`/`INSERT`/`UPDATE` against it;
-read-only table functions cannot serve that), and registering one means
-**linking DuckDB's C++ internals**. This is the same path the built-in
-postgres/sqlite/mysql catalog attachers take. The pure-Rust extension crates
-(`duckdb-rs`, `extension-template-rs`) ride the C API and therefore cannot
-register a catalog.
-
-Therefore `moraine-duckdb` is:
-
-- a **thin C++ shim** that links DuckDB's internal C++ API and registers the
-  `StorageExtension`, `Catalog`, and `TransactionManager`, plus
-- the Rust **`moraine` core** compiled as a staticlib exposing a **minimal C
-  ABI**: open/attach, `begin`/`commit`/`rollback`, `scan(table, projection,
-  filters) -> Arrow`, and `apply(mutations)`.
-
-The shim contains no domain logic — it translates DuckDB catalog callbacks
-into C-ABI calls. This preserves RFC 0001's "thin by policy" intent, restated
-**language-agnostically**: no catalog semantics in the extension layer,
-regardless of the language it is written in.
-
-- **Boundary format: typed C structs, plus the Arrow C Data Interface for
-  inline chunks.** Metadata and inline *scan* results cross the ABI as
-  owned arrays of `#[repr(C)]` row structs (`crates/moraine-duckdb/src/
-  dumps.rs`/`inline.rs`), one `_free` per array — not Arrow arrays as
-  originally intended here. Inline chunk *bodies* are the exception and do
-  use the Arrow C Data Interface: the shim converts a `DataChunk` to
-  `ArrowArray`/`ArrowSchema` with DuckDB's `ArrowConverter` and the Rust
-  bridge (`src/arrow_ipc.rs`) serializes to Arrow IPC, with the structs
-  crossing the ABI by pointer (`moraine_arrow_encode_*`/`_decode_stream`,
-  consuming on encode and producing on decode; ownership rules in
-  `arrow_ipc.rs`).
-
-  **Scan results stay row structs.** The split above is the decision, not
-  an interim state. Arrow's win is bulk columnar transfer, and the
-  metadata path has no bulk to transfer: rows are built one at a time from
-  a `BTreeMap` of protobuf-decoded records, so an Arrow builder would
-  visit every field exactly as often — it moves the copy rather than
-  removing it. The measured cost is elsewhere anyway (`BENCHMARK.md`:
-  ~5–7 µs per live entity to materialize, and RFC 0009's open item names
-  the *clone* in `dump_entities`, not the marshalling), and that fix is
-  strictly cheaper and strictly prior. Against that, the row structs are
-  the schema contract: each is checked field-for-field against
-  `metadata_table_specs.cpp`'s spec table by the compiler and against
-  DuckLake's own DDL by review, where an Arrow schema assembled at runtime
-  would move both to a runtime failure. Inline chunk bodies are the case
-  that genuinely is columnar and where DuckDB owns both export and import,
-  which is exactly why they are the exception. Revisit only on a profile
-  naming dump marshalling — not materialization, not cloning — as a
-  material share of catalog rebind time.
-- **Sync↔async bridge lives in the Rust C-ABI layer.** The core is async
-  (SlateDB requires tokio, RFC 0001). The C-ABI layer owns the tokio runtime
-  and `block_on`s core futures, so the C++ shim only ever calls synchronous C
-  functions. This is the "FFI boundary" of RFC 0001's async rule.
-
-### Metadata row conversion
-
-Metadata row structs and exported functions remain explicit Rust declarations
-so cbindgen can generate the C header without expanding macros. Each row has
-one field mapping for scalar values, nullable scalars, owned strings, and
-nullable strings. That mapping defines both record conversion and cleanup.
-
-Conversion validates all strings in a row before transferring their pointers.
-A batch owner releases completed rows if a later conversion fails or unwinds;
-only a successful batch transfers ownership to the caller. This avoids an
-intermediate buffer of records and converted strings. The C row structs have
-no Rust destructor: only the conversion owner and the matching exported free
-function release their pointers.
-
-### C ABI error mapping (v0)
-
-Pinned by the extension-loads slice (`moraine-duckdb/src/error.rs`, `mod
-codes`). Every fallible C-ABI entry point returns an `i32` code and, on
-failure, fills a caller-provided `(code, message)` pair (`MoraineError`);
-messages are UTF-8, allocated by Rust, and freed only via the exported
-`moraine_error_free`. Every entry point wraps its whole body — `block_on`
-included — in `catch_unwind`, so a core panic surfaces as a code, never as
-an unwind into C++. The shim translates codes to DuckDB exceptions:
-
-| Code | ABI constant | Source | Shim raises |
+DuckLake connects to its metadata catalog by executing a nested
+`ATTACH 'moraine:<store-uri>'` with the alias `__ducklake_metadata_<alias>` and
+`HIDDEN true`. DuckDB's prefix dispatch resolves `moraine:` to the registered
+storage extension, so the nested attach and the standalone
+`ATTACH '<store-uri>' AS m (TYPE moraine)` reach the same
+`MoraineCatalog::Attach`. The standalone attach serves listings, `DESCRIBE`, and
+every `ducklake_*` projection. A `SELECT` on a user table through it binds and
+then raises `InvalidInputException` at execution, naming the `ducklake:moraine:`
+attach. User data is served only through DuckLake.
+
+The store URI selects the object store:
+
+| URI | Store |
+|---|---|
+| `/path/to/dir` | local filesystem, created if absent |
+| `memory://` | ephemeral in-process store |
+| `s3://<bucket>[/<prefix>]` | S3 or S3-compatible, bucket must exist |
+
+Credentials are never attach options. For an `s3://` store the shim resolves the
+DuckDB `s3`-type secret whose scope matches the path and passes it across the
+ABI as `MoraineS3Config`. A secret with `REFRESH 'auto'` supplies a refresh
+recipe, which the core uses as its signing provider. The `WAL_PATH` store
+resolves its own secret.
+
+DuckDB opens any attach whose path starts with a remote prefix read-only unless
+`READ_WRITE` is given, so creating or writing an S3-backed lake requires an
+explicit `READ_WRITE`. A read-only attach of an uninitialized store fails with a
+message that names this fix.
+
+## Attach options
+
+Every option reaches the shim through DuckLake's `META_` passthrough on a
+`ducklake:moraine:` attach, or bare on a standalone attach. Names are matched
+case-insensitively. The shim parses the following in `cpp/catalog.cpp` and
+forwards them through <!-- site:omit -->
+`moraine_attach_with_commit_log`<!-- /site:omit the attach call -->. Semantics
+live with the owning document.
+
+| Option | Core binding | Default |
+|---|---|---|
+| `ENCRYPTED` | `CatalogOptions::encrypted`, creation-time only | `false` |
+| `DATA_PATH` | `CatalogOptions::data_path`, recorded on first attach | unset |
+| `WAL_PATH` | `CatalogOptions::wal_store`, see [the commit protocol](0003-commit-protocol.md) | catalog store |
+| `FLUSH_INTERVAL_MS` | `CatalogOptions::flush_interval`, zero maps to continuous flush | 100 |
+| `FLUSH_ON_COMMIT` | `CatalogOptions::flush_on_commit` | `false` |
+| `READER_POLL_INTERVAL_MS` | `CatalogOptions::reader_poll_interval` | 10000 |
+| `CHECKPOINT` | `CatalogOptions::checkpoint`, read-only attach only | unset |
+| `CACHE_DIR` | `CatalogOptions::cache_dir`, see [the read path](0007-read-path-and-caching.md) | unset |
+| `CACHE_SIZE` | `CatalogOptions::cache_size`, bytes | 16 GiB |
+| `CACHE_MEMORY` | `CatalogOptions::cache_memory`, bytes, process-wide | 640 MiB |
+| `CACHE_AUXILIARY_PERCENT` | `CatalogOptions::cache_auxiliary_percent`, capped at 50 | one eightieth of the budget |
+| `CACHE_PUTS` | `CatalogOptions::cache_puts` | `true` |
+| `CACHE_COMPACTION_PUTS` | `CatalogOptions::cache_compaction_puts` | `true` |
+| `CACHE_PRELOAD` | `CatalogOptions::cache_preload`, one of `none`, `off`, `l0`, `all` | `l0` |
+| <!-- site:omit -->`COMMIT_LOG_TAIL` | `CatalogOptions::commit_log_tail`, see [the commit-log seam](0011-commit-log-seam.md) | `false` |
+| `COMMIT_LOG_POLL_INTERVAL_MS` | `CatalogOptions::commit_log_poll_interval` | 50 ms  <!-- /site:omit -->|
+| `MAINTENANCE_INTERVAL`, `MAINTENANCE_BATCH_SIZE`, `MAINTENANCE_TABLE_BATCHES`, `MAINTENANCE_PROGRESS`, `MAINTENANCE_SWEEP_INDEXES` | shim `MaintenanceConfig`, see [maintenance](0010-maintenance.md) | pass disabled |
+| `MAINTENANCE_COMPACT_STORE`, `MAINTENANCE_COMPACT_STORE_SUBSPACE`, `MAINTENANCE_COMPACT_STORE_TIMEOUT` | shim `MaintenanceConfig`, subspace validated at attach | off |
+| `MAINTENANCE_<step>`, `MAINTENANCE_<step>_<parameter>` | shim `MaintenanceConfig`, steps `expire_snapshots`, `flush_inlined_data`, `merge_adjacent_files`, `rewrite_data_files`, `cleanup_old_files`, `delete_orphaned_files` | off |
+
+A misspelled `CACHE_PRELOAD` level is refused. An unknown
+`MAINTENANCE_COMPACT_STORE_SUBSPACE` is refused at attach by asking the core
+through `moraine_subspace_is_known`. The cache options configure one cache the
+process shares, so the first attach in the process sizes it and later attaches
+are served what stands. The shim also reads DuckDB's `threads` setting and the
+buffer manager's memory limit at attach, passing the first as `host_threads` and
+checking the second through `moraine_validate_host_memory`.
+
+## Attach modes
+
+The selector between read-write and read-only is DuckDB's own `READ_ONLY` attach
+flag. There is no moraine-specific prefix, suffix, or option for it. DuckDB
+resolves the flag into `AttachOptions::access_mode`, and the shim reads that
+field in `MoraineCatalog::Attach` and passes a `read_only` bit across the ABI.
+DuckLake forwards its outer `READ_ONLY` into the nested metadata attach, so the
+flag the user types on the `ducklake:moraine:` attach is the one the shim sees.
+
+The bit selects the core open. Read-write calls `Catalog::open`, which takes the
+one SlateDB writer. Read-only calls `Catalog::open_read_only`, which returns a
+`ReadOnlyCatalog` over a `DbReader`. The ABI holds both behind one
+`MoraineCatalogHandle`, so a write on a read-only handle is refused at the ABI
+with `CONSTRAINT`. A `DbReader` never fences the writer, and any number may run
+beside it.
+
+A deployment designates one read-write process. SlateDB fencing is
+newest-writer-wins, so a second read-write attach does not fail itself. The
+incumbent's next store operation fails with `Error::Fenced`, mapped to `FENCED`
+and raised as `IOException`, with a message telling the operator to re-attach.
+The topology is specified in [the commit protocol](0003-commit-protocol.md).
+
+A follow-latest reader writes a checkpoint into the manifest on open and
+refreshes it every `READER_POLL_INTERVAL_MS`, so reader credentials need
+manifest write access. The checkpoint reader is a sub-mode of read-only:
+`CHECKPOINT '<id>'` opens the `DbReader` against a checkpoint minted ahead of
+time, and the attach issues no writes at all. It reads a fixed cut and never
+observes later commits. A checkpoint id on a read-write attach, an id the
+manifest no longer carries, and a malformed id are each refused.
+
+## Catalog tables
+
+moraine intercepts at DuckDB's catalog, table-scan, and DML layer. It never
+parses SQL. The catalog exposes every `ducklake_*` table DuckLake queries as an
+entry with DuckLake's own column list, transcribed in
+`cpp/metadata_table_specs.cpp`, and serves each from a `moraine_dump_*`
+provider. Tables with no modeled records are registered and empty, because
+DuckLake's commit batches join them unconditionally. `ducklake_metadata` is
+synthesized from store facts, so a fresh moraine store is a valid DuckLake
+catalog and DuckLake's bootstrap DDL never runs against one.
+
+Serving is row for row. Both `current` and `history` rows of a versioned kind
+are emitted, since DuckLake filters lifecycles in SQL. Time travel and schema
+reconstruction therefore need no logic in moraine. Stored column types are
+translated at one point, `DuckLakeColumnType`, from DuckDB SQL names to
+DuckLake's lowercase vocabulary.
+
+DuckLake's `INSERT`, `UPDATE`, and `DELETE` against these tables reach the core
+through four entry points: `moraine_tx_begin`, `moraine_tx_stage`,
+`moraine_tx_commit`, and `moraine_tx_rollback`. Every id, counter,
+`schema_version`, and `begin_snapshot` value DuckLake authors crosses the ABI
+verbatim. One convention is interpreted: an `UPDATE ... SET end_snapshot`
+becomes a `current`-key delete plus a `history`-key write, because
+[the storage format](0001-storage-format.md) encodes the lifecycle columns in
+the key. DuckLake's delete-rewrite also issues an
+`UPDATE ... SET begin_snapshot` against the replacement file it inserted in the
+same transaction, staged as `RowOperation::UpdateSetBegin` on
+`ducklake_data_file` only.
+
+Constraints are DuckLake's primary keys and nothing more. An insert whose id
+already names a live row under one of them is refused with `CONSTRAINT`, and the
+message carries no retry substring. No name uniqueness is enforced on any name
+column, because DuckLake declares none and polices naming in its binder.
+
+With inlining on, DuckLake creates and drives per-table physical tables named
+`ducklake_inlined_data_<table_id>_<schema_version>` and
+`ducklake_inlined_delete_<table_id>`. The shim recognizes both families by
+pattern in `cpp/inline_tables.cpp` and routes them through the same staged path
+into the `inline/*` keyspace, as specified in
+[data inlining](0004-data-inlining.md).
+
+## Commit routing
+
+`MoraineMetadataManager` is registered under the `moraine:` metadata prefix and
+opts every DuckLake commit into the server-side route by calling
+`SetRetrialsServerSide(true)`. Inside `FlushChangesServerSide` the shim runs
+DuckLake's own `RunCommitLoop`, which generates the commit's rows and drives
+them through the ordinary DML hooks under DuckLake's retry budget. A data-only
+commit never spends that budget: the core's batch rebases the head-derived
+values DuckLake stamped and re-drives a benign lost race itself, as
+[the commit protocol](0003-commit-protocol.md) specifies. A commit that is not
+data-only cannot be rebased, so a lost race returns `COMMIT_CONFLICT` and
+DuckLake's loop re-drives it.
+
+`moraine_tx_commit` returns the snapshot id the commit landed. After the loop
+the shim reads the catalog's last committed snapshot and, if it exceeds the id
+DuckLake recorded, calls `SetCommittedSnapshotId` so DuckLake adopts the
+catalog's id.
+
+DuckLake decides retryability by substring match on the lowercased error text.
+Its retry substrings are `conflict`, `concurrent`, `unique`, and `primary key`.
+Two rules follow. The `COMMIT_CONFLICT` message always contains `conflict`.
+Every terminal error, including `RETRY_EXHAUSTED`, `FENCED`, `CONSTRAINT`,
+`COMMIT_OUTCOME_UNKNOWN`, the equality-index uniqueness rejection, and the
+standalone data-scan redirect, contains none of the four. The
+`COMMIT_OUTCOME_UNKNOWN` message is a fixed string for this reason, and the shim
+adds the structured DuckDB error field `commit_outcome=unknown`, which the
+bundled DuckLake patch reads to keep the commit's data and delete files through
+rollback.
+
+## Table functions
+
+The shim registers these functions at load. Each takes a lake name or a store
+path as its first argument, as noted.
+
+| Function | Argument | Purpose | Owner |
 |---|---|---|---|
-| 0 | `OK` | success | — |
+| `moraine_create_checkpoint` | lake, optional lifetime | mints a SlateDB checkpoint through the attached writer | [commit protocol](0003-commit-protocol.md) |
+| `moraine_checkpoints` | store path | lists checkpoints with `manifest_id`, `created_at`, `expires_at` | [commit protocol](0003-commit-protocol.md) |
+| `moraine_delete_checkpoint` | store path, id | releases one checkpoint | [commit protocol](0003-commit-protocol.md) |
+| `moraine_move_wal` | store path, `wal_path` | moves a lake's write-ahead log store, lake attached nowhere | [commit protocol](0003-commit-protocol.md) |
+| `moraine_migrate` | store path | runs a structural format migration, lake attached nowhere | [storage format](0001-storage-format.md) |
+| `moraine_raise_format` | lake | raises the store's structural format version | [storage format](0001-storage-format.md) |
+| `moraine_raise_catalog_version` | lake, `dry_run`, `confirm` | raises the DuckLake catalog format from 1.0 to 1.1 | [feature mapping](0005-ducklake-feature-mapping.md) |
+| `moraine_maintenance` | lake | runs one maintenance pass | [maintenance](0010-maintenance.md) |
+| `moraine_maintenance_status` | lake | lists persisted maintenance pass records and their steps | [maintenance](0010-maintenance.md) |
+| `moraine_compact_store` | lake, options | merges a store subspace | [maintenance](0010-maintenance.md) |
+| `moraine_store_census` | lake | per-subspace manifest bytes and object counts | [read path](0007-read-path-and-caching.md) |
+| `moraine_cache_tally` | none or lake | cache hit and miss counters | [read path](0007-read-path-and-caching.md) |
+| `moraine_cache_status` | none | process-wide cache capacity and occupancy | [read path](0007-read-path-and-caching.md) |
+| `moraine_sidecar_tally` | none | row-summary counters | [read path](0007-read-path-and-caching.md) |
+| `moraine_memory_tally` | lake | attributable live memory | [read path](0007-read-path-and-caching.md) |
+| `moraine_object_store_tally` | lake | object-store request counts and durations | [read path](0007-read-path-and-caching.md) |
+| `moraine_indexes` | catalog, schema, table | lists indexes | [indexes](0009-equality-indexes.md) |
+| `moraine_index_lookup` | catalog, schema, table, index, keys | equality lookup | [indexes](0009-equality-indexes.md) |
+| `moraine_index_in` | catalog, schema, table, index, list | multi-key lookup | [indexes](0009-equality-indexes.md) |
+| `moraine_index_range` | catalog, schema, table, index, bounds | range lookup | [indexes](0009-equality-indexes.md) |
+| `moraine_index_nulls` | catalog, schema, table, index, prefix | null-aware prefix lookup | [indexes](0009-equality-indexes.md) |
+| `moraine_index_verify` | catalog, schema, table, index | verifies and certifies an index | [indexes](0009-equality-indexes.md) |
+| `moraine_fault_stall_next_read` | milliseconds | arms a stall in the next cancellable read, for cancellation tests | this document |
+
+`CREATE INDEX` and `DROP INDEX` on a moraine-backed table are intercepted by
+`RegisterMoraineIndexDdl`. The scan operators `moraine_metadata_scan`,
+`moraine_inline_data_scan`, `moraine_summary_scan`, and `moraine_scan` appear in
+query plans and are bound to table entries. They are not callable by name.
+
+## Error codes
+
+Every fallible entry point returns an `i32` and, on failure, fills a
+caller-owned `MoraineError` with the code and a UTF-8 message that is freed only
+through `moraine_error_free`. The codes are defined in
+`crates/moraine-duckdb/src/error.rs`, and `ThrowMoraineError` in
+`cpp/catalog.cpp` maps them to DuckDB exceptions.
+
+| Code | Constant | Source | Shim raises |
+|---|---|---|---|
+| 0 | `OK` | success | none |
 | 1 | `NOT_FOUND` | `Error::NotFound` | `CatalogException` |
 | 2 | `ALREADY_EXISTS` | `Error::AlreadyExists` | `CatalogException` |
-| 3 | `CONSTRAINT` | `Error::Constraint` | `CatalogException` |
-| 4 | `COMMIT_CONFLICT` | `Error::CommitConflict` | `TransactionException` |
-| 5 | `CORRUPTION` | `Error::Corruption`, plus catalog strings that cannot cross the boundary (embedded NUL) | `IOException` |
-| 6 | `STORE` | `Error::Store` (and, conservatively, any future core variant) | `IOException` |
-| 7 | `INVALID_ARGUMENT` | ABI-layer validation: null pointer, invalid UTF-8, unsupported store scheme | `InvalidInputException` |
-| 8 | `INTERNAL` | a panic caught at the FFI boundary | `InternalException` |
-| 9 | `INTERRUPTED` | a read was cancelled, or a commit was cancelled before its future was polled | `InterruptException` |
-| 10 | `RETRY_EXHAUSTED` | `Error::RetryBudgetExhausted` — the commit spent its whole internal retry budget without settling | `TransactionException` |
-| 11 | `FENCED` | `Error::Fenced` — another process took over as the writer; the handle can no longer commit, and the message says to re-attach | `IOException` |
-| 12 | `MIGRATION` | unsupported or incomplete format migration | `IOException` |
-| 13 | `SNAPSHOT_EXPIRED` | requested snapshot was reclaimed | `CatalogException` |
-| 14 | `UNSUPPORTED` | unsupported feature | `NotImplementedException` |
-| 15 | `OPEN_RACED` | another process created the store first | `IOException` |
-| 16 | `COMMIT_OUTCOME_UNKNOWN` | submitted write was not acknowledged, or a commit call was cancelled after polling began | `IOException` |
+| 3 | `CONSTRAINT` | `Error::Constraint`, and a write on a read-only handle | `CatalogException` |
+| 4 | `COMMIT_CONFLICT` | `Error::CommitConflict`, message contains `conflict` | `TransactionException` |
+| 5 | `CORRUPTION` | `Error::Corruption`, or a catalog string with an embedded NUL | `IOException` |
+| 6 | `STORE` | `Error::Store`, `Error::Configuration`, `Error::IndexBuilding`, and any other variant | `IOException` |
+| 7 | `INVALID_ARGUMENT` | ABI validation: null pointer, invalid UTF-8, unsupported scheme | `InvalidInputException` |
+| 8 | `INTERNAL` | a panic caught at the FFI boundary, fixed message | `InternalException` |
+| 9 | `INTERRUPTED` | the call's probe cancelled it, or it outran the statement deadline | `InterruptException` |
+| 10 | `RETRY_EXHAUSTED` | `Error::RetryBudgetExhausted`, terminal | `TransactionException` |
+| 11 | `FENCED` | `Error::Fenced`, terminal | `IOException` |
+| 12 | `MIGRATION` | `Error::Migration`, at attach the message names `moraine_migrate` | `IOException` |
+| 13 | `SNAPSHOT_EXPIRED` | `Error::SnapshotExpired` | `CatalogException` |
+| 14 | `UNSUPPORTED` | `Error::Unsupported` | `NotImplementedException` |
+| 15 | `OPEN_RACED` | `Error::OpenRaced`, attaching again adopts the store | `IOException` |
+| 16 | `COMMIT_OUTCOME_UNKNOWN` | `Error::CommitOutcomeUnknown`, or a commit cancelled after its first poll | `IOException` with `commit_outcome=unknown` |
 
-Wire contract: the `COMMIT_CONFLICT` message always contains the literal
-substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
-that substring (see the Transactions bullet above) — so the message text
-is part of the ABI contract, not incidental diagnostics. It binds on the
-client-side commit route; on the server-side route the same error is
-terminal and its text is diagnostics.
+Codes 4 and 10 both raise `TransactionException` because DuckLake's retry
+decision reads the text, and the two texts differ in whether they carry a retry
+substring.
 
-The contract runs both ways. `RETRY_EXHAUSTED` is terminal, so its message
-carries **none** of the four substrings DuckLake retries on (`conflict`,
-`concurrent`, `unique`, `primary key`); the same rule governs the
-equality-index uniqueness rejection. DuckLake's loop is itself bounded — by
-`ducklake_max_retry_count`, default 10 — so a retryable terminal error does
-not spin forever, but it does multiply the work by that factor before
-failing, which for a large commit is the difference between an error and an
-apparent hang. Both codes raise `TransactionException`: DuckLake's retry
-decision reads the text, not the exception kind.
+## Runtime and cancellation
 
-### Diagnostics seam
+The core is async and owns no runtime. The ABI layer creates one multi-threaded
+tokio runtime per attached catalog inside <!-- site:omit -->
+`moraine_attach_with_commit_log`<!-- /site:omit the attach call -->, holds it in
+`MoraineCatalogHandle`, and drops it in `moraine_detach` after closing the
+catalog. The runtime is multi-threaded so SlateDB's flush and compaction tasks
+progress while DuckDB threads are parked in catalog calls. Its worker count is
+DuckDB's `threads` setting, passed as `host_threads` and clamped by
+`worker_threads` to `MIN_WORKER_THREADS` of 2 and `MAX_WORKER_THREADS` of 8
+(`crates/moraine-duckdb/src/runtime.rs`). The count is fixed for the attach's
+life.
 
-The core emits `tracing` events; a loaded extension consumes none by
-default, and the host cannot consume them for it — the extension is a
-separate dynamically-loaded library with its own statically-linked
-`tracing`, so a subscriber installed by an embedding process never sees
-them. Left there, every diagnostic the core produces is dropped, which is
-how a commit that spends its retry budget can present as a silent stall.
+Each entry point runs on one of DuckDB's own threads, which is outside the
+runtime, and calls `block_on` on the handle's runtime. Core code only awaits and
+never blocks on a runtime, so a pure-Rust host drives the same core on its own
+runtime. A catalog operation never calls back into DuckDB, so there is no
+re-entrant FFI chain and no nested `block_on`.
 
-`ATTACH` installs a process-wide buffering subscriber (`logging.rs`), once,
-via `try_init` — a host that already set a global subscriber keeps it. The
-buffer is bounded (oldest-first eviction, with the drop count reported on
-the next drain) so diagnostics never grow without limit behind a caller
-that stops draining. `MORAINE_LOG` sets the captured level, default `info`.
+Cancellation is pulled. DuckDB offers no interrupt callback to a storage
+extension, only `ClientContext::IsInterrupted()`, an atomic load any thread may
+perform. Every cancellable entry point therefore takes a trailing
+`MoraineInterruptProbe probe, void *probe_ctx` pair, and the shim passes
+`moraine_shim_is_interrupted` with the `ClientContext`. A null probe makes the
+call non-cancellable. `block_on_cancellable_within` races the core future in a
+`biased` `tokio::select!` against a loop that ticks the probe every
+`INTERRUPT_POLL_INTERVAL` of 100 ms, with the probe branch first so a standing
+interrupt wins a tie. A third branch, `STATEMENT_DEADLINE` of one hour, reports
+`INTERRUPTED` for a call that outruns it. The probe is per call, so one
+connection's interrupt cannot cancel another's query on the same handle. The
+signal is level-triggered and nothing consumes it.
 
-Events fire on the handle's tokio worker threads, where no `ClientContext`
-is in scope. While a catalog is attached, that does not delay them: the
-catalog registers a database-scoped writer
-(`Logger::Get(DatabaseInstance&)`, which is thread-safe) as its handle's
-push sink via `moraine_register_log_sink(handle, sink, ctx)`, and the
-handle's events write through it as they fire. A watcher querying
-`duckdb_logs` from another connection therefore sees a running commit's
-diagnostics while the commit runs — the stalled-commit case the logs exist
-to explain — and nothing is ever evicted while a sink is registered. The
-catalog's destructor unregisters via `moraine_unregister_log_sink(handle)`
-before the handle or the database goes away, and unregistration returning
-guarantees no push is in flight.
+DuckLake runs its metadata SQL on a connection it creates and never hands out,
+so that context's flag cannot be set by a user. `MoraineMetadataManager::Query`
+and `AttachMetadata` record the driving context on that connection as
+`ParentContextState`, and `moraine_shim_is_interrupted` reads the driver's flag
+when the connection's own is clear.
 
-Delivery is routed per handle, though `tracing` itself is process-global:
-each attach's runtime tags its worker threads with the handle's identity
-at spawn, the FFI `block_on` wrappers tag the calling thread per call, and
-an event is attributed to whichever handle tagged the thread it fires on.
-One process serving many attached lakes keeps their diagnostics apart —
-each lake's records surface only in its own database's `duckdb_logs`.
-Records carry DuckDB's own `LogLevel` values, so the sink forwards them
-unchanged, and appear under the `moraine` type after
-`CALL enable_logging(level => 'info', storage => 'memory')` — the default
-storage writes to stdout rather than the table. Under DuckDB's default
-`LEVEL_ONLY` mode the type string is not filtered on, so no log-type
-registration is required.
+A cancelled read returns `INTERRUPTED` and the handle stays usable. An attach is
+cancellable as well, in <!-- site:omit -->
+`moraine_attach_with_commit_log`<!-- /site:omit the ABI -->: a cancelled attach
+leaves nothing attached but may have taken the writer epoch. Its abandoned
+runtime is wound down with a `CANCELLED_ATTACH_SHUTDOWN` deadline of 5 seconds.
+`moraine_detach` takes no probe. A commit cancelled before its future is first
+polled returns `INTERRUPTED` and submitted nothing. A commit cancelled after
+that returns `COMMIT_OUTCOME_UNKNOWN` while any submitted write continues on its
+own task. The cancel-safety contract, including the shielded batch write and
+what a caller does with an unknown outcome, is specified in
+[the commit protocol](0003-commit-protocol.md).
 
-Events with no routable sink — fired before the handle's sink registers
-(registration flushes that handle's backlog through it), after it
-unregisters, or on a thread no handle tagged — buffer instead, and the
-shim drains the buffer through `moraine_drain_logs(sink, ctx)` on threads
-that hold what each sink needs, wherever events could otherwise strand:
+Every entry point wraps its body, `block_on` included, in `catch_unwind` through
+`guard` in `crates/moraine-duckdb/src/abi.rs`. A caught panic becomes `INTERNAL`
+with a fixed message that never derives from the panic payload, so no unwind
+crosses the C boundary.
 
-- **`CommitTransaction`**, on every outcome — success, conflict, or
-  exhausted budget — and **`StartTransaction`**, after the snapshot
-  resolve, both writing through `Logger::Get(context)`. With push sinks
-  registered these find little to drain; they exist for the gaps around
-  registration and for unattributed events.
-- **`Attach`**, on both exits — a failed open's events would otherwise
-  wait forever, since no catalog (and so no push sink) ever exists. On
-  success, registration itself flushes the handle's backlog through the
-  new sink.
-- **The maintenance pass**, which runs on the scheduler's own thread,
-  drains through the same database-scoped writer and closes each pass with
-  one shim-originated outcome line: `warn` naming every failed step,
-  `info` for a clean pass.
+The extension ships one fault seam for proving cancellation:
+`moraine_fault_stall_next_read(milliseconds)` arms a sleep that the next
+cancellable call awaits inside its `select!`, in place of a slow store. One
+arming stalls one call, and only the probe hop transfers it.
 
-The sink never throws: an exception escaping into the ABI would unwind
-across the boundary, and a lost diagnostic must not fail the operation
-that produced it.
+## Logging
 
-**Event frequency is a rule, not a convention.** The buffer holds 512
-records and drops oldest-first, so its capacity is a budget shared by
-everything the core logs between drains. Events are emitted at
-per-operation frequency — per commit, per open, per pass — never per
-entry, per row, or per file. A per-entry event at `debug` would evict the
-very warnings the buffer exists to preserve.
+The core emits `tracing` events, and the extension is a separately loaded
+library with its own `tracing`, so a host subscriber never sees them. The first
+attach installs a process-wide buffering subscriber through `try_init`, and a
+host that already installed one keeps it. `MORAINE_LOG` sets the captured level
+for moraine's own targets, default `info`, and `MORAINE_LOG_DEPENDENCIES` does
+the same for dependencies. The buffer holds `LOG_BUFFER_CAPACITY` of 512
+records, evicts oldest-first, and reports the drop count on the next drain.
+Delivery is per handle: each attach's runtime tags its worker threads and each
+`block_on` tags the calling thread, and an event is attributed to the handle
+whose thread it fired on. The catalog registers a database-scoped writer as its
+handle's push sink through `moraine_register_log_sink` and unregisters it in its
+destructor through `moraine_unregister_log_sink`, so records appear under the
+`moraine` type in `duckdb_logs` as they fire. Events with no routable sink
+buffer, and the shim drains them through `moraine_drain_logs` at attach exit,
+transaction start and commit, the end of each maintenance pass, and after each
+table function that opens a store. Events are emitted per operation, never per
+row or per file.
 
-### Read cancellation seam
+## Pins
 
-Pinned by `moraine-duckdb/src/abi/`, `staged.rs`, and `runtime.rs`. Every cancellable entry
-point `block_on`s a `select!` between the core future and its
-cancellation signal, `biased` toward the signal so a pending interrupt
-always wins a tie and aborts before the core future does any work. A
-cancelled read returns `INTERRUPTED`, which the shim raises as
-`InterruptException`; the handle stays fully usable and the next call is
-unaffected.
+| What | Pinned at |
+|---|---|
+| DuckDB | `v2.0.0`, the version string the loadable is bound to |
+| DuckLake extension | commit `417a9117`, hard-coded by DuckDB in `.github/config/extensions/ducklake.cmake` |
+| DuckLake branch | `main` |
+| DuckLake catalog format | 1.0 by default, 1.1 on a raised store |
 
-**The signal is per call, not per handle.** Cancellable entry points take
-a trailing `MoraineInterruptProbe probe, void *probe_ctx` pair
-(`typedef bool (*MoraineInterruptProbe)(void *)`). The probe is checked
-once synchronously before the core future is first polled (a timer's
-first tick is pending at the poll level even when already elapsed, so a
-future completing on its first poll would otherwise beat a pending
-interrupt), then the `select!` polls it on a ~100 ms interval — DuckDB's
-own slice convention for interruptible waits. A null probe means
-non-cancellable. The probe may run on any of the runtime's threads, so it
-must be thread-safe and `probe_ctx` valid for the duration of the call —
-the shim's probe is a single atomic load of `ClientContext::interrupted`,
-the flag DuckDB's own executor polls. Level-triggered, so a signal cannot
-leak past the call that observed it: the probe is only consulted while a
-call is in flight, and DuckDB clears the flag before the next query
-issues one.
+## Tests
 
-One hop is needed before that load. DuckLake runs its metadata SQL on a
-connection it creates and never hands out, so that context's flag is one
-nobody can set, and a commit stalled in this catalog could not be
-cancelled at all. The registered metadata manager records the driving
-context on that connection — in its `Query` override, which every metadata
-read funnels through, and in `AttachMetadata`, the nested attach that does
-not — and the probe reads the driver's flag when the connection's own is
-clear. Registering where the queries are issued rather than where the
-connection is built is what lets this live in the shim instead of in a
-DuckLake patch.
+- Two threads blocked in catalog calls on one handle both complete while
+  SlateDB's background flush advances.
+- An interrupt before a commit future is polled returns `INTERRUPTED` and leaves
+  the head unchanged.
+- A forced panic in a core call surfaces as `InternalException` and the handle
+  serves the next call.
+- A read-only attach opened beside a live writer does not fence it.
+- The `COMMIT_CONFLICT` message contains `conflict` and every terminal code's
+  message contains no retry substring.
+- The nested attach text, DuckLake's `ducklake_*` access set, and the bundled
+  DuckLake commit match the pins.
 
-Per-call is what the deployment shape requires, and it is why the earlier
-per-handle `Notify` and its `moraine_interrupt(handle)` push channel are
-gone rather than merely unused. DuckDB's flag is per *connection*, and
-several connections share one attached catalog; a single per-handle
-signal would let one connection's Ctrl-C abort another's query, or be
-consumed by it. Two overlapping reads on one handle cancelling
-independently is pinned by test.
+## Alternatives
 
-This is how the shim wires Ctrl-C: DuckDB offers no interrupt callback to
-a storage extension (cancellation is cooperative polling of a public
-atomic flag; a thread blocked in an FFI call never reaches the executor's
-poll sites), so the poll moves inside the blocked call, where the async
-core makes cancellation a dropped future. No first-party remote-catalog
-extension (postgres, mysql, iceberg, delta, httpfs — or DuckLake itself)
-cancels a blocked external call; their shipped mitigations are timeouts.
-
-Read-only cancellable entry points include: `moraine_snapshot`, `moraine_snapshot_scoped`, the `moraine_dump_*` reads, the
-`moraine_inline_*` reads, and `moraine_tx_begin` (reads the head
-snapshot; nothing is staged yet, so aborting it leaves no state). The
-snapshot listing calls (`moraine_snapshot_schemas`/`tables_in`/
-`columns_of`/`views_in`/`data_files_of`) walk the already-materialized
-snapshot in memory and take no probe.
-
-**Proving it takes a seam.** A cancellation only means something while a
-read is blocked, and nothing makes a local store block on command — so the
-extension carries one fault seam:
-`moraine_fault_stall_next_read(milliseconds)`, whose ABI entry point of the
-same name arms a stall the next cancellable call awaits *inside* the
-`select!` that polls its probe, in place of a slow store. One arming stalls
-one call. It ships rather than hiding behind a build feature because the
-only harness that can drive it is a real DuckDB session, and that session
-loads the artifact a release publishes; dormant, it is one relaxed atomic
-load per cancellable call, and nothing on a lake's data path can arm it.
-What it buys is the test that a statement interrupted while its metadata
-read is blocked ends in that statement's failure rather than in the read
-finishing — the one assertion that fails if the hop above is removed.
-
-`moraine_attach_with_wal_store` is cancellable too, and is the exception to
-"mutates nothing": the store open is the one long blocking call an attach
-makes, and against an unreachable endpoint it is the one a user is most
-likely to want out of. A cancelled attach writes no handle and leaves
-nothing attached, but it may already have taken the writer epoch — an
-attach cannot know whether it will finish before it claims one — so a
-process that was attached before it must re-attach, exactly as after any
-failed attach. Its abandoned runtime is wound down with a deadline rather
-than dropped: a plain drop blocks until every background task of the
-half-built store finishes, which is the hang the cancellation existed to
-escape.
-
-Commit calls also take a probe. Before the commit future is first polled,
-cancellation returns `INTERRUPTED` and that call submitted nothing. Once
-polling begins, cancellation returns `COMMIT_OUTCOME_UNKNOWN`; a submitted
-write continues on its own task. Preparation that has not yet submitted is
-conservatively classified the same way. An acknowledged result is returned
-normally when the commit future completes.
-
-`COMMIT_OUTCOME_UNKNOWN` is terminal for automatic retry. Its ABI message is
-fixed so backend error text cannot introduce DuckLake's retry substrings.
-The detailed reason is logged. The shim adds the structured DuckDB error
-field `commit_outcome=unknown`. DuckDB's COMMIT wrapper discards extra fields,
-so `moraine: commit outcome unknown;` is also a fixed transport marker. The
-bundled DuckLake patch treats either signal as terminal and clears its transaction's file-cleanup ownership before
-rollback. This preserves newly written data and delete files even if rollback
-runs again. Errors without the flag retain DuckLake's usual cleanup behavior. Callers retain external files and reconcile
-catalog state before resubmitting. Located deletion retains supplied delete
-files on every commit-call failure, including unknown outcomes; orphan
-cleanup can reclaim files no successful catalog commit registered.
-
-`moraine_detach` takes no probe: cancellation during teardown could leak the
-handle or leave the store half-closed.
-
-### Version pinning and distribution
-
-Linking DuckDB's C++ internals ties the extension to a specific DuckDB build;
-the ABI is not stable across releases. This is the "FFI/build/version-pinning
-tax" RFC 0001 explicitly chose to defer out of the core and pay only at the
-extension boundary; the rest of this section is what paying it looks like.
-
-**A build is bound to one DuckDB version string, exactly.** DuckDB refuses a
-C++-ABI extension whose metadata footer names a different version —
-`ParsedExtensionMetaData::GetInvalidMetadataError` compares the strings, patch
-releases included — so a user on one patch release cannot load another's
-build. Supporting a series therefore means building each release in it
-separately, and the distribution unit is a DuckDB *release*, not a series.
-
-**One manifest owns the pin.** `.github/duckdb-versions` lists the releases
-moraine builds for, newest first, the first line carrying the commit each
-submodule must sit on. `xtask` reads it, both build workflows take their
-version from it, assets are published as
-`moraine.<duckdb-version>.<platform>.duckdb_extension` so several versions
-coexist in one release, and `cargo xtask check-pins` fails if any other place
-naming a version disagrees. That check exists because the failure mode is
-silent: a bump that misses one of the six places produces an artifact that
-builds, passes every other job, and then refuses to load. `cargo xtask
-bump-duckdb <version>` writes those places, so the check guards a
-transcription no one has to make by hand. It covers the DuckLake commit
-too, which DuckDB chooses rather than moraine — otherwise a DuckDB bump
-moves it silently and only e2e says so.
-
-**What a pin has to be: a published release.** An extension stamped with a
-version string no released DuckDB reports has nothing to load it, which is
-why the entry named a bare commit for as long as 2.0 carried no tag. 2.0.0
-tags and publishes, so a build of this pin loads into a stock CLI.
-
-**Which releases are listed** is a judgement, and a short list is the default.
-Each entry multiplies the release build by five platforms, and only the
-primary is proven end-to-end against a real DuckLake — the e2e suite is
-moraine's whole correctness story for the shim, and running it per entry is
-the real cost, not the build. So the list holds the releases users are
-plausibly on; dropping one only stops future releases from carrying it, since
-published assets stay where they are.
-
-**Which DuckDB series moraine tracks:** the one DuckLake's current release
-branch targets, adopted when DuckLake cuts that branch rather than when DuckDB
-releases. The extension exists to be DuckLake's catalog, and a DuckDB with no
-DuckLake built for it has nothing to attach. DuckLake versions by DuckDB-series
-branch, so the two move together by construction.
-
-**Signing is DuckDB's, not moraine's.** The public keys
-`ExtensionHelper::GetPublicKeys` trusts are compiled into every DuckDB binary,
-so no third party can produce a signature the stock CLI accepts;
-`extension-upload-single.sh` zeroes the footer's 256-byte signature region
-unless it holds one of those private keys. Hence: moraine's own release
-workflow publishes unsigned, every e2e harness starts the CLI with
-`-unsigned`, and the community-extensions pipeline — pointed at this repo by
-`description.yml` — is the only route to a signed build. That is a
-consequence of DuckDB's design rather than an unbuilt piece of moraine's.
-
-**The pin, tracking the DuckDB series DuckLake targets:**
-
-| What | Pinned at | Notes |
-|---|---|---|
-| DuckDB | **v2.0.0** | the only entry of `.github/duckdb-versions`; both submodules sit on the commits it names, and it is the version the e2e suite proves the chain against. DuckDB's 2.0 LTS release, supported upstream until at least October 2027 |
-| DuckLake extension | **`417a9117`** | the DuckLake source moraine bundles: what `INSTALL ducklake` resolves to against the pinned DuckDB, which hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. DuckDB patches that commit itself before building it, and moraine's build applies those patches before the `patches/ducklake` series. Verified by running, not assumed |
-| DuckLake branch | **`main`** | DuckLake publishes no release tags — it versions by DuckDB-series branches (`v1.3-ossivalis`, `v1.4-andium`, `v1.5-variegata`), and the 2.0 series has none yet, so the commit DuckDB pins is on `main` |
-| DuckLake catalog format | **`1.0`** by default, **`1.1`** on a raised store | `DuckLakeVersion::V1_0` and `V1_1`; a store records which it serves and `moraine_raise_catalog_version` moves it, as RFC 0012 describes |
-
-**ABI friction between the two does not appear.** The concern was that
-objects crossing the extension↔host boundary by pointer between a DuckLake
-built by DuckDB's own CI and a moraine statically linking another build of
-the same DuckDB might disagree. They do not: the bundled DuckLake loads
-with moraine and the full chain answers correctly, pinned by
-`wire_contract.rs` alongside the version strings, so a bump that introduces
-friction fails there rather than in the field.
-
-The source-verified behaviors this RFC suite cites (conflict matrix, commit
-retry loop, `SchemaChangesMade` classification, per-table column-id
-allocation, the five primary keys) were verified on `main` @ `34db89b`
-(2026-07-09) and re-checked **identical on the pinned branch** — the diffs
-between the two are cosmetic (accessor renames, formatting). The e2e suite
-regression-pins against the table above; moving any row of it is a
-deliberate, reviewed bump.
-
-### Build and pin mechanics (as implemented)
-
-**Built through DuckDB's extension toolchain.** moraine-duckdb builds via
-`extension-ci-tools` — the same CMake+Make toolchain the community-extensions
-repository uses — added as a git submodule alongside a `duckdb` submodule
-pinned to the supported release. The toolchain owns the whole extension link:
-it builds DuckDB from the submodule and **statically links it into the
-loadable**, compiles the C++ shim as extension sources against DuckDB's full
-`src/include/` tree (every internal header at its real path — the parser and
-storage-extension types the shim needs, e.g. `TableFunctionRef`,
-`LogicalInsert`/`LogicalUpdate`/`LogicalDelete`, which the amalgamation never
-exposed), and links the moraine Rust core in as a static library via
-[corrosion](https://github.com/corrosion-rs/corrosion). Static DuckDB linkage
-is what makes the extension loadable into the stock CLI on every platform:
-the stock Linux release CLI exports none of its C++ internals, so a `dlopen`
-that deferred symbol resolution could never resolve them there — carrying its
-own copy is exactly how official DuckDB C++ extensions are shaped. Objects
-cross the extension↔host boundary by pointer between ABI-identical builds of
-the same pinned version — the version pin is what makes this sound. None of
-this linking lives in the crate: it declares `crate-type = ["staticlib",
-"rlib"]` — `staticlib` is what CMake links, `rlib` is what the crate's own
-integration tests link against — and its `build.rs` does one thing
-unrelated to the extension link, generating `cpp/moraine_abi.h` from the
-`extern "C"` surface with cbindgen so the header cannot drift from the
-Rust definitions. Two build details the toolchain needs supplied per
-target: a C++17 bump on the shim targets (it uses `std::optional`; DuckDB
-pins the global standard to C++11), GCC 14 for Linux to match DuckLake's
-extension pipeline, and, on macOS, the `IOKit`/`Security`/
-`CoreFoundation`/`SystemConfiguration` frameworks the Rust dependency tree
-links.
-
-**Entry point and packaging.** DuckDB's loader `dlsym`s a fixed entry
-symbol derived from the artifact filename with every `.`-suffix stripped,
-so the loadable carries exactly one dot (`moraine.duckdb_extension` →
-`moraine_duckdb_cpp_init`). The entry point is a C++ symbol emitted by the
-toolchain's `DUCKDB_CPP_EXTENSION_ENTRY(moraine, loader)` macro
-(`cpp/moraine_extension.cpp`), which forwards to the StorageExtension
-registration; the toolchain's linker whitelist exports exactly that one
-symbol and hides everything else (including the Rust core's C ABI, resolved
-internally at static-link time). The toolchain also appends the required
-512-byte metadata footer (ABI type, extension version, the exact DuckDB
-version string, target platform, magic value, and a signature region left
-zero for unsigned local loading, filled by DuckDB's own signing in the
-community-extensions pipeline). `cargo xtask e2e` builds the loadable by
-invoking the toolchain (`make release`) and points the integration tests at
-`build/release/extension/moraine/moraine.duckdb_extension`.
-
-**e2e harness.** `cargo xtask e2e` downloads and caches the pinned DuckDB
-CLI under `target/` (skipping the fetch once cached), redirects
-`extension_directory` under `target/duckdb-extensions/` before `INSTALL
-ducklake`/`LOAD ducklake` (also cached, never the CLI's home-directory
-default), then drives the CLI with `-unsigned` — required because moraine
-cannot sign the artifact at all (above) — through `LOAD`, `ATTACH`, listing,
-and metadata-projection queries against the standalone attach, and through
-`ducklake:moraine:` for the real DuckLake read/write round trip, against
-stores seeded through the `moraine` API. Full mechanics, including every
-build-time discovery, are recorded in `crates/moraine-duckdb/README.md`.
-
-### The staged-transaction ABI surface
-
-DuckLake's own `INSERT`/`UPDATE`/`DELETE` against `ducklake_*` tables
-reach moraine through four C-ABI entry points (`moraine_abi.h`):
-`moraine_tx_begin(catalog, snapshot) -> tx` (the snapshot the DuckLake
-transaction read at, which is the view its rows are stamped against and
-the one a batch rebases them from; the catalog transaction itself may
-open later), `moraine_tx_stage(tx, table_kind,
-operation_kind, cells)` (accumulates one typed row operation — `insert`, `delete`,
-or `update_set_end` — without touching the store), `moraine_tx_commit(tx)
--> snapshot_id` (translates every staged operation, joins the forming
-batch, and returns the snapshot id the commit landed — which the shim
-reports back to DuckLake, since on the server-side route it may exceed the
-id DuckLake stamped), and `moraine_tx_rollback(tx)` (discards
-the accumulated operations, no store access). The C++ shim's `PlanInsert`/
-`PlanUpdate`/`PlanDelete` (`cpp/catalog.cpp`, `cpp/staged_write.cpp`)
-recognize exactly one target: a `ducklake_*` metadata table entry whose
-spec names a writable `table_kind`; every other target — a real user table,
-or a `ducklake_*` kind this crate does not model as a store entity — still
-throws `NotImplementedException`, matching the "translate staged rows,
-author nothing else" scope above. Per the staged-row rules: DuckLake
-authors every id/counter/`schema_version`/`begin_snapshot` value, carried
-across the ABI verbatim; the one interpreted convention is an `UPDATE`
-setting `end_snapshot`, translated to a `current`-key delete plus `history`-key
-write; a benign lost race at commit is rebased and re-driven inside the
-batch for a data-only commit, and a lost race the rebase refuses returns an
-error whose message contains the literal substring `conflict`, for
-DuckLake's client-side loop to re-drive (C ABI error mapping above).
-
-### `data_inlining_row_limit` is deliberately not synthesized, and dynamic inline-table interception
-
-Beyond the keys the exists-probe path reads (version, encrypted,
-created_by — see the metadata-catalog section below), the synthesized
-`ducklake_metadata` serves **no** row for `data_inlining_row_limit`.
-Inlining is on regardless: DuckLake's `WriteNewInlinedTables`
-(source-verified) skips registering a table's per-schema-version
-inlined-data table only when `DataInliningRowLimit(...)` resolves to 0,
-and absent any served value that resolves to a compiled default of 10.
-(An earlier revision served `"0"` to keep inlining off while RFC 0005 was
-unimplemented, then `"10"` to make the choice legible.)
-
-Serving it is worse than redundant. `DataInliningRowLimit` reads the
-catalog's configuration options first and only then the DuckDB setting
-`ducklake_default_data_inlining_row_limit`, and an
-`ATTACH ... (DATA_INLINING_ROW_LIMIT n)` lands in that same option map —
-so a served row outranks both knobs and shadows them silently, leaving an
-operator with no way to raise the limit. Serving nothing keeps the same
-default and keeps both knobs working; a store that wants a different
-limit records a real option row, which overrides the default as any
-stored option does.
-
-With inlining on, DuckLake **dynamically creates and drives per-table
-physical tables** in the metadata catalog rather than writing fixed
-`ducklake_*` rows (RFC 0005's "Extension surface (as implemented)" has
-the full operation → keyspace mapping). This shim recognizes two dynamic
-name families by pattern, not by a fixed catalog-entry list — this is
-the one place moraine's catalog lookup does more than serve the fixed
-`ducklake_*` set B1 describes above:
-
-- `ducklake_inlined_data_<table_id>_<schema_version>` — recognized once
-  `moraine_inline_schemas` has a matching `(table_id, schema_version)`
-  record (so a `CREATE TABLE IF NOT EXISTS` existence probe correctly
-  reports "does not exist" before the first `CREATE`, and the same
-  connection's own `LookupInlineTableEntry` accepts the `CREATE` that
-  follows).
-- `ducklake_inlined_delete_<table_id>` — recognized from the table's
-  first inlined file-delete until the table is dropped. DuckLake probes
-  this table's existence with `SELECT NULL FROM ... LIMIT 1` and treats a
-  bind error as "does not exist", so unlike the data family this one must
-  report missing for a real table_id until that first file-delete, or
-  DuckLake's own existence discipline breaks. It must equally keep
-  existing once emptied: `ducklake_flush_inlined_data` writes the table's
-  deletions out as a real delete file and clears it with an unqualified
-  `DELETE`, and DuckLake caches the table's existence for the life of the
-  catalog rather than re-probing — so an existence derived from whether
-  any deletion is currently held vanishes under it mid-session and every
-  later bind fails. Existence is recorded in the store (RFC 0005's
-  `inline/file_delete_table` marker) for exactly that reason.
-
-Both route through the same staged-row commit path (`cpp/inline_tables.
-cpp`) as the fixed `ducklake_*` tables, translating into `inline/*`
-records — see RFC 0005 for the exact wire shape and the encoding
-deviation from that RFC's Arrow-IPC design.
-
-The data family's scan is **windowed**: `moraine_inline_scan_open` selects
-the rows and holds them behind a cursor, and each `moraine_inline_scan_next`
-returns the next window with only that window's chunk bodies, so what the
-shim decodes is bounded by the window and not by the table. Binding reads
-nothing — the cursor opens when the plan initializes the scan, which is
-also where the projection is known, so a scan of the metadata columns
-alone opens without bodies and DuckLake's own existence probe costs no
-store read. `moraine_inline_scan_close` releases the cursor's read
-session.
-
-`ducklake_flush_inlined_data` and DuckLake's compaction/rewrite cleanup
-paths also touch fixed `ducklake_*` tables beyond the entity
-projections. `ducklake_files_scheduled_for_deletion` is served for real
-(the `current/gcfile` schedule, written by expiry/compaction and drained
-by `ducklake_cleanup_old_files`). The tables of still-unmodeled features
-(variant-column stats, name/column mapping, macros) remain always-empty
-stand-ins (`metadata_tables.cpp`) purely so DuckLake's generic cleanup
-`DELETE`/`INSERT` batch — issued unconditionally as part of a commit
-that removes or supersedes data files, not gated on any of these
-features actually being in use — binds against an existing table instead
-of failing the whole commit with a "table could not be found" error.
-Raw `DELETE`s against tables with no delete translation plan as
-void-deletes that throw if a row ever actually matches.
-
-Two obligations of DuckLake's maintenance functions land here rather
-than in the core. **Read-your-writes on the snapshot projection:**
-`ducklake_expire_snapshots` stages its snapshot deletes and then
-re-reads `ducklake_snapshot` in the same transaction (its dead-row rule
-is `NOT EXISTS` over the survivors), so a scan of the snapshot tables
-inside a write transaction with an open staged tx serves the
-transaction's own view (`moraine_tx_dump_snapshots`), not committed
-state. **Head-preserving maintenance commits:** an expiry or cleanup
-transaction inserts no `ducklake_snapshot` row; the staged path commits
-it as reclamation-only, minting no snapshot and leaving `sys/head`
-untouched (RFC 0007).
-
-### Standalone data-scan retirement
-
-User-table *data* is served only through DuckLake now, matching the
-Non-goals decision above: the standalone attach's own scan
-(`MoraineTableEntry::GetScanFunction`, `cpp/scan.cpp`) still binds
-unconditionally, so `DESCRIBE`/`EXPLAIN` keep working, but its
-`init_global` — called once per query execution, not once per bind —
-unconditionally throws `InvalidInputException`, naming the table and the
-`ducklake:moraine:<store>` attach to use instead (`DATA_PATH` stays a
-placeholder; this shim has no store-level source of truth for a lake-wide
-data path). The message is deliberately built to exclude DuckLake's own
-retry substrings (`conflict`/`unique`/`primary key`/`concurrent`, per the C
-ABI error mapping table): this is a permanent redirect, not a race to
-retry. The scan machinery this replaced — a nested `read_parquet` query
-over resolved file paths, path-resolution rules, streaming, and a
-column-count guard — is deleted outright; see
-`crates/moraine-duckdb/README.md`'s "User-table data is served only
-through DuckLake" section for the full account and the exact error text.
-
-### A known upstream race: pin `threads=1` for DuckLake re-reads after a write
-
-DuckLake's own catalog cache has a multi-threaded race, independent of
-moraine: a fresh attach's catalog listing comes back **empty** right after
-a write, under DuckDB's default multi-threaded query execution. Not a
-moraine defect — the identical sequence reproduces against a plain
-duckdb-file-backed DuckLake attach with zero moraine code in the chain, in
-**23 of 40 runs** at the tracked version. It is also not `RENAME`-specific
-as an earlier revision of this RFC had it: a plain `CREATE TABLE` is
-enough. Dropping the workaround fails the e2e suite in roughly four runs
-out of five.
-
-`SET threads=1;` before the attach closes it deterministically, and every
-session runner in `crates/moraine-duckdb/tests/ducklake_load/helpers.rs`
-sets it for exactly that reason, not as a production recommendation.
-moraine's own row-faithful projections independently verify that every
-write this crate translates lands correctly regardless of whether
-DuckLake's cache race fires on the read side.
-
-The workaround costs every e2e session its parallelism, so a test asserts
-the race's **presence** against the reference chain
-(`the_upstream_ducklake_listing_race_still_needs_threads_1`). The
-inversion is deliberate: without a canary nobody learns when the
-workaround stopped being needed, and its failure is the signal to delete
-both it and the `SET threads=1`.
-
-### Automatic summary scans and Arrow batches
-
-Summary-driven indexed scans are selected automatically by eligibility and
-physical coverage. There is no SQL on/off setting for this rewrite. The
-`moraine_summary_scan` operator remains in query plans; only its former
-Boolean session setting is removed.
-`moraine_summary_scan_threads` defaults to four and limits a summary scan's
-file/row-group prefetch; the effective count also respects DuckDB's thread
-count and the per-cursor ceiling.
-
-The additive `moraine_row_scan_next_arrow` exports an owned Arrow C Data pair
-and a `has_batch` flag. On success with a batch the caller releases both structs
-exactly once; at EOF or on error it acquires no structs. Buffers outlive the
-cursor. `moraine_row_scan_is_selective` costs projected page coverage,
-`moraine_row_scan_parallelism` configures prefetch before iteration, and
-`moraine_row_scan_metrics` samples cursor-local I/O and decode/worker counters.
-`moraine_row_scan_open` is the only cursor the ABI opens. Index lookups,
-selective scans, and DELETE positioning share `MoraineRowId`; the duplicate
-`MorainePositionPair` and the scan-opening forwarding wrapper are removed.
-The strict whole-row cursor and standalone deletion commit were removed with the
-located SQL verbs. The internal `moraine_locate_row_positions` instead
-accepts index hits in committed files, using the handle's pinned revision,
-and returns exact positions plus existing deletion masks for the automatic
-DELETE rewrite. Its single free function releases the nested file arrays;
-there is no inline-row output or separate snapshot argument.
-The earlier IPC-returning `moraine_rows_at`, `moraine_rows_at_free` and
-`moraine_row_scan_next`, with their `MoraineRowBatch` type, are withdrawn in
-favour of the Arrow pair. Durable inline chunk IPC encoding is unchanged.
-The planning estimate owns no payload batches and discards its temporary scope
-before storing the prepared plan. See RFC 0016 for the eligibility and cost rules.
-
-## Alternatives considered
-
-- **A2 — a standalone moraine `ATTACH` DuckDB catalog** in addition to
-  the DuckLake surface. Originally deferred; since **adopted** as the first
-  shipping surface (`ATTACH ... (TYPE moraine)`, see Non-goals) — not for a
-  direct-query consumer, but because it proves the shim/ABI/core stack
-  end-to-end with the least machinery while the DuckLake chaining
-  ergonomics are still open.
-- **B2 — semantic projection.** Store a re-modeled catalog form and project it
-  into the `ducklake_*` views on read, translating writes back. Rejected: it
-  couples moraine to DuckLake's exact SQL shapes and re-encodes logic DuckLake
-  already owns, so a DuckLake change can silently misread. B1 keeps moraine
-  faithful and evolution-robust. The e2e evidence this was waiting on now
-  exists and does not call for it: the pinned access set (above) is thirty
-  tables of straightforward per-kind scans and staged-row writes, with no
-  filter pushed down and therefore no shape a re-modeled store would serve
-  better. Revisit only if a *specific* pinned access pattern turns out to be
-  expensive because of the row-faithful layout itself — not because the
-  catalog is large, which is 0009's lazy-materialization question, and not
-  because a scan clones, which is 0009's `dump_entities` item.
-- **Keep every DuckLake commit on its client-side retry loop** (the first
-  design). Rejected on measurement: the loop's sleep, tuned for
-  millisecond SQL commits, costs a flush-bound catalog a further flush per
-  lost race, and DuckLake's DML — one staged transaction per commit,
-  racing on the head — lost a race on half its commits at eight concurrent
-  connections. DuckLake's server-side route exists for a catalog that can
-  finish a commit itself; moraine is one.
-- **Patch the sleep out of DuckLake's loop for moraine.** Rejected: the
-  sleep bounds a per-commit race storm — without it the loop livelocks at
-  sixteen writers — and the patch series carries correctness fixes, not a
-  retry policy the server-side route makes unnecessary.
-- **Raw-SQL interception.** moraine parses and answers the SQL DuckLake emits.
-  Rejected: reimplements a query engine for no benefit; DuckDB's executor
-  already does this over moraine's table scans.
-- **Pure-Rust cdylib over the stable C extension API.** Rejected on
-  feasibility: the C API exposes scalar/table functions only, not catalog
-  registration. A read-only table-function surface cannot be DuckLake's
-  writable catalog. A `StorageExtension` requires DuckDB's C++ internals.
-- **Wire-impersonating an existing backend** (present as PostgreSQL/DuckDB over
-  the wire so DuckLake attaches to moraine as one of its known types).
-  Rejected: reimplements a wire protocol and still must satisfy the same
-  metadata semantics — cost with no offsetting benefit, and brittle against
-  protocol changes.
-
-### Fixed snapshot handles
-
-`moraine_snapshot_scoped` is the only snapshot-opening ABI entry point. It
-returns a fixed metadata/index/inline read scope or an error; it never builds a
-whole-catalog snapshot. Descriptor exports load their requested metadata.
-Selective row scans resolve only their table and requested source files, so
-planning and execution cannot trigger whole-catalog rebuilds. Immediate index
-creation/drop, data-path adoption, and catalog-version changes use scoped core
-mutations. One-shot index derivation pins its sources and rechecks both snapshot
-ID and batch sequence before publishing the index.
+- **Intercepting DuckLake's SQL text.** Parsing and answering the SQL DuckLake
+  emits would re-implement a query engine. DuckDB's executor already plans those
+  statements and calls moraine per table.
+- **One runtime per process.** A shared runtime would couple every attached
+  catalog's teardown and background tasks and would need a worker count serving
+  an unknown number of catalogs. One runtime per attach keeps `DETACH` local.

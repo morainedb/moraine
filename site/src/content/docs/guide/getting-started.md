@@ -1,57 +1,48 @@
 ---
 title: Getting started
-description: Load the extension and attach your first moraine-backed lake.
+description: Install the extension and attach a lake.
 sidebar:
   order: 2
 ---
 
 ## Install the extension
 
-Moraine is not yet in the DuckDB community extension repository, so the
-extension loads unsigned. Grab `moraine.<platform>.duckdb_extension` (e.g.
-`moraine.osx_arm64.duckdb_extension`) from the latest `ext-v*` entry on the
-[releases page](https://github.com/morainedb/moraine/releases), then start
-DuckDB with `-unsigned` (the setting cannot be changed on a running
-database):
+Moraine is not yet in DuckDB's community extension repository, so it loads
+unsigned. From the [Releases](/releases/) page, download the
+`moraine.<duckdb-version>.<platform>.duckdb_extension` whose DuckDB version
+matches yours exactly (any other is refused), start DuckDB with
+`-unsigned`, and load it:
 
 ```sh
 duckdb -unsigned
 ```
 
 ```sql
-LOAD 'path/to/moraine.osx_arm64.duckdb_extension';
-INSTALL ducklake;
+LOAD 'path/to/moraine.v2.0.0.osx_arm64.duckdb_extension';
 ```
 
-Once moraine is published as a community extension this becomes
-`INSTALL moraine FROM community; LOAD moraine;`.
+DuckLake is bundled with the extension; there is nothing else to install.
 
-## Attach a lake
-
-A local lake needs nothing but paths:
+## Attach a local lake
 
 ```sql
 ATTACH 'ducklake:moraine:/tmp/demo-lake' AS lake
   (DATA_PATH '/tmp/demo-lake-data/', META_DATA_PATH '/tmp/demo-lake-data/');
 
 CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
-INSERT INTO lake.events VALUES (1, 'hello, bucket');
+INSERT INTO lake.events VALUES (1, 'hello, lake');
 SELECT * FROM lake.events;
 ```
 
-Pass **both** path options, with the same value. `DATA_PATH` is DuckLake's:
-where Parquet files go. `META_DATA_PATH` is forwarded to moraine and
-**recorded in the catalog** at bootstrap — after that, re-attaches can omit
-`DATA_PATH` entirely, and operations that need the data root (like indexing
-a table that already holds data) work. The recorded value is fixed: an
-attach supplying a conflicting `META_DATA_PATH` is refused rather than
-silently diverging.
+Moraine records the data root in the catalog, so give it the same path
+DuckLake gets: `DATA_PATH` for DuckLake, `META_DATA_PATH` for Moraine.
+After the lake exists, attaches may omit both; an attach that supplies a
+different `META_DATA_PATH` is refused.
 
-## S3 lakes need READ_WRITE
+## Attach a lake on S3
 
-DuckDB opens any attach whose path starts with a remote prefix (`s3://`,
-`gcs://`, `azure://`, …) **read-only by default**, and a read-only attach
-cannot create a catalog. To create or write a lake on S3, say `READ_WRITE`:
+DuckDB opens remote paths read-only by default, and a read-only attach
+cannot create a catalog. Add `READ_WRITE` to create or write a lake on S3:
 
 ```sql
 CREATE SECRET s (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2');
@@ -60,8 +51,8 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
    META_DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
 ```
 
-Once the lake is bootstrapped, a later writer attach needs only the flag —
-the data path is served back from the catalog:
+Credentials come from DuckDB secrets, never from attach options. Once the
+lake exists, a writer attach needs only the flag:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
@@ -69,261 +60,69 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
 
 ## One writer, many readers
 
-A moraine lake is **single-writer, many-readers**. The selector is DuckDB's
-standard attach flag — no moraine-specific grammar:
-
-- **Read-write** (the default for local paths) opens the one SlateDB
-  writer. Exactly one process should attach read-write at a time.
-- **`READ_ONLY`** opens a follower that serves consistent snapshots and
-  tracks the writer's commits, and never becomes a writer:
+One process attaches read-write. Every other process attaches
+`READ_ONLY`:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_ONLY);
 ```
 
-Take the one-writer rule seriously: SlateDB fencing means the *newest*
-writer wins, so a second read-write attach doesn't fail — it fences the
-incumbent's committer. Every process past the first should attach
-`READ_ONLY`.
+A second read-write attach does not fail. SlateDB gives the writer role to
+the newest writer, and the previous writer's next commit fails with a
+fencing error. Nothing is corrupted, but the first writer must re-attach.
+A deployment that needs concurrent commits funnels them through one
+writer process, where they share a flush.
 
-## Commit latency
+To follow the writer, a read-only attach writes a checkpoint into the
+store's manifest, so its credentials need write access to the catalog
+bucket. It polls for new commits every `READER_POLL_INTERVAL_MS`, ten
+seconds by default, which is a billed request each time. Readers with
+strictly read-only credentials pin a checkpoint created ahead of time; see
+`CHECKPOINT` in [Configuration](../configuration/#read-only-attaches).
 
-A commit is durable once one write-ahead log PUT reaches object storage,
-and that PUT is the whole latency floor: everything else about a commit is
-local work. Two attach options set how long a commit waits for it, and a
-third moves where it lands.
+## Index a column
 
-`META_FLUSH_INTERVAL_MS` is the **minimum spacing between two log
-flushes**, 100 ms if unset. A commit that arrives past the spacing flushes
-at once and waits only on its own PUT; one that arrives inside it joins a
-single flush deferred to the moment the spacing elapses. So a lone commit
-costs one PUT, a burst costs at most the spacing plus a PUT, and the PUT
-rate never exceeds one per spacing however many commits arrive:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_FLUSH_INTERVAL_MS 5);
-```
-
-Shorten it for a low commit rate that wants latency; leave it for a high
-one, where the spacing is exactly what merges many commits into one
-request. `META_FLUSH_ON_COMMIT true` is the same setting at zero: every
-commit flushes on its own, one PUT each.
-
-That leaves the PUT itself, and it need not go to the bucket the catalog
-lives in. `META_WAL_PATH` writes the log — and nothing else — to a store of
-its own, which is what lets an S3 Express One Zone directory bucket serve
-the one latency-critical write while standard storage holds the rest:
+A DuckLake table is a set of Parquet files, so a lookup by key reads every
+file that statistics cannot rule out. Moraine adds ordered indexes over
+table columns, created with DuckDB's own DDL and maintained in the same
+commit as the rows they cover:
 
 ```sql
-CREATE SECRET wal (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2',
-                   SCOPE 's3://lake-wal--usw2-az1--x-s3');
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_WAL_PATH 's3://lake-wal--usw2-az1--x-s3');
+CREATE UNIQUE INDEX events_by_id ON lake.events (id);
+
+SELECT * FROM lake.events WHERE id = 1;
+SELECT * FROM lake.events WHERE id BETWEEN 100 AND 200;
+SELECT index_name, is_unique, state
+FROM moraine_indexes('lake', 'main', 'events');
 ```
 
-The log store resolves its own `s3` secret, since it is a different bucket
-and a different endpoint, and a bucket named with the suffix AWS reserves
-for directory buckets (`--x-s3`, `--xa-s3`) is addressed as S3 Express with
-nothing further to set. It must be as durable as the catalog bucket: a
-commit no sorted-string table holds yet lives only there.
+Equality, `IN`, range, and `IS NULL` predicates probe the index instead of
+scanning; nothing in the query changes. A unique index rejects a duplicate
+even from concurrent transactions, and an index checked with
+`moraine_index_verify` lets `DELETE … WHERE id = 1` skip the scan. Run
+index DDL on the writer, outside an explicit transaction.
 
-Where a lake keeps its log is recorded in the lake, so **every later attach
-names the same store**, readers included. One that names a different store,
-or none, is refused rather than replaying an empty log over live state —
-and the refusal names the store the lake records, which is how to find out
-what it is. Moving an existing lake's log is a verb, run with the lake
-attached nowhere:
+Options go in a `WITH` clause:
 
-```sql
-SELECT from_wal_path, to_wal_path, moved
-FROM moraine_move_wal('s3://bucket/prefix',
-                      wal_path => 's3://lake-wal--usw2-az1--x-s3');
-```
+| Option | Meaning |
+|---|---|
+| `staged = true` | Build in bounded steps that resume if interrupted. Use for a table that already holds many files. |
+| `step_entries`, `step_bytes` | Size of one staged step; both must be positive. |
+| `maintenance = 'deferred'` | Add entries for new rows in a later repair pass instead of the data commit. Non-unique indexes only. |
+| `directions = ['desc', 'asc']`, `nulls = ['first', 'last']` | Per-column order; DuckDB discards the standard `ASC`/`DESC` clauses. |
 
-It drains the log where it stands before recording the new store, so
-nothing in flight is lost; pass `from_wal_path => '…'` when the lake
-already has a log store of its own, and `wal_path => NULL` to bring the log
-back into the catalog bucket.
+`moraine_index_verify('lake', 'main', 'events', 'events_by_id')` checks the
+index against its table; a clean check lets a `DELETE` by key skip the scan.
+Rebuilding is `DROP INDEX` then `CREATE INDEX`; in between, the index
+neither accelerates queries nor enforces uniqueness. The
+[design document](/rfcs/0009-equality-indexes/) has the lookup functions
+and limits.
 
-## Faster repeat queries on S3
+## Next
 
-moraine keeps one block cache per process, shared by every store the process
-attaches. It holds SST metadata — the indexes and filters every lookup walks
-first — in memory, and data blocks in memory over an optional disk tier.
-
-Give it a directory and the data blocks spill there, so a warm working set
-survives more than memory alone would hold:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine');
-```
-
-Two byte counts size it, both for the whole process rather than per store:
-`META_CACHE_MEMORY` caps memory across both halves, `META_CACHE_SIZE` caps the
-directory (16 GiB if unset).
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine',
-   META_CACHE_MEMORY 1073741824, META_CACHE_SIZE 2147483648);
-```
-
-`META_CACHE_MEMORY` is the number to weigh against DuckDB's own `memory_limit`
-when sizing a host: DuckDB's budget covers its buffers and its Parquet cache,
-and this covers moraine's **process** caches — SST metadata, data blocks, and
-the parsed Parquet metadata equality-index upkeep reads. Each attached
-catalog additionally holds its own decoded view, which no option bounds
-because its size is the catalog's; `projection_bytes` on a catalog handle
-reports it.
-
-SST filters and indexes share that budget with data blocks, and every point
-read walks them before it can reach a block. They are not given a fixed
-slice: metadata is evicted only once no data block is left to evict, so a
-scan cannot push it out, and metadata a store does not need is space blocks
-may use. What is capped is how much stays protected — most of the budget.
-
-A store whose metadata outgrows that turns each probe into an S3 fetch,
-worst for keys that are absent, which consult every filter on the path and
-touch no data block at all. The attach warns when it happens, naming the
-shortfall:
-
-```text
-WARN the metadata cache cannot hold this store's SST filters and indexes,
-     so probes will fetch them from object storage
-     metadata_bytes=625189215 metadata_capacity_bytes=125829120
-```
-
-Raise `META_CACHE_MEMORY` on the **first** attach in the process — the cache
-is process-wide and the first attach builds it. `moraine_store_census`
-reports the same filter and index bytes per subspace if you want to see
-where the weight sits before setting a number.
-
-By default the cache fills only as queries read, so the indexes and filters
-of an SST the writer just flushed are fetched back from S3 the first time
-something reads them. `META_CACHE_PUTS true` admits them as they are written
-instead — metadata only, since a data block the writer produced is not one a
-reader is likely to want next:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_PUTS true);
-```
-
-It is off by default because compaction output goes through the same policy,
-and a large merge can evict what queries had warmed.
-
-A fresh process still starts cold, and the first query pays every first touch.
-`META_CACHE_PRELOAD` moves that cost into the ATTACH — `'l0'` warms every
-subspace's SST metadata, `'all'` additionally reads the catalog subspaces
-whole, `'none'` (the default) warms nothing:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_PRELOAD 'all');
-```
-
-Neither level pulls the index subspace's data blocks, which on an
-index-carrying store is most of its bytes — so `'all'` costs metadata-sized
-reads, not store-sized ones, and equality lookups stay one fetch per block
-behind the filters it just warmed. `moraine_store_census` reports how the
-bytes are distributed.
-
-The first attach in a process sizes the cache; later attaches share what it
-built. On a host that attaches several catalogs, set these on the first one.
-
-`moraine_cache_tally()` reports what that cache has served — hits and misses
-per slot, with a rate beside each — so the budgets can be set from measured
-curves rather than the defaults. Since one cache serves every attach, those
-numbers are the host's; pass a lake name to see one attach's share of them:
-
-```sql
-SELECT * FROM moraine_cache_tally();        -- the process
-SELECT * FROM moraine_cache_tally('lake');  -- one attach
-```
-
-A rate is NULL rather than zero before anything has been looked up. On a host
-attaching several catalogs, the per-lake form is what says which of them is
-spending the budget the process-wide form reports.
-
-## Caching the data files
-
-The cache above is the *catalog's*. Parquet data files are read by DuckDB
-itself, and moraine never touches a data byte or adds a cache of its own
-for them.
-
-DuckDB caches them for you. A lake read goes through DuckDB's built-in
-external file cache, so the data ranges a query fetches are held under
-`memory_limit` and a repeat read of the same bytes costs no storage
-request at all. One caveat worth knowing when you measure it: data-range
-caching rides on the Parquet reader's prefetch, which is used for remote
-files but not for files on local disk, so a local `DATA_PATH` caches only
-footers. A deployment reading `s3://` takes the remote path.
-
-That cache is memory, and it dies with the process — see below if you need
-warmth to survive a restart.
-
-DuckLake data files are immutable once written, so a process serving repeat
-queries wants three DuckDB settings that are off by default:
-
-```sql
-SET validate_external_file_cache = 'NO_VALIDATION';
-SET parquet_metadata_cache = true;
-SET enable_http_metadata_cache = true;
-```
-
-These are global, so moraine will not set them from an ATTACH — that would
-reach into every other database in the process. Set them in the session that
-attaches the lake.
-
-### Keeping S3 data files cached across processes with cache_httpfs
-
-The built-in cache above serves repeat reads within a live process. If
-your processes are short-lived — a serverless handler, a redeploy every
-few minutes — every one of them starts cold, and a cache on disk is what
-survives. The `cache_httpfs` community extension replaces the `s3://`
-filesystem, caching below the reader and outliving the instance:
-
-```sql
-INSTALL cache_httpfs FROM community;
-LOAD cache_httpfs;
-
-SET cache_httpfs_type = 'on_disk';
-SET cache_httpfs_cache_directory = '/var/cache/duckdb-httpfs';
-SET cache_httpfs_cache_block_size = 524288;             -- 512 KiB
--- Keep 8 GiB of the volume free; the cache evicts to stay under it.
-SET cache_httpfs_min_disk_bytes_for_cache = 8589934592;
--- Cache reads run on DuckDB's scheduler, so `SET threads` caps them too.
-SET cache_httpfs_parallel_read_mode = 'duckdb_task_scheduler';
-```
-
-**Budget its memory separately from `memory_limit`.** This cache is not
-DuckDB's and does not answer to DuckDB's budget, and even in `on_disk`
-mode it keeps a read-through memory cache. Two knobs bound it, and both
-multiply by the block size:
-
-```sql
--- on_disk mode: the read-through cache in front of the cache files.
---   256 blocks x 512 KiB = 128 MiB
-SET cache_httpfs_disk_cache_reader_mem_cache_block_count = 256;
-
--- in_mem mode (cache_httpfs_type = 'in_mem'): the cache itself.
---   256 blocks x 512 KiB = 128 MiB
-SET cache_httpfs_max_in_mem_cache_block_count = 256;
-```
-
-So a host running this alongside moraine has three memory consumers to
-size, not one: DuckDB's `memory_limit`, moraine's `META_CACHE_MEMORY`,
-and cache_httpfs's block count times its block size. A fourth sits outside
-every budget: each attached catalog holds its own decoded view, bounded by
-the catalog's size rather than by a cap. The core reports it as
-`projection_bytes` on a catalog handle. Only the first two
-are visible to DuckDB. Set the block counts before the first read —
-they take effect once.
-
-Two smaller notes. `cache_httpfs_max_in_mem_cache_block_count` must be
-set before any filesystem access to take effect. And DuckLake never
-rewrites a data file, so the default
-`cache_httpfs_enable_cache_validation = false` is safe here — the file
-under a cached block cannot have changed.
+- [Configuration](../configuration/) lists every attach option, with
+  sections on commit latency and caching.
+- [Operating manual](../operating/) covers retention, maintenance,
+  encryption, backups, and upgrades.
+- [Architecture](../architecture/) explains how the catalog is laid out
+  and how commits and reads work.

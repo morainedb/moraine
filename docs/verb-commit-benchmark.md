@@ -31,15 +31,15 @@ Run cases sequentially without competing builds or tests.
 Each process seeds a fresh real SlateDB over an in-memory object store, warms up
 five groups, then measures 60 groups. Every member updates the same target table
 with a distinct record count. Setup and shutdown are excluded. No Parquet data
-is read: these files are registered metadata. All numbers are means **per logical
-mutation**, including in four-member groups, where one durable batch serves four
-mutations.
+is read: these files are registered metadata. All numbers are means
+**per logical mutation**, including in four-member groups, where one durable
+batch serves four mutations.
 
 - `total_us`: elapsed wall time over the measured loop.
 - `cpu_us`: process CPU time, including SlateDB worker threads.
 - `durable_us`: time inside the durable transaction commit, observed through the
-  commit event's nanosecond field. This includes validation, WAL flush scheduling,
-  and the object PUT; it is not pure storage-service latency.
+  commit event's nanosecond field. This includes validation, WAL flush
+  scheduling, and the object PUT; it is not pure storage-service latency.
 - `non_durable_us`: total minus the durability phase, including preparation,
   folding, projection updates, and caller overhead.
 - `object_put_us`: physical main-store PUT duration from the object-store tally.
@@ -60,14 +60,14 @@ correctness bug in 7.0.1: its diff can omit an updated record, which would omit
 that record's write from a successful commit. This matches upstream
 [issue #161](https://github.com/jneem/imbl/issues/161); proposed
 [fix #166](https://github.com/jneem/imbl/pull/166) remains unmerged as of
-2026-09-07. The [commit protocol notes](rfcs/0004-commit-protocol.md#mutation-sized-verb-preparation)
-record the reproduction and upgrade constraint.
+2026-09-07.
 
 Environment: Amazon Linux 2023 x86_64 cloud VM, eight logical CPUs (Intel Xeon
-2.50 GHz), Rust 1.96.1, release optimization, two Tokio worker threads. Baseline:
-`1e38abf` with this benchmark harness and nanosecond commit telemetry added, before
-persistent maps or changed-branch diffing. Both versions use identical workloads
-and instrumentation. Raw measurements are alongside this report.
+2.50 GHz), Rust 1.96.1, release optimization, two Tokio worker threads.
+Baseline: `1e38abf` with this benchmark harness and nanosecond commit telemetry
+added, before persistent maps or changed-branch diffing. Both versions use
+identical workloads and instrumentation. Raw measurements are alongside this
+report.
 
 Raw data: [before](verb-commit-before.csv), [after](verb-commit-after.csv).
 
@@ -113,15 +113,15 @@ production throughput claims.
 
 ### Removing empty fallback maps
 
-The initial structural-sharing implementation eagerly allocated empty maps
-when diffing missing table-scoped records. Handling missing maps directly removes
+The initial structural-sharing implementation eagerly allocated empty maps when
+diffing missing table-scoped records. Handling missing maps directly removes
 about 155 KB allocated per mutation across the measured cases. No collection
 version changed: both implementations use imbl 5.0.0.
 
 The final measurements above include this cleanup, measured on 2026-09-08.
-[Intermediate raw measurements](verb-commit-before-empty-map-cleanup.csv) preserve
-the earlier implementation for comparison. Values below are per logical mutation,
-with zero configured flush interval; KB means 1000 bytes.
+[Intermediate raw measurements](verb-commit-before-empty-map-cleanup.csv)
+preserve the earlier implementation for comparison. Values below are per logical
+mutation, with zero configured flush interval; KB means 1000 bytes.
 
 | Unrelated tables | Group | Allocated KB before cleanup → after | Allocation calls before cleanup → after | Total ms before cleanup → after |
 | ---: | ---: | ---: | ---: | ---: |
