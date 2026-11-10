@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { compatibilityRows, downloadsByVersion, fetchReleases, parseChangelog, parseVersionConstants, renderReleases } from './sync-releases.mjs';
+import { compatibilityRows, downloadsByVersion, fetchReleases, listedReleases, parseChangelog, parseVersionConstants, renderReleases } from './sync-releases.mjs';
 
 const changelog = [
   '# Changelog',
@@ -256,4 +256,18 @@ test('without release assets, DuckDB versions come from the tag manifest', () =>
   assert.equal(rows[0].duckdb, 'v1.5.4, v1.5.5');
   const none = compatibilityRows([{ version: '0.4.0' }], new Map(), () => constants, () => '');
   assert.equal(none[0].duckdb, '—');
+});
+
+test('releases older than the listing floor are left off the page', () => {
+  const entries = ['0.8.1', '0.6.0', '0.5.2', '0.1.1'].map((version) => ({
+    version,
+    date: '2026-01-01',
+    compareUrl: null,
+    body: '',
+  }));
+  const listed = listedReleases(entries);
+  assert.deepEqual(
+    listed.map((e) => e.version),
+    ['0.8.1', '0.6.0'],
+  );
 });

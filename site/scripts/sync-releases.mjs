@@ -141,6 +141,13 @@ export function parseVersionConstants(text) {
 
 const unknown = '—';
 
+// The oldest release the page lists; earlier ones stay in the changelog.
+const oldestListed = '0.6.0';
+
+export function listedReleases(entries) {
+  return entries.filter(({ version }) => compareVersionsDescending(version, oldestListed) <= 0);
+}
+
 function range(low, high) {
   return low === high ? `${low}` : `${low} – ${high}`;
 }
@@ -294,7 +301,7 @@ export async function fetchReleases(fetchImpl = fetch, token = process.env.GITHU
 }
 
 export async function syncReleases({ fetchImpl = fetch, offline = false } = {}) {
-  const entries = parseChangelog(await readFile(changelogPath, 'utf8'));
+  const entries = listedReleases(parseChangelog(await readFile(changelogPath, 'utf8')));
   const downloads = offline ? new Map() : downloadsByVersion(await fetchReleases(fetchImpl));
 
   const compatibility = compatibilityRows(entries, downloads, constantsAtTag, manifestAtTag);
