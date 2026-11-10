@@ -33,7 +33,7 @@ use crate::{
 // The stamp the integration harnesses print, shared by source so every
 // measurement names its conditions the same way.
 #[path = "../../../../tests/it/conditions.rs"]
-mod conditions;
+pub(super) mod conditions;
 
 // This module is compiled only into the library's unit-test executable.
 #[global_allocator]

@@ -93,7 +93,7 @@ scoped launcher role, starts one managed ARM CodeBuild container in the
 bucket's region, runs the ignored `object_storage` suite against AWS S3
 under a unique prefix, and keeps the printed tables as a GitHub artifact.
 No self-hosted runner or long-lived AWS key is involved. What the suite
-measures is in [`BENCHMARK.md`](BENCHMARK.md).
+measures is in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ### One-time AWS setup
 

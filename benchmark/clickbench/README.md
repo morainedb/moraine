@@ -17,8 +17,8 @@ is that moraine lands next to the other DuckDB-family entries rather than
 above or below them, and the interesting number is how little the catalog
 costs on a read path — not a win over ClickHouse.
 
-For the metadata path itself — commit latency, DDL, deletes, cold attach —
-see `cargo xtask bench` and [BENCHMARK.md](../../BENCHMARK.md). That is
+For the metadata path itself — commit latency, DDL, deletes, cold attach — see
+`cargo xtask bench` and [the benchmark page](../../docs/benchmarks.md). That is
 where moraine's differences show up.
 
 ## Running it
@@ -94,7 +94,7 @@ Two choices worth stating, both matching what the other embedded entries do:
 
 - Loading the extension and attaching the lake happen before `.timer on`, so
   a query's reported time is the query's and not the catalog open. The cost
-  of opening a moraine catalog cold is measured in `BENCHMARK.md` instead.
+  of opening a moraine catalog cold is measured in `docs/benchmarks.md` instead.
 - The concurrent-QPS test is skipped. Each query is a fresh CLI process with
   no shared scheduler, so concurrent connections would oversubscribe memory
   rather than measure throughput.

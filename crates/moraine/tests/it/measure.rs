@@ -1,4 +1,4 @@
-//! Measurement harnesses behind the numbers in `BENCHMARK.md`.
+//! Measurement harnesses behind the numbers in `docs/benchmarks.md`.
 //! These are not assertions — they print timings, and are `#[ignore]`d so
 //! the ordinary suite stays fast. Run one explicitly and read its output:
 //!

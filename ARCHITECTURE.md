@@ -176,6 +176,7 @@ architecture.
 | Integration | `crates/moraine/tests/` | The public API against real SlateDB on an in-memory `object_store`. No mocks of the store layer. |
 | E2E | `crates/moraine-duckdb/tests/`, `test/sql`, via `cargo xtask e2e` | Build the extension, load it into real DuckDB, run DuckLake SQL. |
 | Fuzzing | `fuzz/` | Store codecs, the commit read path, and crash recovery. |
+| Measurement | `#[ignore]`d harnesses beside the tests, `cargo xtask bench` and kin | Print stamped numbers rather than assert; [docs/benchmarks.md](docs/benchmarks.md) catalogs them. |
 
 [Crash recovery](docs/rfcs/0008-crash-recovery.md) names every point where
 a process can die during a state-changing operation and what must hold

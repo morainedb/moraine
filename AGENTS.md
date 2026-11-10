@@ -70,6 +70,11 @@ summary; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
   that default.
 - Implementation plans go to `docs/plans/` (not-committed).
 - RFCs are required for: KV key layout, commit protocol, public API shape.
+- `docs/benchmarks.md` is the one catalog of measurement harnesses: each
+  entry names the question, the command, and a headline number stamped
+  with date, commit, and machine. A performance PR that moves a headline
+  number updates its stamp there; the investigation narrative goes in the
+  PR description, never into `docs/`.
 
 ## The local gate
 
