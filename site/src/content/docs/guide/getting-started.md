@@ -8,17 +8,16 @@ sidebar:
 ## Install the extension
 
 Moraine is not yet in DuckDB's community extension repository, so it loads
-unsigned. Download `moraine.<platform>.duckdb_extension` from the latest
-`ext-v*` entry on the
-[releases page](https://github.com/morainedb/moraine/releases), start
-DuckDB with `-unsigned`, and load it:
+unsigned. Download `moraine.<duckdb-version>.<platform>.duckdb_extension`
+for your DuckDB version from the [Releases](/releases/) page, start DuckDB
+with `-unsigned`, and load it:
 
 ```sh
 duckdb -unsigned
 ```
 
 ```sql
-LOAD 'path/to/moraine.osx_arm64.duckdb_extension';
+LOAD 'path/to/moraine.v2.0.0.osx_arm64.duckdb_extension';
 INSTALL ducklake;
 ```
 
