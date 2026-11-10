@@ -1,9 +1,10 @@
 # moraine-duckdb
 
-The DuckDB extension surface for [moraine](../moraine). Two layers:
+The DuckDB extension surface for [Moraine](../moraine). Two layers:
 `cpp/` (a C++ shim linking DuckDB's internal C++ API) and `src/` (the Rust
-C-ABI core, sync↔async bridge). The shim carries no DuckLake domain logic —
-see the crate root docs and RFC 0006.
+C-ABI core, sync↔async bridge). The shim carries no DuckLake domain logic;
+see the crate root docs and the
+[extension surface design document](../../docs/rfcs/0006-extension-surface.md).
 
 The extension registers a `duckdb::StorageExtension` under attach type
 `moraine`, reachable two ways:
@@ -29,306 +30,18 @@ DDL issued directly against a user schema/table (outside DuckLake's own
 `ducklake_*` writes), plus querying a view's definition, raises
 `NotImplementedException`.
 
-## Attach modes: one writer, many readers
+## Using the extension
 
-**Exactly one process may attach a given store read-write.** Every other
-process must pass `READ_ONLY`. SlateDB fences by *newest writer wins*, so a
-second read-write attach does not fail — it takes the writer role from the
-incumbent, whose next commit then raises the `FENCED` error telling it to
-re-attach. Two processes attaching read-write take turns breaking each
-other, and neither is told at attach time.
+Attach options, table functions, caching, the write-ahead log, read-only
+attaches, indexes, maintenance, encryption, backups, and upgrades are
+documented on the project site:
 
-```sql
--- The one writer.
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+- [Getting started](https://morainedb.github.io/guide/getting-started/)
+- [Configuration](https://morainedb.github.io/guide/configuration/)
+- [Operating manual](https://morainedb.github.io/guide/operating/)
 
--- Every other process.
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY);
-```
-
-A read-only attach opens SlateDB's `DbReader`, never the writer `Db`: it
-never fences anyone, never participates in fencing, and any number may run
-alongside the writer. DuckDB resolves `READ_ONLY` into the access mode this
-shim reads, and DuckLake forwards it into the nested metadata attach.
-
-`READ_ONLY` is read-only at the **catalog** level, not the IAM level. A
-follow-latest reader writes a checkpoint into the manifest on open and
-refreshes it for the attach's lifetime, so reader credentials still need
-manifest write access. For strictly read-only credentials, see
-`CHECKPOINT` below.
-
-**`CHECKPOINT` — a truly-zero-write read-only attach.** Given the id of a
-SlateDB checkpoint created ahead of time, moraine opens the reader against
-that checkpoint instead of establishing its own: no manifest CAS, no
-refresh, no delete on close — the attach issues object-store reads and
-nothing else.
-
-```sql
--- On the writer, once: mint a checkpoint and note its id.
-SELECT checkpoint_id FROM moraine_create_checkpoint('lake');
-
--- Thereafter, from a process holding only s3:GetObject/ListBucket:
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY,
-   META_CHECKPOINT '4a1f…');
-```
-
-The cost is that the attach reads a **fixed cut**: it never sees commits
-made after the checkpoint, because seeing them is exactly what the manifest
-poll it is forgoing would do. Refreshing means minting a new checkpoint and
-re-attaching. `CHECKPOINT` requires `READ_ONLY` — a read-write attach
-naming one is refused — and a checkpoint the manifest no longer carries
-fails the attach rather than silently falling back to latest.
-
-`moraine_create_checkpoint` names an **attached catalog** rather than a
-store path, because the core mints through the writer that attach already
-opened and a second read-write open would fence it. The other two name a
-store path, and neither opens the writer, so both run against a live
-catalog: `moraine_checkpoints('<store>')` lists what the manifest carries, with the
-`manifest_id` each one pins and its `created_at`/`expires_at` — which is
-how a checkpoint whose id was lost is found, and how a reader's refreshed
-lease is told from one given no lifetime, which pins its objects until
-deleted — and
-`moraine_delete_checkpoint('<store>', '<id>')` releases one.
-
-**`READER_POLL_INTERVAL_MS` — how fresh a read-only attach is, and what
-that costs.** A follow-latest reader polls object storage for what the
-writer has committed since it last looked, every 10 seconds by default,
-and serves its cached view for exactly that long. Each poll is a billed
-request or two, so an attach left open all day is a small standing cost
-whether or not anything queries it. Lengthen the interval for a dashboard
-that tolerates minute-old numbers:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY,
-   META_READER_POLL_INTERVAL_MS 60000);
-```
-
-`CHECKPOINT` is the zero end of the same trade: no poll at all, and a
-fixed cut. The interval is ignored with one, and on a read-write attach
-without a commit log, which reads its own writes.
-
-On a committer — a read-write attach that *does* have a commit log — the
-interval buys no freshness at all: every query refreshes. It sets how
-often the reader polls to keep its checkpoint alive, so longer is simply
-cheaper, within SlateDB's checkpoint lifetime.
-
-**Temporary S3 credentials.** Use a DuckDB `credential_chain` secret with
-`REFRESH 'auto'` for long-lived attaches. Moraine refreshes credentials through
-that provider before their reported expiry; when no expiry is reported, it
-refreshes every minute. Refresh failures surface as store errors. Explicit
-temporary keys without a refresh provider, or changes to the secret's region,
-endpoint, or provider recipe, require detach/reattach.
-
-**Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
-attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
-…) read-only by default, and a read-only attach cannot create a catalog. To
-create or write a lake whose moraine catalog lives on S3, add `READ_WRITE`:
-
-```sql
-CREATE SECRET s (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2');
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
-```
-
-Local and `memory://` stores default to read-write and need no flag. A
-read-only attach of an uninitialized store fails with an error that names this
-fix.
-
-**`FLUSH_INTERVAL_MS` and `FLUSH_ON_COMMIT` — what a commit waits for.** A
-commit is durable once its batch reaches object storage, and by default the
-store's flush timer is what carries it there. Commit latency is therefore up
-to one whole interval (100 ms unset), and the interval is also what batches
-concurrent commits into a single PUT. `META_FLUSH_INTERVAL_MS <n>` shortens
-the wait at the cost of more frequent PUTs:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE, META_FLUSH_INTERVAL_MS 5);
-```
-
-`META_FLUSH_ON_COMMIT true` takes the timer out of the commit path instead:
-each commit forces the write-ahead log out itself and waits only on that PUT,
-whatever the interval is. It trades one PUT per commit for a latency that no
-longer includes waiting, so it suits a low commit rate — a lake written in
-occasional batches — and works against a high one, where the interval is
-exactly what merges many commits into one request:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE, META_FLUSH_ON_COMMIT true);
-```
-
-Off by default. The two compose: the interval still bounds how long an
-*uncommitted* write sits in memory, and a commit no longer waits for it.
-
-**`WAL_PATH` — the write-ahead log on a faster bucket.** Whatever the two
-options above settle, a commit still waits on one PUT of the write-ahead
-log — so the log is the one object worth putting on faster storage than the
-rest of the catalog. `META_WAL_PATH` writes it to a store of its own, an S3
-Express One Zone directory bucket beside the standard bucket holding
-everything else:
-
-```sql
-CREATE SECRET wal (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2',
-                   SCOPE 's3://lake-wal--usw2-az1--x-s3');
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
-   META_WAL_PATH 's3://lake-wal--usw2-az1--x-s3');
-```
-
-The log store resolves its own `s3` secret — a directory bucket is a
-different endpoint, and usually a different secret — and a bucket named with
-the suffix AWS reserves for directory buckets (`--x-s3`, `--xa-s3`) is
-addressed as S3 Express with no option asked for: the name is what says so.
-A local directory or `memory://` works here too, as it does for the catalog;
-the log store must be as durable as the catalog store, since a commit no
-sorted-string table holds yet lives only there.
-
-Where a lake's log lives is recorded in the lake, so **every later attach
-names the same store**, readers included; one that names a different store,
-or none, is refused with a message naming the one the lake records (which is
-also how to find out what it is). Move it with `moraine_move_wal`, which
-takes a store path and must run with the lake attached nowhere:
-
-```sql
-SELECT from_wal_path, to_wal_path, moved
-FROM moraine_move_wal('s3://bucket/prefix',
-                      wal_path => 's3://lake-wal--usw2-az1--x-s3');
-```
-
-It drains the log where it stands before recording the new store, so nothing
-in flight is lost; `from_wal_path => '…'` names the log store as it stands
-when the lake already has one, and `wal_path => NULL` moves the log back
-into the catalog store.
-
-
-**`COMMIT_LOG_TAIL` and `COMMIT_LOG_POLL_INTERVAL_MS` — reading a commit
-log.** When the process has a commit-log provider registered, every commit
-is a slot in a log beside the catalog. A read-write attach is a committer:
-it commits from anywhere, and folding those slots into the store — so the
-log can be truncated and a reader following the folded store stays current
-— is something every committer does on a cadence. Whichever one lands the
-nth slot folds it: no process is the folder, none is configured to be, and
-nothing has to be running for a lake to stay folded. The cadence reaches
-the library API only. A read-only attach is a reader and never commits.
-
-`COMMIT_LOG_TAIL true` makes a read-only attach tail the log and see a commit once its slot
-lands rather than once a folder has folded it, at a listing per
-`READER_POLL_INTERVAL_MS`. A committer does not poll the log at all: every query refreshes its
-reader first and is served what that refresh found, so another attach's
-commits are visible to the next query rather than a tick later, and an
-attach nobody queries makes no request. `COMMIT_LOG_POLL_INTERVAL_MS`
-only paces the refreshes a commit makes while waiting to see its own
-slot, and `READER_POLL_INTERVAL_MS` on a committer keeps the reader's
-checkpoint alive rather than its view fresh. All three are ignored
-without a registered provider, and the tail length `'holding'` acts on
-reaches the library API only.
-
-**`CACHE_DIR` — on-disk object cache for S3 catalogs.** Each query reads the
-catalog metadata from the store; on S3 that is network latency every time, and
-the in-memory caches start empty in each new process. Point SlateDB's disk
-cache of fetched object parts at a local directory so warm reads survive
-restarts and repeat queries skip the GETs — `META_CACHE_DIR` through the
-DuckLake attach (or `CACHE_DIR` directly on a standalone `moraine:` attach):
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE, META_CACHE_DIR '/var/cache/moraine');
-```
-
-Unset, only the in-memory caches apply; redundant for local/`memory://` stores.
-Those are a separate tier — a block cache and a metadata cache, in memory, per
-attached store — and moraine leaves both at SlateDB's sizes.
-
-**`CACHE_SIZE` — how much disk that object cache may take.** Set the cap
-explicitly — a byte count — and size the volume for the number of stores
-attached, since the cap is per store rather than per directory:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
-   META_CACHE_DIR '/var/cache/moraine', META_CACHE_SIZE 2147483648);
-```
-
-Unset, SlateDB's 16 GiB cap stands; without a `META_CACHE_DIR` there is no
-object cache to bound.
-
-**`CACHE_PUTS` — fill the cache as you write as well as you read.** On by
-default: an object the store writes is admitted to the cache at write time,
-so it is not fetched back from S3 the first time it is read, and because
-store objects are immutable and land atomically, read-only sessions sharing
-the same `META_CACHE_DIR` on that host read what the writer cached.
-Compaction output is admitted the same way under `META_CACHE_COMPACTION_PUTS`.
-Turn either off when a large merge evicts what reads had warmed:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
-   META_CACHE_DIR '/var/cache/moraine', META_CACHE_COMPACTION_PUTS false);
-```
-
-**`CACHE_PRELOAD` — warm the cache during ATTACH, not during the first query.**
-Both of the above still leave a fresh process cold. `META_CACHE_PRELOAD 'l0'`
-(the default) loads each subspace's SST metadata before the attach returns,
-`'all'` also the scan-shaped subspaces whole, `'none'` (or `'off'`) nothing:
-
-```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
-   META_CACHE_DIR '/var/cache/moraine', META_CACHE_PRELOAD 'all');
-```
-
-The wait is the attach's: the load runs inside the open and skips anything it
-cannot fetch. It is bounded by `META_CACHE_SIZE`, and it **stops** at the first
-object that would exceed the cap rather than skipping that one and continuing —
-so a cap smaller than the store leaves the tail of it unloaded. moraine logs a
-warning at attach when that is the case. `'all'` pays a slower ATTACH for a
-first query that touches S3 not at all, and is worth it when the whole store
-fits the cache — check with `moraine_store_census`.
-
-## Indexes
-
-Create indexes with ordinary SQL on a Moraine-backed DuckLake table:
-
-```sql
-CREATE UNIQUE INDEX by_id ON lake.main.users(id);
-CREATE INDEX IF NOT EXISTS by_region ON lake.main.users(region)
-    WITH (staged = true, step_entries = 100000);
-SELECT * FROM lake.main.users WHERE id IN (12, 34);
-DROP INDEX IF EXISTS lake.main.by_region;
-```
-
-Index DDL requires autocommit and a writable attach. Index names are
-case-insensitively unique within a schema. The `staged`, `step_entries`,
-`step_bytes`, `maintenance`, `directions`, and `nulls` options use the existing
-build engine; repeating an interrupted staged create without `IF NOT EXISTS` resumes it.
-Expression indexes and table-level key constraints are unsupported.
-Qualify DROP targets as `catalog.schema.index` when using multiple schemas or
-catalogs; unqualified Moraine index names use the current default schema.
-For tables containing Parquet files, configure `META_DATA_PATH` to match
-`DATA_PATH` on the initial attach; Moraine records that root for later builds
-and index maintenance.
-
-Ordinary predicates choose eligible indexes automatically. `moraine_indexes`
-lists them; `moraine_index_verify` checks their contents and certifies a clean
-index for optimizations such as scan-free DELETE. Verification is not required
-for ordinary indexed queries. Introspection and lookup functions remain
-available. Explicit ordering uses
-`WITH (directions = '[desc, asc]', nulls = '[first, last]')`, with one entry per
-column. DuckDB currently discards the standard per-column sort clauses.
-
-The `moraine_index_create` and `moraine_index_drop` SQL functions have been
-removed; use native DDL instead. The Rust API remains available, including
-table-qualified lookup/drop for repairing legacy catalogs with duplicate
-index names within a schema.
-
-Rebuild currently uses drop followed by create, then a fresh verification pass
-when certification is wanted. During that gap, the index provides neither query
-acceleration nor uniqueness enforcement. Online replacement is not implemented.
+The site is the reference for user-facing behaviour; this file covers how
+the crate is built and how it serves DuckLake.
 
 ## How it is built
 
@@ -433,37 +146,24 @@ versions by DuckDB-series branch (`v1.3-ossivalis`, `v1.4-andium`,
 
 ## Installing
 
-```sql
-INSTALL moraine FROM community;
-LOAD moraine;
-```
-
-That path verifies a signature and needs no flags. **Signing is DuckDB's,
-not moraine's**: the public keys `ExtensionHelper::GetPublicKeys` trusts are
-compiled into every DuckDB binary, so no third party can produce a
-signature the stock CLI accepts. `extension-upload-single.sh` fills the
-footer's 256-byte signature region with zeros unless it holds one of those
-private keys, which is why every artifact moraine's own release workflow
-publishes is unsigned, and why the e2e harness starts the CLI with
-`-unsigned`. The community-extensions pipeline is the only route to a
-signed build, and `description.yml` is what points it at this repo.
-
-To load a release asset or a locally built artifact directly, start the CLI
-with `-unsigned` — the setting cannot be changed on a running database:
+Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
+and are unsigned. Pick the one matching your DuckDB version exactly; a
+mismatch is refused even when unsigned, because a C++-ABI extension is bound
+to the version string in its footer. Start the CLI with `-unsigned` (the
+setting cannot be changed on a running database) and load the file:
 
 ```sh
-duckdb -unsigned -c "LOAD './build/release/extension/moraine/moraine.duckdb_extension';"
+duckdb -unsigned -c "LOAD './moraine.v2.0.0.osx_arm64.duckdb_extension';"
 ```
 
-Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
-(`moraine.v1.5.5.linux_amd64.duckdb_extension`, from the last published
-release). Pick the one matching your DuckDB *exactly*: a mismatch is
-rejected even when unsigned, because a
-C++-ABI extension is bound to the version string in its footer. The
-loadable's base filename (`moraine`) is load-bearing too — DuckDB derives
-the entry symbol (`moraine_duckdb_cpp_init`, defined in
-`cpp/moraine_extension.cpp`) from the filename before the first `.` — so
-rename an asset to `moraine.duckdb_extension` before loading it.
+DuckDB derives the entry symbol from the filename before its first `.`, so
+the `moraine` prefix must stay.
+
+Signing is DuckDB's: the public keys `ExtensionHelper::GetPublicKeys` trusts
+are compiled into every DuckDB binary, so only the community-extensions
+pipeline produces a signed build. `description.yml` points that pipeline at
+this repository. Once published there, `INSTALL moraine FROM community;
+LOAD moraine;` needs no flag.
 
 ## Obtaining a CLI for testing
 
@@ -476,14 +176,14 @@ agree. `cargo xtask e2e` passes it to every suite as
 
 ## The bundled DuckLake
 
-moraine does not require a separate DuckLake extension: the loadable links
-the patched DuckLake from [`patches/ducklake/`](../../patches/ducklake/README.md)
-and registers it from its own entry point, so `LOAD moraine` is the whole
-setup. The bundle is recorded as the loaded `ducklake` extension, so a
-later `LOAD ducklake` is a no-op and `duckdb_extensions()` reports its
-source revision:
+Moraine does not require a separate DuckLake extension: the loadable links the
+patched DuckLake from [`patches/ducklake/`](../../patches/ducklake/README.md)
+and registers it from its own entry point, so `LOAD moraine` is the whole setup.
+The bundle is recorded as the loaded `ducklake` extension, so a later
+`LOAD ducklake` is a no-op and `duckdb_extensions()` reports its source
+revision:
 
-```
+```text
 $ duckdb -unsigned \
     -c "LOAD './build/release/extension/moraine/moraine.duckdb_extension';" \
     -c "SELECT extension_name, loaded, extension_version \
@@ -500,14 +200,14 @@ Loading stock DuckLake *before* moraine is refused: it lacks the patches
 moraine's located functions rely on, and its log type would collide with
 the bundle's.
 
-The bundled source is the DuckLake commit the pinned DuckDB's own
-build-time pin selects (`.github/config/extensions/ducklake.cmake` in the
-`duckdb/duckdb` source tree names `GIT_URL
-https://github.com/duckdb/ducklake` at `GIT_TAG
-417a9117f590e8141742ac0579d02f6a90162e37`), so the bundle tracks exactly
-what `INSTALL ducklake` would install against this DuckDB: that commit,
-then DuckDB's own DuckLake patches, then the series on top. `patches/ducklake/source-pins` records that commit per
-supported DuckDB release; `cargo xtask check-pins` keeps it in step.
+The bundled source is the DuckLake commit the pinned DuckDB's own build-time pin
+selects (`.github/config/extensions/ducklake.cmake` in the `duckdb/duckdb`
+source tree names `GIT_URL https://github.com/duckdb/ducklake` at
+`GIT_TAG 417a9117f590e8141742ac0579d02f6a90162e37`), so the bundle tracks
+exactly what `INSTALL ducklake` would install against this DuckDB: that commit,
+then DuckDB's own DuckLake patches, then the series on top.
+`patches/ducklake/source-pins` records that commit per supported DuckDB release;
+`cargo xtask check-pins` keeps it in step.
 
 The patch series records file-level row-id min/max statistics, pushes
 static and dynamic `rowid` filters into DuckLake's file-list query, exposes
@@ -665,8 +365,8 @@ exists-probe (`SELECT NULL FROM ducklake_metadata LIMIT 1`) succeeds:
 
 | Key | Served value | Why |
 |---|---|---|
-| `version` | `"1.0"` | compared against `"1.0"` exactly; anything else triggers migration logic (`MigrateV01`/`V02`/...) never wired up — the schema served is already 1.0-shaped |
-| `encrypted` | `"false"` | read unconditionally, sets `DuckLakeEncryption`; moraine has no encryption support |
+| `version` | the recorded catalog version, `"1.0"` or `"1.1"` | chooses the `ducklake_*` shape served; raised with `moraine_raise_catalog_version` |
+| `encrypted` | the value recorded at creation | set from `ENCRYPTED`; DuckLake generates per-file keys and Moraine stores them |
 | `created_by` | `"moraine"` | never read back by DuckLake's own init path; served anyway since DuckLake itself writes it at bootstrap and it costs nothing |
 | `data_path` | the recorded root, or **not served** | Recorded once from `META_DATA_PATH` (at bootstrap, or on the first attach of a lake that predates it) and served back normalized with a trailing separator, so `LoadExistingDuckLake` reads it and a re-attach need not repeat `DATA_PATH`; a lake with none recorded omits the row, leaving the ATTACH `DATA_PATH` as the authority. The recorded value is fixed — a conflicting `META_DATA_PATH` is refused |
 
@@ -701,19 +401,18 @@ of it. A scan that projects no user column — the flush's own `DELETE`, a
 physical rowids against a per-statement ledger of what that plan's scan
 emitted, which carries row ids and begin snapshots and no payload.
 
-One property of the delete family is worth stating because it is easy to
-get wrong: it exists from the table's first inlined deletion until the
-table is dropped, and **emptying it does not remove it**.
-`ducklake_flush_inlined_data` writes those deletions out as a real delete
-file and then clears the table with an unqualified `DELETE`; DuckLake
-caches the table's existence for the life of the catalog and never
-re-probes, so anything it runs afterwards in the same session still binds
-against it. Existence is therefore recorded in the store
-(`inline/file_delete_table`) rather than derived from whether any
-deletion is currently held. What removes it is the `DROP TABLE` the
-expiry cleanup issues once the table has left live state and history,
-which takes marker and deletions together. See `docs/rfcs/0004-data-inlining.md`'s "Extension surface
-(as implemented)" for the exact operation → keyspace mapping.
+One property of the delete family is worth stating because it is easy to get
+wrong: it exists from the table's first inlined deletion until the table is
+dropped, and **emptying it does not remove it**. `ducklake_flush_inlined_data`
+writes those deletions out as a real delete file and then clears the table with
+an unqualified `DELETE`; DuckLake caches the table's existence for the life of
+the catalog and never re-probes, so anything it runs afterwards in the same
+session still binds against it. Existence is therefore recorded in the store
+(`inline/file_delete_table`) rather than derived from whether any deletion is
+currently held. What removes it is the `DROP TABLE` the expiry cleanup issues
+once the table has left live state and history, which takes marker and deletions
+together. See `docs/rfcs/0004-data-inlining.md`'s "Extension surface (as
+implemented)" for the exact operation → keyspace mapping.
 
 Chunk bodies (`inline/schema`, `inline/insert`) are Arrow IPC. DuckDB's C++
 has no IPC serializer, so the work splits along the Arrow C Data

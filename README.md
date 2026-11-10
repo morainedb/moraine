@@ -1,91 +1,92 @@
-# moraine
+# Moraine
 
 [![CI](https://github.com/morainedb/moraine/actions/workflows/ci.yml/badge.svg)](https://github.com/morainedb/moraine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![crates.io](https://img.shields.io/crates/v/moraine.svg)](https://crates.io/crates/moraine)
 [![docs.rs](https://docs.rs/moraine/badge.svg)](https://docs.rs/moraine)
 
-Moraine brings a [SlateDB](https://slatedb.io) backend to
-[DuckLake](https://ducklake.select): a DuckLake catalog implemented on a
-transactional KV store over object storage, instead of the usual relational
-catalog database. Guides and design documents live on the project site:
+Run a DuckLake data warehouse entirely in object storage. Documentation:
 <https://morainedb.github.io/>.
 
-> **Status: pre-1.0, under active development.** The catalog core and
-> DuckDB extension work end to end: DuckLake SQL, including `CREATE`,
-> `INSERT`, `UPDATE`, `DELETE`, time travel, and maintenance, runs against
-> moraine as its catalog and is validated against real DuckDB in CI.
-> Released on crates.io; APIs may still change before 1.0.
-
-## Why
-
-DuckLake keeps table data in object storage but stores its catalog, the
-transactional source of truth, in a SQL database: a DuckDB file locally,
-Postgres or MySQL for concurrent access. That catalog is the one stateful
-server left in an otherwise serverless lakehouse: something to provision,
-back up, fail over, and pay for while idle.
-
-Moraine replaces it with [SlateDB](https://slatedb.io), a transactional KV
-store whose state lives in object storage, so the catalog sits in the
-bucket next to the Parquet files. There is no catalog server to deploy,
-back up, or pay for while idle. The catalog is as durable as the bucket,
-and copying the bucket copies data and catalog together. The core is a
-plain Rust library, so any tokio host can read and commit against the
-catalog without DuckDB in the path.
-
-The cost is commit latency. A commit is durable once one object-store PUT
-lands: 5 to 10 ms on S3 Express One Zone, 50 to 100 ms on S3 Standard.
-Workloads that write Parquet for seconds before committing will not notice,
-and small inserts use DuckLake's data inlining to avoid a Parquet file per
-commit. Workloads that need sub-millisecond commits want a server with
-local state, and moraine does not compete there.
-
-## One writer, many readers
-
-Exactly one process may attach a moraine lake read-write. Every other
-process must attach `READ_ONLY`. Readers are uncoordinated and unbounded in
-number, and never disturb the writer. SlateDB's writer fencing gives the
-writer role to the newest writer, so a second process attaching read-write
-fences the first instead of failing, and two of them take turns fencing
-each other's committer.
-
 ```sql
--- The one writer.
-ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
-       (DATA_PATH 's3://bucket/lake-data/', READ_WRITE);
--- Everyone else.
-ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
-       (DATA_PATH 's3://bucket/lake-data/', READ_ONLY);
+-- duckdb -unsigned, then LOAD the extension; see Getting started.
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/',
+   -- Moraine records the data root in the catalog; same value as DATA_PATH.
+   META_DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+
+CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
+INSERT INTO lake.events VALUES (1, 'hello, bucket');
 ```
 
-A fenced writer writes nothing and corrupts nothing, so safety is never at
-risk. Availability is, so this is a real limitation next to the
-multi-client SQL catalogs DuckLake otherwise uses: a fleet of independent
-DuckDB processes writing one lake is not a topology moraine supports on its
-own. A deployment that needs commit concurrency funnels its commits through
-one long-lived writer process. Concurrent commits inside that process share
-a flush, so the funnel is not the throughput ceiling it looks like.
+[DuckLake](https://ducklake.select) stores table data as Parquet files in object
+storage and keeps its catalog and inlined rows in a SQL database: a DuckDB or
+SQLite file for one process; Postgres, or DuckDB served over
+[Quack](https://duckdb.org/quack/), its new client-server protocol, for
+several. Moraine is a DuckLake catalog backend that replaces the catalog
+database with [SlateDB](https://slatedb.io), a transactional key-value store
+whose state also lives in object storage. The catalog sits in the bucket beside
+the data files, and DuckLake's SQL runs against it unchanged.
 
-`READ_ONLY` is read-only at the catalog level, not the IAM level. A reader
-that follows the latest state writes a checkpoint into the manifest and
-refreshes it while it lives, so its credentials still need write access. A
-deployment whose readers hold strictly read-only credentials pins them to a
-checkpoint taken ahead of time with `CHECKPOINT`, which writes nothing and
-reads the fixed cut that checkpoint named. See
-[`crates/moraine-duckdb/README.md`](crates/moraine-duckdb/README.md) for
-the attach surface.
+## What you get
 
-## Architecture
+- **No catalog server.** Nothing to deploy, monitor, or back up. A deployment
+  is a storage bucket.
+- **Durability of the bucket.** A copy of the bucket taken while no writer is
+  attached is a complete lake; see
+  [Backups and copies](https://morainedb.github.io/guide/operating/#backups-and-copies).
+- **Nothing to pay for while idle.** An idle lake costs only storage, no
+  compute or database hosting fees.
+- **Indexed lookups.** Ordered indexes over table columns, maintained in the
+  same commit as the rows, so a query by key probes the index instead of
+  scanning every file; see
+  [Index a column](https://morainedb.github.io/guide/getting-started/#index-a-column).
 
-- `crates/moraine` is the core library: DuckLake catalog semantics
-  (snapshots, schemas, tables, transactional commits) mapped onto SlateDB's
-  KV model. Pure Rust, embeddable in any tokio host.
-- `crates/moraine-duckdb` is a DuckDB extension wrapping the core, so
-  DuckLake can use moraine as its catalog backend.
+## When not to use this
 
-How the pieces fit is in [`ARCHITECTURE.md`](ARCHITECTURE.md). Design
-decisions are recorded in [`docs/rfcs/`](docs/rfcs/README.md). The
-[roadmap](ROADMAP.md) tracks each feature.
+- **Commits under about 5 ms.** A commit is durable once one write-ahead-log
+  PUT lands: 50 to 100 ms on S3 Standard, 5 to 10 ms with the log on S3
+  Express One Zone via
+  [`WAL_PATH`](https://morainedb.github.io/guide/configuration/#the-write-ahead-log-on-a-faster-bucket).
+- **Many independent writers.** One process writes; the rest attach
+  `READ_ONLY`. Concurrent commits go through that one writer. See
+  [One writer, many readers](https://morainedb.github.io/guide/getting-started/#one-writer-many-readers).
+- **Engines other than DuckDB.** The catalog is read through the DuckDB
+  extension or the Rust crate, not by other DuckLake clients.
+- **A signed extension.** Not yet in DuckDB's community repository: it loads
+  with `-unsigned`, one build per DuckDB version.
+
+## Status
+
+Moraine is under active development and in production use at
+[contour.app](https://contour.app). DuckLake SQL, including `CREATE`,
+`INSERT`, `UPDATE`, `DELETE`, time travel, and maintenance, runs against
+Moraine as its catalog and is validated against real DuckDB in CI. The
+[roadmap](ROADMAP.md) lists
+what is done and what is next.
+
+## More details
+
+- [Getting started](https://morainedb.github.io/guide/getting-started/) installs
+  the extension and attaches a lake.
+- [Configuration](https://morainedb.github.io/guide/configuration/) lists every
+  attach option and function.
+- [Operating manual](https://morainedb.github.io/guide/operating/) covers
+  retention, maintenance, encryption, backups, and upgrades.
+- [Architecture](https://morainedb.github.io/guide/architecture/) explains how
+  the catalog is laid out and how commits and reads work; the
+  [design documents](https://morainedb.github.io/rfcs/) specify each decision.
+- [Releases](https://morainedb.github.io/releases/) has the changelog and
+  extension downloads.
+
+## In this repository
+
+- `crates/moraine` is the core library: DuckLake catalog semantics mapped onto
+  SlateDB's key-value model. Pure Rust, embeddable in any tokio host.
+- `crates/moraine-duckdb` is the DuckDB extension wrapping the core.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) is the map of the code;
+  [`docs/rfcs/`](docs/rfcs/README.md) holds the design documents;
+  [`CONTRIBUTING.md`](CONTRIBUTING.md) covers setup and the local gate.
 
 ## Versioning
 

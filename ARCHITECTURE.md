@@ -1,29 +1,21 @@
 # Architecture
 
-This is the map of moraine: what the pieces are, how they fit, and where
-each decision is specified. Every design decision has a document in
-[`docs/rfcs/`](docs/rfcs/README.md), linked inline. For what moraine is,
-start with the [README](README.md); for where it is going, the
-[ROADMAP](ROADMAP.md); for how to work in it, [CONTRIBUTING.md](CONTRIBUTING.md).
+This is the map of Moraine: what the pieces are, how they fit, and where each
+decision is specified. Every design decision has a document in
+[`docs/rfcs/`](docs/rfcs/README.md), linked inline. For what Moraine is, start
+with the [README](README.md); for where it is going, the [ROADMAP](ROADMAP.md);
+for how to work in it, [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Status: pre-1.0, under active development. Everything below is implemented
 and exercised end to end through real DuckDB.
 
-## What moraine is
+## What Moraine is
 
-DuckLake keeps table data in object storage and its catalog, the
-transactional source of truth, in a SQL database. Moraine replaces that
-database with [SlateDB](https://slatedb.io), a transactional KV store whose
-state lives in object storage, so the catalog sits in the bucket next to
-the Parquet files.
+Moraine is a DuckLake catalog backend on SlateDB; the
+[site's architecture page](https://morainedb.github.io/guide/architecture/)
+explains it for users. This file maps the code.
 
-Moraine is DuckLake's catalog backend. It occupies the slot a Postgres,
-SQLite, or DuckDB catalog database occupies and implements DuckLake's
-contract rather than its own semantics.
-
-## The stack
-
-```
+```text
 DuckDB engine
   └─ ducklake extension        planner, transactions, query execution
        └─ moraine extension    DuckDB StorageExtension, a thin C++ shim
@@ -109,7 +101,6 @@ reverse. It is the [storage format](docs/rfcs/0001-storage-format.md).
   ranges. Values are protobuf behind a magic-plus-version framing header.
 - A format version in `system` gates key-structure changes. Migration is an
   explicit verb, never automatic on open.
-- Property tests are mandatory for anything that encodes or decodes.
 
 ## Commit protocol
 
@@ -151,7 +142,7 @@ multi-process writers. The single-writer path is complete without it.
   keeps every place that names the version in agreement.
 - Interception is at the catalog, table-scan, and DML layer, never by
   parsing SQL. DuckDB's executor plans DuckLake's statements and calls
-  moraine per table. Rows cross the ABI as row structs.
+  Moraine per table. Rows cross the ABI as row structs.
 - The sync-to-async bridge lives in the Rust ABI layer. It owns a tokio
   runtime per attached catalog and blocks on core futures, so the shim only
   calls synchronous functions. Cancellation polls DuckDB's interrupt flag;
