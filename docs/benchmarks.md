@@ -339,13 +339,15 @@ the GET count is the slope:
 
 | per-GET latency | churned (38 SSTs) | merged (14 SSTs) |
 |---|---|---|
-| 0 ms | 8.5 ms | 7.0 ms |
-| 10 ms | 234.8 ms | 244.5 ms |
-| slope (GETs) | 22.6 | 23.7 |
+| 0 ms | 6.5 ms | 8.0 ms |
+| 10 ms | 202.2 ms | 212.2 ms |
+| slope (GETs) | 19.6 | 20.4 |
 
-At 10 ms per GET the attach costs 28× its in-memory time. The merge cut
-SSTs by 63% and did not reduce GETs, matching the S3 run above. In
-2026-08 it cut GETs from 14.5 to 12.3.
+At 10 ms per GET the attach costs 31× its in-memory time. The merge cut
+SSTs by 63% and did not reduce GETs, matching the S3 run above. 2026-11-10
+at `9b37989`, where a reader no longer writes a checkpoint of its own on
+open; at `8146cbf` the slopes were 22.6 and 23.7. In 2026-08 the merge cut
+GETs from 14.5 to 12.3.
 
 `measure_attach_cost_by_index_size` grows only the `index` subspace:
 
@@ -390,30 +392,37 @@ flat 17,344 bytes at any commit count, and snapshot records are back to
 
 ### Warm reads
 
-`measure_warm_read_attribution`, 2,000 reads per thread over 50 tables:
+`measure_warm_read_attribution`, 2,000 reads per thread over 50 tables,
+2026-11-10 at `9b37989`, where a read-only transaction pins the writer's
+publication instead of listing the manifest:
 
 | threads | read-write | read-only | held view, no check |
 |---|---|---|---|
-| 1 | 11.2 µs | 90 µs | 0.36 µs |
-| 8 | 26.1 µs | 1,056 µs | 4.2 µs |
-| 24 | 73.0 µs | 2,926 µs | 9.7 µs |
+| 1 | 12.2 µs | 35 µs | 0.41 µs |
+| 8 | 29.6 µs | 229 µs | 4.1 µs |
+| 24 | 87.0 µs | 636 µs | 11.1 µs |
 
-A read-write read plateaus near 330,000 reads a second. A read-only read
-serializes near 8,000 a second at any thread count. In 2026-08, before
-the demand-loaded catalog, the figures were 0.12 µs and 6.4 µs. See
-[Open questions](#open-questions).
+A read-write read plateaus near 275,000 reads a second. A read-only read
+plateaus near 37,000 a second from two threads up. At `8146cbf`, where
+every read-only transaction listed the manifest under one lock, it
+serialized near 8,000 a second at any thread count: 90 µs, 1,056 µs, and
+2,926 µs down the same column. In 2026-08, before the demand-loaded
+catalog, the figures were 0.12 µs and 6.4 µs.
 
-`measure_reader_round_trips_under_get_latency`, 20 tables:
+`measure_reader_round_trips_under_get_latency`, 20 tables, 2026-11-10 at
+`9b37989`:
 
 | GET latency | warm read-only read | round trips | cold handle | round trips |
 |---|---|---|---|---|
-| 2 ms | 6.5 ms | 3.3 | 56.7 ms | 28.3 |
-| 20 ms | 43.3 ms | 2.2 | 366.4 ms | 18.3 |
+| 2 ms | 0.04 ms | 0.0 | 47.0 ms | 23.5 |
+| 20 ms | 0.05 ms | 0.0 | 300.4 ms | 15.0 |
 
-A warm read-only read issues about two GETs, because the demand-loaded
-catalog retains no decoded view. In 2026-08 it issued none and a cold
-handle four. For an operator: a read-only statement's metadata costs two
-endpoint round trips.
+A warm read-only read issues no GET: a transaction reuses its handle's
+pinned publication for `READER_POLL_INTERVAL_MS` before listing for a
+newer one. At `8146cbf` it issued about two, the manifest listing every
+transaction paid, and a cold handle 28.3 and 18.3. For an operator: a
+read-only statement's metadata costs no endpoint round trip inside the
+interval and one manifest read at its edge.
 
 ### Worker pool
 
@@ -540,7 +549,6 @@ Found by the 2026-11-10 re-run and not yet explained:
 - A dense index append costs 67 allocations per entry. It cost 13 in
   2026-09 after the shared transactional range read; that sharing no
   longer shows.
-- Read-only warm reads serialize near 8,000 a second across threads.
 - `warm_reads` asserts one shared `Arc` across repeated `materialized()`
   calls, which the demand-loaded catalog no longer guarantees. It fails.
 - `measure_materialization_by_catalog_size`,
