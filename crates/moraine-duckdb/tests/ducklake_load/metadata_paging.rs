@@ -242,7 +242,7 @@ fn staged_snapshot_scans_page_from_the_bound_under_a_small_budget() {
 #[test]
 #[ignore = "a measurement, not an assertion; needs the built DuckDB CLI and packaged Moraine extension"]
 fn measure_staged_conflict_check_by_retained_snapshots() {
-    const REPEATS: usize = 20;
+    const REPEATS: u32 = 20;
     println!("\n# staged conflict check by retained snapshots, 4 KiB of commit info each");
     println!("{:>9} {:>12} {:>8}", "retained", "ms_per_check", "gets");
     for retained in [128_usize, 512, 2048] {
@@ -253,13 +253,13 @@ fn measure_staged_conflict_check_by_retained_snapshots() {
             "SELECT COALESCE((SELECT string_agg(changes_made, ',') FROM m.ducklake_snapshot_changes c \
              WHERE c.snapshot_id > {retained}), '');"
         );
-        let session = |checks: usize| {
+        let session = |checks: u32| {
             let sql = format!(
                 "BEGIN; INSERT INTO m.ducklake_tag (object_id, begin_snapshot, end_snapshot, key, value) \
                  VALUES (1, 1, NULL, 'probe', 'staged'); \
                  SELECT main_gets FROM moraine_object_store_tally('m'); {} \
                  SELECT main_gets FROM moraine_object_store_tally('m'); ROLLBACK;",
-                check.repeat(checks)
+                check.repeat(usize::try_from(checks).unwrap())
             );
             let started = std::time::Instant::now();
             let output = run_session(
@@ -284,7 +284,7 @@ fn measure_staged_conflict_check_by_retained_snapshots() {
         let (baseline, _) = session(0);
         let (with_checks, gets) = session(REPEATS);
         let per_check_ms =
-            with_checks.saturating_sub(baseline).as_secs_f64() * 1000.0 / REPEATS as f64;
+            with_checks.saturating_sub(baseline).as_secs_f64() * 1000.0 / f64::from(REPEATS);
         println!("{retained:>9} {per_check_ms:>12.2} {gets:>8}");
     }
 }
