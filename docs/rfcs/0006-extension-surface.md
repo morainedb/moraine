@@ -135,12 +135,12 @@ incumbent's next store operation fails with `Error::Fenced`, mapped to `FENCED`
 and raised as `IOException`, with a message telling the operator to re-attach.
 The topology is specified in [the commit protocol](0003-commit-protocol.md).
 
-A follow-latest reader writes a checkpoint into the manifest on open and
-refreshes it every `READER_POLL_INTERVAL_MS`, so reader credentials need
-manifest write access. The checkpoint reader is a sub-mode of read-only:
-`CHECKPOINT '<id>'` opens the `DbReader` against a checkpoint minted ahead of
-time, and the attach issues no writes at all. It reads a fixed cut and never
-observes later commits. A checkpoint id on a read-write attach, an id the
+A follow-latest reader pins the checkpoint the writer publishes and issues no
+writes, so read-only credentials suffice. `READER_POLL_INTERVAL_MS` bounds how
+long its transactions keep one publication before looking for a newer one. The
+checkpoint reader is a sub-mode of read-only: `CHECKPOINT '<id>'` opens the
+`DbReader` against a checkpoint minted ahead of time. It reads a fixed cut and
+never observes later commits. A checkpoint id on a read-write attach, an id the
 manifest no longer carries, and a malformed id are each refused.
 
 ## Catalog tables

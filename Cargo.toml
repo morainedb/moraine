@@ -82,6 +82,6 @@ opt-level = 3 # Compiles dependencies with high optimization once
 # metrics traits in `slatedb-common` must be the ones `slatedb` was built
 # against.
 [patch.crates-io]
-# Upstream slatedb 0.18.1 carrying moraine's `DbReader::refresh` and a
-# sequence tracker that tolerates a poisoned manifest; see vendor/slatedb/MORAINE.md.
+# Upstream slatedb 0.18.1 carrying moraine's `DbReader::refresh`; see
+# vendor/slatedb/MORAINE.md.
 slatedb = { path = "vendor/slatedb" }

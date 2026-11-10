@@ -1,26 +1,31 @@
-//! Shares fixed readers across transactions starting at a published revision.
+//! Shares pinned readers across transactions starting at a published revision.
 
 use std::sync::{Arc, Weak};
 
 use object_store::ObjectStore;
-use slatedb::{DbReader, config::CheckpointOptions};
+use slatedb::DbReader;
 use tokio::{sync::Mutex, time::Instant};
 
 use super::{CatalogOptions, reader_session};
 use crate::{
     Error, Result,
     store::{
-        checkpoint::{CheckpointReader, LEASE_LIFETIME, PUBLISHED_NAME},
+        checkpoint::{CheckpointReader, PUBLISHED_NAME, READ_GRACE, remaining_until},
         open::StoreBuilder,
     },
 };
 
 const MAX_READER_GENERATIONS: usize = 8;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Default)]
 struct Readers {
     latest: Option<Arc<CheckpointReader>>,
     generations: Vec<Weak<CheckpointReader>>,
+    /// When the publications were last listed.
+    listed: Option<Instant>,
 }
 
 pub(super) struct ReaderScopes {
@@ -67,21 +72,45 @@ impl ReaderScopes {
         builder.reader_session(session)
     }
 
+    /// The shared reader, when it was listed inside the poll interval and has
+    /// at least half the grace left.
+    fn unexpired(&self, readers: &Readers) -> Option<Arc<CheckpointReader>> {
+        let latest = readers.latest.as_ref()?;
+        if readers.listed?.elapsed() >= self.options.reader_poll_interval {
+            return None;
+        }
+        if latest.remaining()? < READ_GRACE / 2 {
+            return None;
+        }
+        latest.reader().ok()?;
+        Some(latest.clone())
+    }
+
     pub(super) async fn acquire(&self) -> Result<Arc<CheckpointReader>> {
         if let Some(explicit) = &self.explicit {
             return Ok(explicit.clone());
         }
         let mut readers = self.readers.lock().await;
+        if let Some(reader) = self.unexpired(&readers) {
+            return Ok(reader);
+        }
         let admin = Arc::new(self.builder().admin());
         for _ in 0..crate::transaction::commit::MAX_COMMIT_ATTEMPTS {
+            let listed = Instant::now();
             let published = admin.list_checkpoints(Some(PUBLISHED_NAME)).await?
                 .into_iter().max_by_key(|checkpoint| checkpoint.manifest_id)
                 .ok_or_else(|| Error::SnapshotExpired("no published read checkpoint; reopen the writer to publish recovered progress".into()))?;
+            readers.listed = Some(listed);
+            let expires = published
+                .expire_time
+                .map(|expires| remaining_until(expires.timestamp_millis()));
             if let Some(latest) = &readers.latest
                 && latest.manifest == published.manifest_id
-                && latest.reader().is_ok()
             {
-                return Ok(latest.clone());
+                latest.confirm(listed, expires);
+                if latest.reader().is_ok() {
+                    return Ok(latest.clone());
+                }
             }
             let unused_latest = readers
                 .latest
@@ -101,43 +130,27 @@ impl ReaderScopes {
                     "catalog read generation limit ({MAX_READER_GENERATIONS}) reached; finish an older transaction before opening another"
                 )));
             }
-            let created = Instant::now();
-            let lease = match admin
-                .create_detached_checkpoint(&CheckpointOptions {
-                    source: Some(published.id),
-                    lifetime: Some(LEASE_LIFETIME),
-                    ..CheckpointOptions::default()
-                })
-                .await
-            {
-                Ok(lease) => lease,
+            let opened = self
+                .builder()
+                .checkpoint(Some(published.id))
+                .open_reader()
+                .await;
+            let (reader, _) = match opened {
+                Ok(reader) => reader,
                 Err(error) => {
-                    // Retry only a publication that was retired during acquisition.
+                    // Retry only a publication that lapsed during acquisition.
                     if admin
                         .list_checkpoints(Some(PUBLISHED_NAME))
                         .await?
                         .iter()
                         .any(|checkpoint| checkpoint.id == published.id)
                     {
-                        return Err(error.into());
+                        return Err(error);
                     }
                     continue;
                 }
             };
-            let opened = self
-                .builder()
-                .checkpoint(Some(lease.id))
-                .open_reader()
-                .await;
-            let (reader, _) = match opened {
-                Ok(reader) => reader,
-                Err(error) => {
-                    let _ = admin.delete_checkpoint(lease.id).await;
-                    return Err(error);
-                }
-            };
-            let reader =
-                CheckpointReader::leased(reader, published.manifest_id, lease.id, admin, created);
+            let reader = CheckpointReader::pinned(reader, published.manifest_id, listed, expires);
             reader.reader()?;
             readers.latest = Some(reader.clone());
             readers.generations.push(Arc::downgrade(&reader));

@@ -50,8 +50,10 @@ writer has initialized.
 within the bucket. `wal_store: Option<WalStore>` puts the write-ahead log on a
 second object store, paired with the name the catalog records, and every later
 open must name the same store. `checkpoint: Option<String>` pins a read-only
-open to a checkpoint: that reader writes nothing and never sees a later commit.
-`open` refuses it. Other fields tune flushing, caches<!-- site:omit -->, and
+open to a checkpoint: that reader never sees a later commit. `open` refuses it.
+A read-only open without it pins the writer's publications and writes nothing
+either; `reader_poll_interval` bounds how stale it may be. Other fields tune
+flushing, caches<!-- site:omit -->, and
 [the commit-log seam](0011-commit-log-seam.md)<!-- /site:omit -->.
 
 Checkpoint ids are `String`. A writer mints one with

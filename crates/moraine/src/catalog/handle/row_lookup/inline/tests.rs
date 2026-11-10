@@ -345,51 +345,6 @@ async fn full_inline_scan_retries_after_maintenance_removes_selected_rows() {
     reader.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn a_manifest_that_moves_on_every_pass_exhausts_the_read_budget() {
-    let (store, _) = fixture().await;
-    let options = CatalogOptions {
-        reader_poll_interval: std::time::Duration::from_millis(10),
-        ..Default::default()
-    };
-    let reader = Catalog::open_read_only(store.clone(), options.clone())
-        .await
-        .unwrap();
-    let session = reader.begin_read().await.unwrap();
-    let attempts = Cell::new(0);
-    let result = Box::pin(crate::store::read::consistent(session.handle(), || async {
-        attempts.set(attempts.get() + 1);
-        let writer = Catalog::open(store.clone(), options.clone()).await?;
-        let tx = writer.begin_write_tx()?;
-        let mut head = commit::read_head_value(ReadHandle::Tx(&tx)).await?;
-        head.batch_seq += 1;
-        tx.put(Key::Sys(SysKey::Head).encode(), value::encode_value(&head))?;
-        tx.commit().await?;
-        writer.close().await?;
-        // Bring the pass's own handle up to the commit, rather than
-        // waiting for a poll to happen to do it.
-        session.handle().refresh().await?;
-        assert_eq!(commit::read_head_value(session.handle()).await?, head);
-        Ok(())
-    }))
-    .await;
-    assert!(matches!(result, Err(crate::Error::RetryBudgetExhausted(_))));
-    assert_eq!(attempts.get(), 8);
-
-    attempts.set(0);
-    let result: crate::Result<()> = crate::store::read::consistent(session.handle(), || async {
-        attempts.set(attempts.get() + 1);
-        Err(crate::Error::Corruption("stable failure".into()))
-    })
-    .await;
-    assert!(
-        matches!(result, Err(crate::Error::Corruption(message)) if message == "stable failure")
-    );
-    assert_eq!(attempts.get(), 1);
-    session.finish();
-    reader.close().await.unwrap();
-}
-
 /// One confirmation opens one tombstone scan however many rows it asks
 /// about, so its cost does not grow a store round trip per row.
 #[tokio::test]

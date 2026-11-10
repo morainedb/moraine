@@ -37,6 +37,7 @@ async fn acknowledged_slots_are_available_in_fixed_read_scopes() {
     let options = CatalogOptions {
         commit_log: Some(provider),
         commit_log_fold_slots: 10_000,
+        reader_poll_interval: std::time::Duration::ZERO,
         ..options_at("published")
     };
     let writer = Catalog::open(objects.clone(), options.clone())
@@ -522,6 +523,18 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while provider.polls() < polls + 2 && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // A superseded publication keeps the slots it replays from until its
+    // grace ends; stand in for that expiry so this flush may truncate.
+    let admin = slatedb::admin::AdminBuilder::new("lake", object_store.clone()).build();
+    for checkpoint in admin
+        .list_checkpoints(Some(crate::store::checkpoint::PUBLISHED_NAME))
+        .await
+        .unwrap()
+    {
+        if checkpoint.expire_time.is_some() {
+            admin.delete_checkpoint(checkpoint.id).await.unwrap();
+        }
     }
     for name in ["c", "d"] {
         committer

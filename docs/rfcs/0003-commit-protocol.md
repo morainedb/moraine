@@ -17,11 +17,10 @@ through `Catalog::open_read_only`, which returns a `ReadOnlyCatalog`, never
 opens a `Db`, and never bootstraps. There is no bound on the number of
 readers.
 
-A reader following the latest manifest writes a checkpoint into the manifest
-on open and refreshes it for its lifetime, so its credentials need manifest
-write access. `CatalogOptions::checkpoint` pins a reader to an existing
-checkpoint id instead. A pinned reader writes nothing and never sees a commit
-made after its checkpoint. A writer refuses the option.
+A reader following the writer pins the checkpoint the writer publishes and
+writes nothing, so read-only credentials suffice. `CatalogOptions::checkpoint`
+pins a reader to an existing checkpoint id instead, for a fixed cut that never
+sees a commit made after it. A writer refuses the option.
 
 SlateDB fences by writer epoch, and the newest writer wins. A second process
 opening the store read-write fences the incumbent, whose next durable write
@@ -324,10 +323,11 @@ resubmitted by moraine. A publication-only failure never re-runs a catalog
 mutation. On open the writer publishes a checkpoint covering its durable
 progress before serving commits.
 
-Readers discover the published checkpoint and take their own leases on it, as
-specified in [the read path](0007-read-path-and-caching.md). A reader opened
-after `commit` returns resolves `N+1`. A reader opened before may lag by its
-poll interval, which is ordinary snapshot isolation.
+Readers pin the published checkpoint directly, as specified in [the read
+path](0007-read-path-and-caching.md); a superseded publication is kept for a
+grace rather than deleted. A reader opened after `commit` returns resolves
+`N+1`. A reader opened before may lag by its poll interval, which is ordinary
+snapshot isolation.
 
 ## Flush pacing
 

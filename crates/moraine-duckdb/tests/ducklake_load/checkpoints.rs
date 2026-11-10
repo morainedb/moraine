@@ -181,9 +181,8 @@ fn a_pinned_attach_leaves_the_store_untouched() {
     ))[0][0]
         .clone();
 
-    // Spawned directly rather than through `run_session`, whose standalone
-    // attach is itself a follow-latest reader — its own checkpoint write
-    // would be counted against the pinned one under test.
+    // Spawned directly rather than through `run_session`, so the listing
+    // counts the pinned attach alone.
     let before = store_objects(store);
     let pinned = assert_session_ok(
         Command::new(cli_path())
@@ -215,10 +214,10 @@ fn a_pinned_attach_leaves_the_store_untouched() {
     );
 
     run_standalone_read_only_sql(store, "SELECT count(*) FROM m.ducklake_table;");
-    assert_ne!(
+    assert_eq!(
         store_objects(store),
         before,
-        "a follow-latest reader records its own checkpoint, so it does write"
+        "a follow-latest reader pins the writer's publication and writes nothing either"
     );
 }
 

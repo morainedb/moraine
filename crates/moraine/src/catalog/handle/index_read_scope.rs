@@ -192,9 +192,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let reader = Catalog::open_read_only(objects, CatalogOptions::default())
-            .await
-            .unwrap();
+        let reader = Catalog::open_read_only(
+            objects,
+            CatalogOptions {
+                reader_poll_interval: std::time::Duration::ZERO,
+                ..CatalogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let first = reader.index_read_scope().await.unwrap();
         let shared = reader.index_read_scope().await.unwrap();
         assert_eq!(first.identity(), shared.identity());
