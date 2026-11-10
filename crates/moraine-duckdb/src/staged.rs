@@ -69,7 +69,8 @@ impl MoraineTxHandle {
     }
 }
 
-/// Freezes the transaction's authored rows for a paged metadata scan.
+/// Freezes the transaction's authored rows for a paged metadata scan. For the
+/// snapshot kinds `live_bound` is the first snapshot id read.
 ///
 /// # Safety
 /// The transaction must be live; outputs and error must be writable. The probe

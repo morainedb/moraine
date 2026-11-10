@@ -3631,7 +3631,8 @@ int32_t moraine_metadata_cursor_fork(struct MoraineMetadataCursor *cursor,
                                      void *probe_ctx,
                                      struct MoraineError *err);
 
-// Opens a fixed metadata scan; `u64::MAX` means no table or live bound.
+// Opens a fixed metadata scan; `u64::MAX` means no table or live bound. For
+// the snapshot kinds the bound is the first snapshot id read.
 //
 // # Safety
 // `handle` must be live; `out` writable; `err` null or writable. The probe
@@ -3966,7 +3967,8 @@ int32_t moraine_metadata_cursor_schema_versions(struct MoraineMetadataCursor *cu
                                                 void *probe_ctx,
                                                 struct MoraineError *err);
 
-// Freezes the transaction's authored rows for a paged metadata scan.
+// Freezes the transaction's authored rows for a paged metadata scan. For the
+// snapshot kinds `live_bound` is the first snapshot id read.
 //
 // # Safety
 // The transaction must be live; outputs and error must be writable. The probe

@@ -36,6 +36,11 @@ public:
 	duckdb::unique_ptr<duckdb::QueryResult> Query(duckdb::string &query) override;
 	duckdb::unique_ptr<duckdb::QueryResult> AttachMetadata(const duckdb::string &attach_query) override;
 
+	//! The head snapshot by the id the metadata transaction pinned when it
+	//! began, which is what DuckLake's `MAX(snapshot_id)` over every retained
+	//! snapshot resolves to at that read point.
+	duckdb::string GetLatestSnapshotQuery() const override;
+
 	//! DuckLake's server-side commit route, which the constructor opts
 	//! into: the commit's rows are generated and driven as on the
 	//! client-side route, under DuckLake's own retry budget — which a

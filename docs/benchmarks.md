@@ -32,6 +32,7 @@ Two facts shape the write path:
 | the two needing crate-internal seams | `cargo test -p moraine --lib --release -- --ignored --nocapture measure_` | nothing |
 | allocations on the commit path | `cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 --nocapture transaction::commit::tests::allocation::<name>` | nothing |
 | peak heap of a staged index build | `cargo test -p moraine --test staged_build_memory --release -- --ignored --nocapture` | nothing |
+| a commit's conflict check against retained snapshots | `cargo test -p moraine-duckdb --test ducklake_load -- --include-ignored --nocapture measure_staged_conflict_check_by_retained_snapshots` | a built extension, as `cargo xtask e2e` sets up |
 | the core against AWS S3 | the `Real S3 benchmark` workflow | the AWS stack in [CONTRIBUTING.md](../CONTRIBUTING.md#the-real-s3-benchmark) |
 
 Always measure in `--release`. The core harnesses use the in-memory
@@ -345,7 +346,7 @@ the GET count is the slope:
 
 At 10 ms per GET the attach costs 31× its in-memory time. The merge cut
 SSTs by 63% and did not reduce GETs, matching the S3 run above. 2026-11-10
-at `9b37989`, where a reader no longer writes a checkpoint of its own on
+at `c224745`, where a reader no longer writes a checkpoint of its own on
 open; at `8146cbf` the slopes were 22.6 and 23.7. In 2026-08 the merge cut
 GETs from 14.5 to 12.3.
 
@@ -393,7 +394,7 @@ flat 17,344 bytes at any commit count, and snapshot records are back to
 ### Warm reads
 
 `measure_warm_read_attribution`, 2,000 reads per thread over 50 tables,
-2026-11-10 at `9b37989`, where a read-only transaction pins the writer's
+2026-11-10 at `c224745`, where a read-only transaction pins the writer's
 publication instead of listing the manifest:
 
 | threads | read-write | read-only | held view, no check |
@@ -410,7 +411,7 @@ serialized near 8,000 a second at any thread count: 90 µs, 1,056 µs, and
 catalog, the figures were 0.12 µs and 6.4 µs.
 
 `measure_reader_round_trips_under_get_latency`, 20 tables, 2026-11-10 at
-`9b37989`:
+`c224745`:
 
 | GET latency | warm read-only read | round trips | cold handle | round trips |
 |---|---|---|---|---|
@@ -423,6 +424,26 @@ newer one. At `8146cbf` it issued about two, the manifest listing every
 transaction paid, and a cold handle 28.3 and 18.3. For an operator: a
 read-only statement's metadata costs no endpoint round trip inside the
 interval and one manifest read at its edge.
+
+### Staged conflict check
+
+`measure_staged_conflict_check_by_retained_snapshots` seeds 128, 512, and
+2,048 DuckLake commits carrying 4 KiB of commit info each, stages a write,
+and runs the changes arm of DuckLake's commit-time conflict check twenty
+times. GETs are what the twenty runs issued; the per-check time is
+amortized against a session that runs none, through the DuckDB CLI over a
+local store, and is noisy on a shared machine. 2026-11-10:
+
+| retained | GETs, every snapshot read | GETs, from the floor | ms per check, before | after |
+|---:|---:|---:|---:|---:|
+| 128 | 302 | 0 | 12.8 | 1.6 |
+| 512 | 607 | 0 | 7.5 | 1.1 |
+| 2,048 | 1,553 | 0 | noise | 0.5 |
+
+The paged scan read and decoded every retained snapshot and DuckDB filtered
+afterwards. A cursor that opens at the pushed `snapshot_id` floor reads the
+snapshots since the transaction began, which the block cache already holds,
+so the check issues no object-store read at any retained count.
 
 ### Worker pool
 

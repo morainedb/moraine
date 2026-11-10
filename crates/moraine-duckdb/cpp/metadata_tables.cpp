@@ -136,8 +136,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 		auto *handle = moraine_snapshot_read_handle(transaction.Snapshot());
 		if (handle != nullptr) {
 			auto scope = bind_data.scope.IsValid() ? bind_data.scope.GetIndex() : UINT64_MAX;
-			auto live_bound = bind_data.live_bound.IsValid() ? bind_data.live_bound.GetIndex() : UINT64_MAX;
-			state->cursor = OpenMetadataCursor(handle, *bind_data.spec, scope, live_bound, context, staged);
+			// The snapshot tables read from their floor; every other kind takes
+			// the lifecycle bound.
+			auto bound = bind_data.snapshot_floor.IsValid() ? bind_data.snapshot_floor
+			             : bind_data.live_bound.IsValid()   ? bind_data.live_bound
+			                                                : duckdb::optional_idx();
+			state->cursor = OpenMetadataCursor(handle, *bind_data.spec, scope,
+			                                   bound.IsValid() ? bound.GetIndex() : UINT64_MAX, context, staged);
 			if (bind_data.spec->fixed_page_provider != nullptr) {
 				state->page = bind_data.spec->fixed_page_provider(handle, moraine_shim_is_interrupted, &context);
 			}
@@ -266,6 +271,61 @@ duckdb::optional_idx LiveBoundOf(const duckdb::Expression &filter, const duckdb:
 	return saw_is_null ? bound : duckdb::optional_idx();
 }
 
+// `ducklake_snapshot` and `ducklake_snapshot_changes`, whose first column is
+// `snapshot_id`.
+bool IsSnapshotTable(const MetadataTableSpec &spec) {
+	return spec.write_table_kind == 0 || spec.write_table_kind == 1;
+}
+
+// Recognizes `snapshot_id > S`, `snapshot_id >= S`, and `snapshot_id = S`,
+// either way round, and records the first snapshot the scan must read.
+// DuckDB keeps the filter.
+void MetadataScanPushdownSnapshotFloor(duckdb::LogicalGet &get, MetadataScanBindData &bind_data,
+                                       const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &filters) {
+	if (!IsSnapshotTable(*bind_data.spec) || bind_data.snapshot_floor.IsValid()) {
+		return;
+	}
+	auto projected = ProjectedColumn(get, 0);
+	if (!projected.IsValid()) {
+		return;
+	}
+	for (auto &filter : filters) {
+		auto type = filter->GetExpressionType();
+		if (type != duckdb::ExpressionType::COMPARE_GREATERTHAN &&
+		    type != duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO &&
+		    type != duckdb::ExpressionType::COMPARE_LESSTHAN &&
+		    type != duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO &&
+		    type != duckdb::ExpressionType::COMPARE_EQUAL) {
+			continue;
+		}
+		auto &comparison = filter->Cast<duckdb::BoundFunctionExpression>();
+		auto &left = duckdb::BoundComparisonExpression::Left(comparison);
+		auto &right = duckdb::BoundComparisonExpression::Right(comparison);
+		auto column_left = IsColumnRef(left, get, projected.GetIndex());
+		auto column_right = IsColumnRef(right, get, projected.GetIndex());
+		if (column_left == column_right) {
+			continue;
+		}
+		// `snapshot_id > S` and `S < snapshot_id` are the same floor; an
+		// equality is a floor too, with the filter keeping only that row.
+		auto greater = type == duckdb::ExpressionType::COMPARE_GREATERTHAN ||
+		               type == duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+		if (type != duckdb::ExpressionType::COMPARE_EQUAL && column_left != greater) {
+			continue;
+		}
+		auto exclusive =
+		    type == duckdb::ExpressionType::COMPARE_GREATERTHAN || type == duckdb::ExpressionType::COMPARE_LESSTHAN;
+		auto snapshot = ConstantSnapshot(column_left ? right : left);
+		if (!snapshot.IsValid()) {
+			continue;
+		}
+		auto floor = snapshot.GetIndex() + (exclusive ? 1 : 0);
+		if (!bind_data.snapshot_floor.IsValid() || floor > bind_data.snapshot_floor.GetIndex()) {
+			bind_data.snapshot_floor = duckdb::optional_idx(floor);
+		}
+	}
+}
+
 // Records a lifecycle bound without consuming DuckDB's filter.
 void MetadataScanPushdownLiveBound(duckdb::LogicalGet &get, MetadataScanBindData &bind_data,
                                    const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &filters) {
@@ -298,6 +358,7 @@ void MetadataScanPushdownComplexFilter(duckdb::ClientContext &, duckdb::LogicalG
 		return;
 	}
 	MetadataScanPushdownLiveBound(get, bind_data, filters);
+	MetadataScanPushdownSnapshotFloor(get, bind_data, filters);
 	if (bind_data.spec->scope_column < 0 || bind_data.scope.IsValid()) {
 		return;
 	}
@@ -468,6 +529,7 @@ duckdb::unique_ptr<duckdb::FunctionData> MetadataScanBindData::Copy() const {
 	result->catalog_name = catalog_name;
 	result->scope = scope;
 	result->live_bound = live_bound;
+	result->snapshot_floor = snapshot_floor;
 	result->table_entry = table_entry;
 	return result;
 }
@@ -481,7 +543,9 @@ bool MetadataScanBindData::Equals(const duckdb::FunctionData &other_p) const {
 	    scope.IsValid() == other.scope.IsValid() && (!scope.IsValid() || scope.GetIndex() == other.scope.GetIndex());
 	auto same_live_bound = live_bound.IsValid() == other.live_bound.IsValid() &&
 	                       (!live_bound.IsValid() || live_bound.GetIndex() == other.live_bound.GetIndex());
-	return rows == other.rows && spec == other.spec && same_scope && same_live_bound &&
+	auto same_floor = snapshot_floor.IsValid() == other.snapshot_floor.IsValid() &&
+	                  (!snapshot_floor.IsValid() || snapshot_floor.GetIndex() == other.snapshot_floor.GetIndex());
+	return rows == other.rows && spec == other.spec && same_scope && same_live_bound && same_floor &&
 	       table_entry.get() == other.table_entry.get();
 }
 

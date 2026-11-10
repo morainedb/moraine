@@ -56,6 +56,7 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch
             ${CMAKE_CURRENT_LIST_DIR}/0007-fix-keep-the-row-ids-a-merged-file-carries.patch
             ${CMAKE_CURRENT_LIST_DIR}/0008-fix-bound-compaction-input-files.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0009-perf-bound-the-commit-time-head-lookup.patch
     )
     FetchContent_GetProperties(moraine_patched_ducklake)
     if(NOT moraine_patched_ducklake_POPULATED)

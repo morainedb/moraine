@@ -136,6 +136,13 @@ past its deadline rejects its prefetched entries. The DuckDB metadata tables all
 stream through this cursor, so two scans of one table inside one transaction
 agree even when another connection commits between them.
 
+A cursor over the two snapshot tables opens at a floor, the first snapshot id
+it reads, which the shim pushes from a `snapshot_id` comparison against a
+constant, inside a staged transaction as well. DuckLake's commit-time conflict
+check bounds both of its arms by the transaction's start snapshot, and the
+shim answers DuckLake's head lookup from the stamp the metadata transaction
+pinned, so neither reads every retained snapshot.
+
 ## Snapshot expiry and consistent operations
 
 **Expiry.** A `ReadScope` at snapshot `S` names object-store files. Once `S`

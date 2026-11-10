@@ -160,3 +160,133 @@ fn staged_statistics_scan_stays_bounded_after_a_delete() {
     assert!(output.status.success(), "{}", combined_output(&output));
     assert!(String::from_utf8(output.stdout).unwrap().contains("2047"));
 }
+
+/// Seeds `count` DuckLake commits whose snapshot rows each carry `extra_bytes`
+/// of commit info, so the retained snapshots weigh enough to notice.
+fn seed_heavy_snapshots(
+    store_dir: &std::path::Path,
+    data_path: &std::path::Path,
+    count: usize,
+    extra_bytes: usize,
+) {
+    use std::{fmt::Write as _, io::Write as _};
+
+    // Fed through stdin: thousands of statements overflow an argument.
+    let mut sql = format!(
+        "{}\nATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');\nCREATE TABLE lake.t (i BIGINT);\n",
+        load_statement(),
+        store_dir.display(),
+        data_path.display()
+    );
+    for i in 0..count {
+        writeln!(
+            sql,
+            "BEGIN; CALL ducklake_set_commit_message('lake', 'seed', 'commit {i}', extra_info => repeat('x', {extra_bytes})); INSERT INTO lake.t VALUES ({i}); COMMIT;"
+        )
+        .unwrap();
+    }
+    let mut child = std::process::Command::new(cli_path())
+        .arg("-unsigned")
+        .arg("-csv")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the seeding duckdb CLI");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(sql.as_bytes())
+        .expect("seed sql");
+    let output = child.wait_with_output().expect("duckdb CLI");
+    assert!(output.status.success(), "{}", combined_output(&output));
+}
+
+/// The two snapshot tables page from the pushed `snapshot_id` bound inside a
+/// transaction that has staged a write, so the commit-time conflict check
+/// reads the few snapshots since the transaction began rather than dumping
+/// every retained one.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn staged_snapshot_scans_page_from_the_bound_under_a_small_budget() {
+    let directory = TempDir::new("paged-staged-snapshots");
+    let data = TempDir::new("paged-staged-snapshots-data");
+    // 256 snapshots of 128 KiB each: a dump of them all is twice the budget.
+    seed_heavy_snapshots(directory.path(), data.path(), 256, 128 * 1024);
+
+    let queries = "SELECT count(*) FROM m.ducklake_snapshot_changes WHERE snapshot_id > 250; \
+                   SELECT count(*) FROM m.ducklake_snapshot WHERE snapshot_id >= 255; \
+                   SELECT string_agg(changes_made, ',') FROM m.ducklake_snapshot_changes WHERE snapshot_id > 250;";
+    let committed = run_standalone_sql(directory.path(), queries);
+    let staged = run_session_with_env(
+        &Attach::Standalone {
+            store_dir: directory.path(),
+            read_only: false,
+        },
+        &format!(
+            "BEGIN; INSERT INTO m.ducklake_tag (object_id, begin_snapshot, end_snapshot, key, value) \
+             VALUES (1, 1, NULL, 'probe', 'staged'); {queries} ROLLBACK;"
+        ),
+        &[("MORAINE_WORKING_MEMORY_BYTES", "16777216")],
+    );
+    assert!(staged.status.success(), "{}", combined_output(&staged));
+    let staged = String::from_utf8(staged.stdout).unwrap();
+    assert_eq!(csv_rows(&staged), csv_rows(&committed));
+    // The table's creation took snapshot 1 and the 256 inserts 2 through 257.
+    assert_eq!(csv_rows(&committed)[0], vec!["7".to_string()]);
+}
+
+/// What a commit-time conflict check costs against the retained snapshot
+/// count, inside a transaction that has staged a write. Prints the check's
+/// time, amortized over twenty repeats against a session that runs none,
+/// and the object-store GETs the repeats issued.
+#[test]
+#[ignore = "a measurement, not an assertion; needs the built DuckDB CLI and packaged Moraine extension"]
+fn measure_staged_conflict_check_by_retained_snapshots() {
+    const REPEATS: u32 = 20;
+    println!("\n# staged conflict check by retained snapshots, 4 KiB of commit info each");
+    println!("{:>9} {:>12} {:>8}", "retained", "ms_per_check", "gets");
+    for retained in [128_usize, 512, 2048] {
+        let directory = TempDir::new("measure-staged-snapshots");
+        let data = TempDir::new("measure-staged-snapshots-data");
+        seed_heavy_snapshots(directory.path(), data.path(), retained, 4096);
+        let check = format!(
+            "SELECT COALESCE((SELECT string_agg(changes_made, ',') FROM m.ducklake_snapshot_changes c \
+             WHERE c.snapshot_id > {retained}), '');"
+        );
+        let session = |checks: u32| {
+            let sql = format!(
+                "BEGIN; INSERT INTO m.ducklake_tag (object_id, begin_snapshot, end_snapshot, key, value) \
+                 VALUES (1, 1, NULL, 'probe', 'staged'); \
+                 SELECT main_gets FROM moraine_object_store_tally('m'); {} \
+                 SELECT main_gets FROM moraine_object_store_tally('m'); ROLLBACK;",
+                check.repeat(usize::try_from(checks).unwrap())
+            );
+            let started = std::time::Instant::now();
+            let output = run_session(
+                &Attach::Standalone {
+                    store_dir: directory.path(),
+                    read_only: false,
+                },
+                &sql,
+            );
+            assert!(output.status.success(), "{}", combined_output(&output));
+            let gets: Vec<u64> = csv_rows(&String::from_utf8_lossy(&output.stdout))
+                .iter()
+                .filter_map(|row| row.first()?.parse().ok())
+                .collect();
+            let issued = gets
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(gets.first().copied().unwrap_or(0));
+            (started.elapsed(), issued)
+        };
+        let (baseline, _) = session(0);
+        let (with_checks, gets) = session(REPEATS);
+        let per_check_ms =
+            with_checks.saturating_sub(baseline).as_secs_f64() * 1000.0 / f64::from(REPEATS);
+        println!("{retained:>9} {per_check_ms:>12.2} {gets:>8}");
+    }
+}
