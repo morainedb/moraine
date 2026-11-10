@@ -349,6 +349,44 @@ regardless of backend, and swamping the ~2 ms of compute underneath. Every
 durable-commit-bound cost inherits this. Concurrency is the way out, not a
 faster commit: K concurrent commits share one flush.
 
+### Commit time breakdown
+
+`cargo xtask commit-bench` splits an S3-backed one-row `UPDATE` into
+DuckLake's metadata statements, moraine's own commit work, the durable
+write wait, and the physical object-store requests behind them. Parquet
+stays local, so every request it counts belongs to metadata. It builds and
+loads the patched DuckLake, seeds one table with 1,600 rows over `--files`
+files, and times `--commits` updates at each file count.
+
+```text
+MORAINE_S3_BUCKET=... MORAINE_S3_PREFIX=... AWS_REGION=... \
+  cargo xtask commit-bench [--files 16,128] [--commits 7] [--flush-ms 25]
+```
+
+Credentials resolve through the normal AWS chain; a local S3 server also
+takes `MORAINE_S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, and
+`AWS_SECRET_ACCESS_KEY`. Against a loopback RustFS on an **8-vCPU x86-64
+Linux VM**, 2026-10-20, medians over seven commits:
+
+| files | commit | DuckLake metadata | moraine core | durable wait | requests |
+|---:|---:|---:|---:|---:|---|
+| 16 | 23.0 ms | 13.4 ms | 3.3 ms | 3.0 ms | 1 PUT, 2.7 ms |
+| 128 | 25.0 ms | 14.1 ms | 3.4 ms | 3.0 ms | 1 PUT, 2.9 ms |
+
+DuckLake's eight metadata statements are about 60% of the commit and a
+fixed per-commit cost: the total barely moves from 16 to 128 files. Two
+statements carry 69% of it, the per-column file-list query DuckLake plans
+every scan from and the snapshot insert, and neither is data access: the
+same workload against a local-filesystem store costs within 0.2 ms of the
+S3 one, and `commit-bench` records zero GETs per commit. The time is
+DuckDB's SQL front end, parsing, binding, and optimising about a kilobyte
+of generated SQL to run a query that returns one row. Preparing the
+statement buys back only the parse, because DuckDB re-binds and
+re-optimises any prepared statement that reads a catalog. Under `perf`,
+moraine's own code and its SlateDB reads together are under 4% of the
+commit, so the lever is upstream: a bind-stable plan, or a catalog call
+that never becomes SQL.
+
 ### Cold read-only attaches
 
 `cargo xtask reader-bench` measures what a fresh read-only process pays over
@@ -454,9 +492,9 @@ A loopback S3 server's PUT costs about a millisecond, so it lands in the
 this validates the composition against a real object-storage protocol, but
 it understates S3.
 
-The main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) ran the same
-sweep from an ARM CodeBuild worker against AWS S3 in `us-west-2`, with the
-worker and bucket in the same region. Twenty sequential commits per interval
+The main-only [`Real S3 benchmark`](CONTRIBUTING.md#the-real-s3-benchmark) ran
+the same sweep from an ARM CodeBuild worker against AWS S3 in `us-west-2`, with
+the worker and bucket in the same region. Twenty sequential commits per interval
 on 2026-08-09 produced:
 
 | flush interval | median commit | min | max |
@@ -503,9 +541,9 @@ The `_l0` rows show what preloading the newest SSTs' metadata at attach
 buys the cold row: what moves out of `cold_first_lookup` and into the attach.
 
 Locally, `cargo xtask s3` runs it in release against the pinned RustFS; the
-main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) workflow runs it
-against AWS S3 and keeps the printed table in the run artifact. From an ARM
-CodeBuild worker against AWS S3 in `us-west-2` on 2026-08-16 (a run in which
+main-only [`Real S3 benchmark`](CONTRIBUTING.md#the-real-s3-benchmark) workflow
+runs it against AWS S3 and keeps the printed table in the run artifact. From an
+ARM CodeBuild worker against AWS S3 in `us-west-2` on 2026-08-16 (a run in which
 the first lookup still waited on a joined per-table warm, since removed):
 
 | phase | median | min | max | gets |
@@ -1072,3 +1110,87 @@ admits nothing. Serving the held view took warm probes to zero and cut
 the cold path too (79 GETs to 48, 71 KB to 62 KB per probe), because the
 rescan was in both. The measurement found the defect; the numbers above
 are after the fix.
+
+### Allocation and memory
+
+The harnesses above time wall-clock. These count allocator calls and peak
+heap instead, over real SlateDB on an in-memory `object_store`, and are
+the place to look when a path's cost scales with something it should not.
+Each runs alone, in release, with `--test-threads=1`; instrumentation
+changes absolute timing, so compare scaling, not milliseconds. The numbers
+below are from an **8-vCPU x86-64 Linux VM**.
+
+Per-operation allocation counts on the commit path live in the library's
+unit tests, which install a counting allocator and reach the private
+refresh path:
+
+```text
+cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 \
+  --nocapture transaction::commit::tests::allocation::<name>
+```
+
+| test | measures |
+|---|---|
+| `snapshot_refresh` | a one-change incremental refresh against a full rematerialization, at 16 to 1,024 tables |
+| `warm_reads` | a retained snapshot read 2,000 times |
+| `index_lookups` | point hits, misses, and ranges over a reopened unique index, first and warm pass |
+| `index_maintenance` | appends of 1, 64, and 1,024 entries into indexes of 1,024 to 65,536 |
+| `index_maintenance_input_order` | 4,096-entry appends in ascending, descending, and scattered order |
+| `refresh_count_does_not_allocate` | asserts the refresh heuristic's entity count allocates nothing |
+| `index_maintenance_profile` | twenty 1,024-entry appends, shaped for a Valgrind DHAT run |
+
+Findings (2026-09-08): a one-change refresh at 1,024 tables allocates
+44 KB and takes 0.2 ms against 65 MB and 50 ms for a rematerialization,
+and stays near-constant in catalog size; a warm snapshot read allocates
+nothing; a warm index query issues no GET. Appending into a 65,536-entry
+index costs about 13 allocations per entry for dense batches, down from
+66 when every uniqueness probe was a separate SlateDB point read: up to
+128 ready probes now share one transactional range read. Scattered input
+and sparse keys fall back to point reads and keep most of the old cost.
+
+For a heap profile, build the unit-test executable with `--no-run`, run
+`index_maintenance_profile` under `valgrind --tool=dhat`, and filter the
+stacks by `profile_index_append`, which encloses commit preparation only.
+
+Three examples measure whole operations the tests cannot shape:
+
+```text
+cargo build --release -p moraine --examples
+# unrelated tables, files per table, measured groups, members per group, flush ms
+target/release/examples/verb_commit_bench 4096 8 60 1 0
+# files | inline | recent, then source count, then optional `reader`
+target/release/examples/row_lookup_bench files 1024
+# chunks, rows per chunk, step entries, bytes per indexed string
+target/release/examples/staged_build_memory 128 128 128 1024
+```
+
+- `verb_commit_bench` updates one table's statistics while unrelated
+  catalog state grows. A commit's cost is independent of that state: with
+  4,096 unrelated tables a mutation costs 0.2 ms of CPU, where copying the
+  catalog per commit cost 66 ms (2026-09-08). What remains is the
+  durability floor.
+- `row_lookup_bench` times one-hit `locate_row_ids`, inline membership,
+  and `recent_row` lookups cold and warm. Warm lookups are constant in
+  source count, 35 to 100 µs and a few hundred allocations at 1,024
+  sources, where they once scaled linearly to 5 to 48 ms; cold lookups
+  still pay one footer read per dense file (2026-09-08).
+- `staged_build_memory` profiles a whole `create_index_staged` call with
+  dhat's allocator. `BuildStep.entries` bounds the commit buffer, not the
+  heap: at 16,384 inlined rows a 128-entry step peaks at 23 MB, down from
+  40 MB when derivation held the whole table, and a smaller step raises
+  the peak slightly because more commits retain more store state
+  (2026-09-08).
+
+Whole-process memory for a demand-loaded catalog is measured from a fresh
+DuckDB process over a persisted fixture: `write_memory_measurement_fixture`
+in the library tests writes it to `MORAINE_MEMORY_FIXTURE` with
+`MORAINE_MEMORY_FILES` registered files, and the process under measurement
+runs with `MORAINE_WORKING_MEMORY_BYTES` set. With a 16 MiB working-memory
+allowance and a 16 MiB cache budget, a count over two million file-column
+statistics records peaked at 80.9 MiB RSS, 6.4 MiB above the same scan
+over 20,000 records (2026-11-04). The preloading tests beside it,
+`deep_preload_uses_bounded_working_memory` and the extension's
+`preload_streams_a_persisted_catalog`, hold the same allowance.
+`measure_active_writer_reader_generations` prices readers overlapping an
+open writer: five generations reserved 24.7 MiB of WAL replay and the
+sixth was refused, an admission bound rather than an RSS cap (2026-11-05).
