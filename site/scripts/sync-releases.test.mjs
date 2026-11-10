@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { downloadsByVersion, fetchReleases, parseChangelog, renderReleases } from './sync-releases.mjs';
+import { compatibilityRows, downloadsByVersion, fetchReleases, parseChangelog, parseVersionConstants, renderReleases } from './sync-releases.mjs';
 
 const changelog = [
   '# Changelog',
@@ -193,4 +193,59 @@ test('a network failure names the escape hatches too', async () => {
 test('the table of contents stops at version headings', () => {
   const page = renderReleases([], new Map());
   assert.ok(page.includes('\ntableOfContents: { maxHeadingLevel: 2 }\n'));
+});
+
+const constants = [
+  'pub const FORMAT_VERSION: u64 = 1;',
+  'pub const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;',
+  'pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;',
+  'pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;',
+  'pub const CATALOG_VERSION: &str = "1.0";',
+  'pub const MAX_CATALOG_VERSION: &str = "1.1";',
+].join('\n');
+
+test('version constants resolve names to numbers, with old-tag defaults', () => {
+  assert.deepEqual(parseVersionConstants(constants), {
+    formatMin: 9,
+    formatMax: 9,
+    catalogMin: '1.0',
+    catalogMax: '1.1',
+  });
+  assert.deepEqual(
+    parseVersionConstants('const FORMAT_WITH_STAGED_INDEX: u64 = 3;\nconst MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;'),
+    { formatMin: 1, formatMax: 3, catalogMin: '1.0', catalogMax: '1.0' },
+  );
+  assert.equal(parseVersionConstants(''), null);
+});
+
+test('compatibility rows merge consecutive releases that agree', () => {
+  const entries = ['0.8.1', '0.8.0', '0.7.0', '0.6.5'].map((version) => ({ version }));
+  const downloads = new Map([
+    ['0.8.1', new Map([['v2.0.0', new Map()]])],
+    ['0.8.0', new Map([['v2.0.0', new Map()]])],
+    ['0.7.0', new Map([['v1.5.5', new Map()], ['v1.5.4', new Map()]])],
+  ]);
+  const byTag = {
+    'v0.8.1': constants,
+    'v0.8.0': constants,
+    'v0.7.0': constants.replace('"1.1"', '"1.0"'),
+    'v0.6.5': '',
+  };
+  const rows = compatibilityRows(entries, downloads, (tag) => byTag[tag]);
+  assert.deepEqual(rows, [
+    { versions: '0.8.0 – 0.8.1', duckdb: 'v2.0.0', format: '9', catalog: '1.0 – 1.1' },
+    { versions: '0.7.0', duckdb: 'v1.5.4, v1.5.5', format: '9', catalog: '1.0' },
+    { versions: '0.6.5', duckdb: '—', format: '—', catalog: '—' },
+  ]);
+});
+
+test('the page opens with the compatibility table', () => {
+  const page = renderReleases(
+    [{ version: '0.8.1', date: '2026-10-27', compareUrl: null, body: '' }],
+    new Map(),
+    [{ versions: '0.8.1', duckdb: 'v2.0.0', format: '9', catalog: '1.0 – 1.1' }],
+  );
+  assert.ok(page.indexOf('## Compatibility') < page.indexOf('## 0.8.1'));
+  assert.ok(page.includes('| Moraine | DuckDB | Catalog store format | DuckLake catalog version |'));
+  assert.ok(page.includes('| 0.8.1 | v2.0.0 | 9 | 1.0 – 1.1 |'));
 });

@@ -1,6 +1,7 @@
 // Builds the Releases page: each version's CHANGELOG.md entry followed by
 // the extension binaries its ext-v<version> GitHub release carries, by
 // DuckDB version and platform. Runs at build time; the output is gitignored.
+import { execFileSync } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -112,13 +113,92 @@ function downloadTable(byDuckdb) {
   return ['### Download', '', header, rule, ...rows].join('\n');
 }
 
+// The store-format and DuckLake-catalog-version constants as a release's
+// source declares them: `const NAME: u64 = <int or NAME>;` and
+// `const (MAX_)?CATALOG_VERSION: &str = "x.y";`. Releases before the floor
+// was introduced read from format 1; before the catalog version was
+// recorded they served 1.0.
+export function parseVersionConstants(text) {
+  const numbers = new Map();
+  for (const [, name, value] of text.matchAll(/const ([A-Z_]+): u64 = ([^;]+);/g)) {
+    const resolved = /^\d+$/.test(value.trim()) ? Number(value) : numbers.get(value.trim());
+    if (resolved !== undefined) numbers.set(name, resolved);
+  }
+  if (!numbers.has('MAX_FORMAT_VERSION')) return null;
+
+  const strings = new Map();
+  for (const [, name, value] of text.matchAll(/const ((?:MAX_)?CATALOG_VERSION): &str = "([^"]+)";/g)) {
+    strings.set(name, value);
+  }
+  const catalogMin = strings.get('CATALOG_VERSION') ?? '1.0';
+  return {
+    formatMin: numbers.get('MIN_FORMAT_VERSION') ?? 1,
+    formatMax: numbers.get('MAX_FORMAT_VERSION'),
+    catalogMin,
+    catalogMax: strings.get('MAX_CATALOG_VERSION') ?? catalogMin,
+  };
+}
+
+const unknown = '—';
+
+function range(low, high) {
+  return low === high ? `${low}` : `${low} – ${high}`;
+}
+
+// One row per run of consecutive releases with the same DuckDB builds,
+// store-format range, and catalog versions. `entries` are newest first.
+export function compatibilityRows(entries, downloads, constantsFor) {
+  const cells = entries.map(({ version }) => {
+    const duckdb = [...(downloads.get(version)?.keys() ?? [])]
+      .sort(compareVersionsDescending)
+      .reverse();
+    const constants = parseVersionConstants(constantsFor(`v${version}`) ?? '');
+    return {
+      version,
+      duckdb: duckdb.length ? duckdb.join(', ') : unknown,
+      format: constants ? range(constants.formatMin, constants.formatMax) : unknown,
+      catalog: constants ? range(constants.catalogMin, constants.catalogMax) : unknown,
+    };
+  });
+
+  const rows = [];
+  for (const cell of cells) {
+    const last = rows.at(-1);
+    const same =
+      last && last.duckdb === cell.duckdb && last.format === cell.format && last.catalog === cell.catalog;
+    if (same) last.oldest = cell.version;
+    else rows.push({ newest: cell.version, oldest: cell.version, ...cell });
+  }
+  return rows.map(({ newest, oldest, duckdb, format, catalog }) => ({
+    versions: range(oldest, newest),
+    duckdb,
+    format,
+    catalog,
+  }));
+}
+
+function compatibilityTable(rows) {
+  return [
+    '## Compatibility',
+    '',
+    'A build loads only into the DuckDB versions listed. The catalog store',
+    'format is the range a build opens; a lake below it needs `moraine_migrate`,',
+    'and a build below a lake\'s format refuses it. The DuckLake catalog version',
+    'is what a build serves; see [Upgrading](/guide/operating/#upgrading).',
+    '',
+    '| Moraine | DuckDB | Catalog store format | DuckLake catalog version |',
+    '|---|---|---|---|',
+    ...rows.map((row) => `| ${row.versions} | ${row.duckdb} | ${row.format} | ${row.catalog} |`),
+  ].join('\n');
+}
+
 const preamble = `Each release ships the DuckDB extension as unsigned binaries, one per
 DuckDB version and platform; a binary loads only into the DuckDB version
 it names and needs a CLI started with \`-unsigned\`. See
 [Getting started](/guide/getting-started/) for loading one. Changes are
 listed from the repository [changelog](https://github.com/morainedb/moraine/blob/main/CHANGELOG.md).`;
 
-export function renderReleases(entries, downloads) {
+export function renderReleases(entries, downloads, compatibility = []) {
   const sections = entries.map(({ version, date, compareUrl, body }) => {
     const name = compareUrl ? `[${version}](${compareUrl})` : version;
     const parts = [`## ${name} — ${date}`];
@@ -137,8 +217,25 @@ export function renderReleases(entries, downloads) {
     '',
     preamble,
     '',
+    ...(compatibility.length ? [compatibilityTable(compatibility), ''] : []),
     ...sections.flatMap((section) => [section, '']),
   ].join('\n');
+}
+
+const repositoryRoot = path.resolve(scriptDir, '../..');
+
+// The version constants a release tag's source declares, or an empty string
+// when the tag is unavailable (a shallow clone, or a version never tagged).
+function constantsAtTag(tag) {
+  try {
+    return execFileSync(
+      'git',
+      ['grep', '-h', '-E', 'const [A-Z_]+: (u64|&str) =', tag, '--', 'crates/moraine/src'],
+      { cwd: repositoryRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+  } catch {
+    return '';
+  }
 }
 
 const releasesUrl = 'https://api.github.com/repos/morainedb/moraine/releases?per_page=100';
@@ -185,7 +282,8 @@ export async function syncReleases({ fetchImpl = fetch, offline = false } = {}) 
   const entries = parseChangelog(await readFile(changelogPath, 'utf8'));
   const downloads = offline ? new Map() : downloadsByVersion(await fetchReleases(fetchImpl));
 
-  await writeFile(outputPath, renderReleases(entries, downloads));
+  const compatibility = compatibilityRows(entries, downloads, constantsAtTag);
+  await writeFile(outputPath, renderReleases(entries, downloads, compatibility));
   return {
     versions: entries.length,
     withDownloads: entries.filter(({ version }) => downloads.has(version)).length,
