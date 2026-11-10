@@ -3,9 +3,9 @@ name: Site
 on:
   push:
     branches: [main]
-    paths: ['site/**', 'docs/rfcs/**']
+    paths: ['site/**', 'docs/rfcs/**', 'CHANGELOG.md']
   pull_request:
-    paths: ['site/**', 'docs/rfcs/**']
+    paths: ['site/**', 'docs/rfcs/**', 'CHANGELOG.md']
   workflow_dispatch:
 
 permissions:
@@ -29,8 +29,12 @@ jobs:
         working-directory: site
       - run: npm test
         working-directory: site
+      # The releases page lists each extension release's binaries from the
+      # GitHub API; the token keeps the build off the anonymous rate limit.
       - run: npm run build
         working-directory: site
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # The org root site (morainedb.github.io) can only be served from the
       # repository of that name, so the built site is pushed there; Pages in
