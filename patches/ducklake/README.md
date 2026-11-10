@@ -87,6 +87,16 @@ room for just one input skips it because a merge needs two; later passes
 continue the remaining work. The maintenance CLI regressions cover the
 limit, preserved rows, and pending-work status.
 
+`0009-perf-bound-the-commit-time-head-lookup.patch` adds
+`snapshot_id >= {SNAPSHOT_ID}` to both halves of the commit-time head
+lookup in `GetSnapshotAndStatsAndChangesQuery`: the outer row and the
+`MAX(snapshot_id)` beneath it. The head is never below the transaction's
+own start snapshot, so the answer is unchanged, and a metadata scan that
+can start from a snapshot floor reads only the snapshots since the
+transaction began instead of every retained one. The changes arm of the
+same query already carries that bound. Covered by the staged snapshot
+paging tests in `cargo xtask e2e`.
+
 `0005` supplies the positional DELETE used by the optimizer when a certified
 index answers the entire equality predicate. The public located-change SQL
 verbs remain withdrawn; ordinary `DELETE ... WHERE` selects this path without

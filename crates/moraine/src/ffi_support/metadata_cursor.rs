@@ -74,7 +74,9 @@ impl MetadataSource {
                     schema_versions::Cursor::open(handle).await?,
                 )))
             } else {
-                Ok(Self::Snapshots(OwnedSnapshotCursor::open(handle).await?))
+                Ok(Self::Snapshots(
+                    OwnedSnapshotCursor::open(handle, live_bound).await?,
+                ))
             };
         }
         let kind = match table {
@@ -129,7 +131,8 @@ struct PendingRows<T> {
 
 impl MetadataCursor {
     /// Opens the current and, when needed, ended records for one metadata kind.
-    /// `live_bound` skips ended versions only when it reaches the pinned head.
+    /// `live_bound` skips ended versions only when it reaches the pinned head;
+    /// for the snapshot kinds it is the first snapshot id read.
     ///
     /// # Errors
     /// Returns an error for unsupported kinds or an unavailable read scope.
@@ -846,6 +849,82 @@ mod tests {
                 Err(Error::Corruption(_))
             ));
         }
+        catalog.close().await.unwrap();
+    }
+
+    async fn catalog_with_snapshots(through: u64) -> Catalog {
+        let catalog = Catalog::open(
+            Arc::new(object_store::memory::InMemory::new()),
+            CatalogOptions::default(),
+        )
+        .await
+        .unwrap();
+        let write = catalog.begin_write_tx().unwrap();
+        for snapshot_id in 1..=through {
+            write
+                .put(
+                    Key::Snapshot { snapshot_id }.encode(),
+                    crate::store::value::encode_value(&super::super::SnapshotRecord {
+                        snapshot_id,
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+        }
+        catalog.commit_write_tx(write).await.unwrap();
+        catalog
+    }
+
+    #[tokio::test]
+    async fn snapshot_cursors_start_at_the_bound() {
+        let catalog = catalog_with_snapshots(200).await;
+        for kind in [TableKind::Snapshot, TableKind::SnapshotChanges] {
+            let mut cursor = MetadataCursor::open(&catalog, kind, None, Some(150))
+                .await
+                .unwrap();
+            let page = cursor.snapshots().await.unwrap();
+            assert_eq!(
+                page.records
+                    .iter()
+                    .map(|record| record.snapshot_id)
+                    .collect::<Vec<_>>(),
+                (150..=200).collect::<Vec<_>>()
+            );
+            assert!(cursor.snapshots().await.unwrap().records.is_empty());
+        }
+        let mut cursor = MetadataCursor::open(&catalog, TableKind::Snapshot, None, Some(201))
+            .await
+            .unwrap();
+        assert!(cursor.snapshots().await.unwrap().records.is_empty());
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_staged_snapshot_cursor_pages_from_the_bound_without_staged_deletes() {
+        use crate::transaction::staged::{Cell, RowOperation, StagedTransaction};
+
+        let catalog = catalog_with_snapshots(200).await;
+        let scope = catalog.index_read_scope().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap())
+            .with_read_scope(scope.reads().clone());
+        tx.stage(RowOperation::Delete {
+            table: TableKind::Snapshot,
+            cells: vec![Cell::U64(160)],
+        });
+        for kind in [TableKind::Snapshot, TableKind::SnapshotChanges] {
+            let mut cursor = tx.metadata_cursor(kind, None, Some(150)).await.unwrap();
+            let page = cursor.snapshots().await.unwrap();
+            assert_eq!(
+                page.records
+                    .iter()
+                    .map(|record| record.snapshot_id)
+                    .collect::<Vec<_>>(),
+                (150..=200).filter(|id| *id != 160).collect::<Vec<_>>()
+            );
+            assert!(cursor.snapshots().await.unwrap().records.is_empty());
+        }
+        tx.rollback();
+        drop(scope);
         catalog.close().await.unwrap();
     }
 

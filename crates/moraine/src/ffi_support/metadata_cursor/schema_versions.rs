@@ -109,7 +109,8 @@ impl Cursor {
                             }
                         }
                     }
-                    self.snapshots = Some(OwnedSnapshotCursor::open(self.handle.clone()).await?);
+                    self.snapshots =
+                        Some(OwnedSnapshotCursor::open(self.handle.clone(), None).await?);
                     self.phase = Phase::Legacy;
                 }
                 Phase::Legacy => {
@@ -229,7 +230,7 @@ impl Cursor {
         }
         // Legacy catalogs can carry a schema row only inside a snapshot.
         if self.missing_legacy {
-            let mut snapshots = OwnedSnapshotCursor::open(self.handle.clone()).await?;
+            let mut snapshots = OwnedSnapshotCursor::open(self.handle.clone(), None).await?;
             while let Some((snapshot, _memory)) = snapshots.next().await? {
                 if self
                     .overlay

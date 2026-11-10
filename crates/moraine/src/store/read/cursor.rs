@@ -142,12 +142,19 @@ pub(crate) struct OwnedSnapshotCursor {
 }
 
 impl OwnedSnapshotCursor {
-    pub(crate) async fn open(handle: OwnedReadHandle) -> Result<Self> {
+    /// Opens the scan at `from`, or at the first snapshot when `None`.
+    pub(crate) async fn open(handle: OwnedReadHandle, from: Option<u64>) -> Result<Self> {
+        let prefix = crate::store::key::subspace_prefix(crate::store::key::Subspace::Snapshot);
+        let lower = from.map_or(std::ops::Bound::Unbounded, |snapshot_id| {
+            std::ops::Bound::Included(
+                Key::Snapshot { snapshot_id }.encode()[prefix.len()..].to_vec(),
+            )
+        });
         let iterator = handle
             .borrow()
             .scan_prefix(
-                crate::store::key::subspace_prefix(crate::store::key::Subspace::Snapshot),
-                ..,
+                prefix,
+                (lower, std::ops::Bound::Unbounded),
                 ScanShape::Streaming,
             )
             .await?;

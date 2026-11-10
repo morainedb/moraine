@@ -1,0 +1,17 @@
+diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -4789,9 +4789,11 @@ SELECT
+     NULL AS extra_stats)" +
+ 	       snapshot_arm_padding + R"(
+     FROM {METADATA_CATALOG}.ducklake_snapshot
+-    WHERE snapshot_id = (
++    WHERE snapshot_id >= {SNAPSHOT_ID}
++      AND snapshot_id = (
+         SELECT MAX(snapshot_id)
+-        FROM {METADATA_CATALOG}.ducklake_snapshot)
++        FROM {METADATA_CATALOG}.ducklake_snapshot
++        WHERE snapshot_id >= {SNAPSHOT_ID})
+ UNION ALL
+ SELECT
+     NULL,

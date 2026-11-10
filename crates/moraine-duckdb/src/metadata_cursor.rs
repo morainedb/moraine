@@ -84,7 +84,8 @@ pub unsafe extern "C" fn moraine_metadata_cursor_fork(
     }
 }
 
-/// Opens a fixed metadata scan; `u64::MAX` means no table or live bound.
+/// Opens a fixed metadata scan; `u64::MAX` means no table or live bound. For
+/// the snapshot kinds the bound is the first snapshot id read.
 ///
 /// # Safety
 /// `handle` must be live; `out` writable; `err` null or writable. The probe

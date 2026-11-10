@@ -1,6 +1,7 @@
 #include "metadata_manager.hpp"
 
 #include "catalog.hpp"
+#include "transaction_manager.hpp"
 
 #include "common/ducklake_util.hpp"
 #include "common/index.hpp"
@@ -10,6 +11,7 @@
 #include "storage/ducklake_transaction.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/appender.hpp"
 
@@ -43,6 +45,25 @@ void MoraineMetadataManager::FlushChangesServerSide(duckdb::DuckLakeTransaction 
 	if (landed > current) {
 		lake.SetCommittedSnapshotId(static_cast<duckdb::idx_t>(landed));
 	}
+}
+
+duckdb::string MoraineMetadataManager::GetLatestSnapshotQuery() const {
+	// The metadata connection's transaction is open here, so its catalog
+	// transaction either exists or starts on the same pinned head the query
+	// would read.
+	auto &context = *transaction.GetConnection().context;
+	auto &catalog = ResolveMoraineCatalog(context, transaction.GetCatalog().MetadataDatabaseName());
+	auto &moraine_transaction = catalog.GetCatalogTransaction(context).transaction->Cast<MoraineTransaction>();
+	uint64_t snapshot_id = 0;
+	uint64_t batch_seq = 0;
+	if (!moraine_transaction.SnapshotStamp(snapshot_id, batch_seq)) {
+		return duckdb::DuckLakeMetadataManager::GetLatestSnapshotQuery();
+	}
+	return duckdb::StringUtil::Format(R"(SELECT snapshot_id, schema_version, next_catalog_id, next_file_id,
+(SELECT MAX(value) FROM {METADATA_CATALOG}.ducklake_metadata WHERE key = 'version')
+FROM {METADATA_CATALOG}.ducklake_snapshot
+WHERE snapshot_id = %llu;)",
+	                                  static_cast<unsigned long long>(snapshot_id));
 }
 
 void MoraineMetadataManager::RecordDrivingContext() {

@@ -182,6 +182,8 @@ struct MetadataScanBindData : public duckdb::FunctionData {
 	std::string catalog_name;
 	// Pushed lifecycle bound; unset reads every version.
 	duckdb::optional_idx live_bound;
+	// Pushed `snapshot_id` floor for the snapshot tables; unset reads every snapshot.
+	duckdb::optional_idx snapshot_floor;
 	// Pushed table-ID equality; unset scans the whole kind.
 	duckdb::optional_idx scope;
 	// Exposed through get_bind_info for UPDATE/DELETE base-table resolution.
