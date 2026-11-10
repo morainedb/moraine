@@ -148,7 +148,7 @@ test('the roadmap becomes a page with RFC links resolved from the repository roo
       '# Roadmap',
       '',
       'Done ([storage format](docs/rfcs/0001-storage-format.md)); see',
-      '[measurement](BENCHMARK.md#commit-time-breakdown).',
+      '[measurement](docs/benchmarks.md#where-the-time-goes).',
       '',
       '<!-- site:omit -->',
       '### Multi-process writers',
@@ -158,7 +158,7 @@ test('the roadmap becomes a page with RFC links resolved from the repository roo
   assert.match(page, /^---\ntitle: "Roadmap"\n---\n/);
   assert.ok(page.includes('](/rfcs/0001-storage-format/)'));
   assert.ok(
-    page.includes('](https://github.com/morainedb/moraine/blob/main/BENCHMARK.md#commit-time-breakdown)'),
+    page.includes('](https://github.com/morainedb/moraine/blob/main/docs/benchmarks.md#where-the-time-goes)'),
   );
   assert.ok(!page.includes('Multi-process'));
   assert.ok(!page.includes('# Roadmap'));

@@ -86,6 +86,8 @@ what is done and what is next.
 - `crates/moraine-duckdb` is the DuckDB extension wrapping the core.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) is the map of the code;
   [`docs/rfcs/`](docs/rfcs/README.md) holds the design documents;
+  [`docs/benchmarks.md`](docs/benchmarks.md) catalogs the measurement
+  harnesses and their headline numbers;
   [`CONTRIBUTING.md`](CONTRIBUTING.md) covers setup and the local gate.
 
 ## Versioning

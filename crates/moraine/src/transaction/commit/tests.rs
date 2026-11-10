@@ -4388,7 +4388,7 @@ async fn a_refresh_declines_churn_that_outruns_the_catalog() {
     catalog.close().await.unwrap();
 }
 
-/// 0009 — replaying a gap's changelog versus rematerializing at head.
+/// replaying a gap's changelog versus rematerializing at head.
 ///
 /// The refresh declines a gap whose churn passes a share of the live
 /// catalog, and the share is a cost choice: both paths build the same view.
@@ -4407,7 +4407,9 @@ async fn measure_refresh_versus_rematerialization() {
     const FILES_PER_COMMIT: usize = 4;
     const REPEATS: usize = 9;
 
-    println!("\n# 0009 changelog replay vs. rematerialization (in-memory object_store)");
+    allocation::conditions::stamp(
+        "changelog replay vs. rematerialization (in-memory object_store)",
+    );
     println!(
         "# {COLUMNS} columns per table, {FILES_PER_COMMIT} files per gap commit, \
          median of {REPEATS}"
@@ -4487,7 +4489,7 @@ async fn measure_refresh_versus_rematerialization() {
     println!();
 }
 
-/// 0009 — what the changelog costs the read path.
+/// what the changelog costs the read path.
 ///
 /// It used to ride in the snapshot record, and snapshot records are what
 /// DuckLake re-reads every transaction and what moraine keeps a decoded
@@ -4505,7 +4507,9 @@ async fn measure_changelog_read_cost() {
     const COLUMNS: usize = 8;
     const REPEATS: usize = 9;
 
-    println!("\n# 0009 changelog cost on the snapshot read path (in-memory object_store)");
+    allocation::conditions::stamp(
+        "changelog cost on the snapshot read path (in-memory object_store)",
+    );
     println!(
         "# one data file per commit over a {COLUMNS}-column table, stats for every \
          column, median of {REPEATS}\n"
