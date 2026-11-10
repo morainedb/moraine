@@ -9,6 +9,7 @@ mod catalog;
 mod census;
 mod checkpoint;
 mod commit_concurrency;
+mod conditions;
 mod counting_store;
 mod crash_recovery;
 mod data_files;

@@ -21,6 +21,9 @@
 // functions — exempted here instead, crate-wide, as tests.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+#[path = "it/conditions.rs"]
+mod conditions;
+
 use std::{
     ops::Bound,
     sync::Arc,
@@ -332,7 +335,7 @@ async fn measure_attach_latency_against_endpoint() {
     let store = s3_store();
     let target = endpoint_label();
 
-    println!("\n# 0021 fresh-handle attach against {target}");
+    conditions::stamp(&format!("fresh-handle attach against {target}"));
     println!(
         "# {ATTACH_TABLES} tables x {ATTACH_COLUMNS_PER_TABLE} columns, \
          {ATTACH_ROUNDS} churn rounds; median of {ATTACH_REPEATS} fresh handles"
@@ -431,7 +434,7 @@ async fn measure_attach_latency_against_endpoint() {
     println!();
 }
 
-/// 0021 — fresh fixed-checkpoint and live-following attach against the
+/// fresh fixed-checkpoint and live-following attach against the
 /// endpoint.
 ///
 /// Fixed readers go first against independently seeded churned and merged
@@ -447,7 +450,7 @@ async fn measure_attach_latency_against_the_endpoint() {
     Box::pin(measure_attach_latency_against_endpoint()).await;
 }
 
-/// 0004 — durable-commit latency where the WAL flush is a real PUT.
+/// durable-commit latency where the WAL flush is a real PUT.
 ///
 /// The in-memory harness (`tests/it/measure.rs`) settles the shape:
 /// `max(flush cadence, write RTT) + ~2 ms`, with the round trip injected
@@ -466,7 +469,7 @@ async fn measure_commit_latency_against_the_endpoint() {
 
     let store = s3_store();
     let target = endpoint_label();
-    println!("\n# 0004 durable-commit latency against {target}");
+    conditions::stamp(&format!("durable-commit latency against {target}"));
     println!("# {COMMITS} sequential one-table commits per row, each await_durable\n");
     println!(
         "{:>10}  {:>11}  {:>9}  {:>9}",
@@ -775,7 +778,7 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
     let index_bytes = index.bytes;
     census_reader.close().await.unwrap();
 
-    println!("\n# index-lookup latency against {target}");
+    conditions::stamp(&format!("index-lookup latency against {target}"));
     println!("# prefix `{}`", options.path);
     println!(
         "# {INDEX_LOOKUP_FILES} files x {INDEX_LOOKUP_ROWS_PER_FILE} rows: \
@@ -1249,7 +1252,7 @@ async fn measure_located_lookup_latency_against_the_endpoint() {
     census_reader.close().await.unwrap();
     assert_eq!(files.len() as u64, LOCATED_FILES);
 
-    println!("\n# located-lookup latency against {target}");
+    conditions::stamp(&format!("located-lookup latency against {target}"));
     println!("# prefix `{}`, data under `{data_prefix}`", options.path);
     println!(
         "# {LOCATED_FILES} Parquet files x {LOCATED_ROWS_PER_FILE} rows: {LOCATED_DENSE_FILES} \
