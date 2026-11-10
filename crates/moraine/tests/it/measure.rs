@@ -1,4 +1,4 @@
-//! Measurement harnesses behind the numbers in `BENCHMARK.md` and `docs/*.md`.
+//! Measurement harnesses behind the numbers in `BENCHMARK.md`.
 //! These are not assertions — they print timings, and are `#[ignore]`d so
 //! the ordinary suite stays fast. Run one explicitly and read its output:
 //!
@@ -6,8 +6,9 @@
 //! cargo test -p moraine --test it --release -- --ignored --nocapture measure_
 //! ```
 //!
-//! Every number is machine- and backend-specific; the run prints its
-//! conditions so a recorded result stays interpretable. They run on the
+//! Every number is machine- and backend-specific; each run stamps its
+//! output with the commit, host, and build profile so a recorded result
+//! stays interpretable. They run on the
 //! in-memory `object_store`, where a durable commit performs no network IO
 //! — so the durable-commit cost measured here is moraine's flush poll plus
 //! compute, and a real object store adds its WAL-object PUT round-trip on
@@ -33,6 +34,7 @@ use object_store::{
 };
 
 use crate::{
+    conditions,
     crash_recovery::freezing_store::FreezingStore,
     fixtures::{col, datafile},
 };
@@ -78,11 +80,11 @@ const DEFAULT_FLUSH_MS: u64 = 100;
 /// A fast interval for seeding, whose durable waits are not being timed.
 const SEED_FLUSH_MS: u64 = 1;
 
-/// 0009 — catalog materialization versus live-entity count.
+/// catalog materialization versus live-entity count.
 ///
 /// `Catalog::snapshot()` calls `materialize` directly and never consults
 /// the projection cache (which only committers populate), so this is not a
-/// cold-start cost — it is paid on *every* public read. The RFC leaves open
+/// cold-start cost — it is paid on *every* public read. The design leaves open
 /// whether that full materialization stays cheap enough to make partial or
 /// lazy materialization unnecessary; this puts a curve under it. Timing
 /// covers only the read, so the seed's flush interval is irrelevant and set
@@ -96,7 +98,7 @@ async fn measure_materialization_by_catalog_size() {
     const REPEATS: usize = 9;
     let ladder = [10usize, 50, 200, 800];
 
-    println!("\n# 0009 materialization per snapshot() (in-memory object_store)");
+    conditions::stamp("materialization per snapshot() (in-memory object_store)");
     println!(
         "# {COLS_PER_TABLE} columns and {FILES_PER_TABLE} files per table, \
          median of {REPEATS} materializations\n"
@@ -169,7 +171,7 @@ async fn measure_materialization_by_catalog_size() {
     println!();
 }
 
-/// 0021 — cold attach cost against the physical bytes `current` holds.
+/// cold attach cost against the physical bytes `current` holds.
 ///
 /// The claim the store census and the store merge rest on: a cold attach
 /// scans `current`, and it reads through every superseded version those
@@ -191,7 +193,7 @@ async fn measure_attach_cost_by_dead_fraction() {
     // `current` record per table without changing what is live.
     let rounds = [0usize, 10, 40, 160];
 
-    println!("\n# 0021 cold attach vs. physical `current` bytes (in-memory object_store)");
+    conditions::stamp("cold attach vs. physical `current` bytes (in-memory object_store)");
     println!(
         "# {TABLES} tables x {COLS_PER_TABLE} columns, live entities held constant; \
          each round rewrites every table's stats\n"
@@ -358,7 +360,7 @@ async fn churn_into_ssts(store: &Arc<InMemory>, tables: usize, columns: usize, r
     }
 }
 
-/// 0021 — what a store merge is worth once a GET costs what S3 charges.
+/// what a store merge is worth once a GET costs what S3 charges.
 ///
 /// The companion to the sweep above, and the one that reaches the regime
 /// the production incident sat in. That incident was IO-bound — ~5.3 MB/s
@@ -382,7 +384,7 @@ async fn measure_attach_cost_under_get_latency() {
     const REPEATS: usize = 5;
     let latencies = [0u64, 2, 5, 10];
 
-    println!("\n# 0021 cold read-only attach vs. injected per-GET latency");
+    conditions::stamp("cold read-only attach vs. injected per-GET latency");
     println!(
         "# {TABLES} tables x {COLS_PER_TABLE} columns, {ROUNDS} churn rounds, \
          live set constant; median of {REPEATS}\n"
@@ -453,7 +455,7 @@ async fn measure_attach_cost_under_get_latency() {
     println!();
 }
 
-/// 0021 — does a cold attach pay for the `index` subspace it never scans?
+/// does a cold attach pay for the `index` subspace it never scans?
 ///
 /// A production store measured 3.364 GB in `index` (75.6M live entries)
 /// against ~13 MB across every subspace a reader touches, and still took
@@ -469,7 +471,7 @@ async fn measure_attach_cost_by_index_size() {
     const REPEATS: usize = 5;
     let commit_ladder = [0usize, 8, 32, 128];
 
-    println!("\n# 0021 cold read-only attach vs. `index` subspace size");
+    conditions::stamp("cold read-only attach vs. `index` subspace size");
     println!("# reader-visible subspaces held fixed; only `index` grows\n");
     println!(
         "{:>8}  {:>11}  {:>10}  {:>9}  {:>13}  {:>9}  {:>9}",
@@ -581,7 +583,7 @@ async fn measure_attach_cost_by_index_size() {
     println!();
 }
 
-/// 0004 — durable-commit latency versus flush interval.
+/// durable-commit latency versus flush interval.
 ///
 /// `Catalog::commit` awaits durability, and on the in-memory store the WAL
 /// "flush" is driven by the handle's flush-poll timer, not an immediate
@@ -589,7 +591,7 @@ async fn measure_attach_cost_by_index_size() {
 /// sweep exposes that: the compute floor shows at a 1 ms interval, and the
 /// default 100 ms interval shows the realistic per-commit latency. A real
 /// object store replaces the poll wait with its WAL-object PUT round-trip;
-/// this is the term the 0021 sweep multiplies by its commit count.
+/// this is the term the reclaim sweep below multiplies by its commit count.
 #[tokio::test]
 #[ignore = "measurement, not a test: run with --ignored --nocapture"]
 #[allow(clippy::unwrap_used)]
@@ -597,7 +599,7 @@ async fn measure_commit_latency_by_flush_interval() {
     const COMMITS: usize = 60;
     let intervals = [1u64, 10, 50, 100, 250];
 
-    println!("\n# 0004 durable-commit latency by flush interval (in-memory)");
+    conditions::stamp("durable-commit latency by flush interval (in-memory)");
     println!("# {COMMITS} sequential one-table commits, each await_durable\n");
     println!(
         "{:>10}  {:>11}  {:>9}  {:>9}",
@@ -651,7 +653,7 @@ async fn measure_commit_latency_by_flush_interval() {
     println!();
 }
 
-/// 0004 — commit throughput as concurrency rises, and where the batch's
+/// commit throughput as concurrency rises, and where the batch's
 /// member ceiling starts to bind.
 ///
 /// A lone commit costs one WAL flush, so sequential throughput is
@@ -675,7 +677,7 @@ async fn measure_commit_throughput_by_concurrency() {
     const COMMITS: usize = 128;
     let ladder = [1usize, 2, 4, 8, 16, 32, 64, 128];
 
-    println!("\n# 0004 commit throughput by concurrency (in-memory object_store)");
+    conditions::stamp("commit throughput by concurrency (in-memory object_store)");
     println!(
         "# {COMMITS} appends per level at the {DEFAULT_FLUSH_MS} ms default flush interval, \
          one table per caller,"
@@ -763,7 +765,7 @@ async fn measure_commit_throughput_by_concurrency() {
     println!();
 }
 
-/// 0004 — durable-commit latency against a write round-trip, which is what
+/// durable-commit latency against a write round-trip, which is what
 /// a real object store adds and the in-memory store has none of.
 ///
 /// `measure_commit_latency_by_flush_interval` settles the in-memory shape:
@@ -787,7 +789,7 @@ async fn measure_commit_latency_by_write_rtt() {
     let flush_intervals = [1u64, 25, 100];
     let round_trips = [0u64, 5, 25, 100];
 
-    println!("\n# 0004 durable-commit latency by injected write round-trip");
+    conditions::stamp("durable-commit latency by injected write round-trip");
     println!("# {COMMITS} sequential commits per cell, median ms; columns are flush intervals\n");
     print!("{:>10}", "put_rtt_ms");
     for flush_ms in flush_intervals {
@@ -834,7 +836,7 @@ async fn measure_commit_latency_by_write_rtt() {
     println!();
 }
 
-/// 0021 — reclaim throughput versus maintenance batch size.
+/// reclaim throughput versus maintenance batch size.
 ///
 /// Seeds a dropped (dead) non-unique index carrying many entries, then
 /// times a full sweep at a ladder of batch sizes. Each batch is one durable
@@ -891,7 +893,7 @@ async fn measure_reclaim_by_batch_size() {
 
     let ladder = [256usize, 1024, 4096, 16384, 65536];
 
-    println!("\n# 0021 reclaim sweep by batch size (in-memory object_store)");
+    conditions::stamp("reclaim sweep by batch size (in-memory object_store)");
     println!(
         "# {DEAD_ENTRIES} dead entries in one index, median of {REPEATS} sweeps at the \
          {DEFAULT_FLUSH_MS} ms default flush interval;"
@@ -932,7 +934,7 @@ async fn measure_reclaim_by_batch_size() {
     println!();
 }
 
-/// 0010 — does object-store read latency starve the shared worker pool?
+/// does object-store read latency starve the shared worker pool?
 ///
 /// The concern is a multi-threaded runtime whose worker threads all block
 /// on slow object-store reads, so concurrent scans serialize instead of
@@ -996,7 +998,9 @@ async fn measure_read_concurrency_under_io_latency() {
     options.flush_interval = Duration::from_millis(DEFAULT_FLUSH_MS);
     let catalog = Catalog::open(throttled, options).await.unwrap();
 
-    println!("\n# 0010 read concurrency under {READ_LATENCY_MS} ms IO latency");
+    conditions::stamp(&format!(
+        "read concurrency under {READ_LATENCY_MS} ms IO latency"
+    ));
     println!("# {TABLES}-table catalog, 4-worker runtime, median of {REPEATS} batches\n");
     println!(
         "{:>12}  {:>11}  {:>13}",
@@ -1026,7 +1030,7 @@ async fn measure_read_concurrency_under_io_latency() {
     println!();
 }
 
-/// 0016 — unique-index maintenance cost per commit as the store grows,
+/// unique-index maintenance cost per commit as the store grows,
 /// scattered versus clustered indexed values.
 ///
 /// Uniqueness is resolved by bounded-concurrency point reads at every batch
@@ -1126,7 +1130,7 @@ async fn measure_index_maintenance_by_store_size() {
     let clustered = run(false).await;
     let scattered = run(true).await;
 
-    println!("\n# 0016 unique-index maintenance per commit by store size (in-memory object_store)");
+    conditions::stamp("unique-index maintenance per commit by store size (in-memory object_store)");
     println!(
         "# {BATCH} rows per commit (> merged-probe threshold), {COMMITS} commits, fast flush\n"
     );
@@ -1151,7 +1155,7 @@ async fn measure_index_maintenance_by_store_size() {
     println!();
 }
 
-/// 0010 — whether a CPU-bound decode monopolizes a worker.
+/// whether a CPU-bound decode monopolizes a worker.
 ///
 /// `measure_read_concurrency_under_io_latency` settles the IO half: awaits
 /// on object-store latency yield their worker, so slow IO does not starve
@@ -1247,7 +1251,7 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
     }
     let idle = Stats::of(idle);
 
-    println!("\n# 0010 CPU-bound decode under worker pressure (in-memory object_store)");
+    conditions::stamp("CPU-bound decode under worker pressure (in-memory object_store)");
     println!(
         "# {HEAVY_TABLES} tables x ({COLS_PER_TABLE} columns + {FILES_PER_TABLE} files), \
          4-worker runtime, median of {REPEATS} batches"
@@ -1330,7 +1334,7 @@ async fn read_ladder(
     }
 }
 
-/// 0009 — what a warm read on a read-write handle costs, and where.
+/// what a warm read on a read-write handle costs, and where.
 ///
 /// A warm read no longer resolves the head from the store, probes
 /// `sys/migration`, or opens a session at all: it checks the writer's
@@ -1379,7 +1383,7 @@ async fn measure_warm_read_attribution() {
     // Warm the handle: from here every read below is served from the view.
     catalog.read_scope().await.unwrap();
 
-    println!("\n# 0009 warm read (in-memory object_store)");
+    conditions::stamp("warm read (in-memory object_store)");
     println!("# {TABLES} tables, {READS} reads per thread, all served from a held view");
 
     let catalog = Arc::new(catalog);
@@ -1435,7 +1439,7 @@ async fn measure_warm_read_attribution() {
     .await;
 }
 
-/// 0009 — how many round trips a warm read-only read costs.
+/// how many round trips a warm read-only read costs.
 ///
 /// A read-only handle holds no writer-local premise, so serving a cache
 /// hit still means asking the store two questions: whether a structural
@@ -1474,7 +1478,7 @@ async fn measure_reader_round_trips_under_get_latency() {
     }
     writer.close().await.unwrap();
 
-    println!("\n# 0009 warm read-only read, per-GET latency injected");
+    conditions::stamp("warm read-only read, per-GET latency injected");
     println!("# {TABLES} tables, median of {REPEATS} warm reads\n");
     println!(
         "{:>12}  {:>11}  {:>9}  {:>9}  {:>13}",
@@ -1545,7 +1549,7 @@ async fn measure_reader_round_trips_under_get_latency() {
     }
 }
 
-/// 0009 — what an index probe fetches, cold and warm.
+/// what an index probe fetches, cold and warm.
 ///
 /// The design replaced a part-grained object cache with a block-grained
 /// one and argued the swap from grain arithmetic: a probe into a large
@@ -1568,7 +1572,7 @@ async fn measure_probe_cost_by_index_size() {
     const PROBES: u64 = 32;
     let commit_ladder = [1usize, 8, 32, 128];
 
-    println!("\n# 0009 index-probe cost against the shared block cache");
+    conditions::stamp("index-probe cost against the shared block cache");
     println!("# in-memory store: bytes are the transferable number, ms is decode only\n");
     println!(
         "{:>8}  {:>11}  {:>10}  {:>12}  {:>13}  {:>10}  {:>12}  {:>9}",

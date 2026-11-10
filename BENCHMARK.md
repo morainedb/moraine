@@ -336,8 +336,8 @@ cargo test -p moraine --lib --release -- --ignored --nocapture measure_
 Run in `--release`; a debug build's numbers are meaningless. They use the
 in-memory `object_store`, so a durable commit performs no network IO — the
 durable cost measured is moraine's flush poll plus compute, and a real object
-store adds its WAL-object PUT round-trip on top. Each harness prints its
-conditions.
+store adds its WAL-object PUT round-trip on top. Every harness stamps its
+output with the commit it measured, the host, and the build profile.
 
 The results below are one representative run on an **Apple M2 (Mac14,2),
 arm64**. Absolute numbers are machine-specific; the shapes and ratios are the
@@ -1138,6 +1138,8 @@ cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 \
 | `index_maintenance_input_order` | 4,096-entry appends in ascending, descending, and scattered order |
 | `refresh_count_does_not_allocate` | asserts the refresh heuristic's entity count allocates nothing |
 | `index_maintenance_profile` | twenty 1,024-entry appends, shaped for a Valgrind DHAT run |
+| `verb_commit_scaling` | statistics updates on one table as unrelated tables and files grow, alone and in groups of four |
+| `row_lookups` | one-hit file, inline, and `recent_row` lookups by source count, cold and warm, on both handle kinds |
 
 Findings (2026-09-08): a one-change refresh at 1,024 tables allocates
 44 KB and takes 0.2 ms against 65 MB and 50 ms for a rematerialization,
@@ -1152,34 +1154,31 @@ For a heap profile, build the unit-test executable with `--no-run`, run
 `index_maintenance_profile` under `valgrind --tool=dhat`, and filter the
 stacks by `profile_index_append`, which encloses commit preparation only.
 
-Three examples measure whole operations the tests cannot shape:
+The last two measure whole operations rather than one path:
 
-```text
-cargo build --release -p moraine --examples
-# unrelated tables, files per table, measured groups, members per group, flush ms
-target/release/examples/verb_commit_bench 4096 8 60 1 0
-# files | inline | recent, then source count, then optional `reader`
-target/release/examples/row_lookup_bench files 1024
-# chunks, rows per chunk, step entries, bytes per indexed string
-target/release/examples/staged_build_memory 128 128 128 1024
-```
-
-- `verb_commit_bench` updates one table's statistics while unrelated
+- `verb_commit_scaling` updates one table's statistics while unrelated
   catalog state grows. A commit's cost is independent of that state: with
   4,096 unrelated tables a mutation costs 0.2 ms of CPU, where copying the
   catalog per commit cost 66 ms (2026-09-08). What remains is the
   durability floor.
-- `row_lookup_bench` times one-hit `locate_row_ids`, inline membership,
-  and `recent_row` lookups cold and warm. Warm lookups are constant in
-  source count, 35 to 100 µs and a few hundred allocations at 1,024
-  sources, where they once scaled linearly to 5 to 48 ms; cold lookups
-  still pay one footer read per dense file (2026-09-08).
-- `staged_build_memory` profiles a whole `create_index_staged` call with
-  dhat's allocator. `BuildStep.entries` bounds the commit buffer, not the
-  heap: at 16,384 inlined rows a 128-entry step peaks at 23 MB, down from
-  40 MB when derivation held the whole table, and a smaller step raises
-  the peak slightly because more commits retain more store state
-  (2026-09-08).
+- `row_lookups` times one-hit `locate_row_ids`, inline membership, and
+  `recent_row` lookups cold and warm. Warm lookups are constant in source
+  count, 35 to 100 µs and a few hundred allocations at 1,024 sources,
+  where they once scaled linearly to 5 to 48 ms; cold lookups still pay
+  one footer read per dense file (2026-09-08).
+
+Peak heap needs dhat's allocator, which cannot sit beside the counting
+one, so the staged-build profile has a test binary of its own:
+
+```text
+cargo test -p moraine --test staged_build_memory --release -- --ignored --nocapture
+```
+
+It profiles a whole `create_index_staged` call over a persisted store.
+`BuildStep.entries` bounds the commit buffer, not the heap: at 16,384
+inlined rows a 128-entry step peaks at 23 MB, down from 40 MB when
+derivation held the whole table, and a smaller step raises the peak
+slightly because more commits retain more store state (2026-09-08).
 
 Whole-process memory for a demand-loaded catalog is measured from a fresh
 DuckDB process over a persisted fixture: `write_memory_measurement_fixture`

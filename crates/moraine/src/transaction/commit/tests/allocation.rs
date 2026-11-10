@@ -8,8 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow::{
+    array::{Int64Array, RecordBatch},
+    datatypes::{DataType, Field as ArrowField, Schema},
+};
 use cpu_time::ProcessTime;
-use object_store::memory::InMemory;
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+use parquet::arrow::ArrowWriter;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use tracing::{
     Event, Subscriber,
@@ -19,10 +24,16 @@ use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 use super::{bulk_file, bulk_file_entries, int_value, seeded_wide_catalog};
 use crate::{
-    Catalog, CatalogOptions, ColumnDef, IndexDef, IndexId, ObjectStoreTally, TableId,
+    Catalog, CatalogOptions, ColumnDef, CommitMember, DataFile, DataStore, IndexDef, IndexId,
+    InlineChunk, ObjectStoreTally, ReadOnlyCatalog, Result, SchemaId, TableId, Transaction,
     store::handle::ReadHandle,
     transaction::commit::{materialize, refresh},
 };
+
+// The stamp the integration harnesses print, shared by source so every
+// measurement names its conditions the same way.
+#[path = "../../../../tests/it/conditions.rs"]
+mod conditions;
 
 // This module is compiled only into the library's unit-test executable.
 #[global_allocator]
@@ -90,10 +101,11 @@ struct Totals {
     gets: u64,
     puts: u64,
     put_time: Duration,
+    data_gets: u64,
 }
 
 impl Measurement<'_> {
-    fn start(catalog: &Catalog, durability: &Durability) -> Self {
+    fn start(catalog: &ReadOnlyCatalog, durability: &Durability) -> Self {
         let store = catalog.object_store_tally();
         let durable = durability.elapsed();
         Self {
@@ -105,7 +117,7 @@ impl Measurement<'_> {
         }
     }
 
-    fn finish(self, catalog: &Catalog, durability: &Durability, totals: &mut Totals) {
+    fn finish(self, catalog: &ReadOnlyCatalog, durability: &Durability, totals: &mut Totals) {
         let wall = self.wall.elapsed();
         let cpu = self.cpu.elapsed();
         let allocations = self.allocations.change();
@@ -118,6 +130,7 @@ impl Measurement<'_> {
         totals.gets += store.main_gets + store.wal_gets;
         totals.puts += store.main_puts + store.wal_puts;
         totals.put_time += store.main_put_duration + store.wal_put_duration;
+        totals.data_gets += store.data_gets;
     }
 }
 
@@ -132,7 +145,7 @@ impl Totals {
         let count = number(samples);
         let micros = |duration: Duration| duration.as_secs_f64() * 1e6 / count;
         println!(
-            "ALLOC,{operation},{size},{batch},{samples},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{},{},{:.3}",
+            "ALLOC,{operation},{size},{batch},{samples},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{},{},{:.3},{}",
             micros(self.wall),
             micros(self.cpu),
             micros(self.durable),
@@ -141,21 +154,23 @@ impl Totals {
             number(self.bytes) / count,
             self.gets,
             self.puts,
-            micros(self.put_time)
+            micros(self.put_time),
+            self.data_gets
         );
     }
 }
 
-fn header() {
+fn header(title: &str) {
+    conditions::stamp(title);
     println!(
-        "ALLOC,operation,size,batch,samples,total_us,cpu_us,durable_us,non_durable_us,allocations,allocated_bytes,total_gets,total_puts,put_us"
+        "ALLOC,operation,size,batch,samples,total_us,cpu_us,durable_us,non_durable_us,allocations,allocated_bytes,total_gets,total_puts,put_us,data_gets"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "allocation benchmark; run alone with --exact --ignored --test-threads=1 --nocapture"]
 async fn snapshot_refresh() {
-    header();
+    header("snapshot refresh against rematerialization");
     let durability = Durability::default();
     for tables in [16, 128, 1024] {
         let (catalog, ids) = seeded_wide_catalog(tables, 4).await;
@@ -207,7 +222,7 @@ async fn snapshot_refresh() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "allocation benchmark; run alone with --exact --ignored --test-threads=1 --nocapture"]
 async fn warm_reads() {
-    header();
+    header("warm snapshot reads");
     let durability = Durability::default();
     for tables in [16, 128, 1024] {
         let (catalog, _) = seeded_wide_catalog(tables, 4).await;
@@ -279,7 +294,7 @@ async fn indexed_catalog(entries: u64) -> (Catalog, Arc<InMemory>, TableId, Inde
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "allocation benchmark; run alone with --exact --ignored --test-threads=1 --nocapture"]
 async fn index_lookups() {
-    header();
+    header("index lookups over a reopened unique index");
     let durability = Durability::default();
     for entries in [1024u64, 16384, 65536] {
         let (writer, store, table, index) = indexed_catalog(entries).await;
@@ -352,7 +367,7 @@ async fn index_lookups() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "allocation benchmark; run alone with --exact --ignored --test-threads=1 --nocapture"]
 async fn index_maintenance() {
-    header();
+    header("index maintenance by existing size and batch");
     let durability = Durability::default();
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(durability.clone()),
@@ -508,7 +523,7 @@ fn an_integer_entry_uses_one_key_buffer_allocation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "allocation benchmark; run alone with --exact --ignored --test-threads=1 --nocapture"]
 async fn index_maintenance_input_order() {
-    header();
+    header("index maintenance by input order");
     let durability = Durability::default();
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(durability.clone()),
@@ -551,5 +566,269 @@ async fn index_maintenance_input_order() {
         }
         totals.print(&format!("index_append_{order}"), 1024, 4096, 5);
         catalog.close().await.unwrap();
+    }
+}
+
+async fn mutate(catalog: &Catalog, table: TableId, group: usize, sample: usize) -> Result<()> {
+    fn change(
+        table: TableId,
+        rows: u64,
+    ) -> impl for<'a> Fn(&'a mut Transaction) -> futures::future::BoxFuture<'a, Result<()>> {
+        move |tx| Box::pin(async move { tx.update_table_stats(table, rows, 128).await })
+    }
+    let changes: Vec<_> = (0..group)
+        .map(|member| change(table, u64::try_from(sample * group + member).unwrap()))
+        .collect();
+    let members: Vec<CommitMember<'_>> = changes
+        .iter()
+        .map(|change| change as CommitMember<'_>)
+        .collect();
+    catalog.commit_group(&members).await?;
+    Ok(())
+}
+
+/// Statistics updates on one table while unrelated catalog state grows,
+/// with a retained pre-mutation snapshot keeping shared readers alive.
+/// Costs are per logical mutation, so a group of four shares one durable
+/// batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "allocation benchmark; run alone with --exact --ignored --test-threads=1 --nocapture"]
+async fn verb_commit_scaling() {
+    const FILES_PER_TABLE: usize = 8;
+    const WARMUP: usize = 5;
+    const SAMPLES: usize = 60;
+    header("verb commit cost by unrelated catalog state");
+    let durability = Durability::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(durability.clone()),
+    )
+    .unwrap();
+    for tables in [0usize, 128, 1024, 4096] {
+        for group in [1usize, 4] {
+            let catalog = Catalog::open(
+                Arc::new(InMemory::new()),
+                CatalogOptions {
+                    flush_interval: Duration::ZERO,
+                    ..CatalogOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            let column = ColumnDef {
+                name: "value".into(),
+                column_type: "BIGINT".into(),
+                nulls_allowed: true,
+                default_value: None,
+                children: Vec::new(),
+            };
+            catalog
+                .commit(async |tx| {
+                    tx.create_table(SchemaId::new(0), "target", std::slice::from_ref(&column))
+                        .await?;
+                    for index in 0..tables {
+                        let table = tx
+                            .create_table(
+                                SchemaId::new(0),
+                                &format!("unrelated-{index}"),
+                                std::slice::from_ref(&column),
+                            )
+                            .await?;
+                        for file in 0..FILES_PER_TABLE {
+                            tx.register_data_file(table, bulk_file(&format!("f{file}"), 1), &[])
+                                .await?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let held = catalog.read_scope().await.unwrap();
+            let table = held
+                .table_by_name(SchemaId::new(0), "target")
+                .await
+                .unwrap()
+                .expect("target table")
+                .id;
+            for sample in 0..WARMUP {
+                mutate(&catalog, table, group, sample).await.unwrap();
+            }
+
+            let mut totals = Totals::default();
+            let measurement = Measurement::start(&catalog, &durability);
+            for sample in 0..SAMPLES {
+                mutate(&catalog, table, group, WARMUP + sample)
+                    .await
+                    .unwrap();
+            }
+            measurement.finish(&catalog, &durability, &mut totals);
+            totals.print("verb_commit", tables, group, SAMPLES * group);
+
+            std::hint::black_box(&held);
+            drop(held);
+            catalog.close().await.unwrap();
+        }
+    }
+}
+
+/// Seeds one table with `sources` data files or inline chunks of 128 rows
+/// each; files are real dense Parquet so a located lookup reads a footer.
+async fn seed_lookup_sources(
+    catalog: &Catalog,
+    data: &InMemory,
+    mode: &str,
+    sources: usize,
+) -> TableId {
+    const ROWS: usize = 128;
+    let mut encoded = Vec::new();
+    let schema = Arc::new(Schema::new(vec![ArrowField::new(
+        "a",
+        DataType::Int64,
+        true,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1; ROWS]))]).unwrap();
+    let mut writer = ArrowWriter::try_new(&mut encoded, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let footer = u32::from_le_bytes(
+        encoded[encoded.len() - 8..encoded.len() - 4]
+            .try_into()
+            .unwrap(),
+    );
+    if mode == "files" {
+        for source in 0..sources {
+            data.put(
+                &Path::from(format!("main/lookup/file-{source}.parquet")),
+                encoded.clone().into(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let table = Cell::new(None);
+    catalog
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await?
+                .ok_or_else(|| crate::Error::NotFound("main".into()))?
+                .id;
+            let id = tx
+                .create_table(
+                    schema,
+                    "lookup",
+                    &[ColumnDef {
+                        name: "a".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        ..Default::default()
+                    }],
+                )
+                .await?;
+            table.set(Some(id));
+            for source in 0..sources {
+                if mode == "files" {
+                    tx.register_data_file(
+                        id,
+                        DataFile {
+                            path: format!("file-{source}.parquet"),
+                            path_is_relative: true,
+                            file_format: "parquet".into(),
+                            record_count: ROWS as u64,
+                            file_size_bytes: encoded.len() as u64,
+                            footer_size: u64::from(footer),
+                            encryption_key: None,
+                            partition_values: Vec::new(),
+                            column_stats: Vec::new(),
+                        },
+                        &[],
+                    )
+                    .await?;
+                } else {
+                    tx.inline_insert(
+                        id,
+                        &InlineChunk {
+                            schema_version: 0,
+                            row_count: ROWS as u64,
+                            arrow_schema: b"opaque schema".to_vec(),
+                            arrow_body: vec![0; 1024],
+                        },
+                        &[],
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    table.get().expect("lookup table")
+}
+
+/// One-hit row lookups by source count, cold and warm, on a read-write and
+/// a read-only handle: whether a lookup's cost follows the sources it does
+/// not touch. The catalog is closed and reopened before the cold sample.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "allocation benchmark; run alone with --exact --ignored --test-threads=1 --nocapture"]
+async fn row_lookups() {
+    const WARM_SAMPLES: usize = 32;
+    header("one-hit row lookups by source count");
+    let durability = Durability::default();
+    for mode in ["files", "inline", "recent"] {
+        for sources in [16usize, 128, 1024] {
+            for handle in ["writer", "reader"] {
+                let metadata = Arc::new(InMemory::new());
+                let data = Arc::new(InMemory::new());
+                let options = CatalogOptions {
+                    flush_interval: Duration::ZERO,
+                    ..CatalogOptions::default()
+                };
+                let writer = Catalog::open(metadata.clone(), options.clone())
+                    .await
+                    .unwrap();
+                let table = seed_lookup_sources(&writer, &data, mode, sources).await;
+                writer.close().await.unwrap();
+                drop(writer);
+                let catalog = if handle == "reader" {
+                    Catalog::open_read_only(metadata, options).await.unwrap()
+                } else {
+                    (*Catalog::open(metadata, options).await.unwrap()).clone()
+                };
+                let store = DataStore::new(data);
+                let target = u64::try_from(sources / 2).unwrap() * 128 + 1;
+
+                for (cache, samples) in [("cold", 1), ("warm", WARM_SAMPLES)] {
+                    let mut totals = Totals::default();
+                    let measurement = Measurement::start(&catalog, &durability);
+                    for _ in 0..samples {
+                        if mode == "recent" {
+                            let row = catalog
+                                .recent_row(table, target)
+                                .await
+                                .unwrap()
+                                .expect("inline hit");
+                            assert_eq!(row.row_id, target);
+                        } else {
+                            let located = catalog
+                                .locate_row_ids(
+                                    (mode == "files").then(|| store.clone()),
+                                    "",
+                                    table,
+                                    vec![target],
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(located.len(), 1);
+                            assert_eq!(located[0].row_id, target);
+                            assert_eq!(located[0].data_file_id.is_some(), mode == "files");
+                        }
+                    }
+                    measurement.finish(&catalog, &durability, &mut totals);
+                    totals.print(&format!("{mode}_{handle}_{cache}"), sources, 1, samples);
+                }
+                catalog.close().await.unwrap();
+            }
+        }
     }
 }
