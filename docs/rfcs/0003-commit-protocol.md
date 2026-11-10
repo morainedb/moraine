@@ -29,10 +29,12 @@ fails with `Error::Fenced`. A fenced catalog writes nothing further and must
 be reattached. Two processes attaching read-write take turns fencing each
 other, so the operational rule is one read-write process per store.
 
+<!-- site:omit -->
 The single-writer path is complete on its own. A store may additionally keep
 its commits in a bucket-resident commit log, which admits several committers.
 That topology is specified in [the commit-log seam](0011-commit-log-seam.md)
 and is optional.
+<!-- /site:omit -->
 
 ## Commit sequence
 
@@ -424,7 +426,7 @@ reads the migration marker and the format stamp.
 | Migration marker present | `Error::Migration` |
 | Format newer than `MAX_FORMAT_VERSION` | `Error::Migration` |
 | Format below `MIN_FORMAT_VERSION` | `Error::Migration`, migrate with `Catalog::migrate` |
-| Format keeps commits in a commit log, no provider registered | `Error::Migration` |
+| <!-- site:omit -->Format keeps commits in a commit log, no provider registered | `Error::Migration`  <!-- /site:omit -->|
 | Format absent | bootstrap |
 
 Bootstrap stages one batch: the format stamp at `MAX_FORMAT_VERSION` with the
@@ -447,6 +449,7 @@ function of a snapshot id stays in step with it. Deduplicating a re-drive
 across a process death needs a caller-supplied idempotency token, which the
 protocol does not carry. A re-driven commit is an ordinary commit.
 
+<!-- site:omit -->
 ## Commit log offer
 
 When `CatalogOptions::commit_log` names a provider, or one is registered for
@@ -456,6 +459,7 @@ SlateDB commit. A won slot is the commit point, and the session's own
 transaction is rolled back. A lost offer is a lost race. Acknowledgement still
 waits for a published checkpoint covering the slot. Everything else about the
 log is in [the commit-log seam](0011-commit-log-seam.md).
+<!-- /site:omit -->
 
 ## Submission outcomes and cancel safety
 

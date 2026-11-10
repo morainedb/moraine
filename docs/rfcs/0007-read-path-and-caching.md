@@ -57,11 +57,13 @@ A detached checkpoint created from the latest manifest is never used for
 writer publication. Such a checkpoint does not advance the manifest's WAL
 boundary, so a following reader can already see durable commits it omits.
 
+<!-- site:omit -->
 Under the [commit-log seam](0011-commit-log-seam.md), a committer that holds
 the writer publishes after replaying its tail. Another committer flushes,
 opens a `Publisher` on the recovered store, and publishes through the durable
 sequence covering its slot. The `Publisher` serializes publication within a
 process and coalesces writes covered by one checkpoint.
+<!-- /site:omit -->
 
 Each component owns one layer of state and nothing above it.
 

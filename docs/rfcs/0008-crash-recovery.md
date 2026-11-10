@@ -90,23 +90,22 @@ migration marker are specified in [the storage format](0001-storage-format.md).
 ## Genesis
 
 An empty store has no `sys/head` to conflict on, so concurrent genesis is
-guarded by SlateDB's writer epoch across processes and by write-write
-conflict detection on `sys/format` within one writer. An open that is
-fenced while creating the catalog re-attempts, up to `GENESIS_ATTEMPTS`,
-which is 3. Nothing of the fenced attempt reached the store, so the
-re-attempt adopts the catalog the winner created or creates one itself. The
-bound gives termination: every open takes the writer epoch by a manifest
-compare-and-swap, so two initializers could displace each other
-indefinitely. Only genesis re-attempts. An open that finds a catalog stages
-nothing, so a fence anywhere else reaches the caller. A loser fails typed
-by one of two guards. If it lost the race to create the store's first manifest, it
-never attached, and the error is `Error::OpenRaced`: nothing was written,
-and opening again adopts the winner's store. If it created the store and
-was displaced afterwards, the error is `Error::Fenced`. `OpenRaced` is
-classified by matching SlateDB's message text, because a lost
-compare-and-swap and a damaged manifest arrive as the same error kind. The
-suite stages a real lost compare-and-swap and pins the wording, so a
-SlateDB upgrade that rewords the message fails there.
+guarded by SlateDB's writer epoch across processes and by write-write conflict
+detection on `sys/format` within one writer. An open that is fenced while
+creating the catalog re-attempts, up to `GENESIS_ATTEMPTS`, which is 3. Nothing
+of the fenced attempt reached the store, so the re-attempt adopts the catalog
+the winner created or creates one itself. The bound gives termination: every
+open takes the writer epoch by a manifest compare-and-swap, so two initializers
+could displace each other indefinitely. Only genesis re-attempts. An open that
+finds a catalog stages nothing, so a fence anywhere else reaches the caller. A
+loser fails typed by one of two guards. If it lost the race to create the
+store's first manifest, it never attached, and the error is `Error::OpenRaced`:
+nothing was written, and opening again adopts the winner's store. If it created
+the store and was displaced afterwards, the error is `Error::Fenced`.
+`OpenRaced` is classified by matching SlateDB's message text, because a lost
+compare-and-swap and a damaged manifest arrive as the same error kind. The suite
+stages a real lost compare-and-swap and pins the wording, so a SlateDB upgrade
+that rewords the message fails there.
 
 ## Data-file bytes
 
@@ -187,13 +186,22 @@ seconds waited, and the staged bytes. It never gives up on the write.
 
 ## Tests
 
-- `every_case_declares_its_guarantee_and_coverage` iterates `CrashCase::ALL` and requires each case to name its guarantee and be driven.
-- One test per case in `crates/moraine/tests/it/crash_recovery.rs` builds the pre-crash state, crashes, reopens, and asserts the case's invariant.
-- Idempotence cases re-drive after reopen and assert convergence with no id collision and no double-counting.
-- Absence cases sweep the write allowance across every durability boundary of the operation.
-- The `crash_recovery` fuzz target in `fuzz/fuzz_targets/` freezes the store at an arbitrary write offset and asserts a commit landed whole or not at all.
-- `a_kill_before_the_commit_orphans_the_parquet_it_had_already_written` in `crates/moraine-duckdb/tests/ducklake_load/crash.rs` kills a DuckDB process between the Parquet write and its commit.
+- `every_case_declares_its_guarantee_and_coverage` iterates `CrashCase::ALL` and
+  requires each case to name its guarantee and be driven.
+- One test per case in `crates/moraine/tests/it/crash_recovery.rs` builds the
+  pre-crash state, crashes, reopens, and asserts the case's invariant.
+- Idempotence cases re-drive after reopen and assert convergence with no id
+  collision and no double-counting.
+- Absence cases sweep the write allowance across every durability boundary of
+  the operation.
+- The `crash_recovery` fuzz target in `fuzz/fuzz_targets/` freezes the store at
+  an arbitrary write offset and asserts a commit landed whole or not at all.
+- `a_kill_before_the_commit_orphans_the_parquet_it_had_already_written` in
+  `crates/moraine-duckdb/tests/ducklake_load/crash.rs` kills a DuckDB process
+  between the Parquet write and its commit.
 
 ## Alternatives
 
-- **A bounded durability timeout.** Rejected. Abandoning the wait does not stop the flush, so a timeout reports failure for a commit that may still land, and a re-drive applies it twice.
+- **A bounded durability timeout.** Rejected. Abandoning the wait does not stop
+  the flush, so a timeout reports failure for a commit that may still land, and
+  a re-drive applies it twice.

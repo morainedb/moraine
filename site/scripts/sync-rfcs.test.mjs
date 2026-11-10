@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { isRfcFile, transformReadme, transformRfc } from './sync-rfcs.mjs';
+import { isPublishedRfc, isRfcFile, transformReadme, transformRfc, transformRoadmap } from './sync-rfcs.mjs';
 
 const source = [
   '# RFC 0009: Equality and range indexes',
@@ -16,8 +16,8 @@ const source = [
 
 const result = transformRfc('0009-equality-indexes.md', source);
 
-test('frontmatter carries the H1 title, a topic label, and numeric order', () => {
-  assert.match(result, /^---\ntitle: "RFC 0009: Equality and range indexes"\n/);
+test('frontmatter carries the topic as title and label, with numeric order', () => {
+  assert.match(result, /^---\ntitle: "Equality and range indexes"\n/);
   assert.match(result, /sidebar: \{ label: "Equality and range indexes", order: 9 \}\n---\n/);
 });
 
@@ -60,11 +60,106 @@ test('only numbered RFC files are synced', () => {
   assert.ok(!isRfcFile('0000-template.md'));
 });
 
-test('the README becomes the section index with its links rewritten', () => {
-  const index = transformReadme(
-    '# RFCs\n\n| RFC | Topic |\n|---|---|\n| [0001](0001-storage-format.md) | Storage format |\n',
-  );
-  assert.match(index, /^---\ntitle: "Design documents"\nsidebar: \{ label: "About", order: 0 \}\n---\n/);
+const readme = [
+  '# RFCs',
+  '',
+  'Design records for moraine. Each one states the current design.',
+  '',
+  '## Process',
+  '',
+  '1. Copy `0000-template.md` to the next free number.',
+  '',
+  '## Index',
+  '',
+  'Start with the storage format.',
+  '',
+  '### Core',
+  '',
+  '- [Storage format](0001-storage-format.md) — key layout',
+  '',
+  '### Internal',
+  '',
+  '- [Commit-log seam](0011-commit-log-seam.md) — the boundary an external',
+  '  commit log plugs into; not published on the site',
+  '',
+].join('\n');
+
+test('the README becomes the section overview: intro and grouped index, no process', () => {
+  const index = transformReadme(readme);
+  assert.match(index, /^---\ntitle: "Design"\nsidebar: \{ label: "Overview", order: 0 \}\n---\n/);
+  assert.ok(index.includes('Design records for moraine.'));
+  assert.ok(index.includes('\nStart with the storage format.\n'));
+  assert.ok(index.includes('\n## Core\n'));
   assert.ok(index.includes('](/rfcs/0001-storage-format/)'));
+  assert.ok(!index.includes('Process'));
+  assert.ok(!index.includes('0000-template'));
   assert.ok(!index.includes('# RFCs'));
+  assert.ok(!index.includes('## Index'));
+});
+
+test('an RFC withheld from the site is neither synced nor listed, nor its emptied group', () => {
+  assert.ok(!isPublishedRfc('0011-commit-log-seam.md'));
+  assert.ok(isPublishedRfc('0010-maintenance.md'));
+
+  const index = transformReadme(readme);
+  assert.ok(!index.includes('0011'));
+  assert.ok(!index.includes('commit log plugs into'));
+  assert.ok(!index.includes('## Internal'));
+});
+
+test('passages marked site:omit are dropped, inline and whole-line', () => {
+  const source = [
+    '# RFC 0003: Commit protocol',
+    '',
+    'The single-writer path is complete.',
+    '',
+    '<!-- site:omit -->',
+    'A store may also keep a commit log.',
+    '<!-- /site:omit -->',
+    '',
+    '| Case | Result |',
+    '|---|---|',
+    '| Format in range | open |',
+    '| <!-- site:omit -->Commit-log format | refuse  <!-- /site:omit -->|',
+    '',
+    'Other fields tune flushing, caches<!-- site:omit -->, and the',
+    'seam<!-- /site:omit -->.',
+  ].join('\n');
+  const page = transformRfc('0003-commit-protocol.md', source);
+  assert.ok(!page.includes('commit log'));
+  assert.ok(!page.includes('Commit-log'));
+  assert.ok(!page.includes('site:omit'));
+  assert.ok(page.includes('The single-writer path is complete.\n\n| Case | Result |'));
+  assert.ok(page.endsWith('| Format in range | open |\n\nOther fields tune flushing, caches.'));
+});
+
+test('a closing site:omit marker may carry the text the site shows instead', () => {
+  const page = transformRfc(
+    '0006-extension-surface.md',
+    '# RFC 0006: Extension surface\n\nForwarded through <!-- site:omit -->`moraine_attach_with_commit_log`<!-- /site:omit the attach call -->.\n',
+  );
+  assert.ok(page.endsWith('Forwarded through the attach call.\n'));
+  assert.ok(!page.includes('commit_log'));
+});
+
+test('the roadmap becomes a page with RFC links resolved from the repository root', () => {
+  const page = transformRoadmap(
+    [
+      '# Roadmap',
+      '',
+      'Done ([storage format](docs/rfcs/0001-storage-format.md)); see',
+      '[measurement](docs/metadata-query-overhead.md).',
+      '',
+      '<!-- site:omit -->',
+      '### Multi-process writers',
+      '<!-- /site:omit -->',
+    ].join('\n'),
+  );
+  assert.match(page, /^---\ntitle: "Roadmap"\n---\n/);
+  assert.ok(page.includes('](/rfcs/0001-storage-format/)'));
+  assert.ok(
+    page.includes('](https://github.com/morainedb/moraine/blob/main/docs/metadata-query-overhead.md)'),
+  );
+  assert.ok(!page.includes('Multi-process'));
+  assert.ok(!page.includes('# Roadmap'));
 });

@@ -46,13 +46,13 @@ bootstraps an empty store. `Catalog::open_read_only` takes the same arguments,
 returns a `ReadOnlyCatalog`, never fences a writer, and refuses a store no
 writer has initialized.
 
-`CatalogOptions` is moraine's own type. `path` places the catalog under a
-prefix within the bucket. `wal_store: Option<WalStore>` puts the write-ahead
-log on a second object store, paired with the name the catalog records, and
-every later open must name the same store. `checkpoint: Option<String>` pins a
-read-only open to a checkpoint: that reader writes nothing and never sees a
-later commit. `open` refuses it. Other fields tune flushing, caches, and [the
-commit-log seam](0011-commit-log-seam.md).
+`CatalogOptions` is moraine's own type. `path` places the catalog under a prefix
+within the bucket. `wal_store: Option<WalStore>` puts the write-ahead log on a
+second object store, paired with the name the catalog records, and every later
+open must name the same store. `checkpoint: Option<String>` pins a read-only
+open to a checkpoint: that reader writes nothing and never sees a later commit.
+`open` refuses it. Other fields tune flushing, caches<!-- site:omit -->, and
+[the commit-log seam](0011-commit-log-seam.md)<!-- /site:omit -->.
 
 Checkpoint ids are `String`. A writer mints one with
 `create_checkpoint(lifetime)`. `delete_checkpoint` and `checkpoints` are
@@ -193,7 +193,7 @@ itself, so they are `Catalog` methods or associated functions.
 | `store_census_of` (associated) | The manifest leg of a census without opening the catalog. |
 | `migrate(object_store, options, MigrationRequest)` (associated) | Rewrites the store to the newest structural format. Takes the writer epoch and fences a running catalog. |
 | `move_wal_store(object_store, options, to)` (associated) | Moves the write-ahead log to another store. Takes the writer. |
-| `demote(object_store, options)` (associated) | Takes a lake off its commit log. |
+| <!-- site:omit -->`demote(object_store, options)` (associated) | Takes a lake off its commit log.  <!-- /site:omit -->|
 
 [Maintenance](0010-maintenance.md) defines `maintain`, `store_census`, and
 `compact_store`. [Storage format](0001-storage-format.md) defines `migrate`.

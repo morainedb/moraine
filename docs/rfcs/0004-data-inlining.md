@@ -271,11 +271,16 @@ raising the limit work: `ATTACH ... (DATA_INLINING_ROW_LIMIT n)`,
 
 ## Tests
 
-- Nested `LIST`, `STRUCT`, and `MAP` values round-trip through inline storage and flush.
-- The locator width bound stops the directory walk without skipping an overlapping chunk.
-- A flush served from a complete directory removes the same chunks and tombstones as a chunk walk, and heals an incomplete directory.
-- A flushed inlined table deregisters but still binds, and a duplicate schema collapses to a reference.
-- Hard-deleting a data file drops the inlined deletions against it, and ending one keeps them.
+- Nested `LIST`, `STRUCT`, and `MAP` values round-trip through inline storage
+  and flush.
+- The locator width bound stops the directory walk without skipping an
+  overlapping chunk.
+- A flush served from a complete directory removes the same chunks and
+  tombstones as a chunk walk, and heals an incomplete directory.
+- A flushed inlined table deregisters but still binds, and a duplicate schema
+  collapses to a reference.
+- Hard-deleting a data file drops the inlined deletions against it, and ending
+  one keeps them.
 - The inlined deletion table exists from its first deletion until the drop.
 
 ## Alternatives

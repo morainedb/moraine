@@ -13,17 +13,16 @@ configured at attach. An attach that configures nothing schedules nothing.
 
 ## Expiry and cleanup translation
 
-`ducklake_expire_snapshots` selects the expirable snapshots and, in one
-metadata transaction, deletes their records and every entity version no
-surviving snapshot can see. The dead-row rule is DuckLake's: a version is
-dead when no surviving snapshot id falls in `[begin_snapshot,
-end_snapshot)`. The selected set is arbitrary, since `versions` names
-interior snapshots directly. `ducklake_cleanup_old_files` reads the
-deletion schedule, removes the files through DuckDB's filesystem, then
-deletes the schedule rows. `ducklake_delete_orphaned_files` lists the data
-prefix and deletes unreferenced files without touching the catalog. The
-cascade is specified by [DuckLake's metadata
-manager](https://github.com/duckdb/ducklake/blob/main/src/metadata_manager/ducklake_metadata_manager.cpp).
+`ducklake_expire_snapshots` selects the expirable snapshots and, in one metadata
+transaction, deletes their records and every entity version no surviving
+snapshot can see. The dead-row rule is DuckLake's: a version is dead when no
+surviving snapshot id falls in `[begin_snapshot, end_snapshot)`. The selected
+set is arbitrary, since `versions` names interior snapshots directly.
+`ducklake_cleanup_old_files` reads the deletion schedule, removes the files
+through DuckDB's filesystem, then deletes the schedule rows.
+`ducklake_delete_orphaned_files` lists the data prefix and deletes unreferenced
+files without touching the catalog. The cascade is specified by
+[DuckLake's metadata manager](https://github.com/duckdb/ducklake/blob/main/src/metadata_manager/ducklake_metadata_manager.cpp).
 
 moraine computes no dead set, validates no retention parameter, and deletes
 no data-file bytes. The cascade arrives on the staged-row path of [the
@@ -276,7 +275,7 @@ pub struct MaintenanceRequest {
     pub sweep_orphaned_file_column_stats: bool, // default true
     pub sweep_orphaned_inline_tables: bool,     // default true
     pub batch_size: usize,                      // default 65_536, nonzero
-    pub pace: Duration,                         // default 1 s, commit-log stores only
+    pub pace: Duration,                         // default 1 s
 }
 
 pub struct MaintenanceReport {
@@ -363,28 +362,29 @@ An `index_id` is allocated from the global `next_catalog_id`, so ids are
 monotonic and never reused, and a range not live at a snapshot never
 becomes live again. The sweep therefore needs no lock and no quiet period.
 
-Discovery is a skip-scan. Entry keys place `index_id` immediately after the
-kind discriminant, so for each `IndexKind` (`Unique`, `Multi`) the sweep
-calls `first_index_id_from` to seek the lowest id at or after a cursor. A
-live id is skipped by seeking past its whole range. A dead id is reclaimed
-by `reclaim_dead_range`, which opens one bulk scan of the range and drains
-it into head-preserving commits of `batch_size` deletes, waiting `pace`
-between batches on a commit log. Ids at or above the snapshot's
-`next_catalog_id` are left alone, since a later commit may have allocated
-them. Cost is one seek per distinct index id present.
+Discovery is a skip-scan. Entry keys place `index_id` immediately after the kind
+discriminant, so for each `IndexKind` (`Unique`, `Multi`) the sweep calls
+`first_index_id_from` to seek the lowest id at or after a cursor. A live id is
+skipped by seeking past its whole range. A dead id is reclaimed by
+`reclaim_dead_range`, which opens one bulk scan of the range and drains it into
+head-preserving commits of `batch_size` deletes<!-- site:omit -->, waiting
+`pace` between batches on a commit log<!-- /site:omit -->. Ids at or above the
+snapshot's `next_catalog_id` are left alone, since a later commit may have
+allocated them. Cost is one seek per distinct index id present.
 
 The dead set derives from what the `index` subspace contains, checked
 against the live definitions. History is never consulted: expiry may prune
 a dropped definition's history record before any sweep, after which a
 history-derived set would lose the id and leak the range.
 
-The companion sweeps use the same batch shape. A `FileColumnStats` record
-is reclaimed when its data file is absent from both `current` and
-`history`, because statistics carry no snapshot and a time-traveling read
-resolves through the one record. The `inline/*` records of a table id
-recorded in neither `current` nor `history` are reclaimed table by table.
-Each batch is a head-preserving commit on the writer, or a slot on [the
-commit log](0011-commit-log-seam.md), where `pace` bounds contention.
+The companion sweeps use the same batch shape. A `FileColumnStats` record is
+reclaimed when its data file is absent from both `current` and `history`,
+because statistics carry no snapshot and a time-traveling read resolves through
+the one record. The `inline/*` records of a table id recorded in neither
+`current` nor `history` are reclaimed table by table. Each batch is a
+head-preserving commit on the writer<!-- site:omit -->, or a slot on
+[the commit log](0011-commit-log-seam.md), where `pace` bounds
+contention<!-- /site:omit -->.
 
 ### The store merge
 

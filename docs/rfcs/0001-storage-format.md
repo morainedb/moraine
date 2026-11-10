@@ -124,7 +124,7 @@ It has no lifecycle and no `history` mirror.
 
 | Key | Components | Contents |
 |---|---|---|
-| `sys/format` | none | `format_version`, the writer's moraine version, and the commit-log batch origin when the store is a commit-log catalog |
+| `sys/format` | none | `format_version`, the writer's moraine version<!-- site:omit -->, and the commit-log batch origin when the store is a commit-log catalog<!-- /site:omit --> |
 | `sys/head` | none | Latest committed `snapshot_id` and `batch_seq`, the count of batches landed. Every batch rewrites it, so it is the write-write conflict anchor and the stamp a reader validates a cut against |
 | `sys/migration` | none | `{from_format, to_format, cursor}`, present only mid-migration |
 | `sys/maintenance_status` | none | The last 16 completed maintenance passes |
@@ -210,15 +210,16 @@ in `crates/moraine/src/transaction/commit.rs`. A fresh store is stamped at
 | 7 | Inline schema references between schema versions |
 | 8 | Inline chunk identity locators |
 | 9 | Inline tombstones keyed per deletion snapshot, a rewrite. The floor |
-| 10 | Commit-log catalogs, whose commits are slot objects in a bucket-resident log |
+| <!-- site:omit -->10 | Commit-log catalogs, whose commits are slot objects in a bucket-resident log  <!-- /site:omit -->|
 | 11 | The `name` directory |
 | 12 | The `delete_target` directory. The newest |
 
-Formats 1 through 8 are below the floor. Format 10 marks a commit-log
-catalog. From 11, a nonempty `commit_log_batch_origin` in `sys/format` marks
-one, and migration, adoption, and demotion preserve that origin. Opening a
-commit-log store requires the commit-log library linked and registered, see
-[the commit-log seam](0011-commit-log-seam.md).
+Formats 1 through 8 are below the floor.<!-- site:omit --> Format 10 marks a
+commit-log catalog. From 11, a nonempty `commit_log_batch_origin` in
+`sys/format` marks one, and migration, adoption, and demotion preserve that
+origin. Opening a commit-log store requires the commit-log library linked and
+registered, see
+[the commit-log seam](0011-commit-log-seam.md).<!-- /site:omit -->
 
 ### On-open check
 
@@ -228,7 +229,7 @@ Every open reads `sys/migration` and `sys/format` before anything else.
 |---|---|
 | Marker present | Refuse with `Error::Migration`. The message names `Catalog::migrate` |
 | Format above `MAX_FORMAT_VERSION` | Refuse with `Error::Migration`. Nothing is written |
-| Commit-log format without the library | Refuse with `Error::Migration` |
+| <!-- site:omit -->Commit-log format without the library | Refuse with `Error::Migration`  <!-- /site:omit -->|
 | Format below `MIN_FORMAT_VERSION` | Refuse with `Error::Migration`. The message names `Catalog::migrate` |
 | Format in range | Open |
 | Absent | Uninitialized. A read-write open bootstraps the store. A read-only open refuses with `Error::Corruption` |
@@ -255,10 +256,11 @@ without moving the head would be invisible to it.
 
 ### Start, step, finish
 
-A migration runs under the single fenced writer. `Catalog::migrate` opens
-the writer itself, taking the same epoch as `Catalog::open`, so it fences a
-running catalog and is fenced by one. A commit-log catalog submits every
-batch through a commit session to an authoritative log slot.
+A migration runs under the single fenced writer. `Catalog::migrate` opens the
+writer itself, taking the same epoch as `Catalog::open`, so it fences a running
+catalog and is fenced by one.<!-- site:omit --> A commit-log catalog submits
+every batch through a commit session to an authoritative log
+slot.<!-- /site:omit -->
 
 1. **Start**, one batch. Put `sys/migration` with
    `{from_format, to_format, cursor: empty}` and the advanced `sys/head`. A
@@ -337,12 +339,16 @@ deployment drains readers across the flip or accepts the unavailability.
 
 ## Tests
 
-- Every key kind roundtrips through encode and decode, and golden vectors pin the bytes per kind.
+- Every key kind roundtrips through encode and decode, and golden vectors pin
+  the bytes per kind.
 - Encoded byte order equals component order for arbitrary key pairs.
 - Every value message type roundtrips through framing and protobuf.
-- A truncated header, wrong magic, newer encoding byte, or garbage payload fails as `Error::Corruption`.
+- A truncated header, wrong magic, newer encoding byte, or garbage payload fails
+  as `Error::Corruption`.
 - Decoding arbitrary bytes as a key or a value never panics.
-- A migration interrupted after start, after any step, and before and after finish resumes to a coherent store, and a reader with the marker present gets `Error::Migration`.
+- A migration interrupted after start, after any step, and before and after
+  finish resumes to a coherent store, and a reader with the marker present gets
+  `Error::Migration`.
 
 ## Alternatives
 
