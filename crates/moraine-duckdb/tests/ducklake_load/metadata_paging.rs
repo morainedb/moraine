@@ -169,7 +169,7 @@ fn seed_heavy_snapshots(
     count: usize,
     extra_bytes: usize,
 ) {
-    use std::io::Write;
+    use std::{fmt::Write as _, io::Write as _};
 
     // Fed through stdin: thousands of statements overflow an argument.
     let mut sql = format!(
@@ -179,9 +179,11 @@ fn seed_heavy_snapshots(
         data_path.display()
     );
     for i in 0..count {
-        sql.push_str(&format!(
-            "BEGIN; CALL ducklake_set_commit_message('lake', 'seed', 'commit {i}', extra_info => repeat('x', {extra_bytes})); INSERT INTO lake.t VALUES ({i}); COMMIT;\n"
-        ));
+        writeln!(
+            sql,
+            "BEGIN; CALL ducklake_set_commit_message('lake', 'seed', 'commit {i}', extra_info => repeat('x', {extra_bytes})); INSERT INTO lake.t VALUES ({i}); COMMIT;"
+        )
+        .unwrap();
     }
     let mut child = std::process::Command::new(cli_path())
         .arg("-unsigned")
