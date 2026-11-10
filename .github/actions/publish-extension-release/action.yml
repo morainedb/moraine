@@ -75,6 +75,15 @@ runs:
           exit 1
         fi
         timeout 120 gh release edit "${{ inputs.tag }}" --draft=false
+    # The site lists each release's binaries, and its own trigger fired
+    # when the release PR merged, before these assets existed. The job's
+    # token needs actions:write; a stale page is not worth a red release.
+    - name: Rebuild the site with this release's downloads
+      shell: bash
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh workflow run site.yml --ref main
     - name: Pin descriptor ref to the released commit
       shell: bash
       env:

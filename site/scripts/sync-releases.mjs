@@ -36,8 +36,26 @@ export function parseChangelog(source) {
 }
 
 const releasedTag = /^ext-v(\d+\.\d+\.\d+)$/;
-const extensionAsset =
-  /^moraine\.(v[^.]+(?:\.[^.]+)*)\.(linux_amd64|linux_arm64|osx_amd64|osx_arm64)\.duckdb_extension$/;
+const platformNames = 'linux_amd64|linux_arm64|osx_amd64|osx_arm64';
+const extensionAsset = new RegExp(
+  `^moraine\\.(v[^.]+(?:\\.[^.]+)*)\\.(${platformNames})\\.duckdb_extension$`,
+);
+
+// Releases before the per-DuckDB-version naming carry one build per
+// platform and state the DuckDB version in the notes.
+const legacyAsset = new RegExp(`^moraine\\.(${platformNames})\\.duckdb_extension$`);
+const notedDuckdbVersion = /DuckDB (v\d+\.\d+\.\d+)/;
+const unstatedDuckdbVersion = 'unstated';
+
+function assetTarget(name, body) {
+  const versioned = name.match(extensionAsset);
+  if (versioned) return { duckdb: versioned[1], platform: versioned[2] };
+
+  const legacy = name.match(legacyAsset);
+  if (!legacy) return null;
+  const noted = body?.match(notedDuckdbVersion);
+  return { duckdb: noted ? noted[1] : unstatedDuckdbVersion, platform: legacy[1] };
+}
 
 const platforms = [
   ['linux_amd64', 'Linux x86-64'],
@@ -59,11 +77,11 @@ export function downloadsByVersion(releases) {
 
     const byDuckdb = byVersion.get(tag[1]) ?? new Map();
     for (const { name, browser_download_url } of release.assets) {
-      const match = name.match(extensionAsset);
-      if (!match) continue;
-      const byPlatform = byDuckdb.get(match[1]) ?? new Map();
-      byPlatform.set(match[2], browser_download_url);
-      byDuckdb.set(match[1], byPlatform);
+      const target = assetTarget(name, release.body);
+      if (!target) continue;
+      const byPlatform = byDuckdb.get(target.duckdb) ?? new Map();
+      byPlatform.set(target.platform, browser_download_url);
+      byDuckdb.set(target.duckdb, byPlatform);
     }
     if (byDuckdb.size > 0) byVersion.set(tag[1], byDuckdb);
   }
@@ -114,6 +132,7 @@ export function renderReleases(entries, downloads) {
     '---',
     'title: "Releases"',
     'description: "Changelog and extension downloads for every moraine release."',
+    'tableOfContents: { maxHeadingLevel: 2 }',
     '---',
     '',
     preamble,
@@ -141,12 +160,19 @@ export async function fetchReleases(fetchImpl = fetch, token = process.env.GITHU
 
   const releases = [];
   let url = releasesUrl;
+  const hint = 'set GITHUB_TOKEN or MORAINE_SITE_OFFLINE=1 to skip the download tables';
   while (url) {
-    const response = await fetchImpl(url, { headers });
+    let response;
+    try {
+      response = await fetchImpl(url, { headers });
+    } catch (error) {
+      throw new Error(`GitHub releases request failed (${error.message})\n${hint}`, {
+        cause: error,
+      });
+    }
     if (!response.ok) {
       throw new Error(
-        `GitHub releases request failed (HTTP ${response.status}): ${await response.text()}\n` +
-          'set GITHUB_TOKEN or MORAINE_SITE_OFFLINE=1 to skip the download tables',
+        `GitHub releases request failed (HTTP ${response.status}): ${await response.text()}\n${hint}`,
       );
     }
     releases.push(...(await response.json()));

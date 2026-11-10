@@ -161,3 +161,36 @@ test('a failed response names the escape hatches', async () => {
     /403.*GITHUB_TOKEN or MORAINE_SITE_OFFLINE=1/s,
   );
 });
+
+test('legacy unversioned assets take their DuckDB version from the release notes', () => {
+  const d = downloadsByVersion([
+    {
+      tag_name: 'ext-v0.4.0',
+      draft: false,
+      prerelease: false,
+      body: 'Unsigned moraine extension built against DuckDB v1.5.4. Signed install: ...',
+      assets: [asset('moraine.osx_arm64.duckdb_extension', 'https://x/0.4.0/oa')],
+    },
+    {
+      tag_name: 'ext-v0.2.0',
+      draft: false,
+      prerelease: false,
+      body: 'no version here',
+      assets: [asset('moraine.linux_amd64.duckdb_extension', 'https://x/0.2.0/la')],
+    },
+  ]);
+  assert.equal(d.get('0.4.0').get('v1.5.4').get('osx_arm64'), 'https://x/0.4.0/oa');
+  assert.equal(d.get('0.2.0').get('unstated').get('linux_amd64'), 'https://x/0.2.0/la');
+});
+
+test('a network failure names the escape hatches too', async () => {
+  const impl = async () => {
+    throw new TypeError('fetch failed');
+  };
+  await assert.rejects(fetchReleases(impl, undefined), /fetch failed.*GITHUB_TOKEN or MORAINE_SITE_OFFLINE=1/s);
+});
+
+test('the table of contents stops at version headings', () => {
+  const page = renderReleases([], new Map());
+  assert.ok(page.includes('\ntableOfContents: { maxHeadingLevel: 2 }\n'));
+});

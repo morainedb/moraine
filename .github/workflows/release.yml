@@ -157,9 +157,3 @@ jobs:
           tag: ext-v${{ env.VERSION }}
           target: ${{ github.sha }}
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      # The site lists each release's binaries, and its own trigger fired
-      # when the release PR merged, before these assets existed.
-      - name: Rebuild the site with this release's downloads
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-        run: gh workflow run site.yml --ref main
