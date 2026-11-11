@@ -105,7 +105,7 @@ well as the catalog is, and not by DuckLake's data-file encryption.
 ## Backups and copies
 
 A lake is three sets of objects: the catalog store, the write-ahead log
-(inside the catalog store unless `WAL_PATH` moved it), and the data files
+(inside the catalog store unless `META_WAL_PATH` moved it), and the data files
 under `DATA_PATH`. Copy all three.
 
 A copy taken while no writer is attached is a complete lake: a detaching
