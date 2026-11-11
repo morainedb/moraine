@@ -68,15 +68,15 @@ impl CommitSession {
 
     fn new(inner: Inner) -> Self {
         let mut staged = Staged::default();
-        let memory_limit = match std::env::var("MORAINE_COMMIT_MEMORY_BYTES") {
-            Ok(value) => value.parse::<u64>().ok().filter(|value| *value > 0),
-            Err(std::env::VarError::NotPresent) => Some(256 * 1024 * 1024),
-            Err(_) => None,
-        };
-        if memory_limit.is_none() {
-            staged.failure =
-                Some("MORAINE_COMMIT_MEMORY_BYTES must be a positive byte count".into());
+        let memory_limit = crate::memory::budget_bytes(
+            crate::memory::configured_memory().commit,
+            "MORAINE_COMMIT_MEMORY_BYTES",
+            256 * 1024 * 1024,
+        );
+        if let Err(error) = &memory_limit {
+            staged.failure = Some(error.to_string());
         }
+        let memory_limit = memory_limit.ok();
         Self {
             inner,
             staged: Mutex::new(staged),
@@ -151,7 +151,7 @@ impl CommitSession {
             .saturating_add(added);
         if total > self.memory_limit {
             return Err(Error::Constraint(format!(
-                "commit memory exceeds {} bytes; split the transaction or raise MORAINE_COMMIT_MEMORY_BYTES",
+                "commit memory exceeds {} bytes; split the transaction or raise the commit memory budget",
                 self.memory_limit
             )));
         }

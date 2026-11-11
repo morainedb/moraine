@@ -92,10 +92,7 @@ live with the owning document.
 | `FLUSH_ON_COMMIT` | `CatalogOptions::flush_on_commit` | `false` |
 | `READER_POLL_INTERVAL_MS` | `CatalogOptions::reader_poll_interval` | 10000 |
 | `CHECKPOINT` | `CatalogOptions::checkpoint`, read-only attach only | unset |
-| `CACHE_DIR` | `CatalogOptions::cache_dir`, see [the read path](0007-read-path-and-caching.md) | unset |
-| `CACHE_SIZE` | `CatalogOptions::cache_size`, bytes | 16 GiB |
-| `CACHE_MEMORY` | `CatalogOptions::cache_memory`, bytes, process-wide | 640 MiB |
-| `CACHE_AUXILIARY_PERCENT` | `CatalogOptions::cache_auxiliary_percent`, capped at 50 | one eightieth of the budget |
+| `CACHE_DIR`, `CACHE_SIZE`, `CACHE_MEMORY`, `CACHE_AUXILIARY_PERCENT` | the cache settings below, which these stand in for on the first attach; accepted for existing attaches | the settings |
 | `CACHE_PUTS` | `CatalogOptions::cache_puts` | `true` |
 | `CACHE_COMPACTION_PUTS` | `CatalogOptions::cache_compaction_puts` | `true` |
 | `CACHE_PRELOAD` | `CatalogOptions::cache_preload`, one of `none`, `off`, `l0`, `all` | `l0` |
@@ -107,11 +104,9 @@ live with the owning document.
 
 A misspelled `CACHE_PRELOAD` level is refused. An unknown
 `MAINTENANCE_COMPACT_STORE_SUBSPACE` is refused at attach by asking the core
-through `moraine_subspace_is_known`. The cache options configure one cache the
-process shares, so the first attach in the process sizes it and later attaches
-are served what stands. The shim also reads DuckDB's `threads` setting and the
-buffer manager's memory limit at attach, passing the first as `host_threads` and
-checking the second through `moraine_validate_host_memory`.
+through `moraine_subspace_is_known`. The shim also reads DuckDB's `threads`
+setting and the buffer manager's memory limit at attach, passing the first as
+`host_threads` and checking the second through `moraine_validate_host_memory`.
 
 ## Attach modes
 
@@ -142,6 +137,25 @@ checkpoint reader is a sub-mode of read-only: `CHECKPOINT '<id>'` opens the
 `DbReader` against a checkpoint minted ahead of time. It reads a fixed cut and
 never observes later commits. A checkpoint id on a read-write attach, an id the
 manifest no longer carries, and a malformed id are each refused.
+
+## Settings
+
+What one process shares across every lake it attaches is a DuckDB setting,
+registered at `LOAD` by `cpp/settings.cpp` and read by the first attach in
+the process; a later `SET` waits for the next process. Sizes are parsed as
+`memory_limit` is. An attach option listed above stands in for its setting
+when given.
+
+| Setting | Reaches | Default |
+|---|---|---|
+| `moraine_cache_dir` | `CatalogOptions::cache_dir`, see [the read path](0007-read-path-and-caching.md) | unset |
+| `moraine_cache_size` | `CatalogOptions::cache_size` | 16 GiB |
+| `moraine_cache_memory` | `CatalogOptions::cache_memory` | 640 MiB |
+| `moraine_cache_auxiliary_percent` | `CatalogOptions::cache_auxiliary_percent`, capped at 50 | one eightieth of the budget |
+| `moraine_working_memory`, `moraine_staging_memory`, `moraine_commit_memory`, `moraine_store_memory`, `moraine_summary_memory`, `moraine_host_memory`, `moraine_host_headroom` | `moraine_configure_memory` → `configure_memory(MemoryBudgets)`, once per process, before the host check | the read path's defaults |
+
+`moraine_summary_scan_threads` is the one setting read per statement rather
+than at attach.
 
 ## Catalog tables
 

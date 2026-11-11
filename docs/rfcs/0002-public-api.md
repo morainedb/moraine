@@ -210,7 +210,9 @@ Public values are hand-written structs, decoupled from the protobuf messages
 cross the API as `Timestamp`, a signed microsecond count from the Unix epoch.
 `DataStore` wraps the `DATA_PATH` object store with the `CacheIdentity` the
 footer and row-summary caches key on. `WalStore` pairs a log store with its
-recorded name. `MemoryReservation` holds a working-memory admission.
+recorded name. `MemoryReservation` holds a working-memory admission, and
+`configure_memory(MemoryBudgets)` sets the process's budgets once, ahead of
+their environment variables; `store_memory_budget` reads the store's.
 
 ## Versioning
 

@@ -304,7 +304,8 @@ mod memory;
 mod store;
 mod telemetry;
 pub use memory::{
-    MemoryReservation, set_memory_release, validate_host_memory, working_memory_usage,
+    MemoryBudgets, MemoryReservation, configure_memory, set_memory_release, store_memory_budget,
+    validate_host_memory, working_memory_usage,
 };
 mod transaction;
 

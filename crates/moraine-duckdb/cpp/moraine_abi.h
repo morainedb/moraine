@@ -220,6 +220,25 @@ typedef struct MoraineMigrationReport {
   char *units_run;
 } MoraineMigrationReport;
 
+// The process's memory budgets in bytes; zero leaves a budget to its
+// environment variable or default. Mirrors `moraine::MemoryBudgets`.
+typedef struct MoraineMemoryBudgets {
+  // Live working allocations, process-wide.
+  uint64_t working;
+  // Rows staged by one transaction.
+  uint64_t staging;
+  // One commit's batch.
+  uint64_t commit;
+  // SlateDB's unflushed writes per writer.
+  uint64_t store;
+  // One file's row-summary build.
+  uint64_t summary;
+  // The host's memory, which enables the pre-attach host check.
+  uint64_t host;
+  // Memory left unclaimed on the host.
+  uint64_t host_headroom;
+} MoraineMemoryBudgets;
+
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -1652,6 +1671,15 @@ int32_t moraine_catalog_encrypted(struct MoraineCatalogHandle *handle,
 // `handle`, if non-null, must be a pointer previously returned by
 // [`moraine_attach_with_wal_store`] and not yet passed to `moraine_detach`.
 void moraine_detach(struct MoraineCatalogHandle *handle);
+
+// Sets the process's memory budgets. The first call wins, so a host calls
+// it before its first attach; later calls change nothing.
+//
+// # Safety
+// `budgets` must be null or point to a valid [`MoraineMemoryBudgets`] for
+// the duration of this call. `err` must be null or a writable error slot.
+int32_t moraine_configure_memory(const struct MoraineMemoryBudgets *budgets,
+                                 struct MoraineError *err);
 
 // Validates configured host headroom before opening a store. The host must
 // account for other database instances and stores in its headroom allowance.

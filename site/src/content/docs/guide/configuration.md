@@ -1,9 +1,45 @@
 ---
 title: Configuration
-description: Attach options, table functions, and environment variables.
+description: Settings, attach options, table functions, and environment variables.
 sidebar:
   order: 3
 ---
+
+Two kinds of knob. A **setting** is per process: `SET` it before the first
+attach, as you would DuckDB's `memory_limit`, and every lake the process
+attaches shares it. An **attach option** is per lake and goes in the
+`ATTACH` statement.
+
+## Settings
+
+Sizes take the forms `memory_limit` takes: `'512MB'`, `'1GiB'`. The first
+attach in the process reads them; a later `SET` waits for the next process.
+
+```sql
+SET moraine_cache_dir = '/var/cache/moraine';
+SET moraine_cache_memory = '1GiB';
+SET moraine_working_memory = '2GiB';
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `moraine_cache_dir` | unset | Local directory for the block cache's disk tier. |
+| `moraine_cache_size` | 16 GiB | Byte cap on the disk tier. |
+| `moraine_cache_memory` | 640 MiB | Byte cap on the in-memory block cache, shared by every attached store. |
+| `moraine_cache_auxiliary_percent` | 1.25, capped at 50 | Share of the memory budget for parsed Parquet metadata. |
+| `moraine_working_memory` | 1 GiB | Live working allocations. An operation that would exceed it fails instead of growing. |
+| `moraine_staging_memory` | 256 MiB | Rows staged by one transaction. |
+| `moraine_commit_memory` | 256 MiB | One commit's batch. |
+| `moraine_store_memory` | 1 GiB | SlateDB's unflushed writes per writer. |
+| `moraine_summary_memory` | 256 MiB | One file's row-summary build. |
+| `moraine_host_memory` | unset | The host's memory. Setting it makes every attach check that DuckDB's `memory_limit`, the budgets above, and the headroom fit. |
+| `moraine_host_headroom` | a quarter of the host value | Memory to leave unclaimed on the host. |
+
+`moraine_cache_memory` and `moraine_working_memory` are the two numbers to
+weigh against DuckDB's `memory_limit` when sizing a host: DuckDB's budget
+covers its buffers and Parquet cache; these cover Moraine's cache and its
+working allocations.
 
 ## Attach options
 
@@ -26,17 +62,14 @@ prefix, written out below exactly as the `ATTACH` takes it.
 | `META_FLUSH_INTERVAL_MS` | 100 | Minimum spacing between two write-ahead-log flushes. |
 | `META_FLUSH_ON_COMMIT` | false | Flush on every commit, one PUT each, whatever the interval. |
 | `META_WAL_PATH` | the catalog store | A separate object store for the write-ahead log. Recorded in the lake; every attach must name the same one. |
-| `META_CACHE_DIR` | unset | Local directory for the block cache's disk tier. |
-| `META_CACHE_SIZE` | 16 GiB | Byte cap on the disk tier. |
-| `META_CACHE_MEMORY` | 640 MiB | Process-wide byte cap on the in-memory cache, shared by every attached store. |
-| `META_CACHE_AUXILIARY_PERCENT` | 1.25, capped at 50 | Share of the memory budget for parsed Parquet metadata. |
 | `META_CACHE_PUTS` | true | Admit a store's own writes into the cache as they land. |
 | `META_CACHE_COMPACTION_PUTS` | true | Also admit compaction output. Set false if large merges evict what queries warmed. |
 | `META_CACHE_PRELOAD` | `l0` | Warm the cache during attach: `none`, `l0` (SST metadata), or `all`. |
 | `META_MAINTENANCE_*` | off | Enable a scheduled maintenance pass; see [Operating manual](../operating/#scheduled-maintenance). |
 
-The cache options are process-wide. The first attach in a process sizes
-the cache and later attaches share it, so set them on the first attach.
+Older attaches may still name `META_CACHE_DIR`, `META_CACHE_SIZE`,
+`META_CACHE_MEMORY`, and `META_CACHE_AUXILIARY_PERCENT`; each stands in for
+its setting on the first attach and is otherwise ignored.
 
 ## Commit latency
 
@@ -118,17 +151,19 @@ releases one.
 
 Moraine keeps one block cache per process. Catalog index metadata, which
 every lookup reads first, stays in memory; data blocks fill the rest of the
-memory budget and spill to `META_CACHE_DIR` when one is set.
+memory budget and spill to `moraine_cache_dir` when one is set.
 
 ```sql
-ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine',
-   META_CACHE_MEMORY 1073741824, META_CACHE_SIZE 2147483648);
+SET moraine_cache_dir = '/var/cache/moraine';
+SET moraine_cache_memory = '1GiB';
+SET moraine_cache_size = '2GiB';
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
 ```
 
 If the memory budget cannot hold a store's index metadata, the attach logs
 a warning naming the shortfall, and lookups fetch metadata from object
-storage. Raise `META_CACHE_MEMORY` on the first attach in the process.
+storage. Raise `moraine_cache_memory` before the first attach in the
+process.
 `moraine_store_census('lake')` reports how a store's bytes are distributed,
 and `moraine_cache_tally()` reports hits and misses per cache slot for the
 process, or for one attach when given a lake name.
@@ -137,11 +172,7 @@ A fresh process starts cold. `META_CACHE_PRELOAD 'all'` reads the catalog
 subspaces whole during attach, so the first query reads no catalog data
 from object storage. It costs metadata-sized reads, not store-sized ones,
 because index data blocks are not preloaded. If the store exceeds
-`META_CACHE_SIZE`, the preload stops early and logs a warning.
-
-`META_CACHE_MEMORY` is the number to weigh against DuckDB's `memory_limit` when
-sizing a host. DuckDB's budget covers its buffers and Parquet cache; this
-one covers Moraine's caches.
+`moraine_cache_size`, the preload stops early and logs a warning.
 
 ## Caching data files
 
@@ -174,7 +205,8 @@ SET cache_httpfs_cache_directory = '/var/cache/duckdb-httpfs';
 ```
 
 Its memory is outside DuckDB's `memory_limit` and outside Moraine's
-`META_CACHE_MEMORY`, so a host running all three has three budgets to size.
+`moraine_cache_memory`, so a host running all three has three budgets to
+size.
 
 ## Table functions
 
@@ -208,16 +240,14 @@ Indexes are created with DuckDB's own `CREATE INDEX` and `DROP INDEX`; see
 
 ## Environment variables
 
-These cap Moraine's working memory per process, separately from the cache
-budget. An operation that would exceed its cap fails instead of growing.
-
 | Variable | Default | Scope |
 |---|---|---|
-| `MORAINE_WORKING_MEMORY_BYTES` | 1 GiB | Total working allowance for the process. |
-| `MORAINE_STAGING_MEMORY_BYTES` | 256 MiB | Rows staged by one transaction. |
-| `MORAINE_COMMIT_MEMORY_BYTES` | 256 MiB | One commit's batch. |
-| `MORAINE_STORE_MEMORY_BYTES` | 1 GiB | SlateDB's unflushed writes. |
-| `MORAINE_SUMMARY_MEMORY_BYTES` | 256 MiB | One file's row-summary build. |
-| `MORAINE_HOST_MEMORY_BYTES` | unset | The host's memory, checked against the budgets before attach. |
-| `MORAINE_HOST_HEADROOM_BYTES` | a quarter of the host value | Memory to leave unclaimed on the host. |
 | `MORAINE_LOG` | unset | Log filter for Moraine's own records. |
+
+The memory settings above can also be given as environment variables, for
+a process that embeds the Rust crate rather than the extension:
+`MORAINE_WORKING_MEMORY_BYTES`, `MORAINE_STAGING_MEMORY_BYTES`,
+`MORAINE_COMMIT_MEMORY_BYTES`, `MORAINE_STORE_MEMORY_BYTES`,
+`MORAINE_SUMMARY_MEMORY_BYTES`, `MORAINE_HOST_MEMORY_BYTES`, and
+`MORAINE_HOST_HEADROOM_BYTES`, each a byte count. A setting takes
+precedence over its variable.
