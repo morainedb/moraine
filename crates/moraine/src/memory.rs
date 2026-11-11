@@ -12,22 +12,62 @@ use crate::{
     store::cache::retention::{Budget, Charge},
 };
 
+/// The process's memory budgets, in bytes. A budget left `None` comes from
+/// its `MORAINE_*_BYTES` environment variable, then its default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryBudgets {
+    /// Live working allocations, process-wide; default 1 GiB.
+    pub working: Option<u64>,
+    /// Rows staged by one transaction; default 256 MiB.
+    pub staging: Option<u64>,
+    /// One commit's batch; default 256 MiB.
+    pub commit: Option<u64>,
+    /// SlateDB's unflushed writes per writer; default 1 GiB.
+    pub store: Option<u64>,
+    /// One file's row-summary build, at least 64; default 256 MiB.
+    pub summary: Option<u64>,
+    /// The host's memory, which enables the pre-attach host check.
+    pub host: Option<u64>,
+    /// Memory left unclaimed on the host; default a quarter of `host`.
+    pub host_headroom: Option<u64>,
+}
+
+static CONFIGURED: OnceLock<MemoryBudgets> = OnceLock::new();
+
+/// Sets the process's memory budgets. The first call wins and returns
+/// `true`; a later call changes nothing and returns `false`. A budget
+/// already read keeps the value it was read with.
+pub fn configure_memory(budgets: MemoryBudgets) -> bool {
+    CONFIGURED.set(budgets).is_ok()
+}
+
+pub(crate) fn configured_memory() -> MemoryBudgets {
+    CONFIGURED.get().copied().unwrap_or_default()
+}
+
+/// One budget: `configured`, else the environment variable `name`, else
+/// `default`. Zero is refused.
+pub(crate) fn budget_bytes(configured: Option<u64>, name: &str, default: u64) -> Result<u64> {
+    match configured {
+        Some(bytes) if bytes > 0 => Ok(bytes),
+        Some(_) => Err(Error::Configuration(format!(
+            "the budget {name} names must be a positive byte count"
+        ))),
+        None => positive_bytes(name, default),
+    }
+}
+
 fn working_budget() -> Result<Arc<Budget>> {
     static BUDGET: OnceLock<std::result::Result<Arc<Budget>, String>> = OnceLock::new();
     BUDGET
         .get_or_init(|| {
-            let capacity = match std::env::var("MORAINE_WORKING_MEMORY_BYTES") {
-                Ok(value) => value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .ok_or_else(|| {
-                        "MORAINE_WORKING_MEMORY_BYTES must be a positive byte count".to_owned()
-                    })?,
-                Err(std::env::VarError::NotPresent) => 1024 * 1024 * 1024,
-                Err(_) => return Err("MORAINE_WORKING_MEMORY_BYTES must be UTF-8".into()),
-            };
-            Ok(Budget::new(capacity))
+            budget_bytes(
+                configured_memory().working,
+                "MORAINE_WORKING_MEMORY_BYTES",
+                1024 * 1024 * 1024,
+            )
+            .map(Budget::new)
+            .map_err(|error| error.to_string())
         })
         .clone()
         .map_err(Error::Configuration)
@@ -42,7 +82,7 @@ pub struct MemoryReservation {
 }
 
 impl MemoryReservation {
-    /// Reserves bytes under `MORAINE_WORKING_MEMORY_BYTES` (default 1 GiB).
+    /// Reserves bytes under the working memory budget (default 1 GiB).
     ///
     /// ```
     /// let reservation = moraine::MemoryReservation::reserve(3)?;
@@ -80,7 +120,7 @@ impl MemoryReservation {
             Ok(())
         } else {
             Err(Error::Constraint(format!(
-                "working memory cannot admit {bytes} bytes; release held results, split the operation, or raise MORAINE_WORKING_MEMORY_BYTES"
+                "working memory cannot admit {bytes} bytes; release held results, split the operation, or raise the working memory budget"
             )))
         }
     }
@@ -364,13 +404,22 @@ pub(crate) fn positive_bytes(name: &str, default: u64) -> Result<u64> {
     }
 }
 
-pub(crate) fn store_memory_limit() -> Result<u64> {
-    positive_bytes("MORAINE_STORE_MEMORY_BYTES", 1024 * 1024 * 1024)
+/// The store budget: SlateDB's unflushed bytes per writer, default 1 GiB.
+///
+/// # Errors
+/// Returns an error for a budget that is not a positive byte count.
+pub fn store_memory_budget() -> Result<u64> {
+    budget_bytes(
+        configured_memory().store,
+        "MORAINE_STORE_MEMORY_BYTES",
+        1024 * 1024 * 1024,
+    )
 }
 
-/// Checks an optional host envelope before attaching to DuckDB. Set
-/// `MORAINE_HOST_MEMORY_BYTES` to enable it; one quarter is left for native
-/// allocations unless `MORAINE_HOST_HEADROOM_BYTES` overrides that allowance.
+/// Checks an optional host envelope before attaching to DuckDB. A host
+/// budget, configured or from `MORAINE_HOST_MEMORY_BYTES`, enables it; one
+/// quarter is left for native allocations unless the headroom budget says
+/// otherwise.
 ///
 /// `other_bytes` must include cache capacity and every store's write buffers.
 /// The caller must revalidate after increasing DuckDB's memory limit.
@@ -378,11 +427,16 @@ pub(crate) fn store_memory_limit() -> Result<u64> {
 /// # Errors
 /// Returns an error for invalid configuration or overlapping allowances.
 pub fn validate_host_memory(duckdb_bytes: u64, other_bytes: u64) -> Result<()> {
-    if std::env::var_os("MORAINE_HOST_MEMORY_BYTES").is_none() {
+    let configured = configured_memory();
+    if configured.host.is_none() && std::env::var_os("MORAINE_HOST_MEMORY_BYTES").is_none() {
         return Ok(());
     }
-    let host = positive_bytes("MORAINE_HOST_MEMORY_BYTES", 1)?;
-    let headroom = positive_bytes("MORAINE_HOST_HEADROOM_BYTES", (host / 4).max(1))?;
+    let host = budget_bytes(configured.host, "MORAINE_HOST_MEMORY_BYTES", 1)?;
+    let headroom = budget_bytes(
+        configured.host_headroom,
+        "MORAINE_HOST_HEADROOM_BYTES",
+        (host / 4).max(1),
+    )?;
     let (_, working) = working_memory_usage()?;
     check_host_envelope(host, headroom, duckdb_bytes, working, other_bytes)
 }

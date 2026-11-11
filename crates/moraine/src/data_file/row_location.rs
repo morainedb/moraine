@@ -540,21 +540,17 @@ impl Drop for CancelOnDrop {
 }
 
 fn summary_memory_limit() -> Result<usize> {
-    match std::env::var("MORAINE_SUMMARY_MEMORY_BYTES") {
-        Ok(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|&value| value >= 64)
-            .ok_or_else(|| {
-                crate::Error::Configuration(
-                    "MORAINE_SUMMARY_MEMORY_BYTES must be at least 64".into(),
-                )
-            }),
-        Err(std::env::VarError::NotPresent) => Ok(256 * 1024 * 1024),
-        Err(_) => Err(crate::Error::Configuration(
-            "MORAINE_SUMMARY_MEMORY_BYTES must be UTF-8".into(),
-        )),
-    }
+    let bytes = crate::memory::budget_bytes(
+        crate::memory::configured_memory().summary,
+        "MORAINE_SUMMARY_MEMORY_BYTES",
+        256 * 1024 * 1024,
+    )?;
+    usize::try_from(bytes)
+        .ok()
+        .filter(|&value| value >= 64)
+        .ok_or_else(|| {
+            crate::Error::Configuration("the summary memory budget must be at least 64".into())
+        })
 }
 
 async fn read_row_ids(
@@ -588,7 +584,7 @@ pub(super) async fn read_row_ids_limited(
         .map_err(admission_error)?;
     let too_large = || {
         crate::Error::Constraint(format!(
-            "summary memory exceeds {maximum_rows} rows; raise MORAINE_SUMMARY_MEMORY_BYTES"
+            "summary memory exceeds {maximum_rows} rows; raise the summary memory budget"
         ))
     };
     let counts = super::row_group_row_counts(&file).await?;

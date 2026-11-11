@@ -1447,6 +1447,68 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// The process's memory budgets in bytes; zero leaves a budget to its
+/// environment variable or default. Mirrors `moraine::MemoryBudgets`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MoraineMemoryBudgets {
+    /// Live working allocations, process-wide.
+    pub working: u64,
+    /// Rows staged by one transaction.
+    pub staging: u64,
+    /// One commit's batch.
+    pub commit: u64,
+    /// SlateDB's unflushed writes per writer.
+    pub store: u64,
+    /// One file's row-summary build.
+    pub summary: u64,
+    /// The host's memory, which enables the pre-attach host check.
+    pub host: u64,
+    /// Memory left unclaimed on the host.
+    pub host_headroom: u64,
+}
+
+impl From<&MoraineMemoryBudgets> for moraine::MemoryBudgets {
+    fn from(budgets: &MoraineMemoryBudgets) -> Self {
+        let given = |bytes: u64| (bytes > 0).then_some(bytes);
+        Self {
+            working: given(budgets.working),
+            staging: given(budgets.staging),
+            commit: given(budgets.commit),
+            store: given(budgets.store),
+            summary: given(budgets.summary),
+            host: given(budgets.host),
+            host_headroom: given(budgets.host_headroom),
+        }
+    }
+}
+
+/// Sets the process's memory budgets. The first call wins, so a host calls
+/// it before its first attach; later calls change nothing.
+///
+/// # Safety
+/// `budgets` must be null or point to a valid [`MoraineMemoryBudgets`] for
+/// the duration of this call. `err` must be null or a writable error slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_configure_memory(
+    budgets: *const MoraineMemoryBudgets,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        // SAFETY: caller contract for `budgets`.
+        let Some(budgets) = (unsafe { budgets.as_ref() }) else {
+            return Err(AbiError::invalid_argument("`budgets` is null"));
+        };
+        moraine::configure_memory(budgets.into());
+        Ok(())
+    };
+    // SAFETY: error-slot validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Validates configured host headroom before opening a store. The host must
 /// account for other database instances and stores in its headroom allowance.
 ///
@@ -1466,21 +1528,7 @@ pub unsafe extern "C" fn moraine_validate_host_memory(
             cache_bytes
         };
         let store = if writer {
-            match std::env::var("MORAINE_STORE_MEMORY_BYTES") {
-                Ok(value) => value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .ok_or_else(|| {
-                        AbiError::invalid_argument("MORAINE_STORE_MEMORY_BYTES must be positive")
-                    })?,
-                Err(std::env::VarError::NotPresent) => 1024 * 1024 * 1024,
-                Err(_) => {
-                    return Err(AbiError::invalid_argument(
-                        "MORAINE_STORE_MEMORY_BYTES must be UTF-8",
-                    ));
-                }
-            }
+            moraine::store_memory_budget().map_err(AbiError::from)?
         } else {
             0
         };

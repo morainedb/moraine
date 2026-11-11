@@ -5,6 +5,7 @@
 #include "index_cache.hpp"
 
 #include "inline_tables.hpp"
+#include "settings.hpp"
 #include "metadata_manager.hpp"
 #include "metadata_tables.hpp"
 #include "owned_array.hpp"
@@ -976,6 +977,24 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	MoraineWalStore wal {};
 	wal.path = wal_path.empty() ? nullptr : wal_path.c_str();
 	wal.s3 = wal_is_s3 ? &wal_s3 : nullptr;
+	// A process-wide knob the attach did not name comes from its setting.
+	// The attach options stay accepted so an existing ATTACH keeps working.
+	if (cache_dir.empty()) {
+		cache_dir = SettingString(context, "moraine_cache_dir");
+	}
+	if (cache_size_bytes == 0) {
+		cache_size_bytes = SettingBytes(context, "moraine_cache_size").value_or(0);
+	}
+	if (cache_memory_bytes == 0) {
+		cache_memory_bytes = SettingBytes(context, "moraine_cache_memory").value_or(0);
+	}
+	if (cache_auxiliary_percent == 0) {
+		cache_auxiliary_percent = SettingUnsigned(context, "moraine_cache_auxiliary_percent");
+	}
+	auto budgets = MemoryBudgetSettings(context);
+	if (moraine_configure_memory(&budgets, &err) != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
 	// DuckDB's own execution-thread count sizes the catalog's worker pool,
 	// so a session pinned with `SET threads=1` does not get one sized to
 	// the machine on top of DuckDB's. The ABI clamps it; read once here,

@@ -816,6 +816,29 @@ fn a_data_path_recorded_after_attach_is_adopted_on_first_use() {
     unsafe { moraine_detach(handle) };
 }
 
+/// A zero budget across the ABI leaves that budget unset.
+#[test]
+fn zero_memory_budgets_are_left_unset() {
+    let budgets = MoraineMemoryBudgets {
+        working: 1 << 20,
+        host: 1 << 30,
+        ..MoraineMemoryBudgets::default()
+    };
+    let converted = moraine::MemoryBudgets::from(&budgets);
+    assert_eq!(converted.working, Some(1 << 20));
+    assert_eq!(converted.host, Some(1 << 30));
+    assert_eq!(converted.staging, None);
+    assert_eq!(converted.host_headroom, None);
+
+    let mut err = MoraineError::default();
+    // SAFETY: a null budgets pointer is the documented refusal; `err` is a
+    // local slot.
+    let code = unsafe { moraine_configure_memory(ptr::null(), &raw mut err) };
+    assert_eq!(code, codes::INVALID_ARGUMENT);
+    // SAFETY: minted by the failed call, freed once.
+    unsafe { moraine_error_free(err.message) };
+}
+
 /// An encrypted lake gets no data store: moraine reads no byte of an
 /// encrypted data file, so its indexes and summaries never try.
 #[test]

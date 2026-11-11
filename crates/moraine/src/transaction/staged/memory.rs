@@ -14,19 +14,20 @@ pub(super) struct StagingMemory {
 
 impl Default for StagingMemory {
     fn default() -> Self {
-        match std::env::var("MORAINE_STAGING_MEMORY_BYTES") {
-            Ok(value) => match value.parse::<usize>() {
-                Ok(limit) if limit > 0 => Self::with_limit(limit),
-                _ => Self {
-                    failure: Some(
-                        "MORAINE_STAGING_MEMORY_BYTES must be a positive byte count".into(),
-                    ),
-                    ..Self::with_limit(DEFAULT_LIMIT)
-                },
+        match crate::memory::budget_bytes(
+            crate::memory::configured_memory().staging,
+            "MORAINE_STAGING_MEMORY_BYTES",
+            DEFAULT_LIMIT as u64,
+        )
+        .map(usize::try_from)
+        {
+            Ok(Ok(limit)) => Self::with_limit(limit),
+            Ok(Err(_)) => Self {
+                failure: Some("the staging memory budget exceeds platform capacity".into()),
+                ..Self::with_limit(DEFAULT_LIMIT)
             },
-            Err(std::env::VarError::NotPresent) => Self::with_limit(DEFAULT_LIMIT),
-            Err(_) => Self {
-                failure: Some("MORAINE_STAGING_MEMORY_BYTES must be UTF-8".into()),
+            Err(error) => Self {
+                failure: Some(error.to_string()),
                 ..Self::with_limit(DEFAULT_LIMIT)
             },
         }
@@ -63,7 +64,7 @@ impl StagingMemory {
             .saturating_add(payload);
         if bytes > self.limit {
             self.failure = Some(format!(
-                "staging memory exceeds {} bytes; split the transaction or raise MORAINE_STAGING_MEMORY_BYTES",
+                "staging memory exceeds {} bytes; split the transaction or raise the staging memory budget",
                 self.limit
             ));
         } else {

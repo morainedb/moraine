@@ -14,6 +14,8 @@
 namespace moraine_duckdb {
 // Defined in storage_extension.cpp.
 void RegisterMoraineStorageExtension(duckdb::DBConfig &config);
+// Defined in settings.cpp.
+void RegisterMoraineSettings(duckdb::DBConfig &config);
 // Defined in census.cpp.
 void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader);
 // Defined in index_functions.cpp.
@@ -74,6 +76,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("moraine: a SlateDB-backed DuckLake catalog, DuckLake bundled");
 	moraine_duckdb::RegisterMoraineMetadataManager();
 	moraine_duckdb::RegisterMoraineStorageExtension(loader.GetDatabaseInstance().config);
+	moraine_duckdb::RegisterMoraineSettings(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineOptimizer(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineCensusFunctions(loader);
 	moraine_duckdb::RegisterMoraineIndexFunctions(loader);
