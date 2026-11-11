@@ -2,13 +2,14 @@
 
 ## Summary
 
-Every read runs at one fixed store revision and decodes only the records it
-asks for. Writers read through a SlateDB snapshot. Independent readers pin
-checkpoints the writer publishes at durable boundaries, and write nothing.
-Reuse lives in one foyer block cache per store under one process budget, with
-SST metadata protected by eviction priority. Row summaries are published as
-immutable sidecars beside embedded-row-id data files. Live allocations are
-admitted against a separate working-memory allowance, and refusal is an error.
+Every read runs at one fixed store revision and decodes only the records it asks
+for. Writers read through a SlateDB snapshot. Independent readers pin
+checkpoints the writer publishes at durable boundaries, and require only read
+access. Each store has a foyer block cache, with a shared process-wide budget.
+SST metadata has higher eviction priority than data blocks. Row summaries are
+published as immutable sidecars beside embedded-row-id data files. Live
+allocations are admitted against a separate working-memory allowance. Operations
+fail when they exceed it.
 
 ## Read revisions
 
@@ -71,8 +72,6 @@ opens a `Publisher` on the recovered store, and publishes through the durable
 sequence covering its slot. The `Publisher` serializes publication within a
 process and coalesces writes covered by one checkpoint.
 <!-- /site:omit -->
-
-Each component owns one layer of state and nothing above it.
 
 | Owner | Holds |
 |---|---|
@@ -160,7 +159,8 @@ DuckLake holds one catalog snapshot per transaction, resolved on first catalog
 access and kept for the transaction's life. In autocommit mode that is one
 statement. Inside `BEGIN ... COMMIT` it is the whole block, which the user
 controls. The retention window must therefore exceed the longest open explicit
-transaction. Sizing it to statement length is wrong.
+transaction. A window based on statement duration alone can expire an open
+transaction.
 
 **Head-stamp guard.** Equality, `IN`, range, and `NULL` index lookups, full
 inline scans, and requested inline-row lookups each read many keys and must
@@ -337,7 +337,7 @@ reader keeps a value and its charge until its query finishes, after eviction.
 `ReadOnlyCatalog::projection_bytes` reports the estimated bytes these
 facilities hold.
 
-**Knobs.** `moraine_cache_dir`, `moraine_cache_size`,
+**Configuration.** `moraine_cache_dir`, `moraine_cache_size`,
 `moraine_cache_memory`, and `moraine_cache_auxiliary_percent` are settings,
 one per process; `CACHE_PUTS`, `CACHE_COMPACTION_PUTS`, and `CACHE_PRELOAD`
 are attach options, one per lake. Both are documented with the [extension

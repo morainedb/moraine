@@ -2,12 +2,10 @@
 
 ## Summary
 
-This document places each DuckLake catalog feature in the moraine keyspace:
-schema evolution, the catalog version, partitioning and sorting, column and
-name mapping, macros, encryption, and the change data feed. For each feature
-it fixes the kind and key, the value shape, whether the record is versioned,
-which operations advance `schema_version`, the verb surface, and what the
-write path validates. Four rules apply to every feature and are stated once.
+DuckLake supplies catalog rows for schema changes, partitioning, sorting,
+column mappings, macros, and encryption. Moraine validates their structure,
+stores them, and serves them back to DuckLake. DuckLake evaluates expressions
+and reconstructs the change data feed from those records.
 
 ## Shared rules
 
@@ -42,7 +40,6 @@ classification of its own.
 | Bumps `schema_version` | Every column operation |
 | Verbs | `create_table`, `add_column`, `rename_column`, `alter_column`, `drop_column` |
 
-Identity lives in the key and everything mutable lives in the value.
 `column_id` is DuckLake's per-table field id, allocated from 1 and never
 reused. A dropped id never returns. Data files reference columns by field id,
 so a drop, rename, or type change touches no data file. `column_order` is a
@@ -267,17 +264,17 @@ implementations.
 The global `encrypted` option is recorded at bootstrap from the `ENCRYPTED`
 attach option, which reaches a nested moraine attach through DuckLake's
 `META_ENCRYPTED true` passthrough. Later attaches ignore the option, and
-`set_option` refuses the key. The flag decides nothing inside moraine. It is
-served back so DuckLake knows to encrypt its files. The data-file keys
-DuckLake writes to `encryption_key` on `ducklake_data_file` and
-`ducklake_delete_file` are stored and served verbatim. moraine decrypts
-nothing and reads no Parquet byte of an encrypted file.
+`set_option` refuses the key. Moraine serves the flag back to DuckLake, which
+encrypts the files. The data-file keys DuckLake writes to `encryption_key` on
+`ducklake_data_file` and `ducklake_delete_file` are stored and served verbatim.
+moraine decrypts nothing and reads no Parquet byte of an encrypted file.
 
 The catalog has no client-side encryption. Confidentiality of the SlateDB
 objects relies on the bucket's server-side encryption, so an untrusted catalog
 bucket is unsupported. Inlined rows live inside catalog values and are covered
-only by that catalog-at-rest protection. Key policy and bucket configuration
-are operator guidance on the site.
+only by that catalog-at-rest protection. See the
+[operating manual](https://morainedb.github.io/guide/operating/#encryption) for
+key policy and bucket configuration.
 
 ## Change data feed
 

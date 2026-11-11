@@ -5,13 +5,12 @@ sidebar:
   order: 7
 ---
 
-DuckLake keeps table data in object storage and its catalog, the
-transactional source of truth, in a SQL database. Moraine replaces that
-database with [SlateDB](https://slatedb.io), a transactional key-value
-store whose state lives in object storage, so the catalog sits in the
-bucket next to the Parquet files. It occupies the slot a Postgres, SQLite,
-or DuckDB catalog database occupies and implements DuckLake's contract
-rather than semantics of its own.
+DuckLake keeps table data in object storage and its catalog, the transactional
+source of truth, in a SQL database. Moraine replaces that database with
+[SlateDB](https://slatedb.io), a transactional key-value store whose state lives
+in object storage, so the catalog sits in the bucket next to the Parquet files.
+It implements the same catalog interface as the Postgres, SQLite, and DuckDB
+backends.
 
 ## The stack
 
@@ -25,21 +24,18 @@ DuckDB engine
 
 DuckLake remains the planner and transaction layer. Moraine serves the
 `ducklake_*` metadata tables row for row out of SlateDB, so DuckLake's own
-SQL runs unchanged against it: the tables are the catalog state, not a
-projection of it.
+SQL runs unchanged against it.
 
 Two crates:
 
 - `moraine` is the core: snapshots, schemas, tables, data-file metadata,
   and transactional commits mapped onto SlateDB's key-value model. Pure
   Rust, async, and usable without DuckDB: a tokio host embeds it directly
-  ([docs.rs/moraine](https://docs.rs/moraine)). SlateDB never appears in a
-  public signature.
-- `moraine-duckdb` is the DuckDB extension. It holds no domain logic, only
-  the `StorageExtension` registration, the C ABI, and the sync-to-async
-  bridge. DuckDB's stable C extension API cannot register a catalog, so the
-  shim links DuckDB's internals, which pins each build to one DuckDB
-  release.
+  ([docs.rs/moraine](https://docs.rs/moraine)).
+- `moraine-duckdb` registers the DuckDB `StorageExtension` and calls the Rust
+  core through a C ABI and sync-to-async bridge. DuckDB's stable C extension API
+  cannot register a catalog, so the shim links DuckDB's internals, which pins
+  each build to one DuckDB release.
 
 ## Storage model
 
@@ -48,7 +44,7 @@ The keyspace is partitioned by a leading tag byte into subspaces: `system`
 `history` (ended versions), `inline` (inlined rows), `index`
 (equality-index entries), and a few smaller ones.
 
-The `current`/`history` split is the central decision. DuckLake versions
+DuckLake versions
 every entity with a begin and end snapshot. Moraine keeps live versions in
 `current` and moves ended versions to `history` in the same commit, so
 loading the live catalog scans `current` only, at a cost proportional to
@@ -57,8 +53,8 @@ the live catalog rather than its history. Time travel reads `history` too.
 Keys are an enum tree with fixed-width big-endian numeric components, so
 byte order equals numeric order and each table's collections are
 contiguous ranges. Values are protobuf behind a versioned framing header. A
-format version in `system` gates key-structure changes; migration is an
-explicit verb, never automatic on open.
+format version in `system` identifies the key layout. Stores below a
+build's supported range require an explicit migration before opening.
 
 ## Commits
 
@@ -96,15 +92,14 @@ a Parquet file each.
 
 One process attaches a lake read-write; every other process attaches
 `READ_ONLY`. SlateDB fences by newest writer: a second read-write attach takes
-the writer role, and the first writer's next commit fails rather than corrupting
-anything. [Getting started](../getting-started/#one-writer-many-readers) covers
-recovery and what readers' credentials need.
+the writer role, and the first writer's next commit fails with a fencing error.
+[Getting started](../getting-started/#one-writer-many-readers) covers recovery
+and what readers' credentials need.
 
 ## Further reading
 
-The [design documents](/rfcs/) fix each of these decisions in detail:
+The [design documents](/rfcs/) describe
 the [storage format](/rfcs/0001-storage-format/), the
 [commit protocol](/rfcs/0003-commit-protocol/), the
 [read path](/rfcs/0007-read-path-and-caching/), and the
-[extension surface](/rfcs/0006-extension-surface/) are the four to start
-with.
+[extension surface](/rfcs/0006-extension-surface/) in detail.

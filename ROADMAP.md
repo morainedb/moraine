@@ -1,8 +1,6 @@
 # Roadmap
 
-Moraine is at 0.8, built for DuckDB 2.0.0. Everything listed as done runs
-against real DuckLake SQL in the end-to-end suite. Unchecked items are gaps,
-not configuration.
+Moraine 0.8 supports DuckDB 2.0.0.
 
 ## Next
 
@@ -63,14 +61,14 @@ not configuration.
   checkpoint-pinned readers for strictly read-only credentials.
 - [x] Query interruption: Ctrl-C aborts a blocked read, and a submitted
   commit completes and reports its outcome.
-- [x] Bundled, patched DuckLake, so one `LOAD` is the whole setup.
+- [x] DuckLake bundled with the extension and loaded by the same `LOAD` command.
 
 ### Operations
 
 - [x] DuckLake's compaction, rewrite, snapshot expiry, and file cleanup, with
   row ids and pre-operation time travel preserved; a scheduled in-writer
-  maintenance pass that runs them in order and then reclaims what only
-  Moraine can see ([maintenance](docs/rfcs/0010-maintenance.md)).
+  maintenance pass that also removes orphaned index entries, statistics,
+  inline rows, and row summaries ([maintenance](docs/rfcs/0010-maintenance.md)).
 - [x] Explicit, resumable, one-way on-disk format migration; the DuckLake
   catalog version raised on request.
 - [x] Crash recovery: every state-changing path is one atomic batch or a
@@ -90,7 +88,7 @@ not configuration.
 - [x] Commit-served projections and shared commit preparation, so commit
   latency does not grow with snapshot history.
 - [x] Working-memory budgets per process, transaction, commit, and summary
-  build, refusing instead of growing.
+  build. Operations fail when they exceed their budget.
 
 <!-- site:omit -->
 ### Multi-process writers

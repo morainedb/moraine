@@ -6,10 +6,10 @@ DuckLake drives reclamation. `ducklake_expire_snapshots` computes the dead
 set and issues a row cascade, `ducklake_cleanup_old_files` deletes bytes,
 and the compaction functions rewrite Parquet. moraine translates the row
 shapes those functions issue, mints no snapshot for a maintenance-only
-commit, and reclaims what only it can see: orphaned index ranges, stranded
-file statistics, inlined rows of forgotten tables, and row-summary sidecars.
-A shim-side scheduler runs all of this in a fixed order on an interval
-configured at attach. An attach that configures nothing schedules nothing.
+commit, and removes orphaned index ranges, file statistics, inlined rows of
+dropped tables, and row-summary sidecars.
+Set `META_MAINTENANCE_INTERVAL` at attach to schedule maintenance.
+The scheduler runs the enabled steps in a fixed order.
 
 ## Expiry and cleanup translation
 
@@ -24,9 +24,9 @@ through DuckDB's filesystem, then deletes the schedule rows.
 files without touching the catalog. The cascade is specified by
 [DuckLake's metadata manager](https://github.com/duckdb/ducklake/blob/main/src/metadata_manager/ducklake_metadata_manager.cpp).
 
-moraine computes no dead set, validates no retention parameter, and deletes
-no data-file bytes. The cascade arrives on the staged-row path of [the
-extension surface](0006-extension-surface.md) and translates into one
+DuckLake determines which records and files to delete and validates the
+retention parameters. Moraine receives the cascade through the staged-row path
+of [the extension surface](0006-extension-surface.md) and translates into one
 atomic batch by these rules.
 
 | Staged row | Translation |
@@ -47,15 +47,15 @@ maintenance.
 
 ### Read-your-writes
 
-The cascade's `NOT EXISTS` subqueries run after the same transaction staged
-its snapshot deletes, and its orphan-cascade deletes read parents deleted
-moments earlier. Projections served through an open staged transaction
-therefore overlay its staged rows on the committed records in stage order
-(`crates/moraine/src/transaction/staged/overlay.rs`). An insert appends, a
-hard delete drops the version it names, `UPDATE ... SET end_snapshot` ends
-the live version, `UPDATE ... SET begin_snapshot` rebases it, and an
-unversioned kind overwrites or removes by key. The overlay validates
-nothing. A row translation would refuse still appears and fails at commit.
+The cascade's `NOT EXISTS` subqueries run after the same transaction staged its
+snapshot deletes, and its orphan-cascade deletes read parents deleted moments
+earlier. Projections served through an open staged transaction therefore overlay
+its staged rows on the committed records in stage order
+(`crates/moraine/src/transaction/staged/overlay.rs`). An insert appends, a hard
+delete drops the version it names, `UPDATE ... SET end_snapshot` ends the live
+version, `UPDATE ... SET begin_snapshot` rebases it, and an unversioned kind
+overwrites or removes by key. Validation runs at commit; the overlay includes
+staged rows even if commit-time translation will reject them.
 
 Every kind is overlaid. One materialization per DuckDB transaction serves
 both the metadata scan and the staged-write sink, so a rowid the scan emits
@@ -106,7 +106,7 @@ Compaction never allocates row ids. DuckLake stages no change to
 entries name rows, and a compaction changes no row id or value, so a
 compaction-only change set stages no index work and no entry is touched.
 
-### The row-id hold
+### Row-id validation
 
 Before a compaction lands, the commit reads the row ids of the files it
 registers and of the files it hard-deletes or ends, and compares them
@@ -118,9 +118,9 @@ difference is refused with `Error::Corruption` and the sources stay live.
 A commit with no data store to read from skips the check.
 
 The bundled DuckLake carries
-`patches/ducklake/0007-fix-keep-the-row-ids-a-merged-file-carries.patch`,
-under which a merge always writes the row-id column. The hold stays as the
-commit's own check on row identity.
+`patches/ducklake/0007-fix-keep-the-row-ids-a-merged-file-carries.patch`, under
+which a merge always writes the row-id column. The commit also validates row ids
+before accepting the replacement files.
 
 ### Conflict grain
 
@@ -345,14 +345,13 @@ impl ReadOnlyCatalog {
 }
 ```
 
-`SubspaceName` names every subspace of [the storage
-format](0001-storage-format.md) plus `Unknown(Vec<u8>)` for a segment prefix
-this build does not recognize. `StoreObjects` totals the object store by
-kind: write-ahead log, manifest, SST, and other. It is `None` when the
-listing is refused, which read-only credentials without `ListBucket`
-produce. Every struct is `#[non_exhaustive]`, and no `slatedb` type appears
-in a signature. `maintain`, `compact_store`, and `record_maintenance_pass`
-refuse a read-only catalog with `Error::Constraint`.
+`SubspaceName` names every subspace of
+[the storage format](0001-storage-format.md) plus `Unknown(Vec<u8>)` for a
+segment prefix this build does not recognize. `StoreObjects` totals the object
+store by kind: write-ahead log, manifest, SST, and other. It is `None` when the
+listing is refused, which read-only credentials without `ListBucket` produce.
+The result structs are `#[non_exhaustive]`. `maintain`, `compact_store`, and
+`record_maintenance_pass` refuse a read-only catalog with `Error::Constraint`.
 
 ## Orphan sweep and store merge
 
