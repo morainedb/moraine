@@ -159,3 +159,24 @@ SELECT * FROM moraine_raise_catalog_version('lake', confirm => true);
 A DuckLake that requires `1.0` refuses a raised lake. A lake written by a
 newer Moraine at a catalog version this build cannot serve is refused at
 attach.
+
+## What it costs
+
+The smallest single-AZ RDS Postgres (`db.t4g.micro`, 20 GB gp3, us-east-1)
+is $0.016 an hour plus $0.115 per GB-month: about $14 a month, idle or not,
+before backups or Multi-AZ.
+
+A 100 MB Moraine catalog on S3 Standard costs $0.0023 a month to store. A
+writer committing once a minute adds about $0.22 in PUTs and about as much
+in compaction. A reader polling every ten seconds adds at most $1.30
+at the LIST price, $0.22 at once a minute.
+
+## Correctness
+
+A DuckLake transaction is one SlateDB write batch, durable when its
+write-ahead-log object lands, so a crash leaves the catalog before the
+commit or after it, never between. A second writer fences the first, which
+then writes nothing. Both are tested against real SlateDB with a store that
+freezes at every write boundary, fuzzed nightly, and run through about two
+hundred end-to-end tests against real DuckDB.
+[How Moraine is tested](../testing/) lists the cases.

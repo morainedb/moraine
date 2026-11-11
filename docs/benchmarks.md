@@ -234,30 +234,47 @@ file saves); do not compare across pairs. The `indexed` twins add one
 `CREATE INDEX`; the other backends have no equality index and skip them.
 `ATTACH` is a timed phase.
 
+### Single writer
+
+`bulk_load` and `small_commits` at the `small` scale, loopback Postgres
+16, three repeats, 2026-11-11 at commit `dd35dce`:
+
+| phase | moraine | duckdb | postgres |
+|---|---:|---:|---:|
+| attach | 8 ms | 19 ms | 113 ms |
+| `CREATE TABLE` | 53 ms | 57 ms | 75 ms |
+| 100,000-row `INSERT` | 41 ms | 45 ms | 49 ms |
+| 20 single-row inserts | 254 ms | 218 ms | 135 ms |
+
+Serial commits pay moraine's flush each, at the 1 ms interval the latency
+workloads pin; a loopback Postgres commits in about 7 ms and a DuckDB file
+in about 11 ms.
+
 ### Concurrent writers
 
 `--commits` single-row inserts are spread over N writers, released
 together on a barrier. `concurrent_connections` uses
 `xtask/cpp/concurrent_writers.c`, because the CLI holds one connection.
-128 commits, three repeats, 8-vCPU x86-64 Linux, 2026-08:
+128 commits, three repeats. Connections: 2026-11-11 at commit `dd35dce`;
+processes: 2026-08, not re-run.
 
 | writers | processes: moraine | duckdb | postgres | connections: moraine | duckdb | postgres |
 |---|---|---|---|---|---|---|
-| 1 | 12.90 s | 1.30 s | 819 ms | 1.44 s | 1.25 s | 889 ms |
-| 2 | refused | refused | 853 ms | 832 ms | 1.40 s | 801 ms |
-| 4 | refused | refused | 996 ms | 489 ms | 1.74 s | 1.16 s |
-| 8 | refused | refused | 1.29 s | 413 ms | 2.19 s | 1.28 s |
-| 16 | | | | 437 ms | 2.44 s | 1.39 s |
+| 1 | 12.90 s | 1.30 s | 819 ms | 1.47 s | 1.08 s | 665 ms |
+| 2 | refused | refused | 853 ms | | | |
+| 4 | refused | refused | 996 ms | 597 ms | 1.78 s | 953 ms |
+| 8 | refused | refused | 1.29 s | 417 ms | 1.76 s | 1.77 s |
+| 16 | | | | 461 ms | 2.85 s | 2.94 s |
 
 - Across processes, both embedded catalogs are single-writer. Moraine
   fences the previous writer with a typed error; the DuckDB file catalog
   fails on the file lock. Postgres accepts more writers and gets slower.
 - Within one process, moraine is the only catalog that gets faster with
-  writers, and the fastest from four up. The lone-writer column predates
+  writers, and the fastest from four up. The lone-process column predates
   the pacing floor.
-- At 512 commits, DuckDB-file exhausts DuckLake's retry budget at 16
-  writers. Postgres slows with every doubling. Moraine: 3.34 s at 16,
-  1.92 s at 32, 2.10 s at 64.
+- At 512 commits (2026-08), DuckDB-file exhausts DuckLake's retry budget
+  at 16 writers. Postgres slows with every doubling. Moraine: 3.34 s at
+  16, 1.92 s at 32, 2.10 s at 64.
 
 Not covered: remote object stores or statistical rigour beyond median,
 min, and max. CI runs `e2e`, not this.

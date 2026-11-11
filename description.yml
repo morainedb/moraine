@@ -1,7 +1,7 @@
 extension:
   name: moraine
-  description: A SlateDB-backed catalog for DuckLake
-  version: 0.1.0
+  description: A DuckLake catalog in object storage, on SlateDB
+  version: 0.8.1
   language: Rust & C++
   build: cmake
   license: MIT OR Apache-2.0
@@ -12,16 +12,23 @@ extension:
 
 repo:
   github: morainedb/moraine
-  ref: 7eaf0114c273a569f36186d3c355c94e866450c3
+  ref: ef1513f97573d693ce880b48800b5c1004d12595
 
 docs:
   hello_world: |
     INSTALL moraine FROM community;
     LOAD moraine;
-    ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH '<data-path>');
+    ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
+      (DATA_PATH 's3://bucket/lake-data/', META_DATA_PATH 's3://bucket/lake-data/', READ_WRITE);
+    CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
+    INSERT INTO lake.events VALUES (1, 'hello, bucket');
   extended_description: |
-    moraine backs a DuckLake catalog with SlateDB over object storage, and
-    bundles the DuckLake it is built for: LOAD moraine serves both.
-    ATTACH 'ducklake:moraine:<store>' nests moraine as DuckLake's metadata
-    connection; every ducklake_* table is served from the store and DuckLake's
-    own INSERT/UPDATE/DELETE commit atomically.
+    Moraine is a DuckLake catalog backend that keeps the catalog in object
+    storage on SlateDB, beside the Parquet data files, so a lake needs no
+    catalog server: one process writes, any number read, and an idle lake
+    costs only storage. It bundles the DuckLake it is built for, so LOAD
+    moraine serves both. ATTACH 'ducklake:moraine:<store>' nests Moraine as
+    DuckLake's metadata connection; every ducklake_* table is served from the
+    store, DuckLake's own SQL commits atomically, and CREATE INDEX adds
+    ordered indexes maintained in the same commit as the rows.
+    Documentation: https://morainedb.github.io/

@@ -2,7 +2,7 @@
 title: Architecture
 description: How Moraine fits under DuckDB and DuckLake, and how it lays a catalog out in SlateDB.
 sidebar:
-  order: 5
+  order: 7
 ---
 
 DuckLake keeps table data in object storage and its catalog, the
