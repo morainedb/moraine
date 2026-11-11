@@ -95,9 +95,17 @@ The Rust side of that is `mbx`, which `.conductor/settings.toml` installs
 and CI runs through `jdx/mr-boxington-action`: one store per machine keyed on
 compiler inputs, so a fresh worktree restores what another already compiled.
 A cloud workspace routes plain `cargo` through it; elsewhere prefix the
-command, as `mbx test --workspace`. It also moves `target/` into that store
-and collects it when the disk runs short, which takes `target/clang-tools`
-with it — `CONTRIBUTING.md` has the one command that puts it back.
+command, as `mbx test --workspace`. It also moves `target/` into that store,
+so `target` is a symlink, and collects it when the disk runs short.
+
+When the disk runs out, run `mbx gc`. It collects managed targets and
+incremental state first, then evicts store objects down to budget, and a
+build rebuilds whatever it evicted. Never `cargo clean`, `rm -rf target`,
+or replace the `target` link with a directory: each throws away state every
+worktree on the machine shares. A dangling `target` link means mbx collected
+it; the next cargo command through mbx restores it. A collection takes
+`target/clang-tools` with it — `CONTRIBUTING.md` has the one command that
+puts it back.
 
 The Rust/C/C++ formatting, Markdown (`rumdl`), and Clippy checks also run as a
 pre-commit hook from `.githooks/`, and a commit-msg hook there rejects

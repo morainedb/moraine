@@ -52,8 +52,13 @@ it, run `mbx setup`, and prefix Cargo commands with `mbx` — or put the shim
 directory it prints on `PATH` and keep using plain `cargo`. A second
 checkout then restores what the first compiled, and CI caches the same way
 through `jdx/mr-boxington-action`. Conductor workspaces install it in setup.
-mbx holds `target/` in its own store and collects it when the disk runs
-short, so the `clang-tools` venv above needs recreating after that.
+mbx holds `target/` in its own store, behind a `target` symlink, and
+collects it when the disk runs short. When the disk runs out, run `mbx gc`:
+it collects managed targets and incremental state first, then evicts store
+objects to budget, and a build rebuilds whatever it evicted. Do not
+`cargo clean`, `rm -rf target`, or replace the link with a directory; each
+discards state every worktree shares. A collection takes the `clang-tools`
+venv above with it, so recreate it afterwards.
 
 ## The local gate
 
