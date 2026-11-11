@@ -234,3 +234,73 @@ async fn a_listing_that_confirms_the_publication_extends_the_deadline() {
     reader.close().await.unwrap();
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_committer_lists_the_newest_publication_inside_the_interval() {
+    use super::super::index_read_scope::PinnedRead;
+    use crate::store::{checkpoint::CheckpointReader, handle::OwnedReadHandle};
+
+    let objects = Arc::new(InMemory::new());
+    Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+    // The peer's commits wait out a poll of its reader; the committer under
+    // test never commits, so its interval only governs how long its scopes
+    // may reuse a publication.
+    let provider = Arc::new(crate::commit_log::test_log::TestProvider::default());
+    let peer = Catalog::open(
+        objects.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..reader_options(Duration::from_millis(10))
+        },
+    )
+    .await
+    .unwrap();
+    set_probe(&peer, "one").await;
+    let committer = Catalog::open(
+        objects,
+        CatalogOptions {
+            commit_log: Some(Arc::new(provider.sharing())),
+            ..reader_options(Duration::from_mins(1))
+        },
+    )
+    .await
+    .unwrap();
+
+    // A committer's scope is never a listing interval behind a publication:
+    // the one after a commit reads past the one before it.
+    let scopes = committer.reader_scopes.as_ref().unwrap();
+    let first = scopes.acquire().await.unwrap();
+    set_probe(&peer, "two").await;
+    let second = scopes.acquire().await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    let pinned_to = |reader: &Arc<CheckpointReader>| {
+        let mut reads = (*committer).clone();
+        reads.pinned = Some(Arc::new(PinnedRead {
+            handle: OwnedReadHandle::Checkpoint(reader.clone()),
+            revision: reader.manifest,
+        }));
+        reads
+    };
+    assert_eq!(
+        global_option(&pinned_to(&first), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("one")
+    );
+    assert_eq!(
+        global_option(&pinned_to(&second), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("two")
+    );
+    drop((first, second));
+    committer.close().await.unwrap();
+    peer.close().await.unwrap();
+}
