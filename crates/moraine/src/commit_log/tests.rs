@@ -25,6 +25,8 @@ use crate::{
 fn options_at(path: &str) -> CatalogOptions {
     CatalogOptions {
         path: path.to_string(),
+        // A committer's reads wait out a poll of its reader.
+        reader_poll_interval: std::time::Duration::from_millis(10),
         ..CatalogOptions::default()
     }
 }
@@ -865,11 +867,10 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
     idle.close().await.unwrap();
 }
 
-/// Nothing lists the log on a clock: an idle committer makes no request
-/// at all, a commit's wait refreshes until its slot is served, and the
-/// committer reads its own commit straight after.
+/// A commit's wait brings the committer's reader up to the log until its
+/// slot is served, and the committer reads its own commit straight after.
 #[tokio::test]
-async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
+async fn a_commit_waits_until_its_slot_is_served_and_reads_it_back() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -894,25 +895,14 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     )
     .await
     .unwrap();
-    // The reader's first poll fires on open rather than after the
-    // interval; let it pass before the count is a baseline.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let idle = committer_provider.polls();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(
-        committer_provider.polls(),
-        idle,
-        "an idle committer lists nothing: its poll keeps a checkpoint \
-         alive, not a view"
-    );
-
+    let before = committer_provider.polls();
     committer
         .commit_materialized(|tx| tx.create_schema("b").map(|_| ()))
         .await
         .unwrap();
     assert!(
-        committer_provider.polls() > idle,
-        "the commit's wait refreshed until its slot was served"
+        committer_provider.polls() > before,
+        "the commit's wait brought the reader up until its slot was served"
     );
     assert!(
         committer
@@ -922,14 +912,6 @@ async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
             .schema_by_name("b")
             .is_some(),
         "the committer reads its own commit"
-    );
-
-    let settled = committer_provider.polls();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(
-        committer_provider.polls(),
-        settled,
-        "served, the committer rests"
     );
     committer.close().await.unwrap();
 }

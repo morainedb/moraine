@@ -73,7 +73,9 @@ A session is the cursor one open shares with its plug. `WriterSession` yields
 `adopted` before the store is built. The plug replays the log in place of the
 store's own log, so a store on a log nobody has adopted drains its own log into
 the tree first. `ReaderSession` yields `reader`, the SlateDB `WalReader` the
-`DbReader` is built with. Both carry `as_any`.
+`DbReader` is built with, and `refresh`, which brings a reader up to the log
+before a committer's read; its default does nothing and leaves the reader to
+its poll. Both carry `as_any`.
 
 A read-write open with a provider commits as a follower over a tailing reader.
 When the log is not adopted, the open first takes the store as a holder, adopts,

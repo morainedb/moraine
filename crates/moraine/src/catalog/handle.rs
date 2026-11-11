@@ -913,10 +913,10 @@ pub struct ReadOnlyCatalog {
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
-    /// Whether a read brings the reader up to the store before it runs.
-    /// A committer does, so a peer's slot is never a tick away; every
-    /// other store leaves it to the reader's own poll.
-    refresh_on_read: bool,
+    /// The session a read brings the reader up to the log through before
+    /// it runs. A committer carries one, so a peer's slot is never a tick
+    /// away; every other store leaves the reader to its own poll.
+    refresh: Option<Arc<dyn crate::ReaderSession>>,
     /// What a read-only reader over a commit log lists it for: a read
     /// asks, and the next poll lists. `None` where there is no log to
     /// list, or where reads refresh instead.
@@ -1326,10 +1326,10 @@ impl ReadOnlyCatalog {
                 if let Some(asked) = &self.asked {
                     asked.ask();
                 }
-                if self.refresh_on_read {
+                if let Some(session) = &self.refresh {
                     // Refreshed rather than polled for, so the read is
                     // served the log as it stands.
-                    reader.refresh().await.map_err(Error::from)?;
+                    session.refresh(reader).await?;
                 }
                 ReadSession::Reader(reader.clone())
             }
@@ -1621,7 +1621,7 @@ impl Catalog {
                     None,
                 )),
                 projections,
-                refresh_on_read: false,
+                refresh: None,
                 asked: None,
             },
         })
@@ -2037,7 +2037,7 @@ impl Catalog {
         });
         let store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store.clone())
-            .reader_session(session)
+            .reader_session(session.clone())
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
@@ -2115,7 +2115,7 @@ impl Catalog {
                 None,
             )),
             projections,
-            refresh_on_read,
+            refresh: session.filter(|_| refresh_on_read),
             asked,
         })
     }
