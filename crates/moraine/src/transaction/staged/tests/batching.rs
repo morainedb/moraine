@@ -672,6 +672,7 @@ async fn coalesced_log_appends_rebase_against_pending_members() {
             commit_log: Some(Arc::new(
                 crate::commit_log::test_log::TestProvider::default(),
             )),
+            reader_poll_interval: std::time::Duration::from_millis(10),
             ..CatalogOptions::default()
         },
     )

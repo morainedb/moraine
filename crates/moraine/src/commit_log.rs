@@ -191,9 +191,21 @@ pub trait WriterSession: Any + Send + Sync + 'static {
 
 /// One reader open's cursor, shared by its plug and the store built over
 /// it.
+#[async_trait]
 pub trait ReaderSession: Any + Send + Sync + 'static {
     /// The write-ahead-log plug the reader is built with.
     fn reader(&self) -> Arc<dyn WalReader>;
+
+    /// Brings `reader` up to the log as it stands, before a committer's
+    /// read. The default does nothing and leaves the reader to its poll.
+    ///
+    /// # Errors
+    ///
+    /// The store's error when the reader cannot be brought up.
+    async fn refresh(&self, reader: &DbReader) -> Result<()> {
+        let _ = reader;
+        Ok(())
+    }
 
     /// The session as the crate that minted it knows it.
     fn as_any(&self) -> &dyn Any;

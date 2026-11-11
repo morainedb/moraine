@@ -317,6 +317,7 @@ mod tests {
             objects.clone(),
             CatalogOptions {
                 commit_log: Some(provider.clone()),
+                reader_poll_interval: std::time::Duration::from_millis(10),
                 ..Default::default()
             },
         )
@@ -326,6 +327,7 @@ mod tests {
             objects,
             CatalogOptions {
                 commit_log: Some(Arc::new(provider.sharing())),
+                reader_poll_interval: std::time::Duration::from_millis(10),
                 ..Default::default()
             },
         )

@@ -761,6 +761,7 @@ async fn a_provider_can_declare_external_compaction() {
     let options = CatalogOptions {
         path: "declared".to_string(),
         commit_log: Some(Arc::new(TestProvider::default().externally_compacted())),
+        reader_poll_interval: std::time::Duration::from_millis(10),
         ..CatalogOptions::default()
     };
     let catalog = Catalog::open(object_store.clone(), options).await.unwrap();
@@ -770,6 +771,7 @@ async fn a_provider_can_declare_external_compaction() {
     let options = CatalogOptions {
         path: "undeclared".to_string(),
         commit_log: Some(Arc::new(TestProvider::default())),
+        reader_poll_interval: std::time::Duration::from_millis(10),
         ..CatalogOptions::default()
     };
     let catalog = Catalog::open(object_store.clone(), options).await.unwrap();
