@@ -162,7 +162,7 @@ through DuckDB's Arrow importer into a `DataChunk`, and the shim's scan
 emits output by copying contiguous runs of that chunk across with
 `VectorOperations::Copy`, one vector at a time. The three metadata columns
 are written into flat vectors. No cell passes through `duckdb::Value`.
-Windows bound residency: the rows resident at any point are one window's.
+Only one window of rows is held in memory at a time.
 
 A physical rowid is the row's position in the scan's emission order, so
 versions sharing a logical row id stay distinct.

@@ -4,16 +4,14 @@ Moraine replaces DuckLake's metadata catalog. These harnesses measure
 that path: the commit, the catalog open, and what a statement reads
 before it touches Parquet.
 
-Numbers are machine-specific. Unless stamped otherwise, a number is from
-one release run on an 8-vCPU x86-64 Linux VM (six schedulable CPUs) on
-2026-11-10 at commit `8146cbf`, against the in-memory object store.
+Unless stated otherwise, measurements are from one release build on an 8-vCPU
+x86-64 Linux VM (six schedulable CPUs) on 2026-11-10 at commit `8146cbf`,
+against the in-memory object store.
 
-Two facts shape the write path:
-
-- A commit is durable once its write-ahead-log object lands. The writer
-  paces flushes at `META_FLUSH_INTERVAL_MS` (default 100 ms). A writer
-  with no siblings flushes after a tenth of that, so a lone commit costs
-  about 11 ms. Concurrent commits share one flush.
+- A commit is durable once its write-ahead-log object lands. The writer paces
+  flushes at `META_FLUSH_INTERVAL_MS` (default 100 ms). A writer with no
+  concurrent commits flushes after a tenth of that, so a lone commit costs about
+  11 ms. Concurrent commits share one flush.
 - Against a real endpoint the PUT round trip is the floor: about 30 ms
   on same-region S3.
 
@@ -65,8 +63,8 @@ Loopback RustFS, same VM, 2026-10-20, medians of seven commits:
   the cost does not grow with the file count.
 - Two statements are 69% of that: the per-column file-list query and the
   snapshot insert.
-- None of it is storage. A local-filesystem store is within 0.2 ms, and
-  the task records zero GETs per commit. The time is DuckDB parsing,
+- A local-filesystem store is within 0.2 ms of RustFS, and
+  the task records zero GETs per commit. DuckDB spends the time parsing,
   binding, and optimising about a kilobyte of generated SQL. Preparing
   the statement saves only the parse, because DuckDB re-binds any
   prepared statement that reads a catalog.
@@ -136,9 +134,8 @@ the WAL objects written.
 | 64 | 25 ms | 5,212 | 2 | 64.0 |
 | 128 | 23 ms | 5,575 | 2 | 64.0 |
 
-Batch size equals concurrency up to the 64-member ceiling, so throughput
-is linear in K. Routing a fleet's commits through one writer costs them a
-shared flush, not a queue.
+Batch size equals concurrency up to the 64-member ceiling, and throughput
+scales linearly with K in this run.
 
 ### Allocations
 
@@ -157,8 +154,6 @@ milliseconds.
 | `index_maintenance_profile` | twenty 1,024-entry appends, shaped for Valgrind DHAT |
 | `verb_commit_scaling` | statistics updates while unrelated tables grow, alone and in groups of four |
 | `row_lookups` | one-hit file, inline, and `recent_row` lookups by source count |
-
-Findings:
 
 - A statistics update costs 1,764 allocations and 0.55 to 0.72 ms with 0
   or 4,096 unrelated tables. In a group of four: 981 allocations and
@@ -276,8 +271,8 @@ processes: 2026-08, not re-run.
   at 16 writers. Postgres slows with every doubling. Moraine: 3.34 s at
   16, 1.92 s at 32, 2.10 s at 64.
 
-Not covered: remote object stores or statistical rigour beyond median,
-min, and max. CI runs `e2e`, not this.
+These runs use local storage and report median, minimum, and maximum
+latency. They do not run in CI.
 
 ## Reads
 
@@ -332,8 +327,8 @@ after `compact_store`. ARM CodeBuild worker, same-region S3, 2026-08:
 | churned | 135,443 / 24 | 248 ms | 151 ms | 401 ms |
 | merged | 75,379 / 11 | 263 ms | 149 ms | 412 ms |
 
-A small catalog attaches in about 0.4 s. The merge halved the SSTs and
-changed nothing. Use the census before merging.
+This catalog attached in about 0.4 s. Compaction halved the SST count
+without reducing attach latency.
 
 ### What an attach reads
 
@@ -376,17 +371,18 @@ GETs from 14.5 to 12.3.
 | 1,048,576 | 37.8 MB | 76 | 22.9 MB | 7.84 ms | 5.82 ms |
 
 The manifest lists every SST and is read whole, so attach grows with SST
-count (about 85 µs each), never with bytes. A production attach of 833 s
-over 12.8 MB came from none of this: SlateDB's default scan fetched one
-4 KB block per round trip. Reading 4 MiB ahead with eight fetches in
+count (about 85 µs each), never with bytes. A production attach took 833 s
+to read 12.8 MB because SlateDB's default scan fetched one 4 KB block per
+round trip. Reading 4 MiB ahead with eight fetches in
 flight fixed it.
 
 ### Materialization and refresh
 
-`measure_materialization_by_catalog_size` opens a read scope at 250 to
-20,000 entities: 0.24 to 0.30 ms at every size. Since the demand-loaded
-catalog (2026-11) a scope decodes nothing until a lookup, so this now
-measures a constant. In 2026-08 it measured 5 to 7 µs per entity.
+`measure_materialization_by_catalog_size` opens a read scope at 250 to 20,000
+entities: 0.24 to 0.30 ms at every size. Since the demand-loaded catalog
+(2026-11) a scope decodes nothing until a lookup, so scope creation no longer
+measures the cost of reading those entities. In 2026-08 it measured 5 to 7 µs
+per entity.
 
 `measure_refresh_versus_rematerialization` (library tests): a cache
 behind head replays the changelog or rescans. Median of 9:
@@ -399,9 +395,9 @@ behind head replays the changelog or rescans. Median of 9:
 | 8,003 | 1 | 0.001 | 25.4 ms | 1.54 ms |
 | 8,003 | 64 | 0.04 | 31.3 ms | 6.15 ms |
 
-Replay stops paying near a churn share of 0.6; moraine declines it at
-0.5. The changelog cap is 4,096 keys so ordinary bulk flushes stay
-replayable.
+Replaying changes becomes slower than rescanning when about 60% of the catalog
+has changed; Moraine switches to a rescan at 50%. The changelog cap is 4,096
+keys so ordinary bulk flushes stay replayable.
 
 `measure_changelog_read_cost`: in its own subspace the changelog holds a
 flat 17,344 bytes at any commit count, and snapshot records are back to
@@ -420,12 +416,12 @@ publication instead of listing the manifest:
 | 8 | 29.6 µs | 229 µs | 4.1 µs |
 | 24 | 87.0 µs | 636 µs | 11.1 µs |
 
-A read-write read plateaus near 275,000 reads a second. A read-only read
-plateaus near 37,000 a second from two threads up. At `8146cbf`, where
-every read-only transaction listed the manifest under one lock, it
-serialized near 8,000 a second at any thread count: 90 µs, 1,056 µs, and
-2,926 µs down the same column. In 2026-08, before the demand-loaded
-catalog, the figures were 0.12 µs and 6.4 µs.
+Reads through the writer plateau near 275,000 reads a second. Reads through a
+read-only handle plateau near 37,000 a second from two threads up. At `8146cbf`,
+where every read-only transaction listed the manifest under one lock, it
+serialized near 8,000 a second at any thread count: 90 µs, 1,056 µs, and 2,926
+µs down the same column. In 2026-08, before the demand-loaded catalog, the
+figures were 0.12 µs and 6.4 µs.
 
 `measure_reader_round_trips_under_get_latency`, 20 tables, 2026-11-10 at
 `c224745`:
@@ -435,12 +431,12 @@ catalog, the figures were 0.12 µs and 6.4 µs.
 | 2 ms | 0.04 ms | 0.0 | 47.0 ms | 23.5 |
 | 20 ms | 0.05 ms | 0.0 | 300.4 ms | 15.0 |
 
-A warm read-only read issues no GET: a transaction reuses its handle's
-pinned publication for `READER_POLL_INTERVAL_MS` before listing for a
+A warm read through a read-only handle issues no GET: a transaction reuses its
+handle's pinned publication for `READER_POLL_INTERVAL_MS` before listing for a
 newer one. At `8146cbf` it issued about two, the manifest listing every
-transaction paid, and a cold handle 28.3 and 18.3. For an operator: a
-read-only statement's metadata costs no endpoint round trip inside the
-interval and one manifest read at its edge.
+transaction paid, and a cold handle 28.3 and 18.3. Metadata reads within the
+interval require no endpoint round trip; checking for a new publication requires
+a manifest read.
 
 ### Staged conflict check
 
@@ -466,9 +462,9 @@ so the check issues no object-store read at any retained count.
 
 `measure_read_concurrency_under_io_latency` and
 `measure_cpu_bound_decode_under_worker_pressure` showed in 2026-08 that
-materialization neither starves the worker pool on IO nor monopolizes a
-worker on decode. Both drive `read_scope`, now lazy, so today they
-measure nothing. They need re-aiming at a lookup that reads.
+materialization neither starves the worker pool on IO nor monopolizes a worker
+on decode. Both now call the lazy `read_scope` constructor without reading
+records. They need to run lookups to measure I/O and decoding again.
 
 ## Index lookups
 
@@ -591,7 +587,7 @@ Found by the 2026-11-10 re-run and not yet explained:
   calls, which the demand-loaded catalog no longer guarantees. It fails.
 - `measure_materialization_by_catalog_size`,
   `measure_read_concurrency_under_io_latency`, and
-  `measure_cpu_bound_decode_under_worker_pressure` measure a lazy scope
-  open and need re-aiming.
+  `measure_cpu_bound_decode_under_worker_pressure` only open a lazy read scope;
+  they need to read records to measure I/O and decoding.
 - The S3 lookup-latency and located-lookup tables predate the
   demand-loaded catalog and its two round trips per read-only read.

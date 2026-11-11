@@ -2,13 +2,12 @@
 
 ## Summary
 
-Moraine stores DuckLake catalog state in SlateDB. This document fixes the
-physical layout: a keyspace partitioned by a leading subspace byte, keys
-derived from a typed enum tree through `storekey`, protobuf values behind a
-five-byte framing header, and one `WriteBatch` per catalog commit. It also
-fixes how the layout evolves: a structural format version in `sys/format`, a
-readable range per binary, and an explicit, resumable, one-way migration
-protocol for stores below that range.
+Moraine stores DuckLake catalog state in SlateDB. Keys start with a
+subspace byte and use `storekey` encoding. Values are protobuf messages
+with a five-byte framing header. Each catalog commit is one `WriteBatch`.
+
+`sys/format` records the store format. Each binary supports a range of
+formats; older stores require an explicit, resumable migration.
 
 ## Subspaces
 
@@ -109,9 +108,9 @@ needs no type discriminator. Time travel serves the current statistics and
 filters `Tag` entries by their begin and end. A `FileColumnStats` record
 outlives its file's live version and is removed with the file's history.
 
-Two conventions place every DuckLake table. A 1:1 side table merges into its
+A 1:1 side table merges into its
 parent record. A child table with no independent lifecycle embeds in the
-parent's value. A table earns its own kind only when its rows have their own
+parent's value. A table gets its own kind when its rows have their own
 begin and end. Per-table kinds are keyed `table_id` first, so everything
 about one table is one contiguous range per subspace. `FileColumnStats` is
 file-major so one file's columns sit together.
@@ -312,11 +311,11 @@ format and cursor, and the chain continues from its target.
 whether the call `resumed`. Against a store at the newest format it reports
 the same format twice and no units.
 
-Migrations are one-way. No inverse units exist. A step deletes old keys only
-in the batch that writes their replacements, so a failed migration leaves
-old state to reason against. `MigrationRequest { checkpoint: true }` takes a
-whole-store checkpoint before the first rewrite and releases it after the
-last finish batch is durable. A failed migration keeps the checkpoint.
+Migrations are irreversible. A step deletes old keys only in the batch that
+writes their replacements, so an interrupted migration retains the data needed
+to resume. `MigrationRequest { checkpoint: true }` takes a whole-store
+checkpoint before the first rewrite and releases it after the last finish batch
+is durable. A failed migration keeps the checkpoint.
 
 ### Triggering
 

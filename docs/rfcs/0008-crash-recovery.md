@@ -21,16 +21,11 @@ reopened handle.
 
 ## Two guarantees
 
-Which guarantee covers a case follows from the shape of the path. A path is
-either one batch or several.
-
 **Atomicity.** One commit is one SlateDB `WriteBatch`, and one batch is one
 durable flush. A crash leaves the whole batch or none of it, so there is no
 torn state inside a commit. The only two observable outcomes are that the
 flush landed or that it did not. This covers the ordinary commit, a drop
 that ends many records, the group commit, genesis, and writer takeover.
-Takeover adds no torn state of its own. It changes which process observes
-the all-or-none result.
 
 **Resumability.** Some operations are too large for one batch: a staged
 index backfill, the reclamation of a dead index's entries, and a structural
@@ -59,20 +54,20 @@ confirm coverage, so a new variant fails to compile until both are decided.
 | `TakeoverMidCommit` | Writer A dies mid-commit and writer B opens the store, bumping the SlateDB writer epoch. | B reads a consistent head. If A's flush landed, B sees the advanced head and continues from it. If not, B sees the prior head and A's batch is invisible. |
 | `FencedWriterResumes` | Writer A wakes after B has taken over and attempts its commit. | A returns `Error::Fenced` and writes nothing. The object store is byte-identical to the timeline in which A never woke. |
 | `GenesisInterrupted` | An initializer dies partway through creating the catalog, stopped at every write genesis issues. | The store is untouched, so the next open creates the catalog from scratch, or the catalog is wholly created. A `sys/format` with no head is never observed. Genesis is one batch like any commit. |
-| `ConcurrentGenesis` | Two processes create the same empty catalog at once. | At most one genesis lands and reopen shows it. There is never a second `sys/format`, a divergent genesis snapshot, or a conflicting head. A loser adopts the winner's catalog, re-attempts, or fails typed. See the genesis section below. |
+| `ConcurrentGenesis` | Two processes create the same empty catalog at once. | At most one genesis lands and reopen shows it. There is never a second `sys/format`, a divergent genesis snapshot, or a conflicting head. A loser adopts the winner's catalog, re-attempts, or returns `OpenRaced` or `Fenced`. See the genesis section below. |
 
 ### Re-drive scope after an unacknowledged commit
 
-`CommitDurableNotAcknowledged` asserts consistency of the landed commit and
-guard-surfacing on re-drive. Identifiers never collide, because counters
-advanced with the landed commit. A guarded operation surfaces its guard: a
-re-driven create returns `Error::AlreadyExists`, and an operation whose
-premise moved returns `Error::CommitConflict` or `Error::NotFound`. A
-data-only re-drive, such as `register_data_file` of the same file or an
-identical inline insert, is a fresh commit and lands a second time with
-dense, disjoint row id ranges. Nothing in the protocol deduplicates it. The
-caller-facing form of this outcome is `Error::CommitOutcomeUnknown`, whose
-handling is specified in [the commit protocol](0003-commit-protocol.md).
+`CommitDurableNotAcknowledged` checks that the committed state is consistent and
+that retries run the usual existence and conflict checks. Identifiers never
+collide, because counters advanced with the landed commit. For example, a
+re-driven create returns `Error::AlreadyExists`, and an operation whose premise
+moved returns `Error::CommitConflict` or `Error::NotFound`. A data-only
+re-drive, such as `register_data_file` of the same file or an identical inline
+insert, is a fresh commit and lands a second time with dense, disjoint row id
+ranges. Nothing in the protocol deduplicates it. The caller-facing form of this
+outcome is `Error::CommitOutcomeUnknown`, whose handling is specified in
+[the commit protocol](0003-commit-protocol.md).
 
 ### Resumability cases
 
@@ -82,7 +77,7 @@ handling is specified in [the commit protocol](0003-commit-protocol.md).
 | `ReclamationInterrupted` | Reclamation of a dead index's entries, some batches committed and others not. | The committed batches stay reclaimed and the remaining entries survive to be found again. A re-run finishes them without re-reclaiming what is gone, and a further pass reclaims nothing. Live indexes and data files are untouched. |
 | `MigrationInterrupted` | A structural format migration, crashed at `CrashPoint::AfterStart`, `AfterStep`, `BeforeFinish`, or `AfterFinish`. | While the migration marker is present, `Catalog::open` is refused with `Error::Migration`. `Catalog::migrate` reads the marker, resumes the named unit from its durable cursor, and finishes. Every record is moved once. After the finish batch the store is stamped the target format and the marker is gone. The flip and the clear land in one batch, so a new-format store with a marker is never observed. |
 
-Those four points are the only seams a migration has. A step's new-key
+A migration step's new-key
 write, its old-key delete, and its cursor advance share one batch, so there
 is no durable intermediate between them. The format record and the
 migration marker are specified in [the storage format](0001-storage-format.md).
@@ -98,14 +93,14 @@ the winner created or creates one itself. The bound gives termination: every
 open takes the writer epoch by a manifest compare-and-swap, so two initializers
 could displace each other indefinitely. Only genesis re-attempts. An open that
 finds a catalog stages nothing, so a fence anywhere else reaches the caller. A
-loser fails typed by one of two guards. If it lost the race to create the
-store's first manifest, it never attached, and the error is `Error::OpenRaced`:
-nothing was written, and opening again adopts the winner's store. If it created
-the store and was displaced afterwards, the error is `Error::Fenced`.
-`OpenRaced` is classified by matching SlateDB's message text, because a lost
-compare-and-swap and a damaged manifest arrive as the same error kind. The suite
-stages a real lost compare-and-swap and pins the wording, so a SlateDB upgrade
-that rewords the message fails there.
+failed open returns one of two errors. If it lost the race to create the store's
+first manifest, it never attached, and the error is `Error::OpenRaced`: nothing
+was written, and opening again adopts the winner's store. If it created the
+store and was displaced afterwards, the error is `Error::Fenced`. `OpenRaced` is
+classified by matching SlateDB's message text, because a lost compare-and-swap
+and a damaged manifest arrive as the same error kind. The suite stages a real
+lost compare-and-swap and pins the wording, so a SlateDB upgrade that rewords
+the message fails there.
 
 ## Data-file bytes
 
@@ -124,8 +119,8 @@ a file that was never written.
 
 ## Crash harness
 
-The suite produces a crash three ways. None needs `unsafe`, a fork, or
-corruption of SlateDB internals, and no case needs a production knob.
+The harness drops handles, rejects object-store writes, opens competing
+writers, or injects errors at migration boundaries.
 
 **Dropping the handle.** Where the instant of interest is after a durable
 flush, as in `CommitDurableNotAcknowledged`, the harness drops the writer
@@ -174,15 +169,13 @@ registry the shipped planner reads, so the case runs through
 
 A commit's durability wait is unbounded in production. A store that refuses
 writes permanently, through expired credentials or a revoked bucket policy,
-stalls the writer. A deadline would be worse: abandoning the wait does not
-undo the staged batch, because the flush continues beneath the caller. The
-deadline would report failure for a commit that still lands, and a caller
-re-driving it would apply it twice. `CommitDurableNotAcknowledged` is safe
-only because nothing reports the commit as failed. moraine instead makes
-the stall visible.
-`reporting_stalls` in `crates/moraine/src/transaction/commit.rs` logs a
-warning every `STALL_INTERVAL`, 10 seconds, naming the operation, the
-seconds waited, and the staged bytes. It never gives up on the write.
+stalls the writer. A timeout cannot cancel the flush. Reporting the commit as
+failed would allow a caller to retry a write that may still succeed, applying it
+twice. `CommitDurableNotAcknowledged` is safe only because nothing reports the
+commit as failed. moraine instead makes the stall visible. `reporting_stalls` in
+`crates/moraine/src/transaction/commit.rs` logs a warning every
+`STALL_INTERVAL`, 10 seconds, naming the operation, the seconds waited, and the
+staged bytes. It never gives up on the write.
 
 ## Tests
 

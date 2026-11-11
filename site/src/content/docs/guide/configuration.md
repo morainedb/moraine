@@ -5,15 +5,14 @@ sidebar:
   order: 3
 ---
 
-Two kinds of knob. A **setting** is per process: `SET` it before the first
-attach, as you would DuckDB's `memory_limit`, and every lake the process
-attaches shares it. An **attach option** is per lake and goes in the
-`ATTACH` statement.
+Use `SET` for process-wide memory and cache settings before the first
+attach. Use `ATTACH` options to configure individual lakes.
 
 ## Settings
 
-Sizes take the forms `memory_limit` takes: `'512MB'`, `'1GiB'`. The first
-attach in the process reads them; a later `SET` waits for the next process.
+Sizes accept units such as `'512MB'` and `'1GiB'`, like DuckDB's
+`memory_limit`. The first attach fixes these settings for the process.
+To change them, restart the process and set the new values before attaching.
 
 ```sql
 SET moraine_cache_dir = '/var/cache/moraine';
@@ -45,7 +44,7 @@ working allocations.
 
 `READ_ONLY`, `READ_WRITE`, `DATA_PATH`, and `ENCRYPTED` are DuckDB's and
 DuckLake's own options. Everything else reaches Moraine with a `META_`
-prefix, written out below exactly as the `ATTACH` takes it.
+prefix.
 
 | DuckDB and DuckLake option | Default | Meaning |
 |---|---|---|
@@ -80,8 +79,8 @@ for its own PUT. One that arrives inside the spacing joins the next flush.
 A burst therefore costs at most one spacing plus one PUT, and the PUT rate
 never exceeds one per spacing.
 
-Shorten the interval for a low commit rate that wants latency. Leave it for
-a high rate, where the spacing merges many commits into one request.
+A shorter interval reduces the wait between flushes. A longer interval
+groups more concurrent commits into each request.
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
@@ -90,7 +89,7 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 
 ### The write-ahead log on a faster bucket
 
-`META_WAL_PATH` puts the log, and nothing else, on a store of its own. An S3
+`META_WAL_PATH` puts the write-ahead log on a separate object store. An S3
 Express One Zone directory bucket can then serve the one latency-critical
 write while standard storage holds the rest:
 
@@ -130,7 +129,7 @@ up to `META_READER_POLL_INTERVAL_MS` before looking for a newer one, so that is
 how far behind the writer a reader may be. A transaction may run for up to
 fifteen minutes; a longer one fails and must be restarted.
 
-For a fixed view that never moves, create a checkpoint on the writer and pin
+To read a fixed snapshot, create a checkpoint on the writer and attach
 readers to it:
 
 ```sql
@@ -142,10 +141,9 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (READ_ONLY, META_CHECKPOINT '4a1f…');
 ```
 
-A pinned reader sees a fixed cut and never sees later commits. Refreshing
-means creating a new checkpoint and re-attaching. `moraine_checkpoints`
-lists the checkpoints a store carries, and `moraine_delete_checkpoint`
-releases one.
+To see later commits, create a new checkpoint and re-attach.
+`moraine_checkpoints` lists the checkpoints a store carries, and
+`moraine_delete_checkpoint` releases one.
 
 ## Caching catalog reads
 
@@ -210,8 +208,9 @@ size.
 
 ## Table functions
 
-`'lake'` is an attached catalog's name. `'<store>'` is the catalog's path,
-for functions that run with the lake attached nowhere.
+`'lake'` is an attached catalog's name. `'<store>'` is the catalog's path.
+Migration and WAL relocation require the lake to be detached from every
+process.
 
 | Function | Purpose |
 |---|---|

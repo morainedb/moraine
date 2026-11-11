@@ -6,9 +6,7 @@
 catalog. A thin C++ shim registers a `StorageExtension` and calls a C ABI
 exported by the Rust core as a static library. DuckLake attaches moraine as its
 catalog and drives it with ordinary SQL against the `ducklake_*` tables, which
-moraine serves row for row from the store. This document fixes the attach
-surface, the catalog contract, the ABI error mapping, the runtime and
-cancellation bridge, and the logging seam.
+moraine serves row for row from the store.
 
 ## Composition
 
@@ -34,8 +32,8 @@ DuckDB. Metadata scan results cross the ABI as owned arrays of `#[repr(C)]` row
 structs with one `_free` function per array, while inline chunk bodies and
 indexed row scans use the Arrow C Data Interface (`src/arrow_ipc.rs`,
 `moraine_row_scan_next_arrow`). The bundled, patched DuckLake is linked into the
-same loadable and registered from the same entry point, so `LOAD moraine` is the
-whole setup. Loading stock DuckLake first is refused.
+same loadable and registered from the same entry point, so `LOAD moraine` loads
+both extensions. Loading stock DuckLake first is refused.
 
 ## Attach forms
 
@@ -110,8 +108,7 @@ setting and the buffer manager's memory limit at attach, passing the first as
 
 ## Attach modes
 
-The selector between read-write and read-only is DuckDB's own `READ_ONLY` attach
-flag. There is no moraine-specific prefix, suffix, or option for it. DuckDB
+Use DuckDB's `READ_ONLY` attach flag to open a reader. DuckDB
 resolves the flag into `AttachOptions::access_mode`, and the shim reads that
 field in `MoraineCatalog::Attach` and passes a `read_only` bit across the ABI.
 DuckLake forwards its outer `READ_ONLY` into the nested metadata attach, so the
@@ -140,10 +137,10 @@ manifest no longer carries, and a malformed id are each refused.
 
 ## Settings
 
-What one process shares across every lake it attaches is a DuckDB setting,
-registered at `LOAD` by `cpp/settings.cpp` and read by the first attach in
-the process; a later `SET` waits for the next process. Sizes are parsed as
-`memory_limit` is. An attach option listed above stands in for its setting
+Process-wide settings are registered at `LOAD` by `cpp/settings.cpp` and
+read by the first attach. Changes after that require restarting the process
+and setting the new values before attaching. Size parsing follows DuckDB's
+`memory_limit`. An attach option listed above stands in for its setting
 when given.
 
 | Setting | Reaches | Default |
@@ -168,7 +165,7 @@ DuckLake's commit batches join them unconditionally. `ducklake_metadata` is
 synthesized from store facts, so a fresh moraine store is a valid DuckLake
 catalog and DuckLake's bootstrap DDL never runs against one.
 
-Serving is row for row. Both `current` and `history` rows of a versioned kind
+Both `current` and `history` rows of a versioned kind
 are emitted, since DuckLake filters lifecycles in SQL. Time travel and schema
 reconstruction therefore need no logic in moraine. Stored column types are
 translated at one point, `DuckLakeColumnType`, from DuckDB SQL names to
@@ -186,7 +183,7 @@ the key. DuckLake's delete-rewrite also issues an
 same transaction, staged as `RowOperation::UpdateSetBegin` on
 `ducklake_data_file` only.
 
-Constraints are DuckLake's primary keys and nothing more. An insert whose id
+The shim enforces DuckLake's primary keys. An insert whose id
 already names a live row under one of them is refused with `CONSTRAINT`, and the
 message carries no retry substring. No name uniqueness is enforced on any name
 column, because DuckLake declares none and polices naming in its binder.
@@ -218,7 +215,7 @@ catalog's id.
 
 DuckLake decides retryability by substring match on the lowercased error text.
 Its retry substrings are `conflict`, `concurrent`, `unique`, and `primary key`.
-Two rules follow. The `COMMIT_CONFLICT` message always contains `conflict`.
+The `COMMIT_CONFLICT` message always contains `conflict`.
 Every terminal error, including `RETRY_EXHAUSTED`, `FENCED`, `CONSTRAINT`,
 `COMMIT_OUTCOME_UNKNOWN`, the equality-index uniqueness rejection, and the
 standalone data-scan redirect, contains none of the four. The
@@ -314,7 +311,7 @@ never blocks on a runtime, so a pure-Rust host drives the same core on its own
 runtime. A catalog operation never calls back into DuckDB, so there is no
 re-entrant FFI chain and no nested `block_on`.
 
-Cancellation is pulled. DuckDB offers no interrupt callback to a storage
+DuckDB offers no interrupt callback to a storage
 extension, only `ClientContext::IsInterrupted()`, an atomic load any thread may
 perform. Every cancellable entry point therefore takes a trailing
 `MoraineInterruptProbe probe, void *probe_ctx` pair, and the shim passes
