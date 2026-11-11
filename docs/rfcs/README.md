@@ -49,6 +49,8 @@ Rust embedders.
   revisions, the block cache, row summaries, working memory
 - [Crash recovery](0008-crash-recovery.md) — what must hold after a
   process dies mid-operation
+- [Testing](0012-testing.md) — the guarantees under test, how crashes and
+  fences are staged, fuzzing, the suite against real DuckDB
 
 ### Integration and operation
 
