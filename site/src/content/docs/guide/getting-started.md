@@ -8,10 +8,12 @@ sidebar:
 ## Install the extension
 
 Moraine is not yet in DuckDB's community extension repository, so it loads
-unsigned. From the [Releases](/releases/) page, download the
-`moraine.<duckdb-version>.<platform>.duckdb_extension` whose DuckDB version
-matches yours exactly (any other is refused), start DuckDB with
-`-unsigned`, and load it:
+unsigned; `INSTALL moraine FROM community` is on the [roadmap](/roadmap/).
+Each build loads only into the DuckDB version it names, so check
+`SELECT version()`, then take the matching
+`moraine.<duckdb-version>.<platform>.duckdb_extension` from the
+[compatibility table](/releases/#compatibility) on the Releases page. Start
+DuckDB with `-unsigned` and load it:
 
 ```sh
 duckdb -unsigned
@@ -22,6 +24,8 @@ LOAD 'path/to/moraine.v2.0.0.osx_arm64.duckdb_extension';
 ```
 
 DuckLake is bundled with the extension; there is nothing else to install.
+No AWS account is needed to try it: the next section uses a local
+directory.
 
 ## Attach a local lake
 
@@ -34,10 +38,11 @@ INSERT INTO lake.events VALUES (1, 'hello, lake');
 SELECT * FROM lake.events;
 ```
 
-Moraine records the data root in the catalog, so give it the same path
-DuckLake gets: `DATA_PATH` for DuckLake, `META_DATA_PATH` for Moraine.
-After the lake exists, attaches may omit both; an attach that supplies a
-different `META_DATA_PATH` is refused.
+`DATA_PATH` is DuckLake's: where it writes Parquet. DuckLake does not pass
+it on to its catalog, and Moraine reads Parquet too, for
+[indexes](#index-a-column) and row summaries, so `META_DATA_PATH` gives it
+the same root. Both are recorded at creation; later attaches can omit them,
+and a different `META_DATA_PATH` is refused.
 
 ## Attach a lake on S3
 
@@ -57,6 +62,9 @@ lake exists, a writer attach needs only the flag:
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
 ```
+
+Any S3-compatible store works the same way; point the secret's `ENDPOINT`
+at MinIO or RustFS for a lake that never leaves your machine.
 
 ## One writer, many readers
 
@@ -124,5 +132,7 @@ and limits.
   sections on commit latency and caching.
 - [Operating manual](../operating/) covers retention, maintenance,
   encryption, backups, and upgrades.
+- [Compared with other catalogs](../comparison/) sets Moraine beside the
+  DuckDB file, Postgres, and Quack catalogs.
 - [Architecture](../architecture/) explains how the catalog is laid out
   and how commits and reads work.

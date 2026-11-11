@@ -26,6 +26,8 @@ export default defineConfig({
 						{ slug: 'guide/getting-started' },
 						{ slug: 'guide/configuration' },
 						{ slug: 'guide/operating' },
+						{ slug: 'guide/comparison' },
+						{ slug: 'guide/testing' },
 						{ slug: 'guide/architecture' },
 					],
 				},
