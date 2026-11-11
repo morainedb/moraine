@@ -8,11 +8,6 @@ not configuration.
 
 - [ ] Signed distribution through DuckDB's community extension repository,
   so `INSTALL moraine FROM community` works without `-unsigned`.
-- [ ] Publishing to crates.io again. Held while the workspace patches
-  SlateDB; a registry build would resolve the published SlateDB, which lacks
-  the reader refresh Moraine needs. Tags, the changelog, and the extension
-  binaries are unaffected, and 0.7.0 stays the newest version on the registry
-  until the patch ships upstream.
 - [ ] Online index rebuild. Today a rebuild is `DROP INDEX` then
   `CREATE INDEX`, and the index serves neither lookups nor uniqueness in
   between.
@@ -121,6 +116,9 @@ stays complete on the single-writer path without it.
 
 ### Hardening and release
 
+- [x] Re-enable crates.io publishing. Moraine uses published SlateDB 0.18.1
+  without a workspace patch. The next release publishes the crate after CI
+  and extension validation pass.
 - [x] Tests against real object storage; arbitrary-bytes decode proptests
   for every store codec; fuzzing of codecs, the commit read path, and crash
   recovery.
