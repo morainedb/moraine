@@ -9,8 +9,7 @@ sidebar:
 
 `READ_ONLY`, `READ_WRITE`, `DATA_PATH`, and `ENCRYPTED` are DuckDB's and
 DuckLake's own options. Everything else reaches Moraine with a `META_`
-prefix: `META_DATA_PATH`, `META_CACHE_DIR`, `META_FLUSH_INTERVAL_MS`, and
-so on. The second table omits the prefix.
+prefix, written out below exactly as the `ATTACH` takes it.
 
 | DuckDB and DuckLake option | Default | Meaning |
 |---|---|---|
@@ -21,20 +20,20 @@ so on. The second table omits the prefix.
 
 | Moraine option | Default | Meaning |
 |---|---|---|
-| `DATA_PATH` | the recorded root | Normally omitted: Moraine adopts the `DATA_PATH` DuckLake records on the first attach. A value differing from the recorded one is refused. |
-| `CHECKPOINT` | unset | Pin a read-only attach to a SlateDB checkpoint id: a fixed cut that never sees later commits. Requires `READ_ONLY`. |
-| `READER_POLL_INTERVAL_MS` | 10000 | How stale a read-only attach may be before it looks for new commits. |
-| `FLUSH_INTERVAL_MS` | 100 | Minimum spacing between two write-ahead-log flushes. |
-| `FLUSH_ON_COMMIT` | false | Flush on every commit, one PUT each, whatever the interval. |
-| `WAL_PATH` | the catalog store | A separate object store for the write-ahead log. Recorded in the lake; every attach must name the same one. |
-| `CACHE_DIR` | unset | Local directory for the block cache's disk tier. |
-| `CACHE_SIZE` | 16 GiB | Byte cap on the disk tier. |
-| `CACHE_MEMORY` | 640 MiB | Process-wide byte cap on the in-memory cache, shared by every attached store. |
-| `CACHE_AUXILIARY_PERCENT` | 1.25, capped at 50 | Share of the memory budget for parsed Parquet metadata. |
-| `CACHE_PUTS` | true | Admit a store's own writes into the cache as they land. |
-| `CACHE_COMPACTION_PUTS` | true | Also admit compaction output. Set false if large merges evict what queries warmed. |
-| `CACHE_PRELOAD` | `l0` | Warm the cache during attach: `none`, `l0` (SST metadata), or `all`. |
-| `MAINTENANCE_*` | off | Enable a scheduled maintenance pass; see [Operating manual](../operating/#scheduled-maintenance). |
+| `META_DATA_PATH` | the recorded root | Normally omitted: Moraine adopts the `DATA_PATH` DuckLake records on the first attach. A value differing from the recorded one is refused. |
+| `META_CHECKPOINT` | unset | Pin a read-only attach to a SlateDB checkpoint id: a fixed cut that never sees later commits. Requires `READ_ONLY`. |
+| `META_READER_POLL_INTERVAL_MS` | 10000 | How stale a read-only attach may be before it looks for new commits. |
+| `META_FLUSH_INTERVAL_MS` | 100 | Minimum spacing between two write-ahead-log flushes. |
+| `META_FLUSH_ON_COMMIT` | false | Flush on every commit, one PUT each, whatever the interval. |
+| `META_WAL_PATH` | the catalog store | A separate object store for the write-ahead log. Recorded in the lake; every attach must name the same one. |
+| `META_CACHE_DIR` | unset | Local directory for the block cache's disk tier. |
+| `META_CACHE_SIZE` | 16 GiB | Byte cap on the disk tier. |
+| `META_CACHE_MEMORY` | 640 MiB | Process-wide byte cap on the in-memory cache, shared by every attached store. |
+| `META_CACHE_AUXILIARY_PERCENT` | 1.25, capped at 50 | Share of the memory budget for parsed Parquet metadata. |
+| `META_CACHE_PUTS` | true | Admit a store's own writes into the cache as they land. |
+| `META_CACHE_COMPACTION_PUTS` | true | Also admit compaction output. Set false if large merges evict what queries warmed. |
+| `META_CACHE_PRELOAD` | `l0` | Warm the cache during attach: `none`, `l0` (SST metadata), or `all`. |
+| `META_MAINTENANCE_*` | off | Enable a scheduled maintenance pass; see [Operating manual](../operating/#scheduled-maintenance). |
 
 The cache options are process-wide. The first attach in a process sizes
 the cache and later attaches share it, so set them on the first attach.
@@ -42,7 +41,7 @@ the cache and later attaches share it, so set them on the first attach.
 ## Commit latency
 
 A commit is durable once one write-ahead-log PUT reaches object storage.
-`FLUSH_INTERVAL_MS` is the minimum spacing between two flushes. A commit
+`META_FLUSH_INTERVAL_MS` is the minimum spacing between two flushes. A commit
 that arrives after the spacing has elapsed flushes at once and waits only
 for its own PUT. One that arrives inside the spacing joins the next flush.
 A burst therefore costs at most one spacing plus one PUT, and the PUT rate
@@ -58,7 +57,7 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 
 ### The write-ahead log on a faster bucket
 
-`WAL_PATH` puts the log, and nothing else, on a store of its own. An S3
+`META_WAL_PATH` puts the log, and nothing else, on a store of its own. An S3
 Express One Zone directory bucket can then serve the one latency-critical
 write while standard storage holds the rest:
 
@@ -94,7 +93,7 @@ It drains the old log before recording the new store. Pass
 A read-only attach follows the writer by pinning the checkpoint the writer
 publishes with each commit, and writes nothing, so read-only credentials
 suffice. Each transaction keeps the publication the previous one pinned for
-up to `READER_POLL_INTERVAL_MS` before looking for a newer one, so that is
+up to `META_READER_POLL_INTERVAL_MS` before looking for a newer one, so that is
 how far behind the writer a reader may be. A transaction may run for up to
 fifteen minutes; a longer one fails and must be restarted.
 
@@ -119,7 +118,7 @@ releases one.
 
 Moraine keeps one block cache per process. Catalog index metadata, which
 every lookup reads first, stays in memory; data blocks fill the rest of the
-memory budget and spill to `CACHE_DIR` when one is set.
+memory budget and spill to `META_CACHE_DIR` when one is set.
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
@@ -129,18 +128,18 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 
 If the memory budget cannot hold a store's index metadata, the attach logs
 a warning naming the shortfall, and lookups fetch metadata from object
-storage. Raise `CACHE_MEMORY` on the first attach in the process.
+storage. Raise `META_CACHE_MEMORY` on the first attach in the process.
 `moraine_store_census('lake')` reports how a store's bytes are distributed,
 and `moraine_cache_tally()` reports hits and misses per cache slot for the
 process, or for one attach when given a lake name.
 
-A fresh process starts cold. `CACHE_PRELOAD 'all'` reads the catalog
+A fresh process starts cold. `META_CACHE_PRELOAD 'all'` reads the catalog
 subspaces whole during attach, so the first query reads no catalog data
 from object storage. It costs metadata-sized reads, not store-sized ones,
 because index data blocks are not preloaded. If the store exceeds
-`CACHE_SIZE`, the preload stops early and logs a warning.
+`META_CACHE_SIZE`, the preload stops early and logs a warning.
 
-`CACHE_MEMORY` is the number to weigh against DuckDB's `memory_limit` when
+`META_CACHE_MEMORY` is the number to weigh against DuckDB's `memory_limit` when
 sizing a host. DuckDB's budget covers its buffers and Parquet cache; this
 one covers Moraine's caches.
 
@@ -175,7 +174,7 @@ SET cache_httpfs_cache_directory = '/var/cache/duckdb-httpfs';
 ```
 
 Its memory is outside DuckDB's `memory_limit` and outside Moraine's
-`CACHE_MEMORY`, so a host running all three has three budgets to size.
+`META_CACHE_MEMORY`, so a host running all three has three budgets to size.
 
 ## Table functions
 
