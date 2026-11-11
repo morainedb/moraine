@@ -24,8 +24,7 @@ LOAD 'moraine.v2.0.0.linux_amd64.duckdb_extension';
 
 CREATE SECRET s (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2');
 ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
-  (DATA_PATH 's3://bucket/lake-data/',
-   META_DATA_PATH 's3://bucket/lake-data/', READ_WRITE);
+  (DATA_PATH 's3://bucket/lake-data/', READ_WRITE);
 
 CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
 INSERT INTO lake.events VALUES (1, 'hello, bucket'), (2, 'hello again');

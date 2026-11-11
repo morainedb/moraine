@@ -241,7 +241,9 @@ fn ducklakes_catalog_access_set_is_pinned() {
         "ducklake_macro RW",
         "ducklake_macro_impl RW",
         "ducklake_macro_parameters RW",
-        "ducklake_metadata R",
+        // Written once: the bundled DuckLake records DATA_PATH on the first
+        // attach of a catalog that serves none.
+        "ducklake_metadata RW",
         "ducklake_name_mapping RW",
         "ducklake_partition_column R",
         "ducklake_partition_info R",

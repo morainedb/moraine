@@ -12,6 +12,36 @@ mod selective;
 mod verify;
 mod wide_filter;
 
+/// `DATA_PATH` alone is enough: Moraine adopts the root DuckLake records
+/// when it creates the lake, so an index over existing files backfills
+/// without `META_DATA_PATH`.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn an_index_backfills_from_the_data_path_ducklake_records() {
+    let store = TempDir::new("index-adopted-store");
+    let data = TempDir::new("index-adopted-data");
+    let run = |sql: &str| run_ducklake_sql(store.path(), data.path(), sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
+
+    let hit = csv_rows(&run("SELECT b FROM lake.main.t WHERE a = 42;"));
+    assert_eq!(
+        hit,
+        vec![vec!["x".to_string()]],
+        "the lookup reads through the index"
+    );
+    let listed = csv_rows(&run(
+        "SELECT index_name, state FROM moraine_indexes('lake', 'main', 't');",
+    ));
+    assert_eq!(
+        listed,
+        vec![vec!["by_a".to_string(), "ready".to_string()]],
+        "the index backfilled from the files under DATA_PATH"
+    );
+}
+
 /// Native DDL backfills, persists, and drops an index across fresh attaches.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
@@ -800,44 +830,6 @@ fn moraine_index_rejects_hugeint() {
     assert!(
         stderr.contains("lossy double"),
         "expected the lossy-double reason, got: {stderr}"
-    );
-}
-
-/// With no data-path store resolvable (a lake attached with neither a
-/// recorded nor a supplied data path), an index can still be created on
-/// an empty table — but a later bulk INSERT is refused rather than
-/// silently leaving the index under-covered.
-#[test]
-#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_bulk_insert_without_a_data_store_is_refused() {
-    let store = TempDir::new("index-nostore-store");
-    let data = TempDir::new("index-nostore-data");
-    // DATA_PATH only (no META_DATA_PATH) on a fresh lake: moraine records
-    // and resolves no data store.
-    let run = |sql: &str| run_ducklake_sql(store.path(), data.path(), sql);
-
-    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
-    // An index on the still-empty table needs no scoped read, so it is
-    // created fine.
-    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
-
-    // A bulk INSERT registers a Parquet file that would need scoped-reading
-    // to maintain the index; with no store, the commit is refused.
-    let out = run_ducklake_sql_output(
-        store.path(),
-        data.path(),
-        "",
-        "INSERT INTO lake.main.t SELECT i, 'x' FROM range(20) t(i);",
-    );
-    assert!(
-        !out.status.success(),
-        "a bulk insert with no data store must be refused; stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(
-        stderr.contains("no data-path store"),
-        "expected the missing-store reason, got: {stderr}"
     );
 }
 

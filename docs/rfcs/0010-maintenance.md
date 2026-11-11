@@ -419,10 +419,11 @@ write-ahead log would qualify if they sat there. Attach refuses with
 `Constraint` when the store path and the data path are on the same object
 store and one contains the other (`refuse_overlapping_data_path`,
 `moraine::store_paths_overlap`). Containment is compared by path component,
-so siblings that share leading text attach normally. The check runs before
-the catalog records anything, so a refused attach leaves no value for the
-next attach to inherit. Only the path moraine is told about is compared:
-`META_DATA_PATH`, or the value already recorded for the lake.
+so siblings that share leading text attach normally. For a path the attach
+names, the check runs before the catalog records anything, so a refused
+attach leaves no value for the next attach to inherit. The path compared is
+`META_DATA_PATH` when given, otherwise the value recorded for the lake,
+checked again when a root DuckLake recorded is adopted after attach.
 
 ## Tests
 

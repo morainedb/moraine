@@ -141,13 +141,14 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
             }?;
             let table_id = resolve_table(&view, schema, table)?;
 
-            let data_store = handle_ref.data_store.as_ref().ok_or_else(|| {
+            let files = handle_ref.data_files()?;
+            let data_store = files.store.as_ref().ok_or_else(|| {
                 AbiError::invalid_argument("position resolution requires a data store")
             })?;
             let locate = reads.locate_row_positions_at_projected(
                 &view,
                 data_store,
-                &handle_ref.data_prefix,
+                &files.prefix,
                 table_id,
                 &pairs,
             );

@@ -129,7 +129,7 @@ fn row_scan_fixture() -> (MoraineCatalogHandle, moraine::TableId, moraine::DataF
 
     use crate::{
         logging::allocate_handle_id,
-        runtime::{AttachedCatalog, new_runtime},
+        runtime::{AttachedCatalog, DataFiles, DataSlot, new_runtime},
     };
 
     let log_id = allocate_handle_id();
@@ -204,7 +204,10 @@ fn row_scan_fixture() -> (MoraineCatalogHandle, moraine::TableId, moraine::DataF
         (catalog, table, file)
     });
     let mut handle = MoraineCatalogHandle::new(runtime, AttachedCatalog::Writer(catalog), log_id);
-    handle.data_store = Some(DataStore::new(data));
+    handle.data = std::sync::Arc::new(DataSlot::fixed(DataFiles {
+        store: Some(DataStore::new(data)),
+        prefix: String::new(),
+    }));
     (handle, table, file)
 }
 

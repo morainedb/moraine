@@ -1,0 +1,34 @@
+diff --git a/src/storage/ducklake_initializer.cpp b/src/storage/ducklake_initializer.cpp
+--- a/src/storage/ducklake_initializer.cpp
++++ b/src/storage/ducklake_initializer.cpp
+@@ -235,6 +235,7 @@ void DuckLakeInitializer::LoadExistingDuckLake(DuckLakeTransaction &transaction)
+ 	auto &metadata_manager = transaction.GetMetadataManager();
+ 	auto metadata = metadata_manager.LoadDuckLake();
+ 	DuckLakeVersion resolved_version = DuckLakeVersion::UNSET;
++	bool found_data_path = false;
+ 	for (auto &tag : metadata.tags) {
+ 		if (tag.key == "version") {
+ 			auto catalog_version = DuckLakeVersionFromString(tag.value);
+@@ -293,6 +294,7 @@ void DuckLakeInitializer::LoadExistingDuckLake(DuckLakeTransaction &transaction)
+ 			resolved_version = catalog_version;
+ 		}
+ 		if (tag.key == "data_path") {
++			found_data_path = true;
+ 			if (options.data_path.empty()) {
+ 				options.data_path = metadata_manager.LoadPath(tag.value);
+ 				InitializeDataPath();
+@@ -317,6 +319,14 @@ void DuckLakeInitializer::LoadExistingDuckLake(DuckLakeTransaction &transaction)
+ 		}
+ 		options.config_options[tag.key] = tag.value;
+ 	}
++	// A metadata backend that creates the catalog itself serves no data path
++	// until one is recorded; record the one this attach was given, so later
++	// attaches and the backend's own file reads find it.
++	if (!found_data_path && !options.data_path.empty() && !catalog.GetAttached().IsReadOnly()) {
++		metadata_manager.Execute(StringUtil::Format(
++		    "INSERT INTO {METADATA_CATALOG}.ducklake_metadata (key, value) VALUES ('data_path', %s);",
++		    SQLString(metadata_manager.StorePath(options.data_path))));
++	}
+ 	for (auto &entry : metadata.schema_settings) {
+ 		options.schema_options[entry.schema_id][entry.tag.key] = entry.tag.value;
+ 	}

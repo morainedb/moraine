@@ -162,10 +162,11 @@ pub unsafe extern "C" fn moraine_row_scan_open(
             )
         }?);
         let table = resolve_table(&view, schema, table)?;
+        let files = handle.data_files()?;
         let open = reads.scan_rows_at_excluding_projected(
             &view,
-            handle.data_store.clone(),
-            &handle.data_prefix,
+            files.store,
+            &files.prefix,
             table,
             &pairs,
             &columns,

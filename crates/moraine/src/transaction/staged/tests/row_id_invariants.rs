@@ -6,7 +6,8 @@ use super::*;
 
 /// Registers `path` as flush output of table 1 and drains its inline
 /// chunks up to snapshot 4, minting snapshot 5. The drain is named
-/// `drains` times, as DuckLake names it twice.
+/// `drains` times, as DuckLake names it twice. `read` is the scope the
+/// flush read its rows through, when it read before committing.
 async fn commit_flush_draining(
     catalog: &Catalog,
     store: &Arc<InMemory>,
@@ -14,11 +15,15 @@ async fn commit_flush_draining(
     record_count: u64,
     size: ParquetSize,
     drains: usize,
+    read: Option<crate::ReadOnlyCatalog>,
 ) -> Result<()> {
     let db_tx = catalog.begin_write_tx().unwrap();
     let object_store: Arc<dyn object_store::ObjectStore> = store.clone();
     let mut tx =
         StagedTransaction::begin_detached_with_store(catalog, db_tx, DataStore::new(object_store));
+    if let Some(scope) = read {
+        tx = tx.with_read_scope(scope);
+    }
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(12, 3, path, record_count, size),
@@ -48,7 +53,7 @@ async fn commit_flush(
     record_count: u64,
     size: ParquetSize,
 ) -> Result<()> {
-    commit_flush_draining(catalog, store, path, record_count, size, 1).await
+    commit_flush_draining(catalog, store, path, record_count, size, 1, None).await
 }
 
 async fn chunk_count(catalog: &Catalog) -> usize {
@@ -82,6 +87,43 @@ async fn a_flush_that_renumbers_the_drained_rows_is_refused() {
     assert!(matches!(err, Error::Corruption(_)), "{err}");
     assert!(
         err.to_string().contains("row id 3 where the chunks hold 5"),
+        "{err}"
+    );
+    assert_eq!(
+        chunk_count(&catalog).await,
+        2,
+        "a refused flush drains nothing"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A version landing after the flush read its rows is a race the flush
+/// lost, reported for the caller to re-drive rather than as corruption.
+#[tokio::test]
+async fn a_flush_whose_rows_moved_under_it_is_a_conflict() {
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    inline_insert(&catalog, 3, 0, &[0, 1, 2], true).await;
+    let store = Arc::new(InMemory::new());
+    let size =
+        write_parquet_with_row_ids(&store, "main/t/flush.parquet", &[0, 1, 2], &[0, 1, 2]).await;
+    let read = catalog.index_read_scope().await.unwrap();
+    inline_insert(&catalog, 4, 1, &[1], false).await;
+
+    let err = commit_flush_draining(
+        &catalog,
+        &store,
+        "flush.parquet",
+        3,
+        size,
+        1,
+        Some(read.reads().clone()),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, Error::CommitConflict(_)), "{err}");
+    assert!(
+        err.to_string().contains("snapshot 4 changed inlined rows"),
         "{err}"
     );
     assert_eq!(
@@ -150,7 +192,7 @@ async fn a_drain_named_twice_counts_its_rows_once() {
     let size =
         write_parquet_with_row_ids(&store, "main/t/flush.parquet", &[0, 1, 2], &[0, 1, 2]).await;
 
-    commit_flush_draining(&catalog, &store, "flush.parquet", 3, size, 2)
+    commit_flush_draining(&catalog, &store, "flush.parquet", 3, size, 2, None)
         .await
         .unwrap();
 

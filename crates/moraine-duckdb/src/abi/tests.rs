@@ -742,6 +742,198 @@ fn seed_with_data_path(dir: &Path, data_path: &str) {
     });
 }
 
+/// An attach that names no data path adopts the one the lake records
+/// later, as DuckLake writes it when it creates the lake.
+#[test]
+fn a_data_path_recorded_after_attach_is_adopted_on_first_use() {
+    let dir = TempDir::new("adopt-data-path");
+    let data = TempDir::new("adopt-data-path-root");
+    let c_path = dir.c_path();
+    let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+    let mut err = MoraineError::default();
+    // SAFETY: all pointers are valid C strings / local slots.
+    let code = unsafe {
+        moraine_attach_with_wal_store(
+            c_path.as_ptr(),
+            ptr::null(),
+            false,
+            false,
+            0,
+            false,
+            ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            None,
+            ptr::null_mut(),
+            &raw mut handle,
+            &raw mut err,
+        )
+    };
+    // SAFETY: `err.message` is null or just written; `as_ref` allows null.
+    let message = unsafe { err.message.as_ref() };
+    assert_eq!(code, codes::OK, "attach failed: {message:?}");
+    // SAFETY: a live handle from the attach above.
+    let handle_ref = unsafe { &*handle };
+
+    let before = handle_ref
+        .data_files()
+        .expect("no data path is not an error");
+    assert!(before.store.is_none(), "nothing recorded, nothing resolved");
+
+    let recorded = data.path().to_str().expect("utf-8").to_owned();
+    handle_ref
+        .block_on(
+            handle_ref
+                .catalog
+                .writer()
+                .expect("writer")
+                .adopt_data_path(&recorded),
+        )
+        .expect("record the data path the way DuckLake's metadata insert does");
+
+    let after = handle_ref.data_files().expect("the recorded path resolves");
+    assert!(
+        after.store.is_some(),
+        "the recorded path is adopted on first use"
+    );
+    let expected_prefix = object_store::path::Path::from_filesystem_path(data.path())
+        .expect("test setup: data root as a store path")
+        .to_string();
+    assert_eq!(
+        after.prefix, expected_prefix,
+        "the prefix is the recorded root"
+    );
+
+    // SAFETY: freed exactly once.
+    unsafe { moraine_detach(handle) };
+}
+
+/// An encrypted lake gets no data store: moraine reads no byte of an
+/// encrypted data file, so its indexes and summaries never try.
+#[test]
+fn an_encrypted_lake_resolves_no_data_store() {
+    let dir = TempDir::new("encrypted-no-store");
+    let data = TempDir::new("encrypted-no-store-root");
+    let c_path = dir.c_path();
+    let c_data = CString::new(data.path().to_str().expect("utf-8")).expect("no NUL");
+    let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+    let mut err = MoraineError::default();
+    // SAFETY: all pointers are valid C strings / local slots.
+    let code = unsafe {
+        moraine_attach_with_wal_store(
+            c_path.as_ptr(),
+            ptr::null(),
+            false,
+            true,
+            0,
+            false,
+            ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            c_data.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            None,
+            ptr::null_mut(),
+            &raw mut handle,
+            &raw mut err,
+        )
+    };
+    // SAFETY: `err.message` is null or just written; `as_ref` allows null.
+    let message = unsafe { err.message.as_ref() };
+    assert_eq!(code, codes::OK, "attach failed: {message:?}");
+    // SAFETY: a live handle from the attach above.
+    let handle_ref = unsafe { &*handle };
+
+    let files = handle_ref
+        .data_files()
+        .expect("an encrypted lake is not an error");
+    assert!(files.store.is_none(), "no store for an encrypted lake");
+
+    // SAFETY: freed exactly once.
+    unsafe { moraine_detach(handle) };
+}
+
+/// A recorded data path that contains the catalog store is refused when
+/// it is adopted, with the message the attach-time check gives.
+#[test]
+fn a_recorded_data_path_containing_the_store_is_refused_on_adoption() {
+    let dir = TempDir::new("adopt-overlap");
+    let c_path = dir.c_path();
+    let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+    let mut err = MoraineError::default();
+    // SAFETY: all pointers are valid C strings / local slots.
+    let code = unsafe {
+        moraine_attach_with_wal_store(
+            c_path.as_ptr(),
+            ptr::null(),
+            false,
+            false,
+            0,
+            false,
+            ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            None,
+            ptr::null_mut(),
+            &raw mut handle,
+            &raw mut err,
+        )
+    };
+    // SAFETY: `err.message` is null or just written; `as_ref` allows null.
+    let message = unsafe { err.message.as_ref() };
+    assert_eq!(code, codes::OK, "attach failed: {message:?}");
+    // SAFETY: a live handle from the attach above.
+    let handle_ref = unsafe { &*handle };
+
+    let parent = dir
+        .path()
+        .parent()
+        .expect("temp dir has a parent")
+        .to_str()
+        .expect("utf-8")
+        .to_owned();
+    handle_ref
+        .block_on(
+            handle_ref
+                .catalog
+                .writer()
+                .expect("writer")
+                .adopt_data_path(&parent),
+        )
+        .expect("the record itself lands; the check runs on adoption");
+
+    let Err(error) = handle_ref.data_files() else {
+        panic!("a data path containing the store must be refused");
+    };
+    assert_eq!(error.code, codes::CONSTRAINT);
+    assert!(error.message.contains("nested"), "got: {}", error.message);
+
+    // SAFETY: freed exactly once.
+    unsafe { moraine_detach(handle) };
+}
+
 /// A lake's data path is fixed at creation: re-attaching with a
 /// conflicting `META_DATA_PATH` is refused, while the recorded value
 /// (trailing separator and all) attaches cleanly.

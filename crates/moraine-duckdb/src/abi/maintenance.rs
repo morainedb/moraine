@@ -48,14 +48,15 @@ pub unsafe extern "C" fn moraine_maintain(
         let handle_ref = unsafe { &*handle };
 
         // Deferred index additions finish before dead ranges are reclaimed.
+        let files = handle_ref.data_files()?;
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         unsafe {
             handle_ref.block_on_commit(
                 probe,
                 probe_ctx,
                 handle_ref.catalog.writer()?.repair_deferred_indexes(
-                    handle_ref.data_store.clone(),
-                    &handle_ref.data_prefix,
+                    files.store,
+                    &files.prefix,
                     None,
                 ),
             )
@@ -1209,7 +1210,8 @@ pub unsafe extern "C" fn moraine_sweep_row_summaries(
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
 
-        let Some(data_store) = handle_ref.data_store.clone() else {
+        let files = handle_ref.data_files()?;
+        let Some(data_store) = files.store else {
             return Ok(());
         };
 
@@ -1221,7 +1223,7 @@ pub unsafe extern "C" fn moraine_sweep_row_summaries(
                 handle_ref
                     .catalog
                     .reads()
-                    .sweep_published_summaries(data_store, &handle_ref.data_prefix),
+                    .sweep_published_summaries(data_store, &files.prefix),
             )
         }?;
 

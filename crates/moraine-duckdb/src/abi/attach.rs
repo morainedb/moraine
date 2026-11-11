@@ -20,8 +20,8 @@ use super::{
 use crate::{
     error::{AbiError, MoraineError, codes},
     runtime::{
-        AttachedCatalog, CANCELLED_ATTACH_SHUTDOWN, MoraineCatalogHandle, MoraineInterruptProbe,
-        block_on_cancellable_in, new_runtime,
+        AttachedCatalog, CANCELLED_ATTACH_SHUTDOWN, DataFiles, DataSlot, MoraineCatalogHandle,
+        MoraineInterruptProbe, block_on_cancellable_in, new_runtime,
     },
 };
 
@@ -64,6 +64,49 @@ pub(crate) struct S3Creds<'a> {
     url_style: Option<&'a str>,
     use_ssl: Option<bool>,
     provider: Option<Arc<RefreshingCredentials>>,
+}
+
+impl S3Creds<'_> {
+    /// A copy that outlives the C strings it was borrowed from.
+    pub(crate) fn to_owned(&self) -> OwnedS3Creds {
+        OwnedS3Creds {
+            key_id: self.key_id.map(str::to_owned),
+            secret: self.secret.map(str::to_owned),
+            region: self.region.map(str::to_owned),
+            session_token: self.session_token.map(str::to_owned),
+            endpoint: self.endpoint.map(str::to_owned),
+            url_style: self.url_style.map(str::to_owned),
+            use_ssl: self.use_ssl,
+            provider: self.provider.clone(),
+        }
+    }
+}
+
+/// [`S3Creds`] owned by the handle, for a data store opened after attach.
+pub(crate) struct OwnedS3Creds {
+    key_id: Option<String>,
+    secret: Option<String>,
+    region: Option<String>,
+    session_token: Option<String>,
+    endpoint: Option<String>,
+    url_style: Option<String>,
+    use_ssl: Option<bool>,
+    provider: Option<Arc<RefreshingCredentials>>,
+}
+
+impl OwnedS3Creds {
+    fn borrow(&self) -> S3Creds<'_> {
+        S3Creds {
+            key_id: self.key_id.as_deref(),
+            secret: self.secret.as_deref(),
+            region: self.region.as_deref(),
+            session_token: self.session_token.as_deref(),
+            endpoint: self.endpoint.as_deref(),
+            url_style: self.url_style.as_deref(),
+            use_ssl: self.use_ssl,
+            provider: self.provider.clone(),
+        }
+    }
 }
 
 /// Borrows explicit settings; null or entirely unset uses the environment.
@@ -391,16 +434,73 @@ pub(super) struct DataStoreArguments<'a> {
     pub(super) s3_creds: Option<&'a S3Creds<'a>>,
 }
 
-/// Resolves the `DATA_PATH` object store and its bucket-relative key
-/// prefix. The recorded data root is authoritative: a differing
-/// `data_path_arg` is refused, and a lake with none recorded adopts the
-/// given value (recording it unless read-only). `None`/`None` yields no
-/// store.
+/// What adopting a data root the lake records after attach takes: the
+/// paths it is checked against and the credentials it opens with.
+pub(crate) struct DataSource {
+    store_path: String,
+    wal_store: Option<moraine::WalStore>,
+    s3: Option<OwnedS3Creds>,
+}
+
+/// Refuses a data root nested with the catalog store or the log store,
+/// then opens it. DuckLake records the root it is given when it creates
+/// the lake, so an attach that named none adopts it here on first use.
+pub(crate) fn adopt_data_root(source: &DataSource, root: &str) -> Result<DataFiles, AbiError> {
+    refuse_overlapping_data_path(&source.store_path, root)?;
+    refuse_wal_store_in_data_path(source.wal_store.as_ref(), root)?;
+    let s3 = source.s3.as_ref().map(OwnedS3Creds::borrow);
+    open_data_files(root, s3.as_ref())
+}
+
+/// Opens the data root with its bucket-relative key prefix.
+fn open_data_files(path: &str, s3_creds: Option<&S3Creds>) -> Result<DataFiles, AbiError> {
+    let (kind, prefix) = StoreKind::from_path(path)?;
+    if matches!(kind, StoreKind::LocalFile) {
+        std::fs::create_dir_all(path).map_err(|error| {
+            AbiError::invalid_argument(format!("cannot create data directory `{path}`: {error}"))
+        })?;
+        let prefix = object_store::path::Path::from_filesystem_path(path).map_err(|error| {
+            AbiError::invalid_argument(format!("cannot resolve data directory `{path}`: {error}"))
+        })?;
+        // A foreign file can carry an absolute path outside DATA_PATH.
+        let store = LocalFileSystem::new();
+        let identity = moraine::CacheIdentity::local(&store).map_err(|error| {
+            AbiError::invalid_argument(format!("cannot identify local data store: {error}"))
+        })?;
+        return Ok(DataFiles {
+            store: Some(moraine::DataStore::with_cache_identity(
+                Arc::new(store),
+                identity,
+            )),
+            prefix: prefix.to_string(),
+        });
+    }
+    let (store, identity) = kind.open(path, s3_creds)?;
+    Ok(DataFiles {
+        store: Some(moraine::DataStore::with_cache_identity(store, identity)),
+        prefix,
+    })
+}
+
+/// Whether the lake records itself as encrypted. Moraine reads no byte of
+/// an encrypted data file, so such a lake gets no data store.
+pub(crate) async fn lake_is_encrypted(
+    catalog: &moraine::ReadOnlyCatalog,
+) -> Result<bool, AbiError> {
+    let encrypted = moraine::ffi_support::catalog_read::global_option(catalog, "encrypted").await?;
+    Ok(encrypted.as_deref() == Some("true"))
+}
+
+/// Resolves the `DATA_PATH` store at attach. The recorded data root is
+/// authoritative: a differing `data_path_arg` is refused, and a lake with
+/// none recorded adopts the given value (recording it unless read-only).
+/// `None`/`None` leaves the store to be adopted on first use; an encrypted
+/// lake resolves to no store at all.
 fn resolve_data_store(
     runtime: &tokio::runtime::Runtime,
     catalog: &AttachedCatalog,
     arguments: DataStoreArguments<'_>,
-) -> Result<(Option<moraine::DataStore>, String), AbiError> {
+) -> Result<Option<DataFiles>, AbiError> {
     let DataStoreArguments {
         store_path,
         data_path_arg,
@@ -434,54 +534,22 @@ fn resolve_data_store(
         (None, recorded) => recorded,
     };
 
-    if let Some(root) = data_root.as_deref() {
-        refuse_overlapping_data_path(store_path, root)?;
-        refuse_wal_store_in_data_path(wal_store, root)?;
-    }
+    let Some(root) = data_root else {
+        return Ok(None);
+    };
+    refuse_overlapping_data_path(store_path, &root)?;
+    refuse_wal_store_in_data_path(wal_store, &root)?;
 
     if adopting {
-        let to_record = data_root.clone().unwrap_or_default();
         runtime
-            .block_on(catalog.writer()?.adopt_data_path(&to_record))
+            .block_on(catalog.writer()?.adopt_data_path(&root))
             .map_err(AbiError::from)?;
     }
 
-    match data_root {
-        Some(path) => {
-            let (kind, prefix) = StoreKind::from_path(&path)?;
-            if matches!(kind, StoreKind::LocalFile) {
-                std::fs::create_dir_all(&path).map_err(|error| {
-                    AbiError::invalid_argument(format!(
-                        "cannot create data directory `{path}`: {error}"
-                    ))
-                })?;
-                let prefix =
-                    object_store::path::Path::from_filesystem_path(&path).map_err(|error| {
-                        AbiError::invalid_argument(format!(
-                            "cannot resolve data directory `{path}`: {error}"
-                        ))
-                    })?;
-                // A foreign file can carry an absolute path outside DATA_PATH.
-                let store = LocalFileSystem::new();
-                let identity = moraine::CacheIdentity::local(&store).map_err(|error| {
-                    AbiError::invalid_argument(format!("cannot identify local data store: {error}"))
-                })?;
-                return Ok((
-                    Some(moraine::DataStore::with_cache_identity(
-                        Arc::new(store),
-                        identity,
-                    )),
-                    prefix.to_string(),
-                ));
-            }
-            let (store, identity) = kind.open(&path, s3_creds)?;
-            Ok((
-                Some(moraine::DataStore::with_cache_identity(store, identity)),
-                prefix,
-            ))
-        }
-        None => Ok((None, String::new())),
+    if runtime.block_on(lake_is_encrypted(catalog.reads()))? {
+        return Ok(Some(DataFiles::default()));
     }
+    open_data_files(&root, s3_creds).map(Some)
 }
 
 /// Turns an opened catalog into the handle the caller gets, resolving the
@@ -494,8 +562,13 @@ fn handle_for_catalog(
     arguments: DataStoreArguments<'_>,
     preload: bool,
 ) -> Result<Box<MoraineCatalogHandle>, AbiError> {
-    let (data_store, data_prefix) = match resolve_data_store(&runtime, &catalog, arguments) {
-        Ok(parts) => parts,
+    let source = DataSource {
+        store_path: arguments.store_path.to_owned(),
+        wal_store: arguments.wal_store.cloned(),
+        s3: arguments.s3_creds.map(S3Creds::to_owned),
+    };
+    let resolved = match resolve_data_store(&runtime, &catalog, arguments) {
+        Ok(resolved) => resolved,
         Err(error) => {
             // Flush and release the open catalog before failing the attach.
             let _ = runtime.block_on(catalog.reads().close());
@@ -504,8 +577,7 @@ fn handle_for_catalog(
     };
 
     let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
-    handle.data_store = data_store;
-    handle.data_prefix = data_prefix;
+    handle.data = Arc::new(DataSlot::new(resolved, source));
     handle.spawn_warm_at_attach(preload);
     Ok(Box::new(handle))
 }

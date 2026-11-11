@@ -86,7 +86,7 @@ live with the owning document.
 | Option | Core binding | Default |
 |---|---|---|
 | `ENCRYPTED` | `CatalogOptions::encrypted`, creation-time only | `false` |
-| `DATA_PATH` | `CatalogOptions::data_path`, recorded on first attach | unset |
+| `DATA_PATH` | `CatalogOptions::data_path`; normally omitted, since the root the bundled DuckLake records on the first attach is adopted on first use | the recorded root |
 | `WAL_PATH` | `CatalogOptions::wal_store`, see [the commit protocol](0003-commit-protocol.md) | catalog store |
 | `FLUSH_INTERVAL_MS` | `CatalogOptions::flush_interval`, zero maps to continuous flush | 100 |
 | `FLUSH_ON_COMMIT` | `CatalogOptions::flush_on_commit` | `false` |
