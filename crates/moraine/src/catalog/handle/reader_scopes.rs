@@ -1,6 +1,9 @@
 //! Shares pinned readers across transactions starting at a published revision.
 
-use std::sync::{Arc, Weak};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use object_store::ObjectStore;
 use slatedb::DbReader;
@@ -33,6 +36,9 @@ pub(super) struct ReaderScopes {
     options: CatalogOptions,
     readers: Mutex<Readers>,
     explicit: Option<Arc<CheckpointReader>>,
+    /// How long a scope may keep the publication its predecessor listed
+    /// before listing again. Zero lists on every scope.
+    reuse: Duration,
 }
 
 impl ReaderScopes {
@@ -40,6 +46,7 @@ impl ReaderScopes {
         objects: Arc<dyn ObjectStore>,
         options: CatalogOptions,
         reader: Arc<DbReader>,
+        reuse: Duration,
     ) -> Self {
         let explicit = options
             .checkpoint
@@ -50,6 +57,7 @@ impl ReaderScopes {
             options,
             readers: Mutex::new(Readers::default()),
             explicit,
+            reuse,
         }
     }
 
@@ -72,11 +80,11 @@ impl ReaderScopes {
         builder.reader_session(session)
     }
 
-    /// The shared reader, when it was listed inside the poll interval and has
+    /// The shared reader, when it was listed inside the reuse window and has
     /// at least half the grace left.
     fn unexpired(&self, readers: &Readers) -> Option<Arc<CheckpointReader>> {
         let latest = readers.latest.as_ref()?;
-        if readers.listed?.elapsed() >= self.options.reader_poll_interval {
+        if readers.listed?.elapsed() >= self.reuse {
             return None;
         }
         if latest.remaining()? < READ_GRACE / 2 {

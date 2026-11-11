@@ -379,8 +379,9 @@ pub struct CatalogOptions {
     /// Defaults to 10 seconds.
     ///
     /// A committer's reads do not wait on it at all: each refreshes the
-    /// reader and is served what the refresh found, so the log is read
-    /// when a read asks and never on a clock. Its reader still polls at
+    /// reader and is served what the refresh found, and each transaction
+    /// lists for the newest publication, so the log is read when a read
+    /// asks and never on a clock. Its reader still polls at
     /// this interval, to keep the checkpoint it holds from expiring —
     /// longer is cheaper, and must stay well inside SlateDB's checkpoint
     /// lifetime.
@@ -647,6 +648,17 @@ fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::Commit
         .commit_log
         .clone()
         .or_else(crate::commit_log::registered_commit_log)
+}
+
+/// How long a scope may keep the publication its predecessor listed. A
+/// committer lists on every transaction, so each reads what the one before
+/// it committed; a read-only catalog keeps it for the poll interval.
+fn publication_reuse(options: &CatalogOptions, refresh_on_read: bool) -> Duration {
+    if refresh_on_read {
+        Duration::ZERO
+    } else {
+        options.reader_poll_interval
+    }
 }
 
 /// Mints the log session used by an ordinary or fixed checkpoint reader.
@@ -2075,13 +2087,12 @@ impl Catalog {
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         crate::catalog::projection::raise_format_floor(&projections, format);
         let reader = Arc::new(reader);
-        let reader_scopes = Some({
-            Arc::new(reader_scopes::ReaderScopes::new(
-                located.clone(),
-                options.clone(),
-                reader.clone(),
-            ))
-        });
+        let reader_scopes = Some(Arc::new(reader_scopes::ReaderScopes::new(
+            located.clone(),
+            options.clone(),
+            reader.clone(),
+            publication_reuse(&options, refresh_on_read),
+        )));
         Ok(ReadOnlyCatalog {
             pinned: None,
             reader_scopes,

@@ -88,7 +88,9 @@ Reader acquisition works as follows.
    request when the publications were listed less than `reader_poll_interval`
    ago, the reader has at least half of `READ_GRACE` left, and its deadline
    has not passed. The interval is therefore how stale a reader may be; zero
-   lists on every transaction.
+   lists on every transaction. A committer lists on every transaction
+   whatever the interval, so a transaction reads what the one before it
+   committed.
 2. Otherwise the reader lists published checkpoints and takes the one with
    the highest manifest id. If none exists, acquisition fails with
    `SnapshotExpired`, which tells the caller to reopen the writer so it
@@ -529,6 +531,7 @@ container ceiling remains the final boundary.
   transactions, and a writer commit between them.
 - A shared reader keeps its publication inside `reader_poll_interval` and
   moves to a newer one after it.
+- A committer's scope takes a newer publication inside `reader_poll_interval`.
 - A superseded publication carries an expiry and the newest carries none; an
   expired one is deleted at the next publication.
 - A head change under a lookup rerun reaches `RetryBudgetExhausted` after
