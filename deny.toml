@@ -44,7 +44,4 @@ ignore = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-
-# slatedb is patched from vendor/slatedb, a path source, so no git source
-# is needed; see vendor/slatedb/MORAINE.md.
 allow-git = []
