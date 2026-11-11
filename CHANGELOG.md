@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/morainedb/moraine/compare/v0.8.1...v0.9.0) - 2026-11-11
+
+### Added
+
+- *(duckdb)* [**breaking**] adopt the DATA_PATH DuckLake records, so META_DATA_PATH is optional ([#416](https://github.com/morainedb/moraine/pull/416))
+- *(site)* put the evidence on the landing page and add comparison and testing pages ([#415](https://github.com/morainedb/moraine/pull/415))
+- *(commit-log)* bring a committer's reader up through the session ([#412](https://github.com/morainedb/moraine/pull/412))
+- *(catalog)* [**breaking**] pin read-only transactions to writer-owned publications ([#409](https://github.com/morainedb/moraine/pull/409))
+- *(site)* sync the benchmarks page and link it from the landing page ([#407](https://github.com/morainedb/moraine/pull/407))
+- *(commit-log)* [**breaking**] move the loop behind the seam ([#382](https://github.com/morainedb/moraine/pull/382))
+
+### Fixed
+
+- *(catalog)* list a committer's publications on every transaction ([#414](https://github.com/morainedb/moraine/pull/414))
+- *(duckdb)* drop the inlined-delete table expiry names ([#398](https://github.com/morainedb/moraine/pull/398))
+- *(memory)* charge metadata exports for selected descriptors ([#384](https://github.com/morainedb/moraine/pull/384))
+- *(maintenance)* bound transactions and unblock fold shutdown ([#378](https://github.com/morainedb/moraine/pull/378))
+- *(duckdb)* prune exact inline versions during snapshot expiry ([#375](https://github.com/morainedb/moraine/pull/375))
+- *(maintenance)* cap compaction inputs and batch tables ([#377](https://github.com/morainedb/moraine/pull/377))
+
+### Other
+
+- *(duckdb)* bound the commit-time snapshot reads to the transaction's start ([#411](https://github.com/morainedb/moraine/pull/411))
+- replace BENCHMARK.md with a benchmarks page organized by question ([#406](https://github.com/morainedb/moraine/pull/406))
+- *(moraine)* fold the example benchmarks into the measurement harnesses ([#405](https://github.com/morainedb/moraine/pull/405))
+- restructure the site and align the repository docs with it ([#402](https://github.com/morainedb/moraine/pull/402))
+- [**breaking**] vendor slatedb 0.18.1 with the refresh and tolerant-tracker patches ([#401](https://github.com/morainedb/moraine/pull/401))
+- *(catalog)* [**breaking**] replace eager snapshots with demand-loaded scopes ([#397](https://github.com/morainedb/moraine/pull/397))
+- *(catalog)* bound metadata reads and stream file inventories ([#386](https://github.com/morainedb/moraine/pull/386))
+- *(catalog)* demand-load metadata through fixed read scopes ([#387](https://github.com/morainedb/moraine/pull/387))
+
 ## [0.8.1](https://github.com/morainedb/moraine/compare/v0.8.0...v0.8.1) - 2026-10-27
 
 ### Fixed
