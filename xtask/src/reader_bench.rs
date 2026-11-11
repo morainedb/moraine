@@ -271,10 +271,9 @@ fn seed(
     let mut script = preamble(artifacts, target)?;
     let _ = writeln!(
         script,
-        "ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, META_FLUSH_INTERVAL_MS 1, \
+        "ATTACH {} AS lake (DATA_PATH {}, META_FLUSH_INTERVAL_MS 1, \
          DATA_INLINING_ROW_LIMIT 0, READ_WRITE);",
         sql_literal(&format!("ducklake:moraine:{catalog_uri}")),
-        sql_literal(&data_path.display().to_string()),
         sql_literal(&data_path.display().to_string())
     );
     let rows_per_commit = plan.partitions.saturating_mul(ROWS_PER_FILE);
@@ -374,9 +373,8 @@ fn measure(
     script.push_str(".timer on\n");
     let _ = writeln!(
         script,
-        "ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, READ_ONLY{cache});",
+        "ATTACH {} AS lake (DATA_PATH {}, READ_ONLY{cache});",
         sql_literal(&format!("ducklake:moraine:{catalog_uri}")),
-        sql_literal(&data_path.display().to_string()),
         sql_literal(&data_path.display().to_string())
     );
     script.push_str(

@@ -77,7 +77,7 @@
 //!
 //! ```sql
 //! ATTACH 'ducklake:moraine:/lake/catalog' AS lake (
-//!     DATA_PATH '/lake/data', META_DATA_PATH '/lake/data',
+//!     DATA_PATH '/lake/data',
 //!     META_MAINTENANCE_INTERVAL INTERVAL '1 hour',
 //!     META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '7 days',
 //!     META_MAINTENANCE_MERGE_ADJACENT_FILES true,

@@ -88,10 +88,9 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let store = fixture.join("store");
     let data = fixture.join("data");
     let preamble = format!(
-        "LOAD {}; SET threads=1; ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, DATA_INLINING_ROW_LIMIT {}, META_CACHE_PUTS false);",
+        "LOAD {}; SET threads=1; ATTACH {} AS lake (DATA_PATH {}, DATA_INLINING_ROW_LIMIT {}, META_CACHE_PUTS false);",
         sql_literal(&extension.display().to_string()),
         sql_literal(&format!("ducklake:moraine:{}", store.display())),
-        sql_literal(&data.display().to_string()),
         sql_literal(&data.display().to_string()),
         if embedded { 1_048_576 } else { 0 }
     );

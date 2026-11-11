@@ -8,7 +8,7 @@ use std::{
 use super::{borrow_str, free_array, free_c_string, guard, handle_list, to_c_string};
 use crate::{
     error::{AbiError, MoraineError, codes},
-    runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
+    runtime::{DataFiles, MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
 /// An index's build lifecycle, as [`moraine_indexes`] reports it. `building`
@@ -156,6 +156,7 @@ unsafe fn create_index_in_one_commit(
     orders: &[moraine::ColumnOrder],
     maintenance: moraine::IndexMaintenance,
     data_store: Option<moraine::DataStore>,
+    prefix: &str,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
 ) -> Result<(), AbiError> {
@@ -170,7 +171,7 @@ unsafe fn create_index_in_one_commit(
                 orders,
                 maintenance,
                 data_store,
-                &handle.data_prefix,
+                prefix,
             ),
         )
     }?;
@@ -269,11 +270,14 @@ pub unsafe extern "C" fn moraine_index_create(
         // A table that already holds files must be backfilled from the
         // DATA_PATH store; without one, refuse rather than under-cover.
         let holds_files = !snapshot.data_files_of(table_id).is_empty();
-        let data_store = handle_ref.data_store.clone();
+        let DataFiles {
+            store: data_store,
+            prefix,
+        } = handle_ref.data_files()?;
         if holds_files && data_store.is_none() {
             return Err(AbiError::from(moraine::Error::Constraint(
-                "the table already holds data; attach with META_DATA_PATH so its files can be \
-                 scoped-read"
+                "the table already holds data and the lake records no data path, so its files \
+                 cannot be scoped-read; attach with DATA_PATH"
                     .to_owned(),
             )));
         }
@@ -315,7 +319,7 @@ pub unsafe extern "C" fn moraine_index_create(
                             &orders,
                             maintenance,
                             data_store,
-                            &handle_ref.data_prefix,
+                            &prefix,
                             Some(step),
                         ),
                 )
@@ -331,6 +335,7 @@ pub unsafe extern "C" fn moraine_index_create(
                     &orders,
                     maintenance,
                     data_store.filter(|_| holds_files),
+                    &prefix,
                     probe,
                     probe_ctx,
                 )
@@ -554,8 +559,9 @@ pub unsafe extern "C" fn moraine_index_verify(
             )
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
-        let data_store = handle_ref.data_store.clone();
-        let prefix = handle_ref.data_prefix.clone();
+        let files = handle_ref.data_files()?;
+        let data_store = files.store;
+        let prefix = files.prefix;
         // A read-only attach reports; a writer records what it found.
         let report = match handle_ref.catalog.writer() {
             Ok(catalog) => {

@@ -97,6 +97,16 @@ transaction began instead of every retained one. The changes arm of the
 same query already carries that bound. Covered by the staged snapshot
 paging tests in `cargo xtask e2e`.
 
+`0010-fix-record-the-data-path-on-a-catalog-that-serves-none.patch` records
+the attach's `DATA_PATH` in `ducklake_metadata` when an existing catalog
+serves no `data_path` tag. DuckLake writes that tag only in the bootstrap
+it runs on a catalog it creates, and a metadata backend that creates the
+catalog itself, as moraine's genesis does, never reaches that bootstrap, so
+the backend learned the root only from a second option. Inert for DuckLake's
+own catalogs, whose bootstrap always writes the tag; a read-only attach
+records nothing. Covered by the index backfill without `META_DATA_PATH` in
+`cargo xtask e2e`.
+
 `0005` supplies the positional DELETE used by the optimizer when a certified
 index answers the entire equality predicate. The public located-change SQL
 verbs remain withdrawn; ordinary `DELETE ... WHERE` selects this path without

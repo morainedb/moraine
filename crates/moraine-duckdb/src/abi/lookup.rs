@@ -44,6 +44,7 @@ unsafe fn abi_located_row_ids(
     lookup: impl Future<Output = moraine::Result<Vec<u64>>>,
 ) -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
     let reads = handle_ref.catalog.reads();
+    let files = handle_ref.data_files()?;
     // SAFETY: caller contract for `probe`/`probe_ctx`.
     let (located, mut memory) = unsafe {
         handle_ref.block_on_cancellable(probe, probe_ctx, async {
@@ -52,12 +53,7 @@ unsafe fn abi_located_row_ids(
                 (row_ids.len() as u64).saturating_mul(2 * size_of::<MoraineRowId>() as u64),
             )?;
             let located = reads
-                .locate_row_ids(
-                    handle_ref.data_store.clone(),
-                    &handle_ref.data_prefix,
-                    table_id,
-                    row_ids,
-                )
+                .locate_row_ids(files.store.clone(), &files.prefix, table_id, row_ids)
                 .await?;
             Ok::<_, moraine::Error>((located, memory))
         })

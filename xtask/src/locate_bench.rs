@@ -96,10 +96,8 @@ fn preamble(moraine: &Path, temp: &TempDir) -> String {
     );
     let _ = writeln!(
         script,
-        "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH {}, META_DATA_PATH {}, \
-         DATA_INLINING_ROW_LIMIT 0);",
+        "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH {}, DATA_INLINING_ROW_LIMIT 0);",
         temp.store().display(),
-        sql_literal(&temp.data().display().to_string()),
         sql_literal(&temp.data().display().to_string()),
     );
     script

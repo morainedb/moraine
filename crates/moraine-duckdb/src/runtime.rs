@@ -4,7 +4,7 @@
 use std::{
     ffi::c_void,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::Duration,
 };
 
@@ -16,6 +16,7 @@ mod background;
 use background::{Pass, Worker};
 
 use crate::{
+    abi::{DataSource, adopt_data_root},
     error::AbiError,
     logging::{HandleId, enter_handle, tag_thread_for_handle},
 };
@@ -48,14 +49,61 @@ pub struct MoraineCatalogHandle {
     pub(crate) catalog: AttachedCatalog,
     /// Routes this handle's `tracing` events to its registered log sink.
     pub(crate) log_id: HandleId,
-    /// The `DATA_PATH` object store, present only when `META_DATA_PATH`
-    /// was given; index maintenance and scoped reads are skipped without it.
-    pub(crate) data_store: Option<moraine::DataStore>,
-    /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
-    /// bare-bucket store), prepended to a data file's stored path.
-    pub(crate) data_prefix: String,
-    /// Stopped before closing the catalog it reads.
-    warming: Mutex<Option<Worker>>,
+    /// The `DATA_PATH` store, shared with read aliases of this handle.
+    pub(crate) data: Arc<DataSlot>,
+    /// Stopped before closing the catalog it reads. The flag records
+    /// whether the worker was started with a data store.
+    warming: Mutex<Option<(Worker, bool)>>,
+}
+
+/// The `DATA_PATH` store and the bucket-relative key prefix under it
+/// (empty for a local or bare-bucket store), prepended to a data file's
+/// stored path. `store` is `None` while the lake records no data root;
+/// index maintenance and scoped reads are skipped without one.
+#[derive(Clone, Default)]
+pub(crate) struct DataFiles {
+    pub(crate) store: Option<moraine::DataStore>,
+    pub(crate) prefix: String,
+}
+
+/// The data store, resolved at attach when the attach or the lake named
+/// the root and on first use otherwise, once DuckLake has recorded one.
+pub(crate) struct DataSlot {
+    resolved: RwLock<Option<DataFiles>>,
+    source: Option<DataSource>,
+}
+
+impl DataSlot {
+    pub(crate) fn new(resolved: Option<DataFiles>, source: DataSource) -> Self {
+        Self {
+            resolved: RwLock::new(resolved),
+            source: Some(source),
+        }
+    }
+
+    /// A slot holding `files` with nothing further to resolve.
+    #[cfg(test)]
+    pub(crate) fn fixed(files: DataFiles) -> Self {
+        Self {
+            resolved: RwLock::new(Some(files)),
+            source: None,
+        }
+    }
+
+    /// A slot nothing can resolve, for handles opened without an attach.
+    fn empty() -> Self {
+        Self {
+            resolved: RwLock::new(None),
+            source: None,
+        }
+    }
+
+    fn resolved(&self) -> Option<DataFiles> {
+        self.resolved
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Which mode the attach opened in. A write on a read-only attach is
@@ -92,10 +140,38 @@ impl MoraineCatalogHandle {
             runtime,
             catalog,
             log_id,
-            data_store: None,
-            data_prefix: String::new(),
+            data: Arc::new(DataSlot::empty()),
             warming: Mutex::new(None),
         }
+    }
+
+    /// The data store and its prefix, adopting the root the lake recorded
+    /// after attach. Blocks on the handle's runtime; for use off it.
+    pub(crate) fn data_files(&self) -> Result<DataFiles, AbiError> {
+        self.block_on(self.resolve_data_files())
+    }
+
+    /// As [`Self::data_files`], from inside a future on the runtime.
+    pub(crate) async fn resolve_data_files(&self) -> Result<DataFiles, AbiError> {
+        if let Some(files) = self.data.resolved() {
+            return Ok(files);
+        }
+        let Some(source) = &self.data.source else {
+            return Ok(DataFiles::default());
+        };
+        let recorded =
+            moraine::ffi_support::catalog_read::global_option(self.catalog.reads(), "data_path")
+                .await?;
+        let Some(root) = recorded else {
+            return Ok(DataFiles::default());
+        };
+        let files = adopt_data_root(source, &root)?;
+        *self
+            .data
+            .resolved
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(files.clone());
+        Ok(files)
     }
 
     /// A borrowed read-only surface; its owner drops it without closing the
@@ -105,8 +181,7 @@ impl MoraineCatalogHandle {
             runtime: Arc::clone(&self.runtime),
             catalog: AttachedCatalog::Reader(reads),
             log_id: self.log_id,
-            data_store: self.data_store.clone(),
-            data_prefix: self.data_prefix.clone(),
+            data: Arc::clone(&self.data),
             warming: Mutex::new(None),
         }
     }
@@ -115,8 +190,11 @@ impl MoraineCatalogHandle {
     /// also publish missing row summaries; existing summaries cost one header
     /// read.
     pub(crate) fn spawn_warm_at_attach(&self, preload: bool) {
-        let publishes =
-            matches!(self.catalog, AttachedCatalog::Writer(_)) && self.data_store.is_some();
+        let publishes = matches!(self.catalog, AttachedCatalog::Writer(_))
+            && self
+                .data
+                .resolved()
+                .is_some_and(|files| files.store.is_some());
         if !preload && !publishes {
             return;
         }
@@ -138,20 +216,33 @@ impl MoraineCatalogHandle {
     }
 
     fn enqueue_pass(&self, pass: Pass) {
-        let mut warming = self
-            .warming
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let worker = warming.get_or_insert_with(|| {
-            let store = match self.catalog {
-                AttachedCatalog::Writer(_) => self.data_store.clone(),
-                AttachedCatalog::Reader(_) => None,
-            };
-            Worker::start(
-                &self.runtime,
-                self.catalog.reads().clone(),
-                store,
-                self.data_prefix.clone(),
+        let files = self.data_files().unwrap_or_else(|error| {
+            tracing::warn!(error = %error.message, "data path refused; publication skipped");
+            DataFiles::default()
+        });
+        let store = match self.catalog {
+            AttachedCatalog::Writer(_) => files.store,
+            AttachedCatalog::Reader(_) => None,
+        };
+        let mut warming = self.warming.lock().unwrap_or_else(PoisonError::into_inner);
+        // A worker started before the lake recorded its data root cannot
+        // publish; replace it once one resolves.
+        if store.is_some()
+            && matches!(*warming, Some((_, false)))
+            && let Some((worker, _)) = warming.take()
+        {
+            worker.stop(&self.runtime);
+        }
+        let (worker, _) = warming.get_or_insert_with(|| {
+            let has_store = store.is_some();
+            (
+                Worker::start(
+                    &self.runtime,
+                    self.catalog.reads().clone(),
+                    store,
+                    files.prefix,
+                ),
+                has_store,
             )
         });
         worker.push(pass);
@@ -164,7 +255,7 @@ impl MoraineCatalogHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(worker) = worker {
+        if let Some((worker, _)) = worker {
             worker.stop(&self.runtime);
             1
         } else {

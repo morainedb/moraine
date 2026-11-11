@@ -209,9 +209,8 @@ fn run_once(
     }
     let _ = writeln!(
         script,
-        "ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, META_FLUSH_INTERVAL_MS {flush_milliseconds}, READ_WRITE);",
+        "ATTACH {} AS lake (DATA_PATH {}, META_FLUSH_INTERVAL_MS {flush_milliseconds}, READ_WRITE);",
         sql_literal(&format!("ducklake:moraine:{catalog_uri}")),
-        sql_literal(&data_path.display().to_string()),
         sql_literal(&data_path.display().to_string())
     );
     script.push_str("CREATE TABLE lake.main.items(id BIGINT, payload BIGINT);\n");

@@ -878,10 +878,11 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	bool cache_compaction_puts = true;
 	uint8_t cache_preload = 1;
 	std::string checkpoint;
-	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
-	// it is the DATA_PATH the index scoped read and maintenance resolve data
-	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
-	// data layer and does not forward it to this metadata attach.)
+	// `META_DATA_PATH` arrives here as `data_path`: the DATA_PATH the index
+	// scoped read and maintenance resolve data files against. Optional,
+	// since the core adopts the DATA_PATH the bundled DuckLake records on
+	// the first attach. (DuckLake keeps its own unprefixed `DATA_PATH` for
+	// the data layer and does not forward it to this metadata attach.)
 	std::string data_path;
 	// `WAL_PATH` writes the write-ahead log to a store of its own — a
 	// commit waits on one PUT of it, so an S3 Express One Zone bucket beside

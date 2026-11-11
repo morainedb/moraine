@@ -237,18 +237,19 @@ pub unsafe extern "C" fn moraine_tx_begin(
         }
         // SAFETY: caller contract for the optional snapshot.
         let snapshot = unsafe { snapshot.as_ref() };
+        let files = handle_ref.data_files()?;
         let tx = if let Some(scope) = snapshot.map(|snapshot| snapshot.read_alias.as_ref()) {
             staged_begin_scoped(
                 handle_ref.catalog.writer()?,
-                handle_ref.data_store.clone(),
-                handle_ref.data_prefix.clone(),
+                files.store,
+                files.prefix,
                 scope.catalog.reads().clone(),
             )?
         } else {
             staged_begin(
                 handle_ref.catalog.writer()?,
-                handle_ref.data_store.clone(),
-                handle_ref.data_prefix.clone(),
+                files.store,
+                files.prefix,
                 None,
             )?
         };
@@ -421,11 +422,8 @@ pub unsafe extern "C" fn moraine_tx_commit(
         if !report.deferred_indexes.is_empty() {
             match catalog_ref.catalog.writer() {
                 Ok(writer) => {
-                    let repair = writer.repair_deferred_indexes(
-                        catalog_ref.data_store.clone(),
-                        &catalog_ref.data_prefix,
-                        None,
-                    );
+                    let files = catalog_ref.data_files()?;
+                    let repair = writer.repair_deferred_indexes(files.store, &files.prefix, None);
                     // SAFETY: `probe`/`probe_ctx` validity is this function's
                     // own safety contract.
                     let repaired =

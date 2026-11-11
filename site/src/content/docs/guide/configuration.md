@@ -21,7 +21,7 @@ so on. The second table omits the prefix.
 
 | Moraine option | Default | Meaning |
 |---|---|---|
-| `DATA_PATH` | required once | Same value as `DATA_PATH`. Recorded in the catalog at creation; later attaches may omit both, and a different value is refused. |
+| `DATA_PATH` | the recorded root | Normally omitted: Moraine adopts the `DATA_PATH` DuckLake records on the first attach. A value differing from the recorded one is refused. |
 | `CHECKPOINT` | unset | Pin a read-only attach to a SlateDB checkpoint id: a fixed cut that never sees later commits. Requires `READ_ONLY`. |
 | `READER_POLL_INTERVAL_MS` | 10000 | How stale a read-only attach may be before it looks for new commits. |
 | `FLUSH_INTERVAL_MS` | 100 | Minimum spacing between two write-ahead-log flushes. |

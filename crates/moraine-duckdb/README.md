@@ -368,7 +368,7 @@ exists-probe (`SELECT NULL FROM ducklake_metadata LIMIT 1`) succeeds:
 | `version` | the recorded catalog version, `"1.0"` or `"1.1"` | chooses the `ducklake_*` shape served; raised with `moraine_raise_catalog_version` |
 | `encrypted` | the value recorded at creation | set from `ENCRYPTED`; DuckLake generates per-file keys and Moraine stores them |
 | `created_by` | `"moraine"` | never read back by DuckLake's own init path; served anyway since DuckLake itself writes it at bootstrap and it costs nothing |
-| `data_path` | the recorded root, or **not served** | Recorded once from `META_DATA_PATH` (at bootstrap, or on the first attach of a lake that predates it) and served back normalized with a trailing separator, so `LoadExistingDuckLake` reads it and a re-attach need not repeat `DATA_PATH`; a lake with none recorded omits the row, leaving the ATTACH `DATA_PATH` as the authority. The recorded value is fixed — a conflicting `META_DATA_PATH` is refused |
+| `data_path` | the recorded root, or **not served** | Recorded once, by DuckLake's bootstrap insert or from `META_DATA_PATH` on a lake that predates it, and served back normalized with a trailing separator, so `LoadExistingDuckLake` reads it and a re-attach need not repeat `DATA_PATH`; a lake with none recorded omits the row, leaving the ATTACH `DATA_PATH` as the authority. The recorded value is fixed — a conflicting `META_DATA_PATH` is refused |
 
 All rows are global (`scope`/`scope_id` `NULL`) — no schema/table-scoped
 DuckLake settings exist to serve.

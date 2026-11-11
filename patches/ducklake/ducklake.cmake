@@ -57,6 +57,7 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0007-fix-keep-the-row-ids-a-merged-file-carries.patch
             ${CMAKE_CURRENT_LIST_DIR}/0008-fix-bound-compaction-input-files.patch
             ${CMAKE_CURRENT_LIST_DIR}/0009-perf-bound-the-commit-time-head-lookup.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0010-fix-record-the-data-path-on-a-catalog-that-serves-none.patch
     )
     FetchContent_GetProperties(moraine_patched_ducklake)
     if(NOT moraine_patched_ducklake_POPULATED)

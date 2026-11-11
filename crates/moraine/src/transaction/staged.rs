@@ -446,7 +446,7 @@ pub struct StagedTransaction {
     /// a transaction without a catalog.
     store: Option<Arc<Store>>,
     /// The `DATA_PATH` object store and its bucket-relative prefix, present
-    /// when the attach supplied `META_DATA_PATH`. Index maintenance
+    /// when the lake records a data path. Index maintenance
     /// scoped-reads registered data files through it; absent it is skipped.
     data_store: Option<DataStore>,
     data_prefix: String,

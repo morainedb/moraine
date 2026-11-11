@@ -12,6 +12,36 @@ mod selective;
 mod verify;
 mod wide_filter;
 
+/// `DATA_PATH` alone is enough: Moraine adopts the root DuckLake records
+/// when it creates the lake, so an index over existing files backfills
+/// without `META_DATA_PATH`.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn an_index_backfills_from_the_data_path_ducklake_records() {
+    let store = TempDir::new("index-adopted-store");
+    let data = TempDir::new("index-adopted-data");
+    let run = |sql: &str| run_ducklake_sql(store.path(), data.path(), sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
+
+    let hit = csv_rows(&run("SELECT b FROM lake.main.t WHERE a = 42;"));
+    assert_eq!(
+        hit,
+        vec![vec!["x".to_string()]],
+        "the lookup reads through the index"
+    );
+    let listed = csv_rows(&run(
+        "SELECT index_name, state FROM moraine_indexes('lake', 'main', 't');",
+    ));
+    assert_eq!(
+        listed,
+        vec![vec!["by_a".to_string(), "ready".to_string()]],
+        "the index backfilled from the files under DATA_PATH"
+    );
+}
+
 /// Native DDL backfills, persists, and drops an index across fresh attaches.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]

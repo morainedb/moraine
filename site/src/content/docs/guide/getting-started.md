@@ -30,19 +30,16 @@ directory.
 ## Attach a local lake
 
 ```sql
-ATTACH 'ducklake:moraine:/tmp/demo-lake' AS lake
-  (DATA_PATH '/tmp/demo-lake-data/', META_DATA_PATH '/tmp/demo-lake-data/');
+ATTACH 'ducklake:moraine:/tmp/demo-lake' AS lake (DATA_PATH '/tmp/demo-lake-data/');
 
 CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
 INSERT INTO lake.events VALUES (1, 'hello, lake');
 SELECT * FROM lake.events;
 ```
 
-`DATA_PATH` is DuckLake's: where it writes Parquet. DuckLake does not pass
-it on to its catalog, and Moraine reads Parquet too, for
-[indexes](#index-a-column) and row summaries, so `META_DATA_PATH` gives it
-the same root. Both are recorded at creation; later attaches can omit them,
-and a different `META_DATA_PATH` is refused.
+`DATA_PATH` is where DuckLake writes Parquet. The first attach records it in
+the catalog, so later attaches can omit it, and Moraine reads the same root
+for [indexes](#index-a-column) and row summaries.
 
 ## Attach a lake on S3
 
@@ -52,8 +49,7 @@ cannot create a catalog. Add `READ_WRITE` to create or write a lake on S3:
 ```sql
 CREATE SECRET s (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2');
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/',
-   META_DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
 ```
 
 Credentials come from DuckDB secrets, never from attach options. Once the

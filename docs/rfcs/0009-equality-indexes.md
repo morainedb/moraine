@@ -131,9 +131,11 @@ is encoded losslessly, matching how DuckDB writes Parquet, so a value inserted
 inline and the same value written to a file derive the same bytes. A commit
 registering a data or delete file on a table with a maintained index fails with
 `Constraint`, naming the file, when the attach supplied no `DATA_PATH` store.
-The data path is supplied once at creation through `META_DATA_PATH`, recorded
-in the `data_path` metadata option, and served back as DuckLake's
-`ducklake_metadata` row; a re-attach supplying a conflicting value is refused.
+The bundled DuckLake records the attach's `DATA_PATH` in the `data_path`
+metadata option when the catalog serves none, and moraine adopts it on first
+use when the attach named no `META_DATA_PATH`; it is served back as
+DuckLake's `ducklake_metadata` row, and a re-attach supplying a conflicting
+value is refused.
 A table whose rows stay inlined needs no data store. A unique index's scoped
 read is synchronous at commit and a failed read aborts it; the check is never
 skipped.
