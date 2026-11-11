@@ -69,7 +69,7 @@ Moraine is under active development and in production use at
 [contour.app](https://contour.app). DuckLake SQL, including `CREATE`,
 `INSERT`, `UPDATE`, `DELETE`, time travel, and maintenance, runs against
 Moraine as its catalog and is validated against real DuckDB in CI;
-[How Moraine is tested](https://morainedb.github.io/guide/testing/) covers
+[Testing](https://morainedb.github.io/rfcs/0012-testing/) covers
 crash recovery, writer fencing, and fuzzing. The [roadmap](ROADMAP.md) lists
 what is done and what is next. Questions and ideas go to
 [Discussions](https://github.com/morainedb/moraine/discussions).

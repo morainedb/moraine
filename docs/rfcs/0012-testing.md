@@ -1,9 +1,6 @@
----
-title: How Moraine is tested
-description: Crash recovery, writer fencing, fuzzing, and the suite that runs against real DuckDB.
-sidebar:
-  order: 6
----
+# RFC 0012: Testing
+
+## Summary
 
 The catalog is the lake: a torn commit or two live writers would lose data
 no Parquet file can restore. Every test below runs against real SlateDB on
@@ -63,7 +60,7 @@ fences the first with a typed error and that a read-only attach does not
 fence a live writer. `test/sql/commit_concurrency.test` runs two DuckLake
 transactions over one lake from two connections, so DuckLake's own conflict
 loop runs and the loser gets an error DuckLake treats as retryable. The
-[benchmark harness](/benchmarks/#concurrent-writers) launches several
+[benchmark harness](../benchmarks.md#concurrent-writers) launches several
 writer processes against one lake and records the second's refusal as a
 property.
 
@@ -81,7 +78,7 @@ proptest round trip.
 
 `cargo xtask e2e` compiles DuckDB at the pinned release, builds the
 extension with its bundled DuckLake, loads it into the resulting CLI, and
-runs about two hundred tests in `crates/moraine-duckdb/tests/ducklake_load`:
+runs about two hundred tests in `crates/moraine-duckdb/tests/ducklake_load/`:
 DDL and schema evolution, deletes, time travel, the change feed,
 partitioning, every DuckLake type, inlining, indexes, maintenance,
 migration, cancellation, and a kill between a Parquet write and its
@@ -97,5 +94,5 @@ CLI it names, on every platform it ships for.
 
 No test kills a process mid-PUT against a real endpoint; the crash cases
 use the in-memory store. There is no formal model of the commit protocol.
-The [crash recovery design document](/rfcs/0008-crash-recovery/) states
+The [crash recovery](0008-crash-recovery.md) states
 each case precisely.

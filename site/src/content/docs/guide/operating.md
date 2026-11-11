@@ -179,4 +179,4 @@ commit or after it, never between. A second writer fences the first, which
 then writes nothing. Both are tested against real SlateDB with a store that
 freezes at every write boundary, fuzzed nightly, and run through about two
 hundred end-to-end tests against real DuckDB.
-[How Moraine is tested](../testing/) lists the cases.
+[Testing](/rfcs/0012-testing/) lists the cases.
