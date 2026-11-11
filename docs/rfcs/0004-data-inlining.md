@@ -145,9 +145,13 @@ Parquet writes precede the batch.
    Deregister the superseded schema version as described below.
 4. Verify row ids: the multiset of row ids in the data files the commit
    registers for a table must equal the multiset drained from its chunks
-   (`verify_flushed_row_ids`). A mismatch is refused as corruption. Files
-   the commit registers at its own snapshot are left out of the comparison.
-   A `(table, schema_version)` drain named twice by DuckLake counts once.
+   (`verify_flushed_row_ids`). A mismatch is refused as corruption, unless
+   the head has moved past the snapshot the flush read its rows at: a
+   version that landed after the read is then a race the flush lost, and
+   the mismatch is reported as `CommitConflict` for DuckLake to re-drive.
+   Files the commit registers at its own snapshot are left out of the
+   comparison. A `(table, schema_version)` drain named twice by DuckLake
+   counts once.
 
 Pre-flush time travel is served from the flushed Parquet by its per-row
 snapshot column. The catalog retains nothing, since retained rows would be

@@ -1351,12 +1351,21 @@ impl StagedTransaction {
         };
         phases.head_view = phase_started.elapsed();
         let mints_snapshot = mints_snapshot(&ops);
+        let authored_snapshot = match (&read_view, &read_scope) {
+            (Some(view), _) => Some(view.snapshot.snapshot_id),
+            (None, Some(scope)) => match scope.pinned_read_handle() {
+                Some(handle) => read::read_head(handle).await?.map(|head| head.snapshot_id),
+                None => None,
+            },
+            (None, None) => None,
+        };
         let context = StagingContext {
             diagnostic_id,
             projections: Arc::clone(&projections),
             data_store,
             data_prefix,
             data_reads,
+            authored_snapshot,
         };
         let size = StagedSize {
             rows: staged_rows,
@@ -1590,6 +1599,9 @@ struct StagingContext {
     data_store: Option<DataStore>,
     data_prefix: String,
     data_reads: Arc<data_file::DataStoreCounters>,
+    /// The snapshot the caller read its rows at, when it read one before
+    /// this transaction opened; a head past it is a race the rows lost.
+    authored_snapshot: Option<u64>,
 }
 
 /// One commit's rows translated and staged onto a transaction.
@@ -1661,10 +1673,14 @@ async fn stage_rows(
 
     // Neither a flush nor a compaction derives entries, so this is where
     // their files are held to the rows they re-home.
+    let premise = row_id_invariants::Premise {
+        base,
+        authored_snapshot: context.authored_snapshot,
+    };
     reporting_phase(
         "flushed-row-ids",
         row_id_invariants::verify_flushed_row_ids(
-            base,
+            &premise,
             &ops,
             &drained,
             store,
@@ -1674,7 +1690,7 @@ async fn stage_rows(
     .await?;
     reporting_phase(
         "compacted-row-ids",
-        row_id_invariants::verify_compacted_row_ids(base, &ops, store, &context.data_prefix),
+        row_id_invariants::verify_compacted_row_ids(&premise, &ops, store, &context.data_prefix),
     )
     .await?;
 

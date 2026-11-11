@@ -130,7 +130,9 @@ reads the killed positions' values from a delete file's target. The inline body
 is encoded losslessly, matching how DuckDB writes Parquet, so a value inserted
 inline and the same value written to a file derive the same bytes. A commit
 registering a data or delete file on a table with a maintained index fails with
-`Constraint`, naming the file, when the attach supplied no `DATA_PATH` store.
+`Constraint`, naming the file, when moraine has no `DATA_PATH` store: the lake
+records no data path, or is encrypted, since moraine reads no byte of an
+encrypted file.
 The bundled DuckLake records the attach's `DATA_PATH` in the `data_path`
 metadata option when the catalog serves none, and moraine adopts it on first
 use when the attach named no `META_DATA_PATH`; it is served back as

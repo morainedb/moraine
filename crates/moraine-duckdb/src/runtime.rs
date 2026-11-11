@@ -16,7 +16,7 @@ mod background;
 use background::{Pass, Worker};
 
 use crate::{
-    abi::{DataSource, adopt_data_root},
+    abi::{DataSource, adopt_data_root, lake_is_encrypted},
     error::AbiError,
     logging::{HandleId, enter_handle, tag_thread_for_handle},
 };
@@ -165,7 +165,11 @@ impl MoraineCatalogHandle {
         let Some(root) = recorded else {
             return Ok(DataFiles::default());
         };
-        let files = adopt_data_root(source, &root)?;
+        let files = if lake_is_encrypted(self.catalog.reads()).await? {
+            DataFiles::default()
+        } else {
+            adopt_data_root(source, &root)?
+        };
         *self
             .data
             .resolved

@@ -482,10 +482,20 @@ fn open_data_files(path: &str, s3_creds: Option<&S3Creds>) -> Result<DataFiles, 
     })
 }
 
+/// Whether the lake records itself as encrypted. Moraine reads no byte of
+/// an encrypted data file, so such a lake gets no data store.
+pub(crate) async fn lake_is_encrypted(
+    catalog: &moraine::ReadOnlyCatalog,
+) -> Result<bool, AbiError> {
+    let encrypted = moraine::ffi_support::catalog_read::global_option(catalog, "encrypted").await?;
+    Ok(encrypted.as_deref() == Some("true"))
+}
+
 /// Resolves the `DATA_PATH` store at attach. The recorded data root is
 /// authoritative: a differing `data_path_arg` is refused, and a lake with
 /// none recorded adopts the given value (recording it unless read-only).
-/// `None`/`None` leaves the store to be adopted on first use.
+/// `None`/`None` leaves the store to be adopted on first use; an encrypted
+/// lake resolves to no store at all.
 fn resolve_data_store(
     runtime: &tokio::runtime::Runtime,
     catalog: &AttachedCatalog,
@@ -536,6 +546,9 @@ fn resolve_data_store(
             .map_err(AbiError::from)?;
     }
 
+    if runtime.block_on(lake_is_encrypted(catalog.reads()))? {
+        return Ok(Some(DataFiles::default()));
+    }
     open_data_files(&root, s3_creds).map(Some)
 }
 

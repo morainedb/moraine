@@ -25,6 +25,30 @@ use crate::{
 /// Files read for their row ids at once.
 const ROW_ID_READ_CONCURRENCY: usize = 8;
 
+/// What a commit's files were derived against: the head it stages onto
+/// and, when the caller read before this transaction opened, the snapshot
+/// it read at.
+pub(super) struct Premise<'a> {
+    pub(super) base: &'a CatalogSnapshot,
+    pub(super) authored_snapshot: Option<u64>,
+}
+
+impl Premise<'_> {
+    /// A mismatch under a head that moved past what the caller read is a
+    /// race the rows lost, for the caller to re-drive; `mismatch` stands
+    /// otherwise.
+    fn lost_race_or(&self, mismatch: Error) -> Error {
+        let head = self.base.snapshot.snapshot_id;
+        match self.authored_snapshot {
+            Some(read) if head > read => Error::CommitConflict(format!(
+                "snapshot {head} changed inlined rows this commit read at snapshot {read}: \
+                 {mismatch}"
+            )),
+            _ => mismatch,
+        }
+    }
+}
+
 /// The row ids one commit drains from each `(table_id, schema_version)`'s
 /// inline chunks, one per physical row: a row id repeats once per version
 /// drained. Keyed so a drain the commit names twice counts once.
@@ -34,12 +58,13 @@ pub(super) type DrainedRows = HashMap<(u64, u64), Vec<u64>>;
 /// drained chunks'. A table with drained rows but no registered file is
 /// left alone, and so is a commit with no data store to read from.
 pub(super) async fn verify_flushed_row_ids(
-    base: &CatalogSnapshot,
+    premise: &Premise<'_>,
     ops: &[RowOperation],
     drained: &DrainedRows,
     store: Option<&DataStore>,
     data_prefix: &str,
 ) -> Result<()> {
+    let base = premise.base;
     if drained.is_empty() {
         return Ok(());
     }
@@ -73,7 +98,7 @@ pub(super) async fn verify_flushed_row_ids(
         found.sort_unstable();
 
         if found != expected {
-            return Err(mismatch(table_id, files, &expected, &found));
+            return Err(premise.lost_race_or(mismatch(table_id, files, &expected, &found)));
         }
     }
     Ok(())
@@ -84,11 +109,12 @@ pub(super) async fn verify_flushed_row_ids(
 /// drop rows but never renames one. A table whose sources this commit
 /// cannot find is left alone, and so is a commit with no data store.
 pub(super) async fn verify_compacted_row_ids(
-    base: &CatalogSnapshot,
+    premise: &Premise<'_>,
     ops: &[RowOperation],
     store: Option<&DataStore>,
     data_prefix: &str,
 ) -> Result<()> {
+    let base = premise.base;
     let Some(changes) = change_set(ops)? else {
         return Ok(());
     };
@@ -145,14 +171,14 @@ pub(super) async fn verify_compacted_row_ids(
                 .map(|row_id| format!("row id {row_id} is not one its sources hold"))
         };
         if let Some(detail) = detail {
-            return Err(compaction_mismatch(
+            return Err(premise.lost_race_or(compaction_mismatch(
                 table_id,
                 &outputs,
                 &source_ids,
                 held.len(),
                 carried.len(),
                 &detail,
-            ));
+            )));
         }
     }
     Ok(())

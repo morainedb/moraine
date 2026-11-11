@@ -816,6 +816,57 @@ fn a_data_path_recorded_after_attach_is_adopted_on_first_use() {
     unsafe { moraine_detach(handle) };
 }
 
+/// An encrypted lake gets no data store: moraine reads no byte of an
+/// encrypted data file, so its indexes and summaries never try.
+#[test]
+fn an_encrypted_lake_resolves_no_data_store() {
+    let dir = TempDir::new("encrypted-no-store");
+    let data = TempDir::new("encrypted-no-store-root");
+    let c_path = dir.c_path();
+    let c_data = CString::new(data.path().to_str().expect("utf-8")).expect("no NUL");
+    let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+    let mut err = MoraineError::default();
+    // SAFETY: all pointers are valid C strings / local slots.
+    let code = unsafe {
+        moraine_attach_with_wal_store(
+            c_path.as_ptr(),
+            ptr::null(),
+            false,
+            true,
+            0,
+            false,
+            ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            c_data.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            None,
+            ptr::null_mut(),
+            &raw mut handle,
+            &raw mut err,
+        )
+    };
+    // SAFETY: `err.message` is null or just written; `as_ref` allows null.
+    let message = unsafe { err.message.as_ref() };
+    assert_eq!(code, codes::OK, "attach failed: {message:?}");
+    // SAFETY: a live handle from the attach above.
+    let handle_ref = unsafe { &*handle };
+
+    let files = handle_ref
+        .data_files()
+        .expect("an encrypted lake is not an error");
+    assert!(files.store.is_none(), "no store for an encrypted lake");
+
+    // SAFETY: freed exactly once.
+    unsafe { moraine_detach(handle) };
+}
+
 /// A recorded data path that contains the catalog store is refused when
 /// it is adopted, with the message the attach-time check gives.
 #[test]

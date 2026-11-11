@@ -276,8 +276,8 @@ pub unsafe extern "C" fn moraine_index_create(
         } = handle_ref.data_files()?;
         if holds_files && data_store.is_none() {
             return Err(AbiError::from(moraine::Error::Constraint(
-                "the table already holds data and the lake records no data path, so its files \
-                 cannot be scoped-read; attach with DATA_PATH"
+                "the table already holds data and moraine has no store to scoped-read its files \
+                 from: the lake records no data path, or is encrypted"
                     .to_owned(),
             )));
         }
