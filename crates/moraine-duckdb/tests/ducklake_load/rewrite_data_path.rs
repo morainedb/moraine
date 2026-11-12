@@ -7,15 +7,23 @@ fn rewrite_data_path_reopens_copied_parquet_and_preserves_history() {
     let source_catalog = TempDir::new("rewrite-source-catalog");
     let source = TempDir::new("rewrite-source");
     let destination = TempDir::new("rewrite-destination");
-    let inserted = csv_rows(&run_ducklake_sql(
+    run_ducklake_sql(
         source_catalog.path(),
         source.path(),
         "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0);
          CREATE TABLE lake.main.t(id BIGINT);
-         INSERT INTO lake.main.t VALUES (1), (2);
-         SELECT max(snapshot_id) FROM ducklake_snapshots('lake');
-         DELETE FROM lake.main.t WHERE id = 2;",
+         INSERT INTO lake.main.t VALUES (1), (2);",
+    );
+    let inserted = csv_rows(&run_ducklake_sql(
+        source_catalog.path(),
+        source.path(),
+        "SELECT max(snapshot_id) FROM ducklake_snapshots('lake');",
     ));
+    run_ducklake_sql(
+        source_catalog.path(),
+        source.path(),
+        "DELETE FROM lake.main.t WHERE id = 2;",
+    );
     let snapshot = &inserted[0][0];
     copy_directory(source_catalog.path(), catalog.path());
     copy_directory(source.path(), destination.path());
