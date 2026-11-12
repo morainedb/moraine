@@ -91,14 +91,6 @@ struct Migrator {
 
 #[async_trait::async_trait]
 impl crate::TakeStore for Migrator {
-    async fn take_for_publication(&self) -> Result<(Db, Arc<dyn crate::WriterSession>)> {
-        let (db, session) = open_raw(self.object_store.clone(), &self.options).await?;
-        let session = session.ok_or_else(|| {
-            Error::Configuration("migration publisher requires a commit log".into())
-        })?;
-        Ok((db, session))
-    }
-
     async fn take(&self) -> Result<Option<(Db, Arc<dyn crate::WriterSession>)>> {
         let ceiling = slatedb::config::Settings::default().l0_max_ssts;
         let files = census::l0_files(&self.options.path, self.object_store.clone()).await?;
@@ -109,6 +101,9 @@ impl crate::TakeStore for Migrator {
         {
             return Ok(None);
         }
-        self.take_for_publication().await.map(Some)
+        let (db, session) = open_raw(self.object_store.clone(), &self.options).await?;
+        let session = session
+            .ok_or_else(|| Error::Configuration("migration requires a commit log".into()))?;
+        Ok(Some((db, session)))
     }
 }

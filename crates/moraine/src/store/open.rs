@@ -372,16 +372,25 @@ impl<'a> StoreBuilder<'a> {
     /// manifest, writing a checkpoint of its own only when it follows a
     /// commit log.
     pub(crate) async fn open_reader(&self) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
+        self.open_reader_mode(false).await
+    }
+
+    /// Opens a protected fixed view through the commit-log session.
+    pub(crate) async fn open_fixed_reader(&self) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
+        self.open_reader_mode(true).await
+    }
+
+    async fn open_reader_mode(&self, fixed: bool) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
         let options = DbReaderOptions {
             manifest_poll_interval: self.poll_interval,
             ..Default::default()
         };
         let counters = cache::store_counters();
-        let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
+        let mut builder = DbReader::builder(self.path.to_owned(), Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_filter_policies(super::index_filter::policies())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
-            .with_options(options);
+            .with_options(options.clone());
 
         if let Some(wal) = &self.wal_object_store {
             builder = builder.with_wal_object_store(Arc::clone(wal));
@@ -432,7 +441,13 @@ impl<'a> StoreBuilder<'a> {
             crate::MemoryReservation::reserve(0)?,
         )));
 
-        let reader = builder.build().await.map_err(Error::from)?;
+        let reader = if fixed && let Some(session) = &self.reader_session {
+            session
+                .open_fixed_reader(builder, options, self.admin())
+                .await?
+        } else {
+            builder.build().await.map_err(Error::from)?
+        };
         if let Some(preload) = self.cache_preload {
             warm(
                 preload,

@@ -18,13 +18,13 @@ use crate::{catalog::Catalog, data_file::DataStore, error::Result};
 ///
 /// Returns an error if the underlying store transaction cannot be opened.
 #[doc(hidden)]
-pub fn staged_begin(
+pub async fn staged_begin(
     catalog: &Catalog,
     data_store: Option<DataStore>,
     data_prefix: String,
     read_view: Option<std::sync::Arc<crate::catalog::CatalogSnapshot>>,
 ) -> Result<StagedTransaction> {
-    let db_tx = catalog.begin_commit_session()?;
+    let db_tx = catalog.begin_commit_session().await?;
     Ok(StagedTransaction::begin(
         db_tx,
         catalog.projections().clone(),
@@ -43,13 +43,15 @@ pub fn staged_begin(
 ///
 /// # Errors
 /// Returns an error if the underlying store transaction cannot be opened.
-pub fn staged_begin_scoped(
+pub async fn staged_begin_scoped(
     catalog: &Catalog,
     data_store: Option<DataStore>,
     data_prefix: String,
     scope: crate::ReadOnlyCatalog,
 ) -> Result<StagedTransaction> {
-    Ok(staged_begin(catalog, data_store, data_prefix, None)?.with_read_scope(scope))
+    Ok(staged_begin(catalog, data_store, data_prefix, None)
+        .await?
+        .with_read_scope(scope))
 }
 
 // Each child projection below is its parents' rows plus the rows the

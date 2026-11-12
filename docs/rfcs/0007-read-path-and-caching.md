@@ -26,14 +26,15 @@ view, and coalesced commits fold earlier members' pending writes into each
 member's premises. Nothing a committer reads is cached past the operation that
 read it.
 
-**Reader scopes.** An independent reader cannot take a `DbSnapshot`, so it
-reads through a `DbReader` fixed at a checkpoint. The writer publishes that
-checkpoint and readers pin it. `crates/moraine/src/store/checkpoint.rs`
-publishes and pins. `crates/moraine/src/catalog/handle/reader_scopes.rs`
-shares the fixed readers across transactions. The handle's own `DbReader`
-follows the latest manifest without a checkpoint of its own, polling at
-`reader_poll_interval`; it serves head reads only, and the collector's age
-threshold protects what it references between polls.
+**Single-writer reader scopes.** An independent reader cannot take a
+`DbSnapshot`, so it reads through a `DbReader` fixed at a checkpoint. The writer
+publishes that checkpoint and readers pin it.
+`crates/moraine/src/store/checkpoint.rs` publishes and pins.
+`crates/moraine/src/catalog/handle/reader_scopes.rs` shares the fixed readers
+across transactions. The handle's own `DbReader` follows the latest manifest
+without a checkpoint of its own, polling at `reader_poll_interval`; it serves
+head reads only, and the collector's age threshold protects what it references
+between polls.
 
 Publication works as follows.
 
@@ -66,11 +67,13 @@ writer publication. Such a checkpoint does not advance the manifest's WAL
 boundary, so a following reader can already see durable commits it omits.
 
 <!-- site:omit -->
-Under the [commit-log seam](0011-commit-log-seam.md), a committer that holds
-the writer publishes after replaying its tail. Another committer flushes,
-opens a `Publisher` on the recovered store, and publishes through the durable
-sequence covering its slot. The `Publisher` serializes publication within a
-process and coalesces writes covered by one checkpoint.
+Under the [commit-log seam](0011-commit-log-seam.md), each read scope and commit
+preparation acquires a fixed protected reader from its provider. The provider
+captures the durable WAL boundary without taking a writer, and the reader renews
+that checkpoint without advancing the view. A commit is acknowledged at its
+slot; no publication is required. Scopes release their reader when the last
+reference is dropped. The publication-sharing rules below apply to single-writer
+catalogs.
 <!-- /site:omit -->
 
 | Owner | Holds |
@@ -552,10 +555,10 @@ container ceiling remains the final boundary.
 
 - **Writer publication by detached checkpoint of the latest manifest.**
   Rejected: it omits WAL-durable commits a following reader already sees.
-- **Reader-owned leases on the published checkpoint.** Rejected: a manifest
-  write per reader generation and one per renewal, forced only by deleting
-  the superseded publication at once. A grace on retirement lets readers pin
-  the publication itself.
+- **Reader-owned leases on a single-writer publication.** Rejected for that
+  path: a manifest write per reader generation and one per renewal, forced only
+  by deleting the superseded publication at once. A grace on retirement lets
+  readers pin the publication itself.
 - **A fixed metadata slot.** Rejected: a fixed fifth of the budget was both
   floor and ceiling, so holding a large store's filters meant inflating the
   whole budget. Eviction priority lets idle metadata space go to blocks.

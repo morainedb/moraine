@@ -324,7 +324,7 @@ impl Batch {
     }
 
     async fn open(db: &Store, _projections: &std::sync::RwLock<ProjectionCache>) -> Result<Self> {
-        let db_tx = db.begin_commit_session()?;
+        let db_tx = db.begin_commit_session().await?;
         let base = match crate::transaction::staged::dependencies::header(db_tx.handle()).await {
             Ok(base) => Arc::new(base),
             Err(err) => {

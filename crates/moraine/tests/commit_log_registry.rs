@@ -96,7 +96,19 @@ impl WriterSession for EmptySession {
     }
 }
 
+#[async_trait]
 impl ReaderSession for EmptySession {
+    async fn open_fixed_reader(
+        &self,
+        _builder: slatedb::DbReaderBuilder<String>,
+        _options: slatedb::config::DbReaderOptions,
+        _admin: slatedb::admin::Admin,
+    ) -> moraine::Result<DbReader> {
+        Err(moraine::Error::Configuration(
+            "empty test session has no read view".into(),
+        ))
+    }
+
     fn reader(&self) -> Arc<dyn WalReader> {
         Arc::new(EmptyLog)
     }

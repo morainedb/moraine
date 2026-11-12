@@ -1552,7 +1552,7 @@ impl StagedTransaction {
                             return Err(staged_lost_race(result_id, staged_rows));
                         };
                         tokio::time::sleep(commit::retry_backoff(attempt)).await;
-                        db_tx = Arc::new(store.begin_commit_session()?);
+                        db_tx = Arc::new(store.begin_commit_session().await?);
                         base =
                             reporting_phase("head-view", dependencies::load(db_tx.handle(), &ops))
                                 .await

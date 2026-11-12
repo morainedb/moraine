@@ -1151,11 +1151,9 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
     folded_only.close().await.unwrap();
 }
 
-/// A read-only tailing catalog lists the log for a read, not for its
-/// clock: one nothing reads lists nothing, and a read is served the
-/// listing its poll makes, which is the staleness the interval promised.
+/// A fixed read sees committed state without requesting a live-reader poll.
 #[tokio::test]
-async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
+async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -1194,15 +1192,13 @@ async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
         .commit_materialized(|tx| tx.create_schema("landed").map(|_| ()))
         .await
         .unwrap();
-    // A read asks; the tick it asked for lists, and the slot is served.
-    reader.materialized().await.unwrap();
-    assert!(
-        reader_provider
-            .await_served(2, std::time::Duration::from_secs(5))
-            .await,
-        "the read's listing served the slot"
+    let view = reader.materialized().await.unwrap();
+    assert!(view.schema_by_name("landed").is_some());
+    assert_eq!(
+        reader_provider.polls(),
+        idle,
+        "the fixed checkpoint needs no live-reader refresh"
     );
-    assert!(reader_provider.polls() > idle);
 
     reader.close().await.unwrap();
     committer.close().await.unwrap();
