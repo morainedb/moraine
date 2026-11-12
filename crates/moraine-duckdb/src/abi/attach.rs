@@ -753,7 +753,7 @@ pub(super) fn cache_preload_option(
 /// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_lines)]
-pub unsafe extern "C" fn moraine_attach_with_commit_log(
+pub unsafe extern "C" fn moraine_attach_with_options(
     path: *const c_char,
     s3: *const MoraineS3Config,
     read_only: bool,
@@ -770,7 +770,6 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
     cache_compaction_puts: bool,
     data_path: *const c_char,
     wal: *const MoraineWalStore,
-    commit_log: *const MoraineCommitLog,
     checkpoint: *const c_char,
     host_threads: u64,
     probe: MoraineInterruptProbe,
@@ -851,9 +850,6 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
         options.wal_store.clone_from(&wal_store);
-        // SAFETY: `commit_log` validity is this function's own safety
-        // contract.
-        apply_commit_log(&mut options, unsafe { commit_log.as_ref() });
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let opened = unsafe {
@@ -912,40 +908,12 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
     }
 }
 
-/// Mirrors the C `MoraineCommitLog`: how an attach takes part in a commit
-/// log, when a provider is registered for the process. Ignored without
-/// one.
-#[repr(C)]
-pub struct MoraineCommitLog {
-    /// Whether a read-only attach tails the log rather than following the
-    /// folded store.
-    pub tail: bool,
-    /// How often a committer's reader polls for slots, in milliseconds;
-    /// `0` keeps the catalog's default.
-    pub poll_interval_ms: u64,
-}
-
-/// Applies `commit_log` to `options`. A read-write attach that finds a
-/// registered provider is a committer, which takes the store itself when
-/// the tail is long; a read-only attach is a reader.
-fn apply_commit_log(options: &mut CatalogOptions, commit_log: Option<&MoraineCommitLog>) {
-    let Some(commit_log) = commit_log else {
-        return;
-    };
-    options.commit_log_tail = commit_log.tail;
-    if commit_log.poll_interval_ms > 0 {
-        options.commit_log_poll_interval =
-            std::time::Duration::from_millis(commit_log.poll_interval_ms);
-    }
-}
-
-/// Opens a catalog that takes no part in a commit log beyond the process
-/// default: [`moraine_attach_with_commit_log`] with no `commit_log`.
+/// Opens a catalog with the default reader publication interval.
 ///
 /// # Safety
 ///
 /// All pointer and callback requirements are identical to
-/// [`moraine_attach_with_commit_log`].
+/// [`moraine_attach_with_options`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_attach_with_wal_store(
     path: *const c_char,
@@ -973,7 +941,7 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
     // SAFETY: forwards every pointer and callback unchanged under the same
     // contract.
     unsafe {
-        moraine_attach_with_commit_log(
+        moraine_attach_with_options(
             path,
             s3,
             read_only,
@@ -990,7 +958,6 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
             cache_compaction_puts,
             data_path,
             wal,
-            ptr::null(),
             checkpoint,
             host_threads,
             probe,

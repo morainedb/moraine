@@ -13,7 +13,7 @@ use std::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -203,22 +203,6 @@ impl Cursor {
             .load(Ordering::Acquire)
             .max(*self.served.borrow())
     }
-
-    /// Waits for `count` further polls of the log's end, or `timeout`; a
-    /// poll in flight when this starts does not count, so two cover one
-    /// whole tick. Stands in for a refresh the reader cannot be asked for.
-    async fn await_polls(&self, count: u64, timeout: Duration) {
-        let target = self.polls.load(Ordering::Acquire).saturating_add(count);
-        let deadline = Instant::now() + timeout;
-        while self.polls.load(Ordering::Acquire) < target {
-            if Instant::now() >= deadline {
-                tracing::warn!(target, "the reader did not poll in time");
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }
-
     fn serve(&self, sequence: u64) {
         self.served.send_if_modified(|served| {
             let advanced = sequence > *served;
@@ -327,12 +311,11 @@ impl TestProvider {
             .is_ok_and(|waited| waited.is_ok())
     }
 
-    fn session(&self, tail: bool) -> Arc<TestSession> {
+    fn session(&self) -> Arc<TestSession> {
         Arc::new(TestSession {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
             stride: self.stride,
-            tail,
         })
     }
 }
@@ -347,16 +330,15 @@ impl CommitLogProvider for TestProvider {
         _log_store: Arc<dyn ObjectStore>,
         _path: &str,
     ) -> Arc<dyn WriterSession> {
-        self.session(false)
+        self.session()
     }
 
     fn reader_session(
         &self,
         _log_store: Arc<dyn ObjectStore>,
         _path: &str,
-        tail: bool,
     ) -> Arc<dyn ReaderSession> {
-        self.session(tail)
+        self.session()
     }
 
     fn holding(
@@ -402,7 +384,6 @@ pub(crate) struct TestSession {
     log: Arc<TestLog>,
     cursor: Arc<Cursor>,
     stride: u64,
-    tail: bool,
 }
 
 #[async_trait]
@@ -450,7 +431,6 @@ impl ReaderSession for TestSession {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
             stride: self.stride,
-            tail: self.tail,
         })
     }
 
@@ -629,20 +609,6 @@ impl TestStore {
         }
     }
 
-    /// Waits until the reader's polls have served it through `sequence`,
-    /// or the catch-up time passes.
-    async fn await_served(&self, sequence: u64) {
-        let mut served = self.cursor.served.subscribe();
-        let waited = tokio::time::timeout(
-            self.hooks.settings.catch_up,
-            served.wait_for(|reached| *reached >= sequence),
-        )
-        .await;
-        if !waited.is_ok_and(|waited| waited.is_ok()) {
-            tracing::warn!(sequence, "the reader was not served the slot in time");
-        }
-    }
-
     async fn publish(&self, db: &Db) -> Result<()> {
         db.flush().await?;
         let admin = slatedb::admin::AdminBuilder::new(
@@ -748,12 +714,11 @@ impl CommitStore for TestStore {
         self.refuse_if_closed()?;
         let _held = self.guard.lock().await;
         self.log.reveal();
-        if let Side::Follower(_) = &self.side {
-            self.cursor
-                .await_polls(2, self.hooks.settings.catch_up)
-                .await;
-        }
-        let next = self.cursor.known().saturating_add(1);
+        let next = self
+            .cursor
+            .known()
+            .max(self.log.last_sequence())
+            .saturating_add(1);
         if sequence > next {
             return Err(Error::Constraint(format!(
                 "sequence {sequence} is past {next}, the next this store knows"
@@ -787,7 +752,7 @@ impl CommitStore for TestStore {
                 })
             }
             (Some(winner), Side::Follower(_)) => {
-                self.await_served(sequence).await;
+                self.cursor.serve(sequence);
                 self.publish_through(sequence).await?;
                 Ok(SlotOffer::Lost {
                     sequence,
@@ -807,7 +772,7 @@ impl CommitStore for TestStore {
                 Ok(SlotOffer::Won { sequence })
             }
             (None, Side::Follower(_)) => {
-                self.await_served(sequence).await;
+                self.cursor.serve(sequence);
                 let every = self.hooks.settings.fold_every;
                 if every != 0 && sequence.is_multiple_of(every) {
                     self.fold_on_cadence(sequence).await;
@@ -829,9 +794,8 @@ impl CommitStore for TestStore {
             Side::Holder(db) => self.fold_from_cursor(db, &self.cursor).await,
             Side::Follower(_) => {
                 let before = *self.cursor.served.borrow();
-                self.cursor
-                    .await_polls(2, self.hooks.settings.catch_up)
-                    .await;
+                self.publish_through(self.log.last_sequence()).await?;
+                self.cursor.serve(self.log.last_sequence());
                 Ok(self.cursor.served.borrow().saturating_sub(before))
             }
         }
@@ -1086,7 +1050,6 @@ struct TestReader {
     log: Arc<TestLog>,
     cursor: Arc<Cursor>,
     stride: u64,
-    tail: bool,
 }
 
 #[async_trait]
@@ -1128,8 +1091,8 @@ impl WalReader for TestReader {
         if let Some(base) = base {
             self.cursor.serve(replay_after_wal_id.saturating_sub(base));
         }
-        Ok(match (self.tail, base) {
-            (true, Some(base)) => base
+        Ok(match base {
+            Some(base) => base
                 .saturating_add(self.log.last_sequence())
                 .max(replay_after_wal_id),
             _ => replay_after_wal_id,

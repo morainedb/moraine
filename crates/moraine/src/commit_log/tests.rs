@@ -183,7 +183,6 @@ async fn a_tailing_read_only_open_is_served_the_logs_slots() {
         object_store,
         CatalogOptions {
             commit_log: Some(provider.clone()),
-            commit_log_tail: true,
             ..options_at("lake")
         },
     )
@@ -261,7 +260,6 @@ async fn a_committer_adopts_the_log_and_commits_through_it() {
         object_store,
         CatalogOptions {
             commit_log: Some(provider.clone()),
-            commit_log_tail: true,
             ..options_at("lake")
         },
     )
@@ -362,7 +360,6 @@ async fn two_committers_commit_through_one_log() {
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(second_provider.clone()),
-            commit_log_poll_interval: std::time::Duration::from_millis(10),
             reader_poll_interval: std::time::Duration::from_millis(10),
             ..options_at("lake")
         },
@@ -549,7 +546,6 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
-            commit_log_tail: false,
             ..options_at("lake")
         },
     )
@@ -713,11 +709,7 @@ async fn a_holder_folds_a_loss_and_applies_its_win() {
     // The close wrote the fold out: a reader of the folded store alone
     // has what the holder folded and what it won.
     let (reader, _counters) = StoreBuilder::new("lake", object_store)
-        .reader_session(Some(provider.reader_session(
-            any_log_store(),
-            "lake",
-            false,
-        )))
+        .reader_session(Some(provider.reader_session(any_log_store(), "lake")))
         .open_reader()
         .await
         .unwrap();
@@ -813,7 +805,7 @@ async fn a_store_stamped_for_the_log_is_refused_without_a_provider() {
 /// so a read is served state no staler than that interval however long the
 /// catalog went unused.
 #[tokio::test]
-async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
+async fn a_committer_acquires_a_fresh_view_after_idle() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -830,9 +822,7 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
 
     let options = |provider: Arc<TestProvider>| CatalogOptions {
         commit_log: Some(provider),
-        // The poll is slow enough that a read served before the listing it
-        // asked for would miss the peer's commit.
-        commit_log_poll_interval: std::time::Duration::from_millis(100),
+        // The fixed view must see the peer even between base-reader polls.
         reader_poll_interval: std::time::Duration::from_millis(50),
         ..options_at("lake")
     };
@@ -842,7 +832,6 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
         .unwrap();
     idle.materialized().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let listings = idle_provider.polls();
 
     let peer = Catalog::open(object_store, options(Arc::new(provider.sharing())))
         .await
@@ -857,20 +846,15 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
             .unwrap()
             .schema_by_name("landed")
             .is_some(),
-        "the read waited for the listing it asked for"
-    );
-    assert!(
-        idle_provider.polls() > listings,
-        "which it would not have found without listing"
+        "the new fixed view includes the peer commit"
     );
     peer.close().await.unwrap();
     idle.close().await.unwrap();
 }
 
-/// A commit's wait brings the committer's reader up to the log until its
-/// slot is served, and the committer reads its own commit straight after.
+/// The next fixed view includes the committer's acknowledged write.
 #[tokio::test]
-async fn a_commit_waits_until_its_slot_is_served_and_reads_it_back() {
+async fn a_committer_reads_its_commit_in_a_fresh_view() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -895,15 +879,10 @@ async fn a_commit_waits_until_its_slot_is_served_and_reads_it_back() {
     )
     .await
     .unwrap();
-    let before = committer_provider.polls();
     committer
         .commit_materialized(|tx| tx.create_schema("b").map(|_| ()))
         .await
         .unwrap();
-    assert!(
-        committer_provider.polls() > before,
-        "the commit's wait brought the reader up until its slot was served"
-    );
     assert!(
         committer
             .materialized()
@@ -970,15 +949,9 @@ async fn the_taker_folds_the_tail_without_a_live_catalog() {
     db.close().await.unwrap();
     assert!(replay_point(object_store.clone()).await > before);
 
-    let folded_only = Catalog::open_read_only(
-        object_store,
-        CatalogOptions {
-            commit_log_tail: false,
-            ..options
-        },
-    )
-    .await
-    .unwrap();
+    let folded_only = Catalog::open_read_only(object_store, CatalogOptions { ..options })
+        .await
+        .unwrap();
     assert!(
         folded_only
             .materialized()
@@ -1034,7 +1007,6 @@ async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
     let provider = Arc::new(TestProvider::default());
     let options = |provider: Arc<TestProvider>| CatalogOptions {
         commit_log: Some(provider),
-        commit_log_poll_interval: std::time::Duration::from_millis(10),
         ..options_at("lake")
     };
 
@@ -1091,7 +1063,6 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
         commit_log: Some(provider),
         // Every fourth slot is folded by whoever lands it.
         commit_log_fold_slots: 4,
-        commit_log_poll_interval: std::time::Duration::from_millis(10),
         ..options_at("lake")
     };
 
@@ -1134,7 +1105,6 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
     let folded_only = Catalog::open_read_only(
         object_store,
         CatalogOptions {
-            commit_log_tail: false,
             ..options(Arc::new(provider.sharing()))
         },
     )
@@ -1172,8 +1142,7 @@ async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
         object_store,
         CatalogOptions {
             commit_log: Some(reader_provider.clone()),
-            commit_log_tail: true,
-            reader_poll_interval: std::time::Duration::from_millis(10),
+            reader_poll_interval: std::time::Duration::from_secs(60),
             ..options_at("lake")
         },
     )
@@ -1181,13 +1150,6 @@ async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
     .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let idle = reader_provider.polls();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(
-        reader_provider.polls(),
-        idle,
-        "nothing read it, so its ticks listed nothing"
-    );
-
     committer
         .commit_materialized(|tx| tx.create_schema("landed").map(|_| ()))
         .await

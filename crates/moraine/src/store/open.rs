@@ -114,12 +114,8 @@ pub(crate) struct StoreBuilder<'a> {
     /// The commit-log session a writer is built over, when its commits are
     /// slots; the plug replays the log in place of the store's own.
     writer_session: Option<Arc<dyn crate::WriterSession>>,
-    /// The commit-log session a reader is built over, when it follows a
-    /// log: served the folded store, or the tail, as the session was minted.
+    /// The commit-log session supplying durable WAL for a reader.
     reader_session: Option<Arc<dyn crate::ReaderSession>>,
-    /// What a read-only reader lists the log for; without one the plug
-    /// lists on every poll.
-    read_asked: Option<Arc<crate::commit_log::asked::Asked>>,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -149,7 +145,6 @@ impl<'a> StoreBuilder<'a> {
             wal_object_store: None,
             writer_session: None,
             reader_session: None,
-            read_asked: None,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -190,16 +185,6 @@ impl<'a> StoreBuilder<'a> {
     /// Builds the reader over `session`'s write-ahead-log plug. Reader only.
     pub(crate) fn reader_session(mut self, session: Option<Arc<dyn crate::ReaderSession>>) -> Self {
         self.reader_session = session;
-        self
-    }
-
-    /// Lists the log through the reader plug only on a poll a read asked
-    /// for; `None` lists on every poll.
-    pub(crate) fn read_asked(
-        mut self,
-        asked: Option<Arc<crate::commit_log::asked::Asked>>,
-    ) -> Self {
-        self.read_asked = asked;
         self
     }
 
@@ -414,14 +399,7 @@ impl<'a> StoreBuilder<'a> {
         };
         builder = builder.with_reader_mode(mode);
         let wal: Arc<dyn slatedb::wal::WalReader> = if let Some(session) = &self.reader_session {
-            let reader = session.reader();
-            match &self.read_asked {
-                Some(asked) => Arc::new(crate::commit_log::asked::AskedReader::new(
-                    reader,
-                    Arc::clone(asked),
-                )),
-                None => reader,
-            }
+            session.reader()
         } else {
             let mut wal = slatedb::wal::SlateDbWalReaderBuilder::new()
                 .with_path(object_store::path::Path::from(self.path))

@@ -273,10 +273,6 @@ pub struct CommitLogSettings {
     pub retention: Duration,
     /// How often a holder looks for slots its peers landed.
     pub poll: Duration,
-    /// How long a follower waits to be served a slot it knows landed.
-    pub catch_up: Duration,
-    /// How long a follower waits between refreshes while it waits.
-    pub refresh_backoff: Duration,
 }
 
 /// What a commit-log library hands the catalog, for the store at a path on
@@ -292,15 +288,9 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     fn writer_session(&self, log_store: Arc<dyn ObjectStore>, path: &str)
     -> Arc<dyn WriterSession>;
 
-    /// A fresh reader session for one read-only open. A `tail`ing reader is
-    /// served the unfolded tail and sees a commit the moment its slot
-    /// lands; one that does not follows the folded store.
-    fn reader_session(
-        &self,
-        log_store: Arc<dyn ObjectStore>,
-        path: &str,
-        tail: bool,
-    ) -> Arc<dyn ReaderSession>;
+    /// A fresh reader session including the durable log for one read-only open.
+    fn reader_session(&self, log_store: Arc<dyn ObjectStore>, path: &str)
+    -> Arc<dyn ReaderSession>;
 
     /// The commit store over a writer the catalog opened with `session`'s
     /// plug: a holder, into which every slot folds.
@@ -397,11 +387,6 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
     *uuid::Uuid::new_v4().as_bytes()
 }
 
-/// How long a follower waits to be served a slot it knows landed before its
-/// write returns anyway; the slot is durable either way.
-pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub(crate) mod asked;
 #[cfg(test)]
 pub(crate) mod test_log;
 #[cfg(test)]

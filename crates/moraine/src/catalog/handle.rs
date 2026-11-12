@@ -148,8 +148,7 @@ pub(crate) enum Store {
     },
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
-    /// A committer over a tailing reader: reads what the log has served it
-    /// and commits through the log alone.
+    /// A log committer whose transactions acquire independent fixed views.
     Committer {
         reader: Arc<DbReader>,
         commit_log: LogCommitter,
@@ -276,17 +275,6 @@ pub struct CatalogOptions {
     /// the process. `None` (the default) falls back to the registered
     /// provider, and to the store's own log when none is registered.
     pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
-    /// Whether a read-only open over a commit log tails the log, seeing a
-    /// commit once its slot lands rather than once a fold has carried it
-    /// into the store, at a listing per
-    /// [`reader_poll_interval`](Self::reader_poll_interval). A committer
-    /// always tails, and refreshes rather than polls. Defaults to
-    /// `false`.
-    pub commit_log_tail: bool,
-    /// How long a commit waits between refreshes while its slot is not
-    /// yet served. A commit's wait is round trips, not ticks, so this
-    /// only paces them. Defaults to 50ms.
-    pub commit_log_poll_interval: Duration,
     /// How many slots a process holding the store folds before it writes
     /// its memtable out and truncates the log below the replay point. A
     /// cold open replays at most this many slots. Defaults to 256.
@@ -372,27 +360,12 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
-    /// How stale a **read-only** catalog may be: a transaction keeps the
-    /// writer's publication its predecessor pinned for up to this long
-    /// before listing for a newer one, and the catalog's own reader polls
-    /// the manifest at this interval.
-    ///
-    /// Nothing pushes a commit to a reader, so a read-only catalog can be
-    /// one interval behind the writer. Shorter means fresher reads and more
-    /// (on S3, billed) manifest reads; zero lists on every transaction.
-    /// Defaults to 10 seconds.
-    ///
-    /// A committer's reads do not wait on it at all: each refreshes the
-    /// reader and is served what the refresh found, and each transaction
-    /// lists for the newest publication, so the log is read when a read
-    /// asks and never on a clock. Its reader still polls at
-    /// this interval, to keep the checkpoint it holds from expiring —
-    /// longer is cheaper, and must stay well inside SlateDB's checkpoint
-    /// lifetime.
-    ///
-    /// Ignored by a [`Catalog::open`] without a commit log, which reads
-    /// its own writes, and by a catalog pinned to a
-    /// [`checkpoint`](Self::checkpoint), which polls for nothing.
+    /// Native read-only publication reuse and base-reader manifest polling;
+    /// defaults to 10 seconds. Zero discovers a publication on each native
+    /// transaction. Logged transactions always capture fresh fixed views;
+    /// this interval only advances their managed base reader and must remain
+    /// inside SlateDB's checkpoint lifetime. Explicit checkpoint attaches
+    /// and native writers do not use it.
     pub reader_poll_interval: Duration,
     /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
     /// as reported by [`Catalog::create_checkpoint`].
@@ -413,8 +386,6 @@ impl Default for CatalogOptions {
             flush_on_commit: false,
             wal_store: None,
             commit_log: None,
-            commit_log_tail: false,
-            commit_log_poll_interval: Duration::from_millis(50),
             commit_log_flush_slots: 256,
             commit_log_fold_poll: Duration::from_secs(2),
             commit_log_retention: Duration::from_mins(5),
@@ -613,8 +584,6 @@ fn catalog_hooks(
             flush_every: options.commit_log_flush_slots.max(1),
             retention: options.commit_log_retention,
             poll: options.commit_log_fold_poll,
-            catch_up: crate::commit_log::READER_CATCHUP_TIMEOUT,
-            refresh_backoff: options.commit_log_poll_interval,
         },
     }
 }
@@ -648,8 +617,8 @@ fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::Commit
 /// How long a scope may keep the publication its predecessor listed. A
 /// committer lists on every transaction, so each reads what the one before
 /// it committed; a read-only catalog keeps it for the poll interval.
-fn publication_reuse(options: &CatalogOptions, refresh_on_read: bool) -> Duration {
-    if refresh_on_read {
+fn publication_reuse(options: &CatalogOptions, fresh_publication: bool) -> Duration {
+    if fresh_publication {
         Duration::ZERO
     } else {
         options.reader_poll_interval
@@ -660,13 +629,12 @@ fn publication_reuse(options: &CatalogOptions, refresh_on_read: bool) -> Duratio
 fn reader_session(
     object_store: Arc<dyn ObjectStore>,
     options: &CatalogOptions,
-    tail: bool,
 ) -> Option<Arc<dyn crate::ReaderSession>> {
     commit_log_provider(options).map(|provider| {
         let log_store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store(options))
             .log_store();
-        provider.reader_session(log_store, &options.path, tail)
+        provider.reader_session(log_store, &options.path)
     })
 }
 
@@ -920,10 +888,6 @@ pub struct ReadOnlyCatalog {
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
-    /// What a read-only reader over a commit log lists it for: a read
-    /// asks, and the next poll lists. `None` where there is no log to
-    /// list, or where reads refresh instead.
-    asked: Option<Arc<crate::commit_log::asked::Asked>>,
 }
 
 impl std::fmt::Debug for ReadOnlyCatalog {
@@ -1334,9 +1298,6 @@ impl ReadOnlyCatalog {
                 ReadSession::Tx(db.begin(IsolationLevel::Snapshot).map_err(Error::from)?)
             }
             Store::Reader(reader) | Store::Committer { reader, .. } => {
-                if let Some(asked) = &self.asked {
-                    asked.ask();
-                }
                 ReadSession::Reader(reader.clone())
             }
         };
@@ -1543,8 +1504,7 @@ impl Catalog {
                     .to_string(),
             ));
         }
-        // On a commit log every read-write open is a committer, which takes
-        // the store itself when the tail is long or the log unadopted.
+        // A logged open takes a writer only if the log needs adoption.
         if let Some(provider) = commit_log_provider(&options) {
             return Self::open_as_committer(object_store, options, provider).await;
         }
@@ -1627,15 +1587,12 @@ impl Catalog {
                     None,
                 )),
                 projections,
-                asked: None,
             },
         })
     }
 
-    /// Opens the catalog as a commit-log committer: a tailing reader that
-    /// polls at the commit-log poll interval, with every commit a slot. A
-    /// log nothing has adopted is adopted first, by a store taken and let
-    /// go.
+    /// Opens an independent log committer with fixed transaction views.
+    /// An unadopted log first opens and closes a writer for adoption.
     async fn open_as_committer(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
@@ -1665,16 +1622,11 @@ impl Catalog {
             adopted?;
         }
 
-        // Every read refreshes, so the reader's poll is no part of
-        // freshness: it runs only to keep its checkpoint from expiring,
-        // at whatever interval the caller set.
-        let session = provider.reader_session(Arc::clone(&log_store), &options.path, true);
+        // Each transaction acquires its own fixed view from the provider.
+        let session = provider.reader_session(Arc::clone(&log_store), &options.path);
         let mut inner = Self::open_reader_catalog(
             Arc::clone(&object_store),
-            CatalogOptions {
-                commit_log_tail: true,
-                ..options.clone()
-            },
+            options.clone(),
             true,
             Some(Arc::clone(&session)),
         )
@@ -2013,20 +1965,15 @@ impl Catalog {
         Self::open_reader_catalog(object_store, options, false, None).await
     }
 
-    /// [`open_read_only`](Self::open_read_only), refreshing the reader
-    /// before every read when `refresh_on_read` — what a committer
-    /// wants, where a peer's slot is worth a round trip. A reader
-    /// without it follows its own poll.
+    /// Opens the base reader and transaction-scope factory. Native readers
+    /// may reuse a publication; logged transactions always capture a fresh
+    /// view.
     async fn open_reader_catalog(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
-        refresh_on_read: bool,
+        fresh_publication: bool,
         session: Option<Arc<dyn crate::ReaderSession>>,
     ) -> Result<ReadOnlyCatalog> {
-        // A read-only tail is listed for a read; a committer refreshes
-        // instead, and a store with no log has nothing to list.
-        let asked = (!refresh_on_read && options.commit_log_tail && options.commit_log.is_some())
-            .then(|| Arc::new(crate::commit_log::asked::Asked::default()));
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let started = Instant::now();
         let located = Arc::clone(&object_store);
@@ -2041,9 +1988,7 @@ impl Catalog {
             .map(|wal| Arc::clone(wal.object_store()));
         // A reader over a log is built over a session: the committer's own,
         // or one minted here for a read-only open.
-        let session = session.or_else(|| {
-            reader_session(Arc::clone(&object_store), &options, options.commit_log_tail)
-        });
+        let session = session.or_else(|| reader_session(Arc::clone(&object_store), &options));
         let store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store.clone())
             .reader_session(session.clone())
@@ -2063,7 +2008,6 @@ impl Catalog {
             .cache_compaction_puts(options.cache_compaction_puts)
             .external_compaction(external_compaction(&options))
             .poll_interval(options.reader_poll_interval)
-            .read_asked(asked.clone())
             .checkpoint(checkpoint);
 
         let (reader, cache, format) = commit::open_reader_initialized(
@@ -2088,7 +2032,7 @@ impl Catalog {
             located.clone(),
             options.clone(),
             reader.clone(),
-            publication_reuse(&options, refresh_on_read),
+            publication_reuse(&options, fresh_publication),
         )));
         Ok(ReadOnlyCatalog {
             pinned: None,
@@ -2123,7 +2067,6 @@ impl Catalog {
                 None,
             )),
             projections,
-            asked,
         })
     }
 

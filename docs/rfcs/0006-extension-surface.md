@@ -94,8 +94,6 @@ live with the owning document.
 | `CACHE_PUTS` | `CatalogOptions::cache_puts` | `true` |
 | `CACHE_COMPACTION_PUTS` | `CatalogOptions::cache_compaction_puts` | `true` |
 | `CACHE_PRELOAD` | `CatalogOptions::cache_preload`, one of `none`, `off`, `l0`, `all` | `l0` |
-| <!-- site:omit -->`COMMIT_LOG_TAIL` | `CatalogOptions::commit_log_tail`, see [the commit-log seam](0011-commit-log-seam.md) | `false` |
-| `COMMIT_LOG_POLL_INTERVAL_MS` | `CatalogOptions::commit_log_poll_interval` | 50 ms  <!-- /site:omit -->|
 | `MAINTENANCE_INTERVAL`, `MAINTENANCE_BATCH_SIZE`, `MAINTENANCE_TABLE_BATCHES`, `MAINTENANCE_PROGRESS`, `MAINTENANCE_SWEEP_INDEXES` | shim `MaintenanceConfig`, see [maintenance](0010-maintenance.md) | pass disabled |
 | `MAINTENANCE_COMPACT_STORE`, `MAINTENANCE_COMPACT_STORE_SUBSPACE`, `MAINTENANCE_COMPACT_STORE_TIMEOUT` | shim `MaintenanceConfig`, subspace validated at attach | off |
 | `MAINTENANCE_<step>`, `MAINTENANCE_<step>_<parameter>` | shim `MaintenanceConfig`, steps `expire_snapshots`, `flush_inlined_data`, `merge_adjacent_files`, `rewrite_data_files`, `cleanup_old_files`, `delete_orphaned_files` | off |

@@ -5246,7 +5246,6 @@ fn log_options(
 ) -> crate::catalog::CatalogOptions {
     crate::catalog::CatalogOptions {
         commit_log: Some(provider),
-        commit_log_poll_interval: std::time::Duration::from_millis(10),
         commit_log_fold_poll: std::time::Duration::from_millis(10),
         reader_poll_interval: std::time::Duration::from_millis(10),
         ..crate::catalog::CatalogOptions::default()
