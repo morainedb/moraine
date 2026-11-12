@@ -58,6 +58,8 @@ Rust embedders.
   attach, options, functions, the C ABI, runtime
 - [Maintenance](0010-maintenance.md) — expiry and compaction translation,
   the scheduled pass, sweeps
+- [Data root relocation](0013-data-root-relocation.md) — relocating a copied
+  catalog to a new data root
 
 ### Internal
 

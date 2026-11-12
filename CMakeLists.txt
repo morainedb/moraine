@@ -54,6 +54,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/metadata_table_specs.cpp
     ${CPP_DIR}/migrate.cpp
     ${CPP_DIR}/move_wal.cpp
+    ${CPP_DIR}/rewrite_data_path.cpp
     ${CPP_DIR}/optimizer.cpp
     ${CPP_DIR}/optimizer_predicates.cpp
     ${CPP_DIR}/raise_catalog_version.cpp

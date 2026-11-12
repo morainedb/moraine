@@ -82,6 +82,8 @@ what is done and what is next. Questions and ideas go to
   attach option and function.
 - [Operating manual](https://morainedb.github.io/guide/operating/) covers
   retention, maintenance, encryption, backups, and upgrades.
+- [Relocating a copied catalog](docs/rfcs/0013-data-root-relocation.md) explains
+  how to rewrite the data root after copying a bucket.
 - [Compared with other catalogs](https://morainedb.github.io/guide/comparison/)
   sets Moraine beside the DuckDB file, Postgres, Quack, and Iceberg-style
   catalogs.

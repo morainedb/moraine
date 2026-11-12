@@ -32,6 +32,7 @@ void RegisterMoraineMetadataManager();
 void RegisterMoraineRaiseCatalogVersionFunction(duckdb::ExtensionLoader &loader);
 // Defined in move_wal.cpp.
 void RegisterMoraineMoveWalFunction(duckdb::ExtensionLoader &loader);
+void RegisterMoraineRewriteDataPathFunction(duckdb::ExtensionLoader &loader);
 // Defined in checkpoints.cpp.
 void RegisterMoraineCheckpointFunctions(duckdb::ExtensionLoader &loader);
 } // namespace moraine_duckdb
@@ -86,6 +87,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	moraine_duckdb::RegisterMoraineFaultFunctions(loader);
 	moraine_duckdb::RegisterMoraineRaiseCatalogVersionFunction(loader);
 	moraine_duckdb::RegisterMoraineMoveWalFunction(loader);
+	moraine_duckdb::RegisterMoraineRewriteDataPathFunction(loader);
 	moraine_duckdb::RegisterMoraineCheckpointFunctions(loader);
 }
 
