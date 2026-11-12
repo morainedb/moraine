@@ -182,7 +182,7 @@ itself, so they are `Catalog` methods or associated functions.
 | Operation | Role |
 |---|---|
 | `commit`, `commit_group` | The closure commit path. |
-| `set_option`, `adopt_data_path` | One-option commits that load no unrelated entities. |
+| `set_option`, `adopt_data_path`, `rewrite_data_path` | One-option commits that load no unrelated entities. |
 | `create_index`, `drop_index`, `create_index_staged`, `create_index_staged_with_maintenance`, `repair_deferred_indexes`, `certify_index` | Index builds reading data files through a `DataStore`, over one or many commits. |
 | `maintain(MaintenanceRequest)`, `record_maintenance_pass`, `reclaim_index_entries`, `reregister_stranded_inline_schemas` | A bounded maintenance pass that mints no snapshot, and its pieces for a host that sequences them itself. |
 | `compact_store(CompactStoreRequest)` | Merges a subspace's sorted runs into one. Needs the writer. |

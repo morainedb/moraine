@@ -40,6 +40,7 @@ mod metadata_paging;
 mod migrate;
 mod move_wal;
 mod partitioning;
+mod rewrite_data_path;
 mod time_travel;
 mod types;
 mod wire_contract;

@@ -98,3 +98,63 @@ async fn scoped_mutations_ignore_unrelated_statistics_and_preserve_options() {
     ));
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn rewrite_data_path_checks_old_root_and_persists_new_root() {
+    let store = Arc::new(InMemory::new());
+    let options = CatalogOptions {
+        data_path: Some("s3://source/data/".into()),
+        ..Default::default()
+    };
+    let catalog = Catalog::open(store.clone(), options).await.unwrap();
+    assert!(
+        catalog
+            .rewrite_data_path("s3://wrong/data", "s3://copy/data")
+            .await
+            .is_err()
+    );
+    assert!(
+        catalog
+            .rewrite_data_path("s3://source/data", "")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        catalog.materialized().await.unwrap().data_path().as_deref(),
+        Some("s3://source/data/")
+    );
+    catalog
+        .rewrite_data_path("s3://source/data", "s3://copy/data/")
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+    let catalog = Catalog::open(store, CatalogOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.materialized().await.unwrap().data_path().as_deref(),
+        Some("s3://copy/data/")
+    );
+    assert!(
+        catalog
+            .rewrite_data_path("s3://source/data", "s3://other/data")
+            .await
+            .is_err()
+    );
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rewrite_data_path_requires_a_recorded_root() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        catalog
+            .rewrite_data_path("s3://source/data", "s3://copy/data")
+            .await,
+        Err(Error::Constraint(_))
+    ));
+    assert_eq!(catalog.materialized().await.unwrap().data_path(), None);
+    catalog.close().await.unwrap();
+}

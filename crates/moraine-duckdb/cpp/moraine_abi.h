@@ -2273,6 +2273,19 @@ struct MoraineCatalogHandle *moraine_snapshot_read_handle(struct MoraineSnapshot
 // `snapshot` must be null or live; `out`, when non-null, must be writable.
 bool moraine_snapshot_read_revision(struct MoraineSnapshotHandle *snapshot, uint64_t *out);
 
+// Rewrites a detached catalog's recorded data root after its data was copied.
+//
+// # Safety
+// The three path arguments must be valid NUL-terminated strings. `s3` and
+// `wal`, if non-null, must satisfy their types' borrowing contracts. `err`,
+// if non-null, must be writable for this call.
+int32_t moraine_rewrite_data_path_store(const char *path,
+                                        const char *old_root,
+                                        const char *new_root,
+                                        const struct MoraineS3Config *s3,
+                                        const struct MoraineWalStore *wal,
+                                        struct MoraineError *err);
+
 // Opens a projected selective scan; data batches are read by
 // `moraine_row_scan_next_arrow`.
 //
