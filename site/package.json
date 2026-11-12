@@ -5,7 +5,8 @@
   "scripts": {
     "sync-rfcs": "node scripts/sync-rfcs.mjs",
     "sync-releases": "node scripts/sync-releases.mjs",
-    "sync": "npm run sync-rfcs && npm run sync-releases",
+    "sync-extension-repository": "node scripts/sync-extension-repository.mjs",
+    "sync": "npm run sync-rfcs && npm run sync-releases && npm run sync-extension-repository",
     "test": "node --test scripts/*.test.mjs",
     "dev": "npm run sync && astro dev",
     "start": "npm run dev",

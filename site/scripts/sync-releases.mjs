@@ -210,10 +210,11 @@ function compatibilityTable(rows) {
   ].join('\n');
 }
 
-const preamble = `Download the extension for your DuckDB version and platform below.
-Start DuckDB with \`-unsigned\` to load it; see
-[Getting started](/guide/getting-started/) for instructions. Release notes
-come from the [changelog](https://github.com/morainedb/moraine/blob/main/CHANGELOG.md).`;
+const preamble = `The newest release also installs signed through Moraine's extension
+repository; see [Getting started](/guide/getting-started/#install-the-extension).
+The builds below are unsigned: start DuckDB with \`-unsigned\` to load one.
+Release notes come from the
+[changelog](https://github.com/morainedb/moraine/blob/main/CHANGELOG.md).`;
 
 export function renderReleases(entries, downloads, compatibility = []) {
   const sections = entries.map(({ version, date, compareUrl, body }) => {

@@ -11,7 +11,8 @@ exclude = [
   "site/dist",
   "site/.astro",
   # Generated at build time or by release-plz.
-  "site/src/content/docs/rfcs",
+  "site/src/content/docs/rfcs/index.md",
+  "site/src/content/docs/rfcs/[0-9]*.md",
   "site/src/content/docs/releases.md",
   "site/src/content/docs/roadmap.md",
   "site/src/content/docs/benchmarks.md",

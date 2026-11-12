@@ -21,8 +21,11 @@ pnpm-debug.log*
 .DS_Store
 
 # synced from docs/rfcs/, ROADMAP.md, and docs/benchmarks.md at build time
-src/content/docs/rfcs/
+src/content/docs/rfcs/*
+!src/content/docs/rfcs/architecture.md
 src/content/docs/roadmap.md
 src/content/docs/benchmarks.md
 # synced from CHANGELOG.md and GitHub releases at build time
 src/content/docs/releases.md
+# signed builds downloaded from the newest extension release at build time
+public/ext/v*/
