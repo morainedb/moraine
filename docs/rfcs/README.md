@@ -55,11 +55,9 @@ Rust embedders.
 ### Integration and operation
 
 - [Extension surface](0006-extension-surface.md) — the DuckDB extension:
-  attach, options, functions, the C ABI, runtime
+  attach, options, functions, relocating a copied lake, the C ABI, runtime
 - [Maintenance](0010-maintenance.md) — expiry and compaction translation,
   the scheduled pass, sweeps
-- [Data root relocation](0013-data-root-relocation.md) — relocating a copied
-  catalog to a new data root
 
 ### Internal
 

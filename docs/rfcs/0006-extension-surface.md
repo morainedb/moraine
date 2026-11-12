@@ -235,6 +235,7 @@ path as its first argument, as noted.
 | `moraine_checkpoints` | store path | lists checkpoints with `manifest_id`, `created_at`, `expires_at` | [commit protocol](0003-commit-protocol.md) |
 | `moraine_delete_checkpoint` | store path, id | releases one checkpoint | [commit protocol](0003-commit-protocol.md) |
 | `moraine_move_wal` | store path, `wal_path` | moves a lake's write-ahead log store, lake attached nowhere | [commit protocol](0003-commit-protocol.md) |
+| `moraine_rewrite_data_path` | store path, old root, new root, optional `wal_path` | points a copied lake at its new data root, lake attached nowhere | this document |
 | `moraine_migrate` | store path | runs a structural format migration, lake attached nowhere | [storage format](0001-storage-format.md) |
 | `moraine_raise_format` | lake | raises the store's structural format version | [storage format](0001-storage-format.md) |
 | `moraine_raise_catalog_version` | lake, `dry_run`, `confirm` | raises the DuckLake catalog format from 1.0 to 1.1 | [feature mapping](0005-ducklake-feature-mapping.md) |
@@ -259,6 +260,51 @@ path as its first argument, as noted.
 `RegisterMoraineIndexDdl`. The scan operators `moraine_metadata_scan`,
 `moraine_inline_data_scan`, `moraine_summary_scan`, and `moraine_scan` appear in
 query plans and are bound to table entries. They are not callable by name.
+
+## Relocating a copied lake
+
+A copied lake retains its original global `data_path`, so the destination
+refuses an attach that names the destination root. The rewrite changes that
+root explicitly, after the operator has copied the data and stopped all access
+to the destination catalog:
+
+```sql
+CALL moraine_rewrite_data_path(
+    's3://destination/catalog',
+    's3://source/data/',
+    's3://destination/data/'
+);
+```
+
+The function opens the catalog independently and closes it on either success
+or failure. It requires autocommit and a detached catalog; opening the writer
+fences any other writer, as the other offline commands do. An optional
+`wal_path` names the catalog's current separate WAL store and resolves its own
+credentials. Catalog credentials come from DuckDB secrets or the environment
+fallback. Data credentials are unnecessary, because the command touches
+metadata only.
+
+A read-only open first rejects a missing catalog. Before opening a writer, the
+command rejects a destination data root that overlaps the catalog or WAL
+store, and rejects empty paths. The attach path continues to reject mismatched
+roots. The core method is `Catalog::rewrite_data_path` in the
+[public API](0002-public-api.md#catalog-level-operations).
+
+The copy procedure:
+
+1. Stop writers, compactors, garbage collectors, and maintenance before
+   copying catalog objects. Close the source catalog cleanly and keep it
+   quiescent throughout; copying a live bucket is not a backup.
+2. For an independent copy, first use `moraine_move_wal` to bring any
+   separate WAL into the source catalog store, then copy the catalog and data
+   prefixes preserving relative object keys. Two independent copies must never
+   share a separate WAL prefix.
+3. Run the rewrite against the destination catalog, naming its old and new
+   data roots, with destination readers and writers detached.
+4. Attach the destination with the new `DATA_PATH` and `META_DATA_PATH`.
+
+The command does not copy objects, rewrite absolute paths, change WAL
+identity, or turn an arbitrary partial copy into a consistent catalog.
 
 ## Error codes
 

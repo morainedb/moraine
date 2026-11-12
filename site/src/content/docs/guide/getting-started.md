@@ -7,13 +7,25 @@ sidebar:
 
 ## Install the extension
 
-Moraine is not yet in DuckDB's community extension repository, so it loads
-unsigned; `INSTALL moraine FROM community` is on the [roadmap](/roadmap/).
-Each build loads only into the DuckDB version it names, so check
-`SELECT version()`, then take the matching
+Moraine publishes signed builds in its own DuckDB extension repository.
+Register it once, then install and load:
+
+```sql
+SET allow_extension_repositories = 'allowed';
+CREATE EXTENSION REPOSITORY moraine WITH PREFIX 'https://morainedb.github.io/ext';
+INSTALL AND LOAD moraine FROM moraine;
+```
+
+The repository definition and the installed build persist, so later
+sessions need only `LOAD moraine FROM moraine`; the `SET` is required
+again only to install or upgrade. The repository serves the newest release
+for every DuckDB version it was built for, and DuckDB picks the build
+matching its own version.
+
+To load a build by hand instead, take the matching
 `moraine.<duckdb-version>.<platform>.duckdb_extension` from the
-[compatibility table](/releases/#compatibility) on the Releases page. Start
-DuckDB with `-unsigned` and load it:
+[compatibility table](/releases/#compatibility) on the Releases page. It is
+unsigned, so DuckDB must start with unsigned extensions allowed:
 
 ```sh
 duckdb -unsigned
@@ -22,6 +34,9 @@ duckdb -unsigned
 ```sql
 LOAD 'path/to/moraine.v2.0.0.osx_arm64.duckdb_extension';
 ```
+
+A listing in DuckDB's community repository, which needs neither step, is on
+the [roadmap](/roadmap/).
 
 The extension includes DuckLake. You can try it with a local directory
 before configuring object storage.

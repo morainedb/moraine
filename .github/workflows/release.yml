@@ -154,6 +154,7 @@ jobs:
       - name: Publish the ext-v<version> extension release
         uses: ./.github/actions/publish-extension-release
         with:
+          signing_key: ${{ secrets.DUCKDB_EXTENSION_SIGNING_PK }}
           tag: ext-v${{ env.VERSION }}
           target: ${{ github.sha }}
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}

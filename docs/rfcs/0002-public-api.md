@@ -194,6 +194,15 @@ itself, so they are `Catalog` methods or associated functions.
 | `move_wal_store(object_store, options, to)` (associated) | Moves the write-ahead log to another store. Takes the writer. |
 | <!-- site:omit -->`demote(object_store, options)` (associated) | Takes a lake off its commit log.  <!-- /site:omit -->|
 
+`rewrite_data_path(old_root, new_root)` checks the recorded global root,
+ignoring trailing slashes, and replaces it in one scoped option commit,
+returning the committed snapshot id. A missing or mismatched old root and an
+empty root fail without changing metadata. Relative schema, table, data-file,
+and delete-file paths continue to resolve under the global root, in retained
+snapshots too; absolute paths are untouched, imported files outside the root
+included. The method neither copies nor verifies data objects, and the caller
+must quiesce readers and writers, since open handles cache the old root.
+
 [Maintenance](0010-maintenance.md) defines `maintain`, `store_census`, and
 `compact_store`. [Storage format](0001-storage-format.md) defines `migrate`.
 

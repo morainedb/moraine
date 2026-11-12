@@ -80,6 +80,7 @@ jobs:
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       - uses: ./.github/actions/publish-extension-release
         with:
+          signing_key: ${{ secrets.DUCKDB_EXTENSION_SIGNING_PK }}
           tag: ${{ inputs.tag }}
           target: ${{ github.sha }}
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}

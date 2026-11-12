@@ -49,6 +49,7 @@ mod pins;
 mod reader_bench;
 mod release;
 mod s3;
+mod sign;
 
 fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(2).collect();
@@ -73,21 +74,20 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some("stage-release-assets") => release::stage_release_assets(&arguments),
+        Some("sign-release-assets") => sign::sign_release_assets(&arguments),
         Some("validate-release-artifact") => release::validate_release_artifact(&arguments),
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some(other) => {
             bail!(
                 "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
-                 check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
-             version-matrix, \
-                 version-matrix, \
-                 bump-duckdb"
+                 check-patch-pins, check-release-assets, stage-release-assets, sign-release-assets, validate-release-artifact, \
+                 version-matrix, bump-duckdb"
             )
         }
         None => bail!(
             "usage: cargo xtask <task>; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
-             check-patch-pins, check-release-assets, stage-release-assets, validate-release-artifact, \
-             bump-duckdb"
+             check-patch-pins, check-release-assets, stage-release-assets, sign-release-assets, validate-release-artifact, \
+             version-matrix, bump-duckdb"
         ),
     }
 }

@@ -5,7 +5,8 @@
   "scripts": {
     "sync-rfcs": "node scripts/sync-rfcs.mjs",
     "sync-releases": "node scripts/sync-releases.mjs",
-    "sync": "npm run sync-rfcs && npm run sync-releases",
+    "sync-extension-repository": "node scripts/sync-extension-repository.mjs",
+    "sync": "npm run sync-rfcs && npm run sync-releases && npm run sync-extension-repository",
     "test": "node --test scripts/*.test.mjs",
     "dev": "npm run sync && astro dev",
     "start": "npm run dev",
@@ -14,8 +15,8 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.42.9",
-    "astro": "^7.4.7",
+    "@astrojs/starlight": "^0.42.10",
+    "astro": "^7.4.8",
     "sharp": "^0.35.3",
     "starlight-theme-nova": "^0.12.3"
   }
