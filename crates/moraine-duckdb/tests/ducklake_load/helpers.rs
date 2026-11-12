@@ -631,7 +631,10 @@ fn strip_ansi(line: &str) -> String {
             stripped.push(character);
             continue;
         }
-        // A control sequence runs to its final byte, `@` through `~`.
+        // Consume the CSI introducer before looking for its final byte.
+        if chars.next() != Some('[') {
+            continue;
+        }
         for character in chars.by_ref() {
             if ('@'..='~').contains(&character) {
                 break;
@@ -786,4 +789,14 @@ fn csv_rows_keeps_a_row_that_looks_faintly_like_a_record() {
         csv_rows("header\nplain: value\nducklake:moraine:/tmp/lake\n"),
         vec![vec!["plain: value"], vec!["ducklake:moraine:/tmp/lake"]]
     );
+}
+
+#[test]
+fn strip_ansi_consumes_the_csi_introducer_before_parameters() {
+    for sequence in ["\u{1b}[00m", "\u{1b}[90m", "\u{1b}[38;5;240m"] {
+        assert_eq!(
+            strip_ansi(&format!("{sequence}count_star()")),
+            "count_star()"
+        );
+    }
 }
