@@ -273,7 +273,7 @@ The catalog has no client-side encryption. Confidentiality of the SlateDB
 objects relies on the bucket's server-side encryption, so an untrusted catalog
 bucket is unsupported. Inlined rows live inside catalog values and are covered
 only by that catalog-at-rest protection. See the
-[operating manual](https://morainedb.github.io/guide/operating/#encryption) for
+[operating manual](https://morainedb.com/guide/operating/#encryption) for
 key policy and bucket configuration.
 
 ## Change data feed

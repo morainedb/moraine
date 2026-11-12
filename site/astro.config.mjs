@@ -4,7 +4,7 @@ import starlight from '@astrojs/starlight';
 import starlightThemeNova from 'starlight-theme-nova';
 
 export default defineConfig({
-	site: 'https://morainedb.github.io',
+	site: 'https://morainedb.com',
 	// The architecture page moved from the guide into the design section.
 	redirects: { '/guide/architecture/': '/rfcs/architecture/' },
 	integrations: [

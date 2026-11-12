@@ -2,7 +2,7 @@
 
 The project website — [Astro](https://astro.build) +
 [Starlight](https://starlight.astro.build), deployed to GitHub Pages at
-<https://morainedb.github.io/> by `.github/workflows/site.yml`, which
+<https://morainedb.com/> by `.github/workflows/site.yml`, which
 pushes the built site to the `morainedb/morainedb.github.io` repository
 (deploy key in the `SITE_DEPLOY_KEY` secret).
 

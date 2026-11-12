@@ -12,7 +12,7 @@ Register it once, then install and load:
 
 ```sql
 SET allow_extension_repositories = 'allowed';
-CREATE EXTENSION REPOSITORY moraine WITH PREFIX 'https://morainedb.github.io/ext';
+CREATE EXTENSION REPOSITORY moraine WITH PREFIX 'https://morainedb.com/ext';
 INSTALL AND LOAD moraine FROM moraine;
 ```
 
