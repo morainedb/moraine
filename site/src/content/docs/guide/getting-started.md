@@ -23,9 +23,8 @@ duckdb -unsigned
 LOAD 'path/to/moraine.v2.0.0.osx_arm64.duckdb_extension';
 ```
 
-DuckLake is bundled with the extension; there is nothing else to install.
-No AWS account is needed to try it: the next section uses a local
-directory.
+The extension includes DuckLake. You can try it with a local directory
+before configuring object storage.
 
 ## Attach a local lake
 
@@ -73,15 +72,15 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_ONLY);
 
 A second read-write attach does not fail. SlateDB gives the writer role to
 the newest writer, and the previous writer's next commit fails with a
-fencing error. Nothing is corrupted, but the first writer must re-attach.
+fencing error. Stop the second writer before re-attaching the first.
 A deployment that needs concurrent commits funnels them through one
 writer process, where they share a flush.
 
 A read-only attach follows the writer by pinning the checkpoints the writer
 publishes, and writes nothing to the bucket. It looks for new commits at most
-every `READER_POLL_INTERVAL_MS`, ten seconds by default, which is a billed
-request each time. A reader that should never move pins a checkpoint created
-ahead of time; see `CHECKPOINT` in
+every `META_READER_POLL_INTERVAL_MS`, ten seconds by default, which is a billed
+request each time. To keep reading the same snapshot, attach to a checkpoint
+created ahead of time; see `META_CHECKPOINT` in
 [Configuration](../configuration/#read-only-attaches).
 
 ## Index a column
@@ -101,7 +100,7 @@ FROM moraine_indexes('lake', 'main', 'events');
 ```
 
 Equality, `IN`, range, and `IS NULL` predicates probe the index instead of
-scanning; nothing in the query changes. A unique index rejects a duplicate
+scanning, using the same SQL. A unique index rejects a duplicate
 even from concurrent transactions, and an index checked with
 `moraine_index_verify` lets `DELETE … WHERE id = 1` skip the scan. Run
 index DDL on the writer, outside an explicit transaction.
@@ -124,8 +123,8 @@ and limits.
 
 ## Next
 
-- [Configuration](../configuration/) lists every attach option, with
-  sections on commit latency and caching.
+- [Configuration](../configuration/) covers process settings, attach options,
+  commit latency, and caching.
 - [Operating manual](../operating/) covers retention, maintenance,
   encryption, backups, and upgrades.
 - [Compared with other catalogs](../comparison/) sets Moraine beside the

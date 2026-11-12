@@ -27,7 +27,6 @@ export default defineConfig({
 						{ slug: 'guide/configuration' },
 						{ slug: 'guide/operating' },
 						{ slug: 'guide/comparison' },
-						{ slug: 'guide/testing' },
 						{ slug: 'guide/architecture' },
 					],
 				},

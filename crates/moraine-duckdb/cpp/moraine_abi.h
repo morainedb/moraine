@@ -220,6 +220,25 @@ typedef struct MoraineMigrationReport {
   char *units_run;
 } MoraineMigrationReport;
 
+// The process's memory budgets in bytes; zero leaves a budget to its
+// environment variable or default. Mirrors `moraine::MemoryBudgets`.
+typedef struct MoraineMemoryBudgets {
+  // Live working allocations, process-wide.
+  uint64_t working;
+  // Rows staged by one transaction.
+  uint64_t staging;
+  // One commit's batch.
+  uint64_t commit;
+  // SlateDB's unflushed writes per writer.
+  uint64_t store;
+  // One file's row-summary build.
+  uint64_t summary;
+  // The host's memory, which enables the pre-attach host check.
+  uint64_t host;
+  // Memory left unclaimed on the host.
+  uint64_t host_headroom;
+} MoraineMemoryBudgets;
+
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -1653,6 +1672,15 @@ int32_t moraine_catalog_encrypted(struct MoraineCatalogHandle *handle,
 // [`moraine_attach_with_wal_store`] and not yet passed to `moraine_detach`.
 void moraine_detach(struct MoraineCatalogHandle *handle);
 
+// Sets the process's memory budgets. The first call wins, so a host calls
+// it before its first attach; later calls change nothing.
+//
+// # Safety
+// `budgets` must be null or point to a valid [`MoraineMemoryBudgets`] for
+// the duration of this call. `err` must be null or a writable error slot.
+int32_t moraine_configure_memory(const struct MoraineMemoryBudgets *budgets,
+                                 struct MoraineError *err);
+
 // Validates configured host headroom before opening a store. The host must
 // account for other database instances and stores in its headroom allowance.
 //
@@ -2244,6 +2272,19 @@ struct MoraineCatalogHandle *moraine_snapshot_read_handle(struct MoraineSnapshot
 // # Safety
 // `snapshot` must be null or live; `out`, when non-null, must be writable.
 bool moraine_snapshot_read_revision(struct MoraineSnapshotHandle *snapshot, uint64_t *out);
+
+// Rewrites a detached catalog's recorded data root after its data was copied.
+//
+// # Safety
+// The three path arguments must be valid NUL-terminated strings. `s3` and
+// `wal`, if non-null, must satisfy their types' borrowing contracts. `err`,
+// if non-null, must be writable for this call.
+int32_t moraine_rewrite_data_path_store(const char *path,
+                                        const char *old_root,
+                                        const char *new_root,
+                                        const struct MoraineS3Config *s3,
+                                        const struct MoraineWalStore *wal,
+                                        struct MoraineError *err);
 
 // Opens a projected selective scan; data batches are read by
 // `moraine_row_scan_next_arrow`.

@@ -1,18 +1,11 @@
 # Roadmap
 
-Moraine is at 0.8, built for DuckDB 2.0.0. Everything listed as done runs
-against real DuckLake SQL in the end-to-end suite. Unchecked items are gaps,
-not configuration.
+Moraine 0.8 supports DuckDB 2.0.0.
 
 ## Next
 
 - [ ] Signed distribution through DuckDB's community extension repository,
   so `INSTALL moraine FROM community` works without `-unsigned`.
-- [ ] Publishing to crates.io again. Held while the workspace patches
-  SlateDB; a registry build would resolve the published SlateDB, which lacks
-  the reader refresh Moraine needs. Tags, the changelog, and the extension
-  binaries are unaffected, and 0.7.0 stays the newest version on the registry
-  until the patch ships upstream.
 - [ ] Online index rebuild. Today a rebuild is `DROP INDEX` then
   `CREATE INDEX`, and the index serves neither lookups nor uniqueness in
   between.
@@ -68,14 +61,14 @@ not configuration.
   checkpoint-pinned readers for strictly read-only credentials.
 - [x] Query interruption: Ctrl-C aborts a blocked read, and a submitted
   commit completes and reports its outcome.
-- [x] Bundled, patched DuckLake, so one `LOAD` is the whole setup.
+- [x] DuckLake bundled with the extension and loaded by the same `LOAD` command.
 
 ### Operations
 
 - [x] DuckLake's compaction, rewrite, snapshot expiry, and file cleanup, with
   row ids and pre-operation time travel preserved; a scheduled in-writer
-  maintenance pass that runs them in order and then reclaims what only
-  Moraine can see ([maintenance](docs/rfcs/0010-maintenance.md)).
+  maintenance pass that also removes orphaned index entries, statistics,
+  inline rows, and row summaries ([maintenance](docs/rfcs/0010-maintenance.md)).
 - [x] Explicit, resumable, one-way on-disk format migration; the DuckLake
   catalog version raised on request.
 - [x] Crash recovery: every state-changing path is one atomic batch or a
@@ -95,7 +88,7 @@ not configuration.
 - [x] Commit-served projections and shared commit preparation, so commit
   latency does not grow with snapshot history.
 - [x] Working-memory budgets per process, transaction, commit, and summary
-  build, refusing instead of growing.
+  build. Operations fail when they exceed their budget.
 
 <!-- site:omit -->
 ### Multi-process writers
@@ -121,6 +114,9 @@ stays complete on the single-writer path without it.
 
 ### Hardening and release
 
+- [x] Re-enable crates.io publishing. Moraine uses published SlateDB 0.18.1
+  without a workspace patch. The next release publishes the crate after CI
+  and extension validation pass.
 - [x] Tests against real object storage; arbitrary-bytes decode proptests
   for every store codec; fuzzing of codecs, the commit read path, and crash
   recovery.

@@ -133,8 +133,8 @@ Options are last-write-wins, matching DuckLake.
 Name collisions are invisible to the set comparison. Two commits creating
 `orders` in one schema allocate disjoint table ids and classify benign.
 Uniqueness is enforced by re-validation on retry: the verb path re-runs the
-closure against the new head and returns `Error::AlreadyExists`. A mechanical
-re-stamp of the staged records without re-validation is refused as a design.
+closure against the new head and returns `Error::AlreadyExists`. Staged records
+must be re-validated before their snapshot ids are updated.
 
 ## Retry and the error contract
 
@@ -200,8 +200,7 @@ bump, matching DuckLake. On the staged-row path DuckLake computes
 
 ## Entry paths
 
-Both paths land through one function, so the durable write, the head-race
-classification, and the projection bookkeeping exist once. They differ in what
+Both entry paths use the same commit function. They differ in what
 a retry re-runs.
 
 ### Verb path
@@ -314,7 +313,6 @@ A commit returns success only after two waits:
 2. Checkpoint publication. The writer's `Publisher` creates a
    `CheckpointScope::Durable` checkpoint named `moraine-read-head-v1` covering
    the handle's sequence. Publication must finish before success is reported.
-   Requesting it is insufficient.
 
 Publication is coalesced: one checkpoint acknowledges every commit whose
 sequence it covers. If publication fails after the write became durable, the
@@ -399,8 +397,8 @@ open returns, so the catalog store carries the stamp and the name from the
 moment the catalog exists. Otherwise an open handed the wrong store would find
 no catalog and bootstrap a second one over the first.
 
-`Catalog::move_wal_store` takes a catalog nothing holds and moves its log in
-two opens, returning a `WalStoreMove`:
+`Catalog::move_wal_store` requires the catalog to be detached from every
+process. It moves the log in two opens and returns a `WalStoreMove`:
 
 1. Open the writer against the recorded log store, refusing any other, and
    write the memtable out as a sorted-string table. The old log then holds

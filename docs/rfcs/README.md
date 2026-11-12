@@ -49,6 +49,8 @@ Rust embedders.
   revisions, the block cache, row summaries, working memory
 - [Crash recovery](0008-crash-recovery.md) — what must hold after a
   process dies mid-operation
+- [Testing](0012-testing.md) — the guarantees under test, how crashes and
+  fences are staged, fuzzing, the suite against real DuckDB
 
 ### Integration and operation
 
@@ -56,6 +58,8 @@ Rust embedders.
   attach, options, functions, the C ABI, runtime
 - [Maintenance](0010-maintenance.md) — expiry and compaction translation,
   the scheduled pass, sweeps
+- [Data root relocation](0013-data-root-relocation.md) — relocating a copied
+  catalog to a new data root
 
 ### Internal
 

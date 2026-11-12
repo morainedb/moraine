@@ -329,6 +329,79 @@ fn ducklake_attach_cache_options_are_applied() {
     );
 }
 
+/// `SET moraine_cache_dir` and `moraine_cache_size` size the cache the
+/// first attach opens, as the attach options do.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn settings_size_the_cache_the_first_attach_opens() {
+    let dir = TempDir::new("cache-setting-store");
+    let data_dir = TempDir::new("cache-setting-data");
+    let cache_dir = TempDir::new("cache-setting-cache");
+
+    let session = |sql: &str| {
+        run_unattached(&format!(
+            "SET moraine_cache_dir = '{}'; SET moraine_cache_size = '64MB'; \
+             ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}', META_CACHE_PRELOAD 'all'); {sql}",
+            cache_dir.path().display(),
+            dir.path().display(),
+            data_dir.path().display(),
+        ))
+    };
+    assert_session_ok(
+        session("CREATE TABLE lake.main.t(id BIGINT); INSERT INTO lake.main.t VALUES (1), (2);"),
+        "duckdb CLI",
+        "cache settings",
+    );
+    let stdout = assert_session_ok(
+        session("SELECT count(*) FROM lake.main.t;"),
+        "duckdb CLI",
+        "cache settings",
+    );
+    // Each SET leaves a blank line ahead of the result's header.
+    assert_eq!(csv_rows(&stdout).last(), Some(&vec!["2".to_string()]));
+
+    let populated =
+        std::fs::read_dir(cache_dir.path()).is_ok_and(|mut entries| entries.next().is_some());
+    assert!(
+        populated,
+        "expected the disk tier under the directory the setting named: {:?}",
+        cache_dir.path()
+    );
+}
+
+/// `SET moraine_working_memory` caps the process as the environment
+/// variable does, and a refused read leaves the lake readable.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn a_working_memory_setting_caps_the_process() {
+    let store = TempDir::new("working-setting");
+    let data = TempDir::new("working-setting-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.rows (value BIGINT); INSERT INTO lake.main.rows VALUES (7);",
+    );
+
+    let output = run_unattached(&format!(
+        "SET moraine_working_memory = '1 byte'; \
+         ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'); \
+         SELECT * FROM lake.main.rows;",
+        store.path().display(),
+        data.path().display(),
+    ));
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("working memory"), "{error}");
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT * FROM lake.main.rows;"
+        )),
+        vec![vec!["7".to_owned()]]
+    );
+}
+
 /// `META_WAL_PATH` end to end: `ATTACH (META_WAL_PATH '…')` →
 /// DuckLake's `META_` passthrough → this shim's inner attach → the store
 /// SlateDB writes the log to. The log lands there and nowhere else, the

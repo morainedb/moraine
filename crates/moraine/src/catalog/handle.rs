@@ -174,7 +174,7 @@ impl Store {
     pub(crate) fn begin_commit_session(&self) -> Result<CommitSession> {
         match self {
             Self::Writer { db, counters, .. } => {
-                if counters.slatedb_unflushed_bytes() >= crate::memory::store_memory_limit()? {
+                if counters.slatedb_unflushed_bytes() >= crate::memory::store_memory_budget()? {
                     return Err(Error::Constraint("storage memory admission full; wait for the store to flush before retrying".into()));
                 }
                 Ok(CommitSession::folder(

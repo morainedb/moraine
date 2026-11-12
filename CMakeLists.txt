@@ -42,6 +42,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/checkpoints.cpp
     ${CPP_DIR}/census.cpp
     ${CPP_DIR}/fault.cpp
+    ${CPP_DIR}/settings.cpp
     ${CPP_DIR}/summary_scan.cpp
     ${CPP_DIR}/index_functions.cpp
     ${CPP_DIR}/index_ddl.cpp
@@ -53,6 +54,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/metadata_table_specs.cpp
     ${CPP_DIR}/migrate.cpp
     ${CPP_DIR}/move_wal.cpp
+    ${CPP_DIR}/rewrite_data_path.cpp
     ${CPP_DIR}/optimizer.cpp
     ${CPP_DIR}/optimizer_predicates.cpp
     ${CPP_DIR}/raise_catalog_version.cpp

@@ -7,9 +7,9 @@ sidebar:
 
 ## Retention
 
-Expiry and cleanup are DuckLake's, driven by `ducklake_expire_snapshots`
-and `ducklake_cleanup_old_files`. Moraine reclaims what they schedule and
-adds no policy of its own. Two windows are the operator's to size:
+Use `ducklake_expire_snapshots` to remove old snapshots and
+`ducklake_cleanup_old_files` to delete files they no longer reference.
+Configure both retention windows:
 
 - The retention window of `ducklake_expire_snapshots` must exceed the
   longest read or open attach. Expiry deletes snapshot records, not data, so
@@ -46,7 +46,7 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 
 | Option | Meaning |
 |---|---|
-| `META_MAINTENANCE_INTERVAL` | How often the pass runs. Nothing runs without it. |
+| `META_MAINTENANCE_INTERVAL` | Required to enable scheduled maintenance; sets the interval between passes. |
 | `META_MAINTENANCE_<STEP> true` | Enable a step with DuckLake's defaults. |
 | `META_MAINTENANCE_<STEP>_<PARAMETER> value` | Enable the step and pass one of its parameters, e.g. `META_MAINTENANCE_MERGE_ADJACENT_FILES_MAX_COMPACTED_FILES 50`. An `OLDER_THAN` interval is a rolling window, evaluated each pass. |
 | `META_MAINTENANCE_COMPACT_STORE true` | Also run a SlateDB compaction of the catalog store. |
@@ -70,7 +70,8 @@ the recent passes with each step's outcome.
 
 ## Encryption
 
-Two independent layers, configured in different places.
+Configure data-file encryption in DuckLake and catalog encryption on the
+object-store bucket.
 
 ### Data files
 
@@ -90,22 +91,21 @@ decrypt them, `kms:GenerateDataKey` and `kms:Decrypt` in AWS terms. A
 read-only attach needs `kms:Decrypt`. Prefer a key dedicated to the
 catalog bucket, since the grant covers every object in it.
 
-Key rotation is invisible to Moraine. Rotation does not re-encrypt
-existing objects, so a key that wrote any surviving object must stay
+Key rotation does not re-encrypt existing objects. Any key used to encrypt
+a surviving object must stay
 enabled, including objects pinned by an unexpired snapshot or a
-checkpoint. Disabling such a key makes the catalog unreadable, and no
-Moraine setting recovers from it.
+checkpoint. Disabling such a key makes those objects unreadable until the key is
+re-enabled.
 
-Two things encryption does not hide. Column statistics are stored in the
-catalog as plaintext because DuckLake reads them to prune files, so anyone
-with the catalog grant can see the shape of the data. Inlined rows live in
+Anyone with permission to decrypt the catalog can read its column
+statistics, which DuckLake uses to prune files. Inlined rows live in
 catalog values rather than Parquet files, so they are protected only as
 well as the catalog is, and not by DuckLake's data-file encryption.
 
 ## Backups and copies
 
 A lake is three sets of objects: the catalog store, the write-ahead log
-(inside the catalog store unless `WAL_PATH` moved it), and the data files
+(inside the catalog store unless `META_WAL_PATH` moved it), and the data files
 under `DATA_PATH`. Copy all three.
 
 A copy taken while no writer is attached is a complete lake: a detaching
@@ -124,16 +124,16 @@ store and refuses an attach that names different ones.
 
 ## Upgrading
 
-Three things carry a version. The changelog on the
-[Releases](/releases/) page flags each breaking change.
+Check the extension build, store format, and DuckLake catalog version
+before upgrading. The [release notes](/releases/) list breaking changes.
 
 **The extension build.** Each build loads only into the DuckDB version it
 was built for. Upgrading DuckDB means downloading the matching build.
 
 **The on-disk format.** A Moraine build opens any store within the range of
 formats it reads. A store below that range is refused at attach with a
-message naming `moraine_migrate`; nothing migrates on its own. Run it with
-the lake attached nowhere:
+message naming `moraine_migrate`. Detach the lake from every process
+before running it:
 
 ```sql
 SELECT from_format, to_format, units_run, resumed
@@ -148,8 +148,7 @@ an attached store can be stamped to a newer format without a rewrite, and
 with `dry_run := false` does so.
 
 **The DuckLake catalog version.** New lakes record DuckLake catalog version
-`1.0`. Raising it to `1.1` is one-way and refuses to record without
-confirmation:
+`1.0`. Raising it to `1.1` is irreversible and requires `confirm => true`:
 
 ```sql
 SELECT * FROM moraine_raise_catalog_version('lake', dry_run => true);
@@ -179,4 +178,4 @@ commit or after it, never between. A second writer fences the first, which
 then writes nothing. Both are tested against real SlateDB with a store that
 freezes at every write boundary, fuzzed nightly, and run through about two
 hundred end-to-end tests against real DuckDB.
-[How Moraine is tested](../testing/) lists the cases.
+[Testing](/rfcs/0012-testing/) lists the cases.

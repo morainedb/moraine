@@ -46,6 +46,32 @@ impl Catalog {
         .map(|_| ())
     }
 
+    /// Replaces the recorded data root after copying data to a new location.
+    /// Relative paths, including historical files, resolve under the new root;
+    /// absolute paths are unchanged. Quiesce readers and writers before
+    /// calling.
+    ///
+    /// # Errors
+    /// Returns a constraint error for an empty root or a recorded root that
+    /// differs from `old_root` (ignoring trailing slashes), or a commit error.
+    pub async fn rewrite_data_path(&self, old_root: &str, new_root: &str) -> Result<SnapshotId> {
+        if old_root.trim().is_empty() || new_root.trim().is_empty() {
+            return Err(Error::Constraint("data roots must not be empty".into()));
+        }
+        self.commit_scoped(CommitRead::Options(OptionScope::Global), |tx| {
+            let recorded = tx.option(OptionScope::Global, "data_path");
+            if recorded.as_deref().map(|path| path.trim_end_matches('/'))
+                != Some(old_root.trim_end_matches('/'))
+            {
+                return Err(Error::Constraint(
+                    "the recorded data path does not match the expected old root".into(),
+                ));
+            }
+            tx.set_option(OptionScope::Global, "data_path", new_root)
+        })
+        .await
+    }
+
     /// Drops an index by its schema-level name, using case-insensitive index
     /// matching.
     ///

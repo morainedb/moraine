@@ -1,13 +1,10 @@
----
-title: How Moraine is tested
-description: Crash recovery, writer fencing, fuzzing, and the suite that runs against real DuckDB.
-sidebar:
-  order: 6
----
+# RFC 0012: Testing
 
-The catalog is the lake: a torn commit or two live writers would lose data
-no Parquet file can restore. Every test below runs against real SlateDB on
-an in-memory object store; the storage layer is never mocked.
+## Summary
+
+Tests cover commit atomicity, crash recovery, writer fencing, and DuckLake
+SQL compatibility. Core tests use real SlateDB on an in-memory object store.
+Integration tests also run against DuckDB, RustFS, and AWS S3.
 
 ## Guarantees
 
@@ -44,17 +41,17 @@ reopens the store on a fresh handle, and asserts:
 | entry reclamation interrupted | a re-run finishes the rest; a further pass finds nothing |
 | migration interrupted at any of its four seams | `open` refused until `migrate` resumes; every record moves once |
 
-Three mechanisms stage these, none needing a fork or `unsafe`. Dropping a
-writer handle without `close` is a crash after the last durable write,
-because SlateDB flushes nothing on drop. `FreezingStore` wraps the object
-store, allows a counted number of writes, then refuses the rest; a test
-measures how many writes an operation issues and sweeps the allowance from
-zero to that number, so a multi-table drop, a group commit, and genesis are
-crashed at every write boundary they have. Fencing needs no simulation:
-SlateDB's writer epoch is the behaviour under test, and it runs through the
-same object-store interface in memory as on S3. Migration, whose batch
-boundaries are internal, has a seam that errors once at an armed point
-under a test-only feature and is empty in release builds.
+The harness uses four methods:
+
+- Drop a writer handle without `close`. SlateDB does not flush on drop, so
+  reopening tests recovery from the last durable write.
+- Wrap the object store in `FreezingStore`, which allows a counted number of
+  writes and rejects the rest. Tests vary the allowance from zero to the
+  operation's total write count to interrupt multi-table drops, group commits,
+  and catalog creation at every write boundary.
+- Open competing writers through SlateDB to test fencing.
+- Inject an error at a migration batch boundary. These hooks are enabled only
+  in tests and builds with the `fault-injection` feature.
 
 ## Writer fencing
 
@@ -63,25 +60,23 @@ fences the first with a typed error and that a read-only attach does not
 fence a live writer. `test/sql/commit_concurrency.test` runs two DuckLake
 transactions over one lake from two connections, so DuckLake's own conflict
 loop runs and the loser gets an error DuckLake treats as retryable. The
-[benchmark harness](/benchmarks/#concurrent-writers) launches several
-writer processes against one lake and records the second's refusal as a
-property.
+[benchmark harness](../benchmarks.md#concurrent-writers) launches several
+writer processes against one lake and records writer-fencing errors.
 
 ## Fuzzing
 
 Three `cargo-fuzz` targets run nightly with a corpus kept across runs.
-`key_decode` and `record_decode` assert that decoding is total: any bytes
-become a key or record or an error, never a panic, including a key from one
-subspace paired with another subspace's value. `crash_recovery` builds a
-real store, freezes it at an offset the fuzzer picks, reopens, and asserts
-the commit landed whole or not at all. Every encoder in `store` also has a
-proptest round trip.
+`key_decode` and `record_decode` check that arbitrary bytes decode to a key or
+record or return an error without panicking, including a key from one subspace
+paired with another subspace's value. `crash_recovery` builds a real store,
+freezes it at an offset the fuzzer picks, reopens, and asserts the commit landed
+whole or not at all. Every encoder in `store` also has a proptest round trip.
 
 ## Against real DuckDB
 
 `cargo xtask e2e` compiles DuckDB at the pinned release, builds the
 extension with its bundled DuckLake, loads it into the resulting CLI, and
-runs about two hundred tests in `crates/moraine-duckdb/tests/ducklake_load`:
+runs about two hundred tests in `crates/moraine-duckdb/tests/ducklake_load/`:
 DDL and schema evolution, deletes, time travel, the change feed,
 partitioning, every DuckLake type, inlining, indexes, maintenance,
 migration, cancellation, and a kill between a Parquet write and its
@@ -97,5 +92,4 @@ CLI it names, on every platform it ships for.
 
 No test kills a process mid-PUT against a real endpoint; the crash cases
 use the in-memory store. There is no formal model of the commit protocol.
-The [crash recovery design document](/rfcs/0008-crash-recovery/) states
-each case precisely.
+[Crash recovery](0008-crash-recovery.md) lists the cases and expected results.

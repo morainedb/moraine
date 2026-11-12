@@ -3,12 +3,11 @@
 ## Summary
 
 The `moraine` crate exposes four handle types, `Catalog`, `ReadOnlyCatalog`,
-`ReadScope`, and `Transaction`, over hand-written domain structs and one
-`Error` enum with a variant per failure domain. A host opens a catalog on an
-`object_store`, reads it through pinned scopes, and mutates it through a
-closure the catalog may run more than once. No SlateDB or protobuf type
-appears in a public signature. `crates/moraine/src/lib.rs` is the complete
-list of exported items.
+`ReadScope`, and `Transaction`, over hand-written domain structs and one `Error`
+enum with a variant per failure domain. A host opens a catalog on an
+`object_store`, reads it through pinned scopes, and mutates it through a closure
+the catalog may run more than once. `crates/moraine/src/lib.rs` lists all
+exported items.
 
 ## Handle types
 
@@ -25,9 +24,8 @@ list of exported items.
 - **`Transaction`** is the mutation handle a commit closure receives. Its
   metadata accessors match `ReadScope` and include its own staged changes.
 
-Read-only mode is in the type. A `ReadOnlyCatalog` has no `commit`, so
-committing through one fails to compile, and a `compile_fail` doctest pins
-that. The runtime refusal exists only in the DuckDB shim, where a C ABI has
+A `ReadOnlyCatalog` has no `commit` method, enforced by a `compile_fail`
+doctest. The runtime refusal exists only in the DuckDB shim, where a C ABI has
 one handle type.
 
 `CatalogSnapshot` is also exported: an immutable decoded view at one snapshot,
@@ -46,14 +44,14 @@ bootstraps an empty store. `Catalog::open_read_only` takes the same arguments,
 returns a `ReadOnlyCatalog`, never fences a writer, and refuses a store no
 writer has initialized.
 
-`CatalogOptions` is moraine's own type. `path` places the catalog under a prefix
-within the bucket. `wal_store: Option<WalStore>` puts the write-ahead log on a
-second object store, paired with the name the catalog records, and every later
-open must name the same store. `checkpoint: Option<String>` pins a read-only
-open to a checkpoint: that reader never sees a later commit. `open` refuses it.
-A read-only open without it pins the writer's publications and writes nothing
-either; `reader_poll_interval` bounds how stale it may be. Other fields tune
-flushing, caches<!-- site:omit -->, and
+`CatalogOptions::path` places the catalog under a prefix within the bucket.
+`wal_store: Option<WalStore>` puts the write-ahead log on a second object store,
+paired with the name the catalog records, and every later open must name the
+same store. `checkpoint: Option<String>` pins a read-only open to a checkpoint:
+that reader never sees a later commit. `open` refuses it. A read-only open
+without it pins the writer's publications and writes nothing either;
+`reader_poll_interval` bounds how stale it may be. Other fields configure flush
+timing and caches<!-- site:omit -->, and
 [the commit-log seam](0011-commit-log-seam.md)<!-- /site:omit -->.
 
 Checkpoint ids are `String`. A writer mints one with
@@ -153,8 +151,7 @@ substrings DuckLake's commit loop retries on.
 
 ## Transaction operations
 
-Every mutator is an async method on `Transaction` and reads as a DuckLake
-catalog verb.
+Mutation methods on `Transaction` are async.
 
 | Group | Operations |
 |---|---|
@@ -185,7 +182,7 @@ itself, so they are `Catalog` methods or associated functions.
 | Operation | Role |
 |---|---|
 | `commit`, `commit_group` | The closure commit path. |
-| `set_option`, `adopt_data_path` | One-option commits that load no unrelated entities. |
+| `set_option`, `adopt_data_path`, `rewrite_data_path` | One-option commits that load no unrelated entities. |
 | `create_index`, `drop_index`, `create_index_staged`, `create_index_staged_with_maintenance`, `repair_deferred_indexes`, `certify_index` | Index builds reading data files through a `DataStore`, over one or many commits. |
 | `maintain(MaintenanceRequest)`, `record_maintenance_pass`, `reclaim_index_entries`, `reregister_stranded_inline_schemas` | A bounded maintenance pass that mints no snapshot, and its pieces for a host that sequences them itself. |
 | `compact_store(CompactStoreRequest)` | Merges a subspace's sorted runs into one. Needs the writer. |
@@ -210,7 +207,9 @@ Public values are hand-written structs, decoupled from the protobuf messages
 cross the API as `Timestamp`, a signed microsecond count from the Unix epoch.
 `DataStore` wraps the `DATA_PATH` object store with the `CacheIdentity` the
 footer and row-summary caches key on. `WalStore` pairs a log store with its
-recorded name. `MemoryReservation` holds a working-memory admission.
+recorded name. `MemoryReservation` holds a working-memory admission, and
+`configure_memory(MemoryBudgets)` sets the process's budgets once, ahead of
+their environment variables; `store_memory_budget` reads the store's.
 
 ## Versioning
 

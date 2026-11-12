@@ -2,13 +2,14 @@
 
 ## Summary
 
-Every read runs at one fixed store revision and decodes only the records it
-asks for. Writers read through a SlateDB snapshot. Independent readers pin
-checkpoints the writer publishes at durable boundaries, and write nothing.
-Reuse lives in one foyer block cache per store under one process budget, with
-SST metadata protected by eviction priority. Row summaries are published as
-immutable sidecars beside embedded-row-id data files. Live allocations are
-admitted against a separate working-memory allowance, and refusal is an error.
+Every read runs at one fixed store revision and decodes only the records it asks
+for. Writers read through a SlateDB snapshot. Independent readers pin
+checkpoints the writer publishes at durable boundaries, and require only read
+access. Each store has a foyer block cache, with a shared process-wide budget.
+SST metadata has higher eviction priority than data blocks. Row summaries are
+published as immutable sidecars beside embedded-row-id data files. Live
+allocations are admitted against a separate working-memory allowance. Operations
+fail when they exceed it.
 
 ## Read revisions
 
@@ -71,8 +72,6 @@ opens a `Publisher` on the recovered store, and publishes through the durable
 sequence covering its slot. The `Publisher` serializes publication within a
 process and coalesces writes covered by one checkpoint.
 <!-- /site:omit -->
-
-Each component owns one layer of state and nothing above it.
 
 | Owner | Holds |
 |---|---|
@@ -160,7 +159,8 @@ DuckLake holds one catalog snapshot per transaction, resolved on first catalog
 access and kept for the transaction's life. In autocommit mode that is one
 statement. Inside `BEGIN ... COMMIT` it is the whole block, which the user
 controls. The retention window must therefore exceed the longest open explicit
-transaction. Sizing it to statement length is wrong.
+transaction. A window based on statement duration alone can expire an open
+transaction.
 
 **Head-stamp guard.** Equality, `IN`, range, and `NULL` index lookups, full
 inline scans, and requested inline-row lookups each read many keys and must
@@ -205,24 +205,24 @@ resolves its head per scan and does not narrow.
 
 **Instances and budget.** The block cache is one foyer instance per store,
 shared by every `Db` and `DbReader` opened on that store in the process.
-`CACHE_MEMORY` is one memory budget for the process, split once at the first
-attach. The first store to open settles the budget, the disk directory, and
-the shares. A later attach asking for different values is sized by what is
-settled.
+`moraine_cache_memory` is one memory budget for the process, split once at
+the first attach. The first store to open settles the budget, the disk
+directory, and the shares. A later attach asking for different values is
+sized by what is settled.
 
 | Share | Size | Default at 640 MiB |
 |---|---|---|
 | Lookup retention | one eighth of the budget | 80 MiB |
-| Auxiliary metadata | one eightieth, or `CACHE_AUXILIARY_PERCENT` up to 50 | 8 MiB |
+| Auxiliary metadata | one eightieth, or `moraine_cache_auxiliary_percent` up to 50 | 8 MiB |
 | Blocks and SST metadata | the remainder, shared elastically by stores | 552 MiB |
 
-The default budget without `CACHE_MEMORY` is 640 MiB. Within the block share
-an empty attach reserves nothing. Read fills, disk promotions, and admitted
-flush or compaction output grow a store's allowance under pressure: first from
-unassigned bytes, then by borrowing unused allowance from other stores, then
-by reclaiming a fair share from larger borrowers. Transfers happen under one
-process lock, shrinking donors before growing the recipient, and the sum of
-store capacities never exceeds the block share. A store's final detach
+The default budget without `moraine_cache_memory` is 640 MiB. Within the block
+share an empty attach reserves nothing. Read fills, disk promotions, and
+admitted flush or compaction output grow a store's allowance under pressure:
+first from unassigned bytes, then by borrowing unused allowance from other
+stores, then by reclaiming a fair share from larger borrowers. Transfers happen
+under one process lock, shrinking donors before growing the recipient, and the
+sum of store capacities never exceeds the block share. A store's final detach
 releases its memory allowance. Its disk device stays open and keeps its
 persisted blocks.
 
@@ -241,8 +241,8 @@ and statistics fetches, and an untyped insert is treated as a block. Every
 attach compares the store's recorded filter, index, and statistics bytes
 against the protected capacity in force and warns when they do not fit.
 
-**Disk tier.** With `CACHE_DIR` set the cache is foyer's hybrid: the memory
-tier spills at block grain to a device at `CACHE_DIR/<store>/blocks`, where
+**Disk tier.** With `moraine_cache_dir` set the cache is foyer's hybrid: the
+memory tier spills at block grain to a device at `<dir>/<store>/blocks`, where
 `<store>` is `v2-` followed by a hash of the cache identity and the store
 path. Entries are written on insertion and recovered on the next open. SlateDB
 scopes cache keys per opened handle from a process-local counter that follows
@@ -252,13 +252,13 @@ that impossible. A store deleted and recreated at the same location restarts
 its WAL ids, so its cache directory must be removed with it. The device is cut
 into at most `DISK_CACHE_BLOCKS` files, sixty-four, each at least 16 MiB, so a
 process attaching many stores does not exhaust its descriptor limit.
-`CACHE_SIZE` caps the device, defaulting to 16 GiB, and the device fills only
-with what the store reads. The cache builds its own runtime for foyer's
-background tasks, so no attach's runtime is borrowed and later dropped under
-them.
+`moraine_cache_size` caps the device, defaulting to 16 GiB, and the device
+fills only with what the store reads. The cache builds its own runtime for
+foyer's background tasks, so no attach's runtime is borrowed and later dropped
+under them.
 
 **Auxiliary cache.** The scoped Parquet reader keeps a separate foyer hybrid
-at `CACHE_DIR/auxiliary-v2`, holding parsed footers, page indexes, and row
+at `<dir>/auxiliary-v2`, holding parsed footers, page indexes, and row
 summaries keyed by cache identity, path, and recorded file size. A resident
 footer gains its page index in place. Footers and summaries are admitted
 whatever the read declares. Projected column ranges are admitted at low
@@ -337,10 +337,11 @@ reader keeps a value and its charge until its query finishes, after eviction.
 `ReadOnlyCatalog::projection_bytes` reports the estimated bytes these
 facilities hold.
 
-**Attach options.** `CACHE_DIR`, `CACHE_SIZE`, `CACHE_MEMORY`,
-`CACHE_AUXILIARY_PERCENT`, `CACHE_PUTS`, `CACHE_COMPACTION_PUTS`, and
-`CACHE_PRELOAD` are the cache's attach options. Their tuning is documented
-with the [extension surface](0006-extension-surface.md) and the README.
+**Configuration.** `moraine_cache_dir`, `moraine_cache_size`,
+`moraine_cache_memory`, and `moraine_cache_auxiliary_percent` are settings,
+one per process; `CACHE_PUTS`, `CACHE_COMPACTION_PUTS`, and `CACHE_PRELOAD`
+are attach options, one per lake. Both are documented with the [extension
+surface](0006-extension-surface.md).
 `moraine_cache_tally`, `moraine_cache_status`, `moraine_store_census`, and
 `moraine_object_store_tally` report hits and misses per tier, capacity and
 occupancy, recorded SST metadata bytes, and object-store requests.
@@ -442,8 +443,8 @@ process running it.
 
 ## Working memory
 
-Cache allowances bound retention. `MORAINE_WORKING_MEMORY_BYTES`, default 1
-GiB, is a separate process-wide allowance for live working allocations. Every
+Cache allowances bound retention. The working budget, default 1 GiB, is a
+separate process-wide allowance for live working allocations. Every
 allowance in this section is admission accounting of estimated bytes,
 calibrated to refuse a little early. None measures allocator overhead or RSS.
 
@@ -458,15 +459,21 @@ reserved bytes and capacity. A caller materializing a `CatalogSnapshot` admits
 its copies with `CatalogSnapshot::reserve_copy`. Legacy methods returning
 plain `Vec` values leave reservation to the caller.
 
-| Variable | Default | Scope |
-|---|---|---|
-| `MORAINE_WORKING_MEMORY_BYTES` | 1 GiB | live allocations, process-wide |
-| `MORAINE_STAGING_MEMORY_BYTES` | 256 MiB | per staged transaction: operation vectors, cells, strings, schemas, Arrow bodies |
-| `MORAINE_COMMIT_MEMORY_BYTES` | 256 MiB | per commit session: translation scratch and the write ledger, admitted before each store write |
-| `MORAINE_STORE_MEMORY_BYTES` | 1 GiB | SlateDB's unflushed-bytes threshold per writer. A transaction starting at a full threshold is refused |
-| `MORAINE_SUMMARY_MEMORY_BYTES` | 256 MiB, at least 64 | per summary build, admitting `bytes / 64` physical rows |
-| `MORAINE_HOST_MEMORY_BYTES` | unset | enables the pre-attach host check |
-| `MORAINE_HOST_HEADROOM_BYTES` | one quarter of the host value | native headroom in that check |
+Each budget is a `MemoryBudgets` field a host sets once per process through
+`configure_memory`, which the extension fills from its `moraine_*_memory`
+settings before the first attach; a budget left unset is read from the
+environment variable named here, then defaults. The first `configure_memory`
+wins, and a budget already read keeps the value it was read with.
+
+| Budget | Variable | Default | Scope |
+|---|---|---|---|
+| `working` | `MORAINE_WORKING_MEMORY_BYTES` | 1 GiB | live allocations, process-wide |
+| `staging` | `MORAINE_STAGING_MEMORY_BYTES` | 256 MiB | per staged transaction: operation vectors, cells, strings, schemas, Arrow bodies |
+| `commit` | `MORAINE_COMMIT_MEMORY_BYTES` | 256 MiB | per commit session: translation scratch and the write ledger, admitted before each store write |
+| `store` | `MORAINE_STORE_MEMORY_BYTES` | 1 GiB | SlateDB's unflushed-bytes threshold per writer. A transaction starting at a full threshold is refused |
+| `summary` | `MORAINE_SUMMARY_MEMORY_BYTES` | 256 MiB, at least 64 | per summary build, admitting `bytes / 64` physical rows |
+| `host` | `MORAINE_HOST_MEMORY_BYTES` | unset | enables the pre-attach host check |
+| `host_headroom` | `MORAINE_HOST_HEADROOM_BYTES` | one quarter of the host value | native headroom in that check |
 
 Staging and commit allowances are consumed alongside the shared working
 allowance. Reservations follow coalesced members and commit submission through
@@ -512,7 +519,7 @@ a durable commit, and a publication window, at most once per
 DuckDB extension installs glibc's `malloc_trim`. A platform with no equivalent
 leaves the hook uninstalled, which skips the release.
 
-**Host check.** When `MORAINE_HOST_MEMORY_BYTES` is set,
+**Host check.** When the host budget is set,
 `validate_host_memory(duckdb_bytes, other_bytes)` runs before the store opens
 and refuses the attach if DuckDB's managed limit, the working allowance, the
 cache budget, one writer's store allowance, and the headroom together exceed

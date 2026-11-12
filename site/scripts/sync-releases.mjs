@@ -199,10 +199,10 @@ function compatibilityTable(rows) {
   return [
     '## Compatibility',
     '',
-    'A build loads only into the DuckDB versions listed. The catalog store',
-    'format is the range a build opens; a lake below it needs `moraine_migrate`,',
-    'and a build below a lake\'s format refuses it. The DuckLake catalog version',
-    'is what a build serves; see [Upgrading](/guide/operating/#upgrading).',
+    'Choose a build matching your DuckDB version and platform. The store-format',
+    'column lists the formats each build can open. Older stores need',
+    '`moraine_migrate`; newer stores need a newer Moraine build. The last column',
+    'lists supported DuckLake catalog versions. See [Upgrading](/guide/operating/#upgrading).',
     '',
     '| Moraine | DuckDB | Catalog store format | DuckLake catalog version |',
     '|---|---|---|---|',
@@ -210,11 +210,10 @@ function compatibilityTable(rows) {
   ].join('\n');
 }
 
-const preamble = `Each release ships the DuckDB extension as unsigned binaries, one per
-DuckDB version and platform; a binary loads only into the DuckDB version
-it names and needs a CLI started with \`-unsigned\`. See
-[Getting started](/guide/getting-started/) for loading one. Changes are
-listed from the repository [changelog](https://github.com/morainedb/moraine/blob/main/CHANGELOG.md).`;
+const preamble = `Download the extension for your DuckDB version and platform below.
+Start DuckDB with \`-unsigned\` to load it; see
+[Getting started](/guide/getting-started/) for instructions. Release notes
+come from the [changelog](https://github.com/morainedb/moraine/blob/main/CHANGELOG.md).`;
 
 export function renderReleases(entries, downloads, compatibility = []) {
   const sections = entries.map(({ version, date, compareUrl, body }) => {

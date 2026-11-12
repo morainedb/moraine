@@ -108,8 +108,8 @@ bytes, is refused with `Constraint` at insert or registration.
 
 ## Coverage
 
-An index covers every live row of its table, or the operation that would breach
-that is refused. Who derives an entry depends on who has the rows.
+Writes to a table with a maintained index must supply or derive entries
+for every added row and remove entries for every deleted row:
 
 | Moment | Embedding API | Extension path |
 |---|---|---|
@@ -148,9 +148,9 @@ Inlined rows are backfilled by scanning the chunks; rows in external files need
 writer-supplied entries, or, for `CREATE INDEX`, a scoped read of every live
 data file, so the cost is the table's indexed columns. The build is one commit
 and one atomic batch, with uniqueness validated over the assembled set before
-staging. A backfill above the commit bound fails typed before staging anything,
-and the caller re-drives it as a staged build. A table that already holds files
-cannot be indexed without a data store to backfill from.
+staging. A backfill above the commit bound returns an error before staging
+anything, and the caller re-drives it as a staged build. A table that already
+holds files cannot be indexed without a data store to backfill from.
 
 ### Re-derivation and compaction
 
@@ -228,11 +228,11 @@ predicates never match NULL, so `index_range` clamps open sides to the non-null
 region and `index_nulls` serves the NULL subrange. A multi-column bound is a
 tuple, and a tuple window requires every named column to sort the same way.
 
-Lookups are head-only: a lookup through `read_scope_at(snapshot)` fails typed
-and time travel remains a scan. A lookup against a `Building` or `Maintaining`
-index fails with `Error::IndexBuilding`. A warm read-write handle serves
-lookups from the view it already holds; a read-only handle probes under a read
-session, per the [read path](0007-read-path-and-caching.md).
+Lookups are head-only: a lookup through `read_scope_at(snapshot)` returns an
+error and time travel remains a scan. A lookup against a `Building` or
+`Maintaining` index fails with `Error::IndexBuilding`. A warm read-write handle
+serves lookups from the view it already holds; a read-only handle probes under a
+read session, per the [read path](0007-read-path-and-caching.md).
 
 `locate_row_ids(store, prefix, table, row_ids)` resolves row ids to
 `FileRowCandidate { row_id, data_file_id }` at head, `None` for a live inlined
@@ -320,9 +320,9 @@ helper, whose positions are re-mapped onto a freshly allocated dense range, and
 refuses a file carrying the embedded column, since registering it under new ids
 would fork its identity.
 
-Killed positions ride to the target's scoped read, and an entry is removed when
-its ordinal is named by a delete file or an inline file-delete. Indexed columns
-are located by field id through the
+Deleted positions are passed to the target's scoped read, and an entry is
+removed when its ordinal is named by a delete file or an inline file-delete.
+Indexed columns are located by field id through the
 [column mapping rules](0005-ducklake-feature-mapping.md); missing fields use
 `initial_default`, and old physical values convert to the current type with
 checked casts.
@@ -397,7 +397,8 @@ backfill uses and diffs it against the index. `IndexVerification` reports:
 | `dead` | A held entry no live row requires. |
 | `mismatched` | A unique entry under the right value naming another row. |
 
-Verification costs what a build costs and holds the stored entry set in memory.
+Verification reads the indexed columns of every live row and holds the
+stored entry set in memory.
 A `building` index is refused.
 
 `certify_index` runs the pass through a read-write attach and records the
@@ -423,18 +424,21 @@ covers a leading predicate. The original predicate is still evaluated over the
 candidate rows. A certified full-key probe with no residual predicate is the
 one case where a `DELETE` is rewritten to positional deletion without a scan.
 
-The mechanisms: `IndexReadScope` pins catalog, index, file, and inline reads to
-one committed store revision, and its `IndexReadIdentity` lets a plan validate
-reuse without retaining a transaction, with DuckLake's file-list and metadata
-reads for the statement on the same scope;
-`locate_row_positions_at(scope, data_store, data_prefix, table, pairs)` resolves
-`(row_id, data_file_id)` pairs to `LocatedDeletion` positions at that revision;
-`LocatedRowScan`, from `scan_rows_at` and in SQL `moraine_summary_scan`, reads
-only the requested columns at the resolved positions, one projected Arrow batch
-at a time; and per-table in-memory file directories and summaries map row ids
-to the files and inline chunks that hold them, refreshed in place as the file
-map changes, over the [read path](0007-read-path-and-caching.md)'s published
-row summaries.
+Index scans use four components:
+
+- `IndexReadScope` pins catalog, index, file, and inline reads to one committed
+  revision, including DuckLake's file-list and metadata reads for the statement.
+  `IndexReadIdentity` lets a plan check whether it can reuse results without
+  retaining the transaction.
+- `locate_row_positions_at(scope, data_store, data_prefix, table, pairs)` maps
+  `(row_id, data_file_id)` pairs to `LocatedDeletion` positions at that
+  revision.
+- `LocatedRowScan`, returned by `scan_rows_at` and exposed in SQL as
+  `moraine_summary_scan`, reads the requested columns at those positions,
+  one Arrow batch at a time.
+- Per-table file directories and row summaries map row ids to files and inline
+  chunks. They update as the file map changes and use the
+  [published row summaries](0007-read-path-and-caching.md#published-row-summaries).
 
 Candidate row ids and file ids feed DuckLake's scan as filters on `rowid` and
 the virtual `data_file_id` column, so both the file list and the rows read

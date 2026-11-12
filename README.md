@@ -54,7 +54,7 @@ SELECT payload FROM lake.events WHERE id = 2;
 - **Commits under about 5 ms.** A commit is durable once one write-ahead-log
   PUT lands: 50 to 100 ms on S3 Standard, 5 to 10 ms with the log on S3
   Express One Zone via
-  [`WAL_PATH`](https://morainedb.github.io/guide/configuration/#the-write-ahead-log-on-a-faster-bucket).
+  [`META_WAL_PATH`](https://morainedb.github.io/guide/configuration/#the-write-ahead-log-on-a-faster-bucket).
 - **Many independent writer processes.** One process writes; the rest attach
   `READ_ONLY`. Concurrent commits go through that one writer. See
   [One writer, many readers](https://morainedb.github.io/guide/getting-started/#one-writer-many-readers).
@@ -69,7 +69,7 @@ Moraine is under active development and in production use at
 [contour.app](https://contour.app). DuckLake SQL, including `CREATE`,
 `INSERT`, `UPDATE`, `DELETE`, time travel, and maintenance, runs against
 Moraine as its catalog and is validated against real DuckDB in CI;
-[How Moraine is tested](https://morainedb.github.io/guide/testing/) covers
+[Testing](https://morainedb.github.io/rfcs/0012-testing/) covers
 crash recovery, writer fencing, and fuzzing. The [roadmap](ROADMAP.md) lists
 what is done and what is next. Questions and ideas go to
 [Discussions](https://github.com/morainedb/moraine/discussions).
@@ -82,6 +82,8 @@ what is done and what is next. Questions and ideas go to
   attach option and function.
 - [Operating manual](https://morainedb.github.io/guide/operating/) covers
   retention, maintenance, encryption, backups, and upgrades.
+- [Relocating a copied catalog](docs/rfcs/0013-data-root-relocation.md) explains
+  how to rewrite the data root after copying a bucket.
 - [Compared with other catalogs](https://morainedb.github.io/guide/comparison/)
   sets Moraine beside the DuckDB file, Postgres, Quack, and Iceberg-style
   catalogs.

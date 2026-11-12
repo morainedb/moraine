@@ -48,7 +48,7 @@ SELECT payload FROM lake.events WHERE id = 2;
 
 ## What you get
 
-- **No catalog server:** Nothing to deploy, monitor, or back up. A deployment
+- **No catalog server:** No catalog server to deploy or monitor. A deployment
   is a storage bucket.
 - **Bucket durability:** The catalog is objects in the bucket, so it gets
   the bucket's durability, replication, and versioning. A copy taken while
@@ -66,7 +66,7 @@ SELECT payload FROM lake.events WHERE id = 2;
 - **Sub-5 ms commits.** A commit is durable once one write-ahead-log PUT
   lands: 50 to 100 ms on S3 Standard, 5 to 10 ms with the log on S3 Express
   One Zone via
-  [`WAL_PATH`](guide/configuration/#the-write-ahead-log-on-a-faster-bucket).
+  [`META_WAL_PATH`](guide/configuration/#the-write-ahead-log-on-a-faster-bucket).
 - **Many independent writer processes.** One process writes; the rest
   attach `READ_ONLY`. See
   [one writer, many readers](guide/getting-started/#one-writer-many-readers).
@@ -115,7 +115,7 @@ Dual-licensed under
   encryption, backups, and upgrades.
 - [Compared with other catalogs](guide/comparison/) sets Moraine beside
   the DuckDB file, Postgres, Quack, and Iceberg-style catalogs.
-- [How Moraine is tested](guide/testing/) covers crash recovery, writer
+- [Testing](rfcs/0012-testing/) covers crash recovery, writer
   fencing, fuzzing, and the suite against real DuckDB.
 - [Architecture](guide/architecture/) explains how the catalog is laid out
   and how commits and reads work.
