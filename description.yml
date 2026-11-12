@@ -31,4 +31,4 @@ docs:
     DuckLake's metadata connection; every ducklake_* table is served from the
     store, DuckLake's own SQL commits atomically, and CREATE INDEX adds
     ordered indexes maintained in the same commit as the rows.
-    Documentation: https://morainedb.github.io/
+    Documentation: https://morainedb.com/

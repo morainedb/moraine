@@ -36,9 +36,9 @@ Attach options, table functions, caching, the write-ahead log, read-only
 attaches, indexes, maintenance, encryption, backups, and upgrades are
 documented on the project site:
 
-- [Getting started](https://morainedb.github.io/guide/getting-started/)
-- [Configuration](https://morainedb.github.io/guide/configuration/)
-- [Operating manual](https://morainedb.github.io/guide/operating/)
+- [Getting started](https://morainedb.com/guide/getting-started/)
+- [Configuration](https://morainedb.com/guide/configuration/)
+- [Operating manual](https://morainedb.com/guide/operating/)
 
 The site is the reference for user-facing behaviour; this file covers how
 the crate is built and how it serves DuckLake.
@@ -147,7 +147,7 @@ versions by DuckDB-series branch (`v1.3-ossivalis`, `v1.4-andium`,
 ## Installing
 
 The signed path is the extension repository the site serves, documented in
-[Getting started](https://morainedb.github.io/guide/getting-started/#install-the-extension).
+[Getting started](https://morainedb.com/guide/getting-started/#install-the-extension).
 Its `.gz` assets on each release are the builds below with the signature
 footer filled in; the publish action signs them with the
 `DUCKDB_EXTENSION_SIGNING_PK` secret through `cargo xtask sign-release-assets`.
