@@ -153,6 +153,7 @@ pub(crate) enum Store {
     Committer {
         reader: Arc<DbReader>,
         commit_log: LogCommitter,
+        scopes: Arc<reader_scopes::ReaderScopes>,
     },
 }
 
@@ -171,7 +172,7 @@ impl Store {
     ///
     /// [`Error::Constraint`] for a read-only store; the store's error if its
     /// transaction cannot begin.
-    pub(crate) fn begin_commit_session(&self) -> Result<CommitSession> {
+    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
         match self {
             Self::Writer { db, counters, .. } => {
                 if counters.slatedb_unflushed_bytes() >= crate::memory::store_memory_limit()? {
@@ -181,7 +182,9 @@ impl Store {
                     db.begin(IsolationLevel::Snapshot).map_err(Error::from)?,
                 ))
             }
-            Self::Committer { reader, .. } => Ok(CommitSession::committer(Arc::clone(reader))),
+            Self::Committer { scopes, .. } => {
+                Ok(CommitSession::committer(Box::pin(scopes.acquire()).await?))
+            }
             Self::Reader(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
             )),
@@ -558,16 +561,6 @@ struct Folder {
 
 #[async_trait::async_trait]
 impl crate::TakeStore for Folder {
-    async fn take_for_publication(&self) -> Result<(Db, Arc<dyn crate::WriterSession>)> {
-        // Publication replays the WAL and closes without writing an L0 file.
-        Box::pin(open_writer_db(
-            Arc::clone(&self.object_store),
-            &self.options,
-        ))
-        .await
-        .map(|(db, session, _format)| (db, session))
-    }
-
     async fn take(&self) -> Result<Option<(Db, Arc<dyn crate::WriterSession>)>> {
         // A fold writes an L0 file, and where the provider leaves
         // compaction to another process nothing merges those away. A
@@ -615,6 +608,7 @@ fn catalog_hooks(
         object_store: Arc::clone(object_store),
         settings: crate::CommitLogSettings {
             fold_every: options.commit_log_fold_slots,
+            compact: !options.external_compaction,
             flush_every: options.commit_log_flush_slots.max(1),
             retention: options.commit_log_retention,
             poll: options.commit_log_fold_poll,
@@ -925,10 +919,6 @@ pub struct ReadOnlyCatalog {
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
-    /// The session a read brings the reader up to the log through before
-    /// it runs. A committer carries one, so a peer's slot is never a tick
-    /// away; every other store leaves the reader to its own poll.
-    refresh: Option<Arc<dyn crate::ReaderSession>>,
     /// What a read-only reader over a commit log lists it for: a read
     /// asks, and the next poll lists. `None` where there is no log to
     /// list, or where reads refresh instead.
@@ -1325,9 +1315,17 @@ impl ReadOnlyCatalog {
     /// every batch and stays hot, where the absent marker is the store's
     /// most expensive possible read.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
+        self.refuse_if_closed()?;
         if let Some(pinned) = &self.pinned {
-            self.refuse_if_closed()?;
             return Ok(ReadSession::Pinned(pinned.handle.clone()));
+        }
+        if let Some(scopes) = &self.reader_scopes
+            && scopes.captures_log()
+        {
+            let reader = Box::pin(scopes.acquire()).await?;
+            let handle = crate::store::handle::OwnedReadHandle::Checkpoint(reader);
+            commit::refuse_mid_migration(handle.borrow()).await?;
+            return Ok(ReadSession::Pinned(handle));
         }
         let session = match self.store.as_ref() {
             Store::Writer { db, .. } => {
@@ -1337,11 +1335,6 @@ impl ReadOnlyCatalog {
             Store::Reader(reader) | Store::Committer { reader, .. } => {
                 if let Some(asked) = &self.asked {
                     asked.ask();
-                }
-                if let Some(session) = &self.refresh {
-                    // Refreshed rather than polled for, so the read is
-                    // served the log as it stands.
-                    session.refresh(reader).await?;
                 }
                 ReadSession::Reader(reader.clone())
             }
@@ -1633,7 +1626,6 @@ impl Catalog {
                     None,
                 )),
                 projections,
-                refresh: None,
                 asked: None,
             },
         })
@@ -1704,6 +1696,10 @@ impl Catalog {
         inner.store = Arc::new(Store::Committer {
             reader,
             commit_log: log.clone(),
+            scopes: inner
+                .reader_scopes
+                .clone()
+                .ok_or_else(|| Error::Corruption("committer has no fixed reader factory".into()))?,
         });
         inner.commits = Arc::new(commit::Coalescer::new(
             Arc::clone(&inner.projections),
@@ -1787,7 +1783,7 @@ impl Catalog {
         await_durable: bool,
     ) -> Result<()> {
         for _ in 0..commit::MAX_COMMIT_ATTEMPTS {
-            let session = self.store.begin_commit_session()?;
+            let session = self.store.begin_commit_session().await?;
             let base = commit::read_head_value(session.handle()).await?;
             commit::refuse_mid_migration_at(session.handle(), &self.projections, &base).await?;
             let head = base.snapshot_id;
@@ -2126,7 +2122,6 @@ impl Catalog {
                 None,
             )),
             projections,
-            refresh: session.filter(|_| refresh_on_read),
             asked,
         })
     }
@@ -2388,8 +2383,8 @@ impl Catalog {
     /// # Errors
     ///
     /// As [`Store::begin_commit_session`].
-    pub(crate) fn begin_commit_session(&self) -> Result<CommitSession> {
-        self.store.begin_commit_session()
+    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
+        self.store.begin_commit_session().await
     }
 
     /// Writes the memtable out as a sorted-string table, so a test can put

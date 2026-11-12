@@ -75,15 +75,14 @@ impl SlotEnvelope {
 /// How an offer ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotOffer {
-    /// The commit holds `sequence`, and this process's store has applied
-    /// it, or been served it, and a durable read checkpoint covers it.
+    /// The validated commit durably holds `sequence`; a fresh fixed view can
+    /// read it.
     Won {
         /// The sequence won.
         sequence: u64,
     },
-    /// Another committer holds the sequence raced. Everything that beat the
-    /// offer is in this process's store already; the caller re-prepares
-    /// against it.
+    /// Another committer holds the sequence raced. The caller acquires a
+    /// fresh fixed view and revalidates before retrying.
     Lost {
         /// The sequence raced.
         sequence: u64,
@@ -133,8 +132,8 @@ pub trait CommitStore: Any + fmt::Debug + Send + Sync + 'static {
     /// Offers `commit` as the slot at `sequence`, which the caller derives
     /// from the state the commit was prepared against: a stale state names
     /// a taken slot and loses. The sequence may be at most one past what
-    /// this process's store knows. A win may return only after a durable
-    /// checkpoint covers the slot; publication failure is an unknown outcome.
+    /// the durable log's tail. A win is acknowledged at the immutable slot;
+    /// reader refresh and maintenance are separate operations.
     ///
     /// # Errors
     ///
@@ -196,16 +195,17 @@ pub trait ReaderSession: Any + Send + Sync + 'static {
     /// The write-ahead-log plug the reader is built with.
     fn reader(&self) -> Arc<dyn WalReader>;
 
-    /// Brings `reader` up to the log as it stands, before a committer's
-    /// read. The default does nothing and leaves the reader to its poll.
+    /// Opens one fixed, protected view of the durable log using the configured
+    /// reader builder. The reader owns protection until it closes.
     ///
     /// # Errors
-    ///
-    /// The store's error when the reader cannot be brought up.
-    async fn refresh(&self, reader: &DbReader) -> Result<()> {
-        let _ = reader;
-        Ok(())
-    }
+    /// Returns an error when the boundary cannot be captured or replayed.
+    async fn open_fixed_reader(
+        &self,
+        builder: slatedb::DbReaderBuilder<String>,
+        options: slatedb::config::DbReaderOptions,
+        admin: slatedb::admin::Admin,
+    ) -> Result<DbReader>;
 
     /// The session as the crate that minted it knows it.
     fn as_any(&self) -> &dyn Any;
@@ -224,17 +224,6 @@ pub trait TakeStore: Send + Sync + 'static {
     ///
     /// As [`Catalog::open`](crate::Catalog::open).
     async fn take(&self) -> Result<Option<(Db, Arc<dyn WriterSession>)>>;
-
-    /// Opens a temporary writer for checkpoint publication without an L0 flush.
-    /// The caller must close it with `flush_type: None`.
-    ///
-    /// # Errors
-    /// Returns the open error, or a constraint error when `take` declines.
-    async fn take_for_publication(&self) -> Result<(Db, Arc<dyn WriterSession>)> {
-        self.take().await?.ok_or_else(|| {
-            Error::Constraint("checkpoint publication could not take the store".to_owned())
-        })
-    }
 }
 
 /// A check the library runs on every slot before it folds it. A slot the
@@ -258,24 +247,6 @@ pub struct CatalogHooks {
     pub settings: CommitLogSettings,
 }
 
-impl CatalogHooks {
-    /// Publishes the writer's durable state for fixed catalog readers.
-    /// Call after applying a won slot and again after flushing it to SSTs.
-    ///
-    /// # Errors
-    /// Returns an error when WAL durability or checkpoint publication fails.
-    pub async fn publish(&self, db: &Db) -> Result<()> {
-        db.flush().await?;
-        let admin =
-            slatedb::admin::AdminBuilder::new(self.path.clone(), Arc::clone(&self.object_store))
-                .build();
-        crate::store::checkpoint::Publisher::new(db.clone(), admin)
-            .through(db.status().durable_seq)
-            .await
-            .map_err(Into::into)
-    }
-}
-
 impl fmt::Debug for CatalogHooks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CatalogHooks")
@@ -292,6 +263,9 @@ pub struct CommitLogSettings {
     /// Every this many slots, the follower that lands one takes the store,
     /// folds, writes it out, and lets go. Zero folds on no cadence.
     pub fold_every: u64,
+    /// Whether cadence maintenance owns compaction; false with an external
+    /// service.
+    pub compact: bool,
     /// After this many folded slots a holder writes its memtable out and
     /// truncates the log below the replay point.
     pub flush_every: u64,

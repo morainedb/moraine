@@ -90,8 +90,10 @@ impl ReadOnlyCatalog {
         let (handle, revision) = if let Some(pinned) = &self.pinned {
             (pinned.handle.clone(), pinned.revision)
         } else if let Some(scopes) = &self.reader_scopes {
-            self.begin_read().await?.finish();
-            let reader = scopes.acquire().await?;
+            if !scopes.captures_log() {
+                self.begin_read().await?.finish();
+            }
+            let reader = Box::pin(scopes.acquire()).await?;
             let revision = reader.manifest;
             (OwnedReadHandle::Checkpoint(reader), revision)
         } else if let Store::Writer { db, .. } = self.store.as_ref() {
@@ -306,7 +308,7 @@ mod tests {
         catalog.close().await.unwrap();
     }
     #[tokio::test]
-    async fn closing_a_committer_releases_its_idle_reader_generation() {
+    async fn releasing_a_committer_scope_releases_its_reader_generation() {
         let objects = Arc::new(InMemory::new());
         let initial = Catalog::open(objects.clone(), CatalogOptions::default())
             .await
@@ -341,7 +343,7 @@ mod tests {
         };
         let reader = Arc::downgrade(reader);
         drop(scope);
-        assert!(reader.upgrade().is_some());
+        assert!(reader.upgrade().is_none());
         committer.close().await.unwrap();
         assert!(reader.upgrade().is_none());
         folder.close().await.unwrap();

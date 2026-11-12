@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use slatedb::{DbReader, DbTransaction, WriteHandle};
+use slatedb::{DbTransaction, WriteHandle};
 
 use crate::{
     MemoryReservation,
@@ -44,7 +44,7 @@ enum Inner {
     Folder(DbTransaction),
     /// A committer over a tailing reader: reads the store, commits nothing
     /// into it, and sees its own batch once the reader is served the slot.
-    Committer(Arc<DbReader>),
+    Committer(Arc<crate::store::checkpoint::CheckpointReader>),
 }
 
 impl std::fmt::Debug for CommitSession {
@@ -62,7 +62,7 @@ impl CommitSession {
     }
 
     /// A committer's session over `reader`.
-    pub(crate) fn committer(reader: Arc<DbReader>) -> Self {
+    pub(crate) fn committer(reader: Arc<crate::store::checkpoint::CheckpointReader>) -> Self {
         Self::new(Inner::Committer(reader))
     }
 
@@ -93,7 +93,7 @@ impl CommitSession {
     pub(crate) fn handle(&self) -> ReadHandle<'_> {
         match &self.inner {
             Inner::Folder(tx) => ReadHandle::Tx(tx),
-            Inner::Committer(reader) => ReadHandle::Reader(reader),
+            Inner::Committer(reader) => ReadHandle::Checkpoint(reader),
         }
     }
 
@@ -232,7 +232,9 @@ mod tests {
         db.close().await.unwrap();
         let reader = Arc::new(DbReader::builder("", store).build().await.unwrap());
 
-        let mut session = CommitSession::committer(reader.clone());
+        let mut session = CommitSession::committer(
+            crate::store::checkpoint::CheckpointReader::external(reader.clone()),
+        );
         assert!(!session.is_folder());
         session.put(b"k", b"v").unwrap();
         session.delete(b"gone").unwrap();

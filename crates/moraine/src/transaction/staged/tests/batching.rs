@@ -32,8 +32,9 @@ async fn catalog_with_two_tables() -> Catalog {
 }
 
 async fn seed_two_tables(catalog: &Catalog) {
-    let mut tx =
-        crate::ffi_support::staged::staged_begin(catalog, None, String::new(), None).unwrap();
+    let mut tx = crate::ffi_support::staged::staged_begin(catalog, None, String::new(), None)
+        .await
+        .unwrap();
     for (table_id, name) in [(1, "t"), (2, "u")] {
         tx.stage(RowOperation::Insert {
             table: TableKind::Table,
@@ -524,6 +525,7 @@ async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_open
     // Rows authored against head 1 on a transaction opened at head 2.
     let mut tx =
         crate::ffi_support::staged::staged_begin(&catalog, None, String::new(), Some(read))
+            .await
             .unwrap();
     stage_append(&mut tx, 1, 1, 1, 0);
     assert_eq!(tx.commit().await.unwrap().get(), 3);
@@ -686,6 +688,7 @@ async fn coalesced_log_appends_rebase_against_pending_members() {
         String::new(),
         scope.reads().clone(),
     )
+    .await
     .unwrap();
     let mut second = crate::ffi_support::staged::staged_begin_scoped(
         &catalog,
@@ -693,6 +696,7 @@ async fn coalesced_log_appends_rebase_against_pending_members() {
         String::new(),
         scope.reads().clone(),
     )
+    .await
     .unwrap();
     stage_append(&mut first, 1, 1, 1, 0);
     stage_append(&mut second, 1, 1, 1, 0);

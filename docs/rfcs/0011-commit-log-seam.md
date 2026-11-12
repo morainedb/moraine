@@ -23,9 +23,8 @@ committer-minted `transaction_id`, with its `validated_head` and the DuckLake
 `changes_made` of the snapshot it mints. A `SlotEnvelope` is the commits that
 won one slot, in order.
 
-The library never opens a SlateDB store. The catalog opens the `Db` or
-`DbReader` with its own settings over the plug a session yields, and hands the
-handle back to the provider.
+The catalog configures every SlateDB store and reader. A provider completes
+fixed reader construction so it can capture and protect its log boundary.
 
 ## Commit store
 
@@ -45,13 +44,10 @@ catalog opened.
 from the state the commit was prepared against. The sequence may be at most one
 past what this process's store knows. A stale head names a taken slot and loses.
 
-`SlotOffer::Won { sequence }` means the commit holds the slot, this process's
-store has applied it or been served it, and a durable read checkpoint covers it.
-`SlotOffer::Lost { sequence, winner, through }` means another committer holds
-the raced sequence. Everything that beat the offer is in this process's store
-before the result returns, and `through` is the last sequence the store covers.
-The catalog re-prepares against the store. It never commits a logged batch into
-SlateDB itself.
+`SlotOffer::Won { sequence }` means the validated commit durably holds the slot.
+Reader refresh, checkpoint acquisition, flushing, and compaction cannot turn a
+known win into an unknown outcome. A lost slot requires a fresh fixed view and
+revalidation; the catalog never writes a logged batch into SlateDB itself.
 
 `adopted` and `adopt` serve the open path. `fold_tail` serves demotion.
 
@@ -73,9 +69,8 @@ A session is the cursor one open shares with its plug. `WriterSession` yields
 `adopted` before the store is built. The plug replays the log in place of the
 store's own log, so a store on a log nobody has adopted drains its own log into
 the tree first. `ReaderSession` yields `reader`, the SlateDB `WalReader` the
-`DbReader` is built with, and `refresh`, which brings a reader up to the log
-before a committer's read; its default does nothing and leaves the reader to
-its poll. Both carry `as_any`.
+`DbReader` is built with, and `open_fixed_reader`, which captures a protected
+fixed view for a transaction. Both carry `as_any`.
 
 A read-write open with a provider commits as a follower over a tailing reader.
 When the log is not adopted, the open first takes the store as a holder, adopts,
@@ -101,10 +96,7 @@ compactor nor its collector, the same as `CatalogOptions::external_compaction`.
 open, over a fresh writer session from the provider, and the open's replay is
 the fold. It returns `None` when the store is one file short of SlateDB's
 `l0_max_ssts` ceiling. The library then folds nothing and the log grows until a
-compactor serves the lake. `TakeStore::take_for_publication` opens a temporary
-writer for checkpoint publication, which writes no L0 file, so the catalog's
-implementation skips the ceiling check. The default implementation delegates to
-`take` and reports a decline as `Error::Constraint`.
+compactor serves the lake.
 
 The catalog's `inspect` is the head-stamp check: every slot past the first
 carries one `sys/head` write. Any other count is `Error::Corruption`.
@@ -121,11 +113,22 @@ library reads. The catalog interprets none of them.
 | `catch_up` | `READER_CATCHUP_TIMEOUT` | 5 seconds |
 | `refresh_backoff` | `commit_log_poll_interval` | 50 ms |
 
-`CatalogHooks::publish(&db)` flushes WAL durability and publishes the current
-read checkpoint under the hooks' path and object store. The library calls it
-before reporting a won slot, and again after flushing one to SSTs. A publication
-failure after the slot lands is an unknown commit outcome. Offering the same
-mutation again does not happen.
+`ReaderSession::open_fixed_reader` receives the catalog-configured reader
+builder, reader options, and administrator. The provider captures and protects
+the durable log boundary and returns a fixed reader that owns its checkpoint
+lifetime. The catalog retains that reader across every read in one transaction
+and closes it when the last scope releases it. Both read scopes and commit
+preparation use this surface; no provider publication hook is involved.
+
+`CommitLogSettings::compact` is false when `external_compaction` is explicitly
+configured. Otherwise the provider may compact in bounded cadence passes using
+its own coordinator lifecycle. Ordinary writer opens still have no embedded
+compactor. Deployments with a continuous maintenance coordinator must set the
+external option on every catalog.
+
+Staged transaction creation is asynchronous because acquiring a protected fixed
+view performs object-store operations. The DuckDB ABI remains synchronous and
+runs acquisition through its cancellable runtime boundary.
 
 ## Catalog entry points
 

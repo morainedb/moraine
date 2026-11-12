@@ -489,7 +489,11 @@ async fn open_attempt(
 ) -> std::result::Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>), OpenFailure> {
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
-    let pacer = FlushPacer::publishing(db.clone(), flush_spacing, store.admin());
+    let pacer = if log_resident {
+        FlushPacer::new(db.clone(), flush_spacing)
+    } else {
+        FlushPacer::publishing(db.clone(), flush_spacing, store.admin())
+    };
     info!(
         writer_open_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-write"

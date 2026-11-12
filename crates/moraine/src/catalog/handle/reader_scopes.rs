@@ -9,7 +9,7 @@ use object_store::ObjectStore;
 use slatedb::DbReader;
 use tokio::{sync::Mutex, time::Instant};
 
-use super::{CatalogOptions, reader_session};
+use super::{CatalogOptions, commit_log_provider, reader_session};
 use crate::{
     Error, Result,
     store::{
@@ -31,7 +31,7 @@ struct Readers {
     listed: Option<Instant>,
 }
 
-pub(super) struct ReaderScopes {
+pub(crate) struct ReaderScopes {
     objects: Arc<dyn ObjectStore>,
     options: CatalogOptions,
     readers: Mutex<Readers>,
@@ -59,6 +59,10 @@ impl ReaderScopes {
             explicit,
             reuse,
         }
+    }
+
+    pub(crate) fn captures_log(&self) -> bool {
+        commit_log_provider(&self.options).is_some()
     }
 
     fn builder(&self) -> StoreBuilder<'_> {
@@ -94,12 +98,27 @@ impl ReaderScopes {
         Some(latest.clone())
     }
 
-    pub(super) async fn acquire(&self) -> Result<Arc<CheckpointReader>> {
+    pub(crate) async fn acquire(&self) -> Result<Arc<CheckpointReader>> {
         if let Some(explicit) = &self.explicit {
             return Ok(explicit.clone());
         }
         let mut readers = self.readers.lock().await;
         if let Some(reader) = self.unexpired(&readers) {
+            return Ok(reader);
+        }
+        if self.captures_log() {
+            // Log scopes capture on every acquisition, including read-only catalogs.
+            readers
+                .generations
+                .retain(|reader| reader.strong_count() != 0);
+            if readers.generations.len() >= MAX_READER_GENERATIONS {
+                return Err(Error::Constraint(
+                    "catalog read generation limit reached; finish an older transaction".into(),
+                ));
+            }
+            let (reader, _) = self.builder().open_fixed_reader().await?;
+            let reader = CheckpointReader::fixed(reader);
+            readers.generations.push(Arc::downgrade(&reader));
             return Ok(reader);
         }
         let admin = Arc::new(self.builder().admin());
