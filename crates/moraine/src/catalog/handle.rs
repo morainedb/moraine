@@ -363,7 +363,8 @@ pub struct CatalogOptions {
     /// the store instead. Every writer of such a store must set it: a
     /// writer's own compactor and a standalone one fence each other through
     /// the compactor epoch, and the fenced side closes its store. Defaults
-    /// to `false`.
+    /// to `false`. With a commit-log provider, this also disables compaction
+    /// in cadence maintenance passes.
     pub external_compaction: bool,
     /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
     /// recorded as the stored global `data_path` option when a fresh store
