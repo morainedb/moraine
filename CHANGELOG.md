@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Docs update and signing ([#430](https://github.com/morainedb/moraine/pull/430))
 - rewrite the data root of a copied catalog ([#425](https://github.com/morainedb/moraine/pull/425))
 - *(duckdb)* process-wide budgets as DuckDB settings ([#420](https://github.com/morainedb/moraine/pull/420))
 
