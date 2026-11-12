@@ -1142,7 +1142,7 @@ async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
         object_store,
         CatalogOptions {
             commit_log: Some(reader_provider.clone()),
-            reader_poll_interval: std::time::Duration::from_secs(60),
+            reader_poll_interval: std::time::Duration::from_mins(1),
             ..options_at("lake")
         },
     )
