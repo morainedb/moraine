@@ -10,6 +10,10 @@ inputs:
   token:
     description: Token with contents:write (release + push to main).
     required: true
+  signing_key:
+    description: PEM private key that signs builds for the extension repository the site serves; empty publishes unsigned builds only.
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
@@ -32,6 +36,25 @@ runs:
     - name: Require a build for every supported version on every platform
       shell: bash
       run: cargo run -q -p xtask -- check-release-assets dist
+    # The site serves a DuckDB extension repository from these: each build's
+    # zeroed signature footer is replaced by an RSA signature over the rest,
+    # gzipped, and published beside the unsigned build. Without the key the
+    # release is still whole, just unsigned.
+    - name: Sign builds for the extension repository
+      shell: bash
+      env:
+        SIGNING_KEY: ${{ inputs.signing_key }}
+      run: |
+        set -euo pipefail
+        mkdir -p signed
+        if [ -z "$SIGNING_KEY" ]; then
+          echo "::notice::no signing key configured; publishing unsigned builds only"
+          exit 0
+        fi
+        key=$(mktemp)
+        printf '%s\n' "$SIGNING_KEY" > "$key"
+        cargo run -q -p xtask -- sign-release-assets dist signed "$key"
+        rm -f "$key" "$key.pub"
     - name: Create draft release, attach binaries, reveal
       shell: bash
       env:
@@ -41,7 +64,7 @@ runs:
           | sed -E 's/^moraine\.(v[0-9.]+)\..*/\1/' | sort -u | paste -sd', ' -)
         gh release create "${{ inputs.tag }}" --target "${{ inputs.target }}" --draft \
           --title "${{ inputs.tag }}" \
-          --notes "Unsigned moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs a CLI started with -unsigned. Signed install (no flags, any supported version): INSTALL moraine FROM community; LOAD moraine;" \
+          --notes "moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs DuckDB started with unsigned extensions allowed. The .gz assets are the same builds signed for the extension repository at https://morainedb.github.io/ext, which installs them with no flag: see https://morainedb.github.io/guide/getting-started/#install-the-extension." \
           || true
         # The upload has hung indefinitely against the releases API on a
         # payload it usually moves in under a minute, leaving a draft that
@@ -51,7 +74,7 @@ runs:
         uploaded=false
         for attempt in 1 2 3; do
           if timeout 600 gh release upload "${{ inputs.tag }}" \
-               dist/*.duckdb_extension --clobber; then
+               dist/*.duckdb_extension signed/*.gz --clobber; then
             uploaded=true
             break
           fi
@@ -67,7 +90,7 @@ runs:
         # mostly failed still passed it and revealed with one asset of
         # eight. A reveal is the point of no return for anyone watching the
         # releases page, so it happens only once the remote agrees.
-        staged=$(ls dist/*.duckdb_extension | wc -l)
+        staged=$(ls dist/*.duckdb_extension signed/*.gz 2>/dev/null | wc -l)
         landed=$(gh release view "${{ inputs.tag }}" \
           --json assets --jq '[.assets[] | select(.state == "uploaded")] | length')
         if [ "$landed" -ne "$staged" ]; then

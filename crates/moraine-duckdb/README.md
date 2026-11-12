@@ -146,11 +146,18 @@ versions by DuckDB-series branch (`v1.3-ossivalis`, `v1.4-andium`,
 
 ## Installing
 
-Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
-and are unsigned. Pick the one matching your DuckDB version exactly; a
-mismatch is refused even when unsigned, because a C++-ABI extension is bound
-to the version string in its footer. Start the CLI with `-unsigned` (the
-setting cannot be changed on a running database) and load the file:
+The signed path is the extension repository the site serves, documented in
+[Getting started](https://morainedb.github.io/guide/getting-started/#install-the-extension).
+Its `.gz` assets on each release are the builds below with the signature
+footer filled in; the publish action signs them with the
+`DUCKDB_EXTENSION_SIGNING_PK` secret through `cargo xtask sign-release-assets`.
+
+Release assets named `moraine.<duckdb-version>.<platform>.duckdb_extension`
+are unsigned. Pick the one matching your DuckDB version exactly; a mismatch
+is refused even when unsigned, because a C++-ABI extension is bound to the
+version string in its footer. DuckDB decides at startup whether it loads
+unsigned extensions, and the setting cannot be changed on a running
+database: start the CLI with `-unsigned`, then load the file:
 
 ```sh
 duckdb -unsigned -c "LOAD './moraine.v2.0.0.osx_arm64.duckdb_extension';"

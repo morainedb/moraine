@@ -5,10 +5,13 @@ import starlightThemeNova from 'starlight-theme-nova';
 
 export default defineConfig({
 	site: 'https://morainedb.github.io',
+	// The architecture page moved from the guide into the design section.
+	redirects: { '/guide/architecture/': '/rfcs/architecture/' },
 	integrations: [
 		starlight({
 			plugins: [starlightThemeNova()],
 			customCss: ['./src/styles/custom.css'],
+			components: { Header: './src/components/Header.astro' },
 			title: 'Moraine',
 			description:
 				'A DuckLake catalog backend that stores the catalog in object storage on SlateDB.',
@@ -18,6 +21,7 @@ export default defineConfig({
 			},
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/morainedb/moraine' },
+				{ icon: 'email', label: 'Contact', href: 'mailto:info@contour.app' },
 			],
 			sidebar: [
 				{
@@ -27,7 +31,6 @@ export default defineConfig({
 						{ slug: 'guide/configuration' },
 						{ slug: 'guide/operating' },
 						{ slug: 'guide/comparison' },
-						{ slug: 'guide/architecture' },
 					],
 				},
 				{

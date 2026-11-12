@@ -83,9 +83,18 @@ gh workflow run extension.yml --repo morainedb/moraine --ref main \
 ```
 
 Tags use `ext-v<version>` or `ext-v<version>-build.<number>`. After every
-platform builds and passes validation, the workflow publishes unsigned
-binaries to that GitHub release and pins the community descriptor to the
-built commit. This does not bump the crate version or publish to crates.io.
+platform builds and passes validation, the workflow publishes the binaries
+to that GitHub release and pins the community descriptor to the built
+commit. This does not bump the crate version or publish to crates.io.
+
+With the `DUCKDB_EXTENSION_SIGNING_PK` repository secret set to the PEM
+private key, the workflow also publishes each build signed and gzipped, and
+the site build lays the newest release's signed builds out as the DuckDB
+extension repository it serves at `/ext`. The matching public key is
+committed at `site/public/ext/.well-known/duckdb-extension-repo.json`;
+rotating the key means replacing both and re-signing the current release,
+since DuckDB pins a repository's keys when a user registers it and has no
+revocation.
 
 ## The real S3 benchmark
 

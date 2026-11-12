@@ -4,8 +4,11 @@ Moraine 0.8 supports DuckDB 2.0.0.
 
 ## Next
 
-- [ ] Signed distribution through DuckDB's community extension repository,
-  so `INSTALL moraine FROM community` works without `-unsigned`.
+- [ ] `INSTALL moraine FROM community`. The build runs through DuckDB's
+  extension toolchain and the community descriptor is in the repository;
+  what remains is the pull request to the community extension repository.
+  Until then, releases are signed with Moraine's own key and served from the
+  extension repository at `https://morainedb.github.io/ext`.
 - [ ] Online index rebuild. Today a rebuild is `DROP INDEX` then
   `CREATE INDEX`, and the index serves neither lookups nor uniqueness in
   between.

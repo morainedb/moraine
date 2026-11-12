@@ -2,7 +2,7 @@
 title: Architecture
 description: How Moraine fits under DuckDB and DuckLake, and how it lays a catalog out in SlateDB.
 sidebar:
-  order: 7
+  order: 0.5
 ---
 
 DuckLake keeps table data in object storage and its catalog, the transactional
@@ -93,8 +93,8 @@ a Parquet file each.
 One process attaches a lake read-write; every other process attaches
 `READ_ONLY`. SlateDB fences by newest writer: a second read-write attach takes
 the writer role, and the first writer's next commit fails with a fencing error.
-[Getting started](../getting-started/#one-writer-many-readers) covers recovery
-and what readers' credentials need.
+[Getting started](/guide/getting-started/#one-writer-many-readers) covers
+recovery and what readers' credentials need.
 
 ## Further reading
 

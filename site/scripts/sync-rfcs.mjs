@@ -172,8 +172,12 @@ export async function syncRfcs() {
   const entries = await readdir(sourceDir);
   const rfcs = entries.filter(isPublishedRfc).sort();
 
-  await rm(outputDir, { recursive: true, force: true });
+  // Only generated pages are replaced; the directory also holds committed
+  // pages that sort among them.
   await mkdir(outputDir, { recursive: true });
+  for (const name of await readdir(outputDir)) {
+    if (name === 'index.md' || isRfcFile(name)) await rm(path.join(outputDir, name));
+  }
 
   const readme = await readFile(path.join(sourceDir, 'README.md'), 'utf8');
   await writeFile(path.join(outputDir, 'index.md'), transformReadme(readme));
