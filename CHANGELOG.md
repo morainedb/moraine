@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- refresh README and move the site to morainedb.com ([#432](https://github.com/morainedb/moraine/pull/432))
 - resume crates.io publishing against registry dependencies ([#422](https://github.com/morainedb/moraine/pull/422))
 
 - *(duckdb)* bound the commit-time snapshot reads to the transaction's start ([#411](https://github.com/morainedb/moraine/pull/411))
