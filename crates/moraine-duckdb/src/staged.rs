@@ -238,21 +238,30 @@ pub unsafe extern "C" fn moraine_tx_begin(
         // SAFETY: caller contract for the optional snapshot.
         let snapshot = unsafe { snapshot.as_ref() };
         let files = handle_ref.data_files()?;
-        let tx = if let Some(scope) = snapshot.map(|snapshot| snapshot.read_alias.as_ref()) {
-            staged_begin_scoped(
-                handle_ref.catalog.writer()?,
-                files.store,
-                files.prefix,
-                scope.catalog.reads().clone(),
-            )?
-        } else {
-            staged_begin(
-                handle_ref.catalog.writer()?,
-                files.store,
-                files.prefix,
-                None,
-            )?
-        };
+        // SAFETY: callback and context obey this function's caller contract.
+        let tx = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, async {
+                let tx = if let Some(scope) = snapshot.map(|snapshot| snapshot.read_alias.as_ref())
+                {
+                    staged_begin_scoped(
+                        handle_ref.catalog.writer()?,
+                        files.store,
+                        files.prefix,
+                        scope.catalog.reads().clone(),
+                    )
+                    .await?
+                } else {
+                    staged_begin(
+                        handle_ref.catalog.writer()?,
+                        files.store,
+                        files.prefix,
+                        None,
+                    )
+                    .await?
+                };
+                Ok::<_, AbiError>(tx)
+            })
+        }?;
         Ok(Box::new(MoraineTxHandle {
             catalog: handle,
             tx: Mutex::new(tx),

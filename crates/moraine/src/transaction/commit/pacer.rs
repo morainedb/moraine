@@ -156,7 +156,6 @@ impl PacerState {
 }
 
 impl FlushPacer {
-    #[cfg(test)]
     pub(crate) fn new(db: Db, spacing: Duration) -> Arc<Self> {
         Arc::new(Self {
             db,

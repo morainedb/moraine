@@ -41,7 +41,7 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
             tokio::time::sleep(commit::retry_backoff(attempt)).await;
         }
 
-        let session = store.begin_commit_session()?;
+        let session = store.begin_commit_session().await?;
         let base = commit::read_head_value(session.handle()).await?;
         commit::refuse_mid_migration_at(session.handle(), catalog.projections(), &base).await?;
         let status = read::read_maintenance_status(session.handle()).await?;

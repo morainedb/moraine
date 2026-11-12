@@ -28,6 +28,7 @@ pub(crate) struct CheckpointReader {
     reader: Arc<DbReader>,
     pub(crate) manifest: u64,
     deadline: Option<SyncMutex<Instant>>,
+    owned: bool,
 }
 
 impl CheckpointReader {
@@ -61,6 +62,17 @@ impl CheckpointReader {
             manifest: reader.manifest().id(),
             reader,
             deadline: None,
+            owned: false,
+        })
+    }
+
+    /// Owns a reader whose checkpoint lifetime is managed by its provider.
+    pub(crate) fn fixed(reader: DbReader) -> Arc<Self> {
+        Arc::new(Self {
+            manifest: reader.manifest().id(),
+            reader: Arc::new(reader),
+            deadline: None,
+            owned: true,
         })
     }
 
@@ -76,6 +88,7 @@ impl CheckpointReader {
             reader: Arc::new(reader),
             manifest,
             deadline: Some(SyncMutex::new(listed)),
+            owned: true,
         };
         this.confirm(listed, expires);
         Arc::new(this)
@@ -107,6 +120,19 @@ impl CheckpointReader {
     /// memory.
     pub(crate) async fn retire(self) {
         let _ = self.reader.close().await;
+    }
+}
+
+impl Drop for CheckpointReader {
+    fn drop(&mut self) {
+        if self.owned
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let reader = self.reader.clone();
+            runtime.spawn(async move {
+                let _ = reader.close().await;
+            });
+        }
     }
 }
 

@@ -426,11 +426,23 @@ impl WriterSession for TestSession {
 
 #[async_trait]
 impl ReaderSession for TestSession {
-    async fn refresh(&self, _reader: &DbReader) -> Result<()> {
-        self.cursor
-            .await_polls(2, super::READER_CATCHUP_TIMEOUT)
-            .await;
-        Ok(())
+    async fn open_fixed_reader(
+        &self,
+        builder: slatedb::DbReaderBuilder<String>,
+        options: slatedb::config::DbReaderOptions,
+        admin: slatedb::admin::Admin,
+    ) -> Result<DbReader> {
+        let checkpoint = admin
+            .list_checkpoints(Some(crate::store::checkpoint::PUBLISHED_NAME))
+            .await?
+            .into_iter()
+            .max_by_key(|checkpoint| checkpoint.manifest_id)
+            .ok_or_else(|| Error::Corruption("test log has no checkpoint".into()))?;
+        Ok(builder
+            .with_options(options)
+            .with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint.id))
+            .build()
+            .await?)
     }
 
     fn reader(&self) -> Arc<dyn WalReader> {
@@ -571,7 +583,7 @@ impl TestStore {
         })
         .await
         .map_err(Error::from)?;
-        self.hooks.publish(db).await?;
+        self.publish(db).await?;
         self.folded_since_flush.store(0, Ordering::Release);
         let directory = slatedb::config::GarbageCollectorDirectoryOptions {
             interval: None,
@@ -631,11 +643,29 @@ impl TestStore {
         }
     }
 
+    async fn publish(&self, db: &Db) -> Result<()> {
+        db.flush().await?;
+        let admin = slatedb::admin::AdminBuilder::new(
+            self.hooks.path.clone(),
+            self.hooks.object_store.clone(),
+        )
+        .build();
+        crate::store::checkpoint::Publisher::new(db.clone(), admin)
+            .through(db.status().durable_seq)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn publish_through(&self, sequence: u64) -> Result<()> {
-        let (db, session) = self.hooks.take.take_for_publication().await?;
+        let (db, session) = self
+            .hooks
+            .take
+            .take()
+            .await?
+            .ok_or_else(|| Error::Constraint("test publisher could not take store".into()))?;
         let session = own_session(session.as_any());
         let publication = if session.cursor.folded.load(Ordering::Acquire) >= sequence {
-            self.hooks.publish(&db).await
+            self.publish(&db).await
         } else {
             Err(Error::CommitOutcomeUnknown(format!(
                 "checkpoint publisher has not replayed committed slot {sequence}",
@@ -758,6 +788,7 @@ impl CommitStore for TestStore {
             }
             (Some(winner), Side::Follower(_)) => {
                 self.await_served(sequence).await;
+                self.publish_through(sequence).await?;
                 Ok(SlotOffer::Lost {
                     sequence,
                     winner,
@@ -767,7 +798,7 @@ impl CommitStore for TestStore {
             (None, Side::Holder(db)) => {
                 let publication = async {
                     self.fold_from_cursor(db, &self.cursor).await?;
-                    self.hooks.publish(db).await
+                    self.publish(db).await
                 }
                 .await;
                 publication.map_err(|error| Error::CommitOutcomeUnknown(format!(
