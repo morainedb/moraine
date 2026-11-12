@@ -64,7 +64,7 @@ runs:
           | sed -E 's/^moraine\.(v[0-9.]+)\..*/\1/' | sort -u | paste -sd', ' -)
         gh release create "${{ inputs.tag }}" --target "${{ inputs.target }}" --draft \
           --title "${{ inputs.tag }}" \
-          --notes "moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs DuckDB started with unsigned extensions allowed. The .gz assets are the same builds signed for the extension repository at https://morainedb.github.io/ext, which installs them with no flag: see https://morainedb.github.io/guide/getting-started/#install-the-extension." \
+          --notes "moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs DuckDB started with unsigned extensions allowed. The .gz assets are the same builds signed for the extension repository at https://morainedb.com/ext, which installs them with no flag: see https://morainedb.com/guide/getting-started/#install-the-extension." \
           || true
         # The upload has hung indefinitely against the releases API on a
         # payload it usually moves in under a minute, leaving a draft that

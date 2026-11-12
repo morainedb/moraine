@@ -12,7 +12,7 @@ and exercised end to end through real DuckDB.
 ## What Moraine is
 
 Moraine is a DuckLake catalog backend on SlateDB; the
-[site's architecture page](https://morainedb.github.io/rfcs/architecture/)
+[site's architecture page](https://morainedb.com/rfcs/architecture/)
 explains it for users. This file maps the code.
 
 ```text
