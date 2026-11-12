@@ -90,7 +90,7 @@ compactor nor its collector, the same as `CatalogOptions::external_compaction`.
 | `inspect: Inspect` | A check run on every slot before it is folded. A refused slot is not folded and the fold stops with the refusal. |
 | `path` | The store's path, as it was opened. |
 | `object_store` | The store's object store, as it was opened. |
-| `settings: CommitLogSettings` | The cadence and the waits. |
+| `settings: CommitLogSettings` | Maintenance cadence, compaction ownership, and retention. |
 
 `TakeStore::take` opens the store as its writer through the catalog's own writer
 open, over a fresh writer session from the provider, and the open's replay is
@@ -110,6 +110,7 @@ library reads. The catalog interprets none of them.
 | `flush_every` | `commit_log_flush_slots`, at least 1 | 256 |
 | `retention` | `commit_log_retention` | 5 minutes |
 | `poll` | `commit_log_fold_poll` | 2 seconds |
+| `compact` | inverse of `external_compaction` | `true` |
 
 `ReaderSession::open_fixed_reader` receives the catalog-configured reader
 builder, reader options, and administrator. The provider captures and protects
