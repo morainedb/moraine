@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.0](https://github.com/morainedb/moraine/compare/v0.8.1...v0.9.0) - 2026-11-11
+## [0.9.0](https://github.com/morainedb/moraine/compare/v0.8.1...v0.9.0) - 2026-11-12
 
 ### Added
+
+- rewrite the data root of a copied catalog ([#425](https://github.com/morainedb/moraine/pull/425))
+- *(duckdb)* process-wide budgets as DuckDB settings ([#420](https://github.com/morainedb/moraine/pull/420))
 
 - *(duckdb)* [**breaking**] adopt the DATA_PATH DuckLake records, so META_DATA_PATH is optional ([#416](https://github.com/morainedb/moraine/pull/416))
 - *(site)* put the evidence on the landing page and add comparison and testing pages ([#415](https://github.com/morainedb/moraine/pull/415))
@@ -20,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(test)* consume ANSI color prefixes before parsing CSV ([#426](https://github.com/morainedb/moraine/pull/426))
+
 - *(catalog)* list a committer's publications on every transaction ([#414](https://github.com/morainedb/moraine/pull/414))
 - *(duckdb)* drop the inlined-delete table expiry names ([#398](https://github.com/morainedb/moraine/pull/398))
 - *(memory)* charge metadata exports for selected descriptors ([#384](https://github.com/morainedb/moraine/pull/384))
@@ -28,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(maintenance)* cap compaction inputs and batch tables ([#377](https://github.com/morainedb/moraine/pull/377))
 
 ### Other
+
+- resume crates.io publishing against registry dependencies ([#422](https://github.com/morainedb/moraine/pull/422))
 
 - *(duckdb)* bound the commit-time snapshot reads to the transaction's start ([#411](https://github.com/morainedb/moraine/pull/411))
 - replace BENCHMARK.md with a benchmarks page organized by question ([#406](https://github.com/morainedb/moraine/pull/406))
