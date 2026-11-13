@@ -7,7 +7,7 @@ bucket-resident commit log, which lets several processes commit to one lake,
 lives in a separate library and plugs into one boundary in this crate: a
 provider trait the library implements, a commit store the catalog commits
 through, and the hooks the catalog hands back. The offer, fold, flush, truncate,
-promote, and demote loop lives in the library. Nothing on disk changes.
+and maintenance loop lives in the library. Nothing on disk changes.
 
 ## Seam boundary
 
@@ -58,7 +58,7 @@ revalidation; the catalog never writes a logged batch into SlateDB itself.
 | Method | Returns |
 |---|---|
 | `writer_session(log_store, path)` | A fresh `WriterSession` for one read-write open. |
-| `reader_session(log_store, path, tail)` | A fresh `ReaderSession` for one read-only open. A tailing reader is served the unfolded tail. One that does not tail follows the folded store. |
+| `reader_session(log_store, path)` | A fresh `ReaderSession` including durable WAL for one read-only open. |
 | `holding(db, session, hooks)` | A `CommitStore` over a writer the catalog opened with the session's plug: a holder, into which every slot folds. |
 | `following(reader, session, hooks)` | A `CommitStore` over a reader the catalog opened with the session's plug: a follower, whose writes land as slots. |
 | `garbage_collector(log_store, path)` | The `WalGc` plug SlateDB's collector truncates the log through. |
@@ -72,10 +72,10 @@ the tree first. `ReaderSession` yields `reader`, the SlateDB `WalReader` the
 `DbReader` is built with, and `open_fixed_reader`, which captures a protected
 fixed view for a transaction. Both carry `as_any`.
 
-A read-write open with a provider commits as a follower over a tailing reader.
-When the log is not adopted, the open first takes the store as a holder, adopts,
-and closes it. The catalog builds a holder only for adoption and demotion. Every
-other hold is the library's, through the hooks.
+A read-write open with a provider commits as an independent follower using fixed
+transaction views. When the log is not adopted, the open first takes the store
+as a holder, adopts, and closes it. The catalog builds a holder only for
+adoption and demotion. Every other hold is the library's, through the hooks.
 
 When `external_compaction` returns `true`, a writer starts neither SlateDB's
 compactor nor its collector, the same as `CatalogOptions::external_compaction`.
@@ -90,7 +90,7 @@ compactor nor its collector, the same as `CatalogOptions::external_compaction`.
 | `inspect: Inspect` | A check run on every slot before it is folded. A refused slot is not folded and the fold stops with the refusal. |
 | `path` | The store's path, as it was opened. |
 | `object_store` | The store's object store, as it was opened. |
-| `settings: CommitLogSettings` | The cadence and the waits. |
+| `settings: CommitLogSettings` | Maintenance cadence, compaction ownership, and retention. |
 
 `TakeStore::take` opens the store as its writer through the catalog's own writer
 open, over a fresh writer session from the provider, and the open's replay is
@@ -110,8 +110,7 @@ library reads. The catalog interprets none of them.
 | `flush_every` | `commit_log_flush_slots`, at least 1 | 256 |
 | `retention` | `commit_log_retention` | 5 minutes |
 | `poll` | `commit_log_fold_poll` | 2 seconds |
-| `catch_up` | `READER_CATCHUP_TIMEOUT` | 5 seconds |
-| `refresh_backoff` | `commit_log_poll_interval` | 50 ms |
+| `compact` | inverse of `external_compaction` | `true` |
 
 `ReaderSession::open_fixed_reader` receives the catalog-configured reader
 builder, reader options, and administrator. The provider captures and protects
@@ -198,29 +197,25 @@ first slot stands on in the format stamp. Slot `k` carries the head stamp at
 
 | Option | Effect |
 |---|---|
-| `COMMIT_LOG_TAIL` | A read-only attach tails the log, seeing a commit once its slot lands. Maps to `CatalogOptions::commit_log_tail`. |
-| `COMMIT_LOG_POLL_INTERVAL_MS` | How long a committer waits between refreshes while its slot is not yet served. Maps to `CatalogOptions::commit_log_poll_interval`. |
-| `READER_POLL_INTERVAL_MS` | How often a read-only attach looks for new commits. On a committer it keeps the reader's checkpoint alive. |
+| `READER_POLL_INTERVAL_MS` | How often a native read-only attach discovers a new publication; logged views always capture fresh state. |
 
-The first two reach the core through `moraine_attach_with_commit_log`, whose
-`commit_log` argument the older attach entry points pass as null. Without a
-registered provider they are ignored. `READER_POLL_INTERVAL_MS` applies with no
-provider at all.
+The attach entry point `moraine_attach_with_options` carries the native reader
+publication interval. Logged catalog views always capture the durable boundary;
+there is no opt-in tail mode or catch-up pacing. The base reader keeps SlateDB's
+managed checkpoint advancement so an idle catalog does not retain its opening
+WAL range forever; transactions never use that advancing view.
 
 ## Parity behaviors
 
-The library preserves these behaviors for a catalog on the seam.
-
-- Committers fence nothing. Every read-write open with a provider is a follower
-  over a tailing reader.
-- A lost race is folded before the retry lands. `Lost` returns only after every
-  slot that beat the offer is in this process's store.
-- Folding runs on a cadence from any committer. The committer that lands slot
-  `n * fold_every` takes the store through the hooks, folds, writes it out,
-  truncates the log below the replay point, and lets go. A fold that fails does
-  not fail the commit.
-- A commit over a follower waits, bounded by `catch_up`, for its reader to be
-  served the slot. The slot is durable either way.
+- Committers do not hold a writer after adoption. Read scopes and commit
+  preparation acquire protected fixed views through the provider.
+- A lost race returns the winning slot; the catalog acquires a fresh view and
+  revalidates before another offer.
+- A known durable slot completes acknowledgement. No live-reader catch-up is
+  required, and the next fixed view includes it.
+- Cadence winners schedule independent finite writer passes. The provider owns
+  replay, flush, compaction, collection, and shutdown; failure leaves durable
+  slots for a later pass.
 - Demote takes a lake back off its log. A demoted lake is refused re-adoption.
 
 ## Errors
