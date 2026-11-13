@@ -3,7 +3,10 @@
 use std::ops::Bound;
 
 use super::revision_memo::RevisionMemo;
-use crate::{IndexId, TableId, store::index_encoding::CanonicalKey};
+use crate::{
+    IndexId, TableId,
+    store::{cache::retention::Shared, index_encoding::CanonicalKey},
+};
 
 const CAPACITY: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -58,7 +61,7 @@ impl IndexProbeCache {
         table: TableId,
         index: IndexId,
         probe: &Probe,
-    ) -> Option<Vec<u64>> {
+    ) -> Option<Shared<Vec<u64>>> {
         let rows = self.0.get_matching(
             revision,
             table,
@@ -68,11 +71,14 @@ impl IndexProbeCache {
         tracing::debug!(
             table_id = table.get(),
             index_id = index.get(),
+            reused_rows = rows.len(),
+            reused_row_bytes = rows.len().saturating_mul(size_of::<u64>()),
             "index probe reused"
         );
-        Some(rows.as_ref().clone())
+        Some(rows)
     }
 
+    #[cfg(test)]
     pub(super) fn put(
         &self,
         revision: u64,
@@ -112,21 +118,30 @@ impl super::ReadOnlyCatalog {
         index: IndexId,
         probe: Probe,
         read: impl AsyncFnOnce() -> crate::Result<Vec<u64>>,
-    ) -> crate::Result<Vec<u64>> {
+    ) -> crate::Result<Shared<Vec<u64>>> {
         let revision = self.pinned_revision();
         if let Some(revision) = revision
             && let Some(rows) = self.index_probes.get(revision, table, index, &probe)
         {
             return Ok(rows);
         }
-        let rows = read().await?;
+        let rows = Shared::new(read().await?);
         tracing::debug!(
             table_id = table.get(),
             index_id = index.get(),
             "index probe resolved"
         );
         if let Some(revision) = revision {
-            self.index_probes.put(revision, table, index, probe, &rows);
+            let bytes = rows.capacity().saturating_mul(size_of::<u64>());
+            let probe_bytes = probe.bytes();
+            self.index_probes.0.put(
+                revision,
+                table,
+                (index, probe),
+                rows.clone(),
+                probe_bytes,
+                bytes,
+            );
         }
         Ok(rows)
     }
@@ -135,6 +150,20 @@ impl super::ReadOnlyCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_hits_share_the_row_allocation() {
+        let cache = IndexProbeCache::default();
+        let probe = Probe::Many(vec![]);
+        cache.put(1, TableId::new(1), IndexId::new(1), probe.clone(), &[1, 2]);
+        let first = cache
+            .get(1, TableId::new(1), IndexId::new(1), &probe)
+            .unwrap();
+        let second = cache
+            .get(1, TableId::new(1), IndexId::new(1), &probe)
+            .unwrap();
+        assert_eq!(first.as_ptr(), second.as_ptr());
+    }
 
     #[test]
     fn borrowed_probes_find_every_owned_mode() {
@@ -162,7 +191,7 @@ mod tests {
         for (position, probe) in probes.iter().enumerate() {
             assert_eq!(
                 cache.get(1, TableId::new(1), IndexId::new(1), probe),
-                Some(vec![position as u64])
+                Some(Shared::new(vec![position as u64]))
             );
         }
     }
@@ -174,7 +203,10 @@ mod tests {
         let index = IndexId::new(1);
         let probe = Probe::Many(vec![]);
         cache.put(1, table, index, probe.clone(), &[7]);
-        assert_eq!(cache.get(1, table, index, &probe), Some(vec![7]));
+        assert_eq!(
+            cache.get(1, table, index, &probe),
+            Some(Shared::new(vec![7]))
+        );
         assert_eq!(cache.get(2, table, index, &probe), None);
         assert_eq!(cache.get(1, TableId::new(2), index, &probe), None);
         assert_eq!(cache.get(1, table, IndexId::new(2), &probe), None);
@@ -192,6 +224,6 @@ mod tests {
         cache.put(3, table, index, probe.clone(), &rows);
         assert_eq!(cache.get(1, table, index, &probe), None);
         assert!(cache.estimated_bytes() <= CAPACITY as u64);
-        assert_eq!(cache.get(3, table, index, &probe), Some(rows));
+        assert_eq!(cache.get(3, table, index, &probe), Some(Shared::new(rows)));
     }
 }

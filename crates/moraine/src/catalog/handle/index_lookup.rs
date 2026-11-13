@@ -287,7 +287,7 @@ impl ReadOnlyCatalog {
             .await;
         finish_session(session);
 
-        index_row_ids
+        index_row_ids.map(crate::store::cache::retention::Shared::into_owned)
     }
 
     /// Resolves a comparison query to the rows whose indexed value falls
@@ -342,7 +342,7 @@ impl ReadOnlyCatalog {
             .await;
         finish_session(session);
 
-        range_row_ids
+        range_row_ids.map(crate::store::cache::retention::Shared::into_owned)
     }
 
     /// Resolves an `IS NULL` query to the rows whose leading indexed columns
@@ -406,7 +406,7 @@ impl ReadOnlyCatalog {
             .await;
         finish_session(session);
 
-        null_prefix_row_ids
+        null_prefix_row_ids.map(crate::store::cache::retention::Shared::into_owned)
     }
 
     /// A bounded optimizer probe; a full buffer signals possible overflow.
@@ -416,7 +416,7 @@ impl ReadOnlyCatalog {
         index: IndexId,
         probe: Probe,
         limit: usize,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<crate::store::cache::retention::Shared<Vec<u64>>> {
         let mut session = None;
         let rows = self
             .lookup_at_head(&mut session, table, index, async |handle, info| {

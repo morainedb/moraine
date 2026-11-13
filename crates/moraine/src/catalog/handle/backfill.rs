@@ -45,26 +45,27 @@ async fn collect_immediate_backfill(
         EntityRecordKind::File,
         Versions::Live,
         Some(source.table.get()),
+        crate::read_policy::CacheAdmission::ReuseOnly,
     )
     .await?;
     let files = stream::try_unfold(cursor, |mut cursor| async move {
-        while let Some((record, memory)) = cursor.next().await? {
-            if let EntityRecord::File(file) = record {
-                return Ok(Some(((file, memory), cursor)));
+        while let Some(record) = cursor.next().await? {
+            if let EntityRecord::File(file) = record.value() {
+                let file = file.clone();
+                return Ok(Some((record.map(|_| file), cursor)));
             }
         }
         Ok(None)
     });
     let resolve = &resolve;
     files
-        .map_ok(|(file, memory)| {
+        .map_ok(|file| {
             let object_store = object_store.clone();
             let metrics = Arc::clone(&metrics);
             async move {
-                let _memory = memory;
                 let columns = source
                     .snapshot
-                    .file_read_columns_at(source.handle, source.table, &file)
+                    .file_read_columns_at(source.handle, source.table, file.value())
                     .await?;
                 let dead = dead_positions(
                     source.handle,

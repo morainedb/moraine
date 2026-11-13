@@ -830,16 +830,26 @@ impl ReadOnlyCatalog {
         use crate::store::read::{EntityRecord, EntityRecordKind, OwnedEntityCursor, Versions};
         let scope = self.index_read_scope().await?;
         let handle = scope.reads().owned_read_handle();
-        let mut cursor =
-            OwnedEntityCursor::open(handle.clone(), EntityRecordKind::File, Versions::Live, None)
-                .await?;
+        let mut cursor = OwnedEntityCursor::open(
+            handle.clone(),
+            EntityRecordKind::File,
+            Versions::Live,
+            None,
+            crate::read_policy::CacheAdmission::ReuseOnly,
+        )
+        .await?;
         let tables: Option<HashSet<TableId>> = tables.map(|tables| tables.into_iter().collect());
+        let context = publication::TableContext::default();
         let mut total = RowSummaryPublish::default();
         let mut done = false;
         while !done {
             let mut files = Vec::new();
             while files.len() < data_file::PUBLISH_CONCURRENCY {
-                let Some((record, memory)) = cursor.next().await? else {
+                let Some((record, memory)) = cursor
+                    .next()
+                    .await?
+                    .map(crate::memory::Reserved::into_parts)
+                else {
                     done = true;
                     break;
                 };
@@ -860,10 +870,21 @@ impl ReadOnlyCatalog {
             let mut results = stream::iter(files)
                 .map(|(file, memory)| {
                     let handle = handle.borrow();
+                    let context = &context;
                     async move {
-                        let result = self
-                            .publish_registered_file(handle, data_store, data_prefix, &file)
-                            .await;
+                        let result = async {
+                            let table = TableId::new(file.table_id);
+                            let prefix = context.resolve(handle, table).await?;
+                            self.publish_file(
+                                data_store,
+                                data_prefix,
+                                &prefix,
+                                table,
+                                data_file_info(&file),
+                            )
+                            .await
+                        }
+                        .await;
                         drop(memory);
                         (file.table_id, file.data_file_id, result)
                     }
@@ -884,19 +905,12 @@ impl ReadOnlyCatalog {
         Ok(total)
     }
 
-    async fn publish_registered_file(
-        &self,
-        handle: ReadHandle<'_>,
-        data_store: &DataStore,
-        data_prefix: &str,
-        file: &crate::store::proto::DataFileValue,
-    ) -> Result<bool> {
+    async fn publication_table_prefix(handle: ReadHandle<'_>, table: TableId) -> Result<String> {
         use crate::store::{
             key::{EntityKey, Key},
             proto::{SchemaValue, TableValue},
             read::read_singleton,
         };
-        let table = TableId::new(file.table_id);
         let descriptor: TableValue = read_singleton(
             handle,
             Key::current(EntityKey::Table {
@@ -913,15 +927,7 @@ impl ReadOnlyCatalog {
         )
         .await?
         .ok_or_else(|| Error::Corruption("table references a missing schema".into()))?;
-        let table_prefix = format!("{}{}", schema.path, descriptor.path);
-        self.publish_file(
-            data_store,
-            data_prefix,
-            &table_prefix,
-            table,
-            data_file_info(file),
-        )
-        .await
+        Ok(format!("{}{}", schema.path, descriptor.path))
     }
 
     async fn publish_file(

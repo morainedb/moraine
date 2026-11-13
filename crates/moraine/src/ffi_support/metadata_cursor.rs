@@ -119,7 +119,14 @@ impl MetadataSource {
         let head = crate::transaction::commit::read_head_value(handle.borrow()).await?;
         let versions = read::versions_for(live_bound, Some(head.snapshot_id));
         Ok(Self::Entities(
-            OwnedEntityCursor::open(handle, kind, versions, table_id).await?,
+            OwnedEntityCursor::open(
+                handle,
+                kind,
+                versions,
+                table_id,
+                crate::read_policy::CacheAdmission::ReuseOnly,
+            )
+            .await?,
         ))
     }
 }
@@ -189,7 +196,11 @@ impl MetadataCursor {
             ));
         };
         while !self.base_finished {
-            let Some((record, memory)) = cursor.next().await? else {
+            let Some((record, memory)) = cursor
+                .next()
+                .await?
+                .map(crate::memory::Reserved::into_parts)
+            else {
                 self.base_finished = true;
                 break;
             };

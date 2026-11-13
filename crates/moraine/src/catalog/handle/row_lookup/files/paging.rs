@@ -28,6 +28,7 @@ impl ReadOnlyCatalog {
             EntityRecordKind::File,
             Versions::Live,
             Some(table.get()),
+            crate::read_policy::CacheAdmission::Retain,
         )
         .await?;
         let mut placements = Placements::new();
@@ -36,7 +37,11 @@ impl ReadOnlyCatalog {
             let mut memory = Vec::new();
             let mut bytes = 0_u64;
             for _ in 0..PAGE_FILES {
-                let Some((record, reservation)) = cursor.next().await? else {
+                let Some((record, reservation)) = cursor
+                    .next()
+                    .await?
+                    .map(crate::memory::Reserved::into_parts)
+                else {
                     break;
                 };
                 let read::EntityRecord::File(file) = &record else {

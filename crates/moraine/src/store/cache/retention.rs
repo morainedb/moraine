@@ -128,6 +128,17 @@ impl<T> Shared<T> {
     }
 }
 
+impl<T: Clone> Shared<T> {
+    /// Moves an unshared value out, copying only while another owner retains
+    /// it.
+    pub(crate) fn into_owned(self) -> T {
+        match Arc::try_unwrap(self.0) {
+            Ok(held) => held.value,
+            Err(held) => held.value.clone(),
+        }
+    }
+}
+
 impl<T> Clone for Shared<T> {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))

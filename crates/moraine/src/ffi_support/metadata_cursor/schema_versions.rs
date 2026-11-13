@@ -287,6 +287,7 @@ impl FileFloors {
                     EntityRecordKind::File,
                     Versions::Live,
                     None,
+                    crate::read_policy::CacheAdmission::ReuseOnly,
                 )
                 .await?,
                 OwnedEntityCursor::open_ended(handle, EntityRecordKind::File).await?,
@@ -300,7 +301,8 @@ impl FileFloors {
         if self.pending[index].is_some() || self.ended[index] {
             return Ok(());
         }
-        while let Some((record, _memory)) = self.cursors[index].next().await? {
+        while let Some(record_owner) = self.cursors[index].next().await? {
+            let record = record_owner.value().clone();
             let record = match &self.overlay {
                 Some(overlay) => overlay.apply(record)?,
                 None => Some(record),

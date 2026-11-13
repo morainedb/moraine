@@ -37,14 +37,15 @@ impl<'a> EntityCursor<'a> {
         kind: EntityRecordKind,
         versions: Versions,
         table: Option<u64>,
+        admission: crate::read_policy::CacheAdmission,
     ) -> Result<Self> {
         Ok(Self {
             handle,
-            state: CursorState::open(handle, kind, versions, table).await?,
+            state: CursorState::open(handle, kind, versions, table, admission).await?,
         })
     }
 
-    pub(crate) async fn next(&mut self) -> Result<Option<(EntityRecord, MemoryReservation)>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<crate::memory::Reserved<EntityRecord>>> {
         self.state.next(self.handle).await
     }
 }
@@ -61,8 +62,9 @@ impl OwnedEntityCursor {
         kind: EntityRecordKind,
         versions: Versions,
         table: Option<u64>,
+        admission: crate::read_policy::CacheAdmission,
     ) -> Result<Self> {
-        let state = CursorState::open(handle.borrow(), kind, versions, table).await?;
+        let state = CursorState::open(handle.borrow(), kind, versions, table, admission).await?;
         Ok(Self { handle, state })
     }
 
@@ -132,12 +134,19 @@ impl OwnedEntityCursor {
         handle: OwnedReadHandle,
         kind: EntityRecordKind,
     ) -> Result<Self> {
-        let mut cursor = Self::open(handle, kind, Versions::LiveAndEnded, None).await?;
+        let mut cursor = Self::open(
+            handle,
+            kind,
+            Versions::LiveAndEnded,
+            None,
+            crate::read_policy::CacheAdmission::ReuseOnly,
+        )
+        .await?;
         cursor.state.latest_only = true;
         Ok(cursor)
     }
 
-    pub(crate) async fn next(&mut self) -> Result<Option<(EntityRecord, MemoryReservation)>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<crate::memory::Reserved<EntityRecord>>> {
         self.state.next(self.handle.borrow()).await
     }
 }
@@ -209,6 +218,7 @@ impl CursorState {
         kind: EntityRecordKind,
         versions: Versions,
         table: Option<u64>,
+        admission: crate::read_policy::CacheAdmission,
     ) -> Result<Self> {
         let (current, history) = if let Some(table) = table {
             let scoped = kind.table_scoped().ok_or_else(|| {
@@ -227,7 +237,7 @@ impl CursorState {
             (current_gc_file_prefix(), None)
         };
         let history = history.filter(|_| versions == Versions::LiveAndEnded && kind.is_versioned());
-        let shape = if table.is_some() {
+        let shape = if admission.retains() {
             ScanShape::bounded().retain()
         } else {
             ScanShape::bounded().reuse_only()
@@ -248,7 +258,7 @@ impl CursorState {
     async fn next(
         &mut self,
         handle: ReadHandle<'_>,
-    ) -> Result<Option<(EntityRecord, MemoryReservation)>> {
+    ) -> Result<Option<crate::memory::Reserved<EntityRecord>>> {
         loop {
             handle.validate()?;
             if let Some(mut entry) = self.iterator.next().await? {
@@ -299,7 +309,7 @@ impl CursorState {
                 } else {
                     decode_current_record(key, &entry.value)?
                 };
-                return Ok(Some((record, memory)));
+                return Ok(Some(crate::memory::Reserved::new(record, memory)));
             }
             let Some(history) = self.history.take() else {
                 return Ok(None);
@@ -361,10 +371,11 @@ mod tests {
             EntityRecordKind::File,
             Versions::Live,
             Some(1),
+            crate::read_policy::CacheAdmission::Retain,
         )
         .await
         .unwrap();
-        let (record, memory) = cursor.next().await.unwrap().unwrap();
+        let (record, memory) = cursor.next().await.unwrap().unwrap().into_parts();
         assert!(matches!(record, EntityRecord::File(file) if file.data_file_id == 1));
         assert!(memory.bytes() > 0);
         assert!(matches!(cursor.next().await, Err(Error::Corruption(_))));
@@ -374,7 +385,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_table_scans_reuse_foyer_blocks() {
+    async fn entity_scans_obey_admission_independently_of_table_scope() {
+        use crate::read_policy::CacheAdmission::{Retain, ReuseOnly};
         let (database, counters) = StoreBuilder::new("cached-metadata", Arc::new(InMemory::new()))
             .cache_puts(false)
             .open_writer()
@@ -404,14 +416,23 @@ mod tests {
             })
             .await
             .unwrap();
-        for warm in [false, true] {
+        for (pass, (table, admission)) in [
+            (Some(1), ReuseOnly),
+            (None, ReuseOnly),
+            (Some(1), Retain),
+            (None, Retain),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let before = counters.tally();
             let transaction = database.begin(IsolationLevel::Snapshot).unwrap();
             let mut cursor = EntityCursor::open(
                 ReadHandle::Tx(&transaction),
                 EntityRecordKind::File,
                 Versions::Live,
-                Some(1),
+                table,
+                admission,
             )
             .await
             .unwrap();
@@ -423,7 +444,7 @@ mod tests {
             drop(cursor);
             transaction.rollback();
             let reads = counters.tally().since(before);
-            if warm {
+            if pass == 3 {
                 assert!(reads.block_hits > 0, "{reads:?}");
                 assert_eq!(reads.block_misses, 0, "{reads:?}");
             } else {

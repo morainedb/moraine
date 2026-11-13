@@ -18,6 +18,9 @@ use crate::store::{
     value,
 };
 
+mod context;
+pub(super) use context::TableContext;
+
 pub(super) type Position = (u64, u64);
 
 const DISCOVERY_FILES: usize = 128;
@@ -54,6 +57,7 @@ pub struct RowSummaryProgress {
     page: VecDeque<DiscoveredFile>,
     counts: PublicationCounts,
     reported: std::time::Instant,
+    context: context::TableContext,
 }
 
 impl RowSummaryProgress {
@@ -74,6 +78,7 @@ impl RowSummaryProgress {
             page: VecDeque::new(),
             counts: PublicationCounts::default(),
             reported: std::time::Instant::now(),
+            context: context::TableContext::default(),
         }
     }
 
@@ -193,10 +198,11 @@ impl RowSummaryProgress {
     }
 
     fn finish_round(&mut self) -> Result<bool> {
+        self.context.clear();
         self.handle = None;
         if self.failed.is_empty() {
             self.complete = true;
-            tracing::info!(?self.counts, "row summary publication completed");
+            tracing::info!(?self.counts, table_context_loads = self.context.loads(), table_context_reuses = self.context.reuses(), "row summary publication completed");
             return Ok(true);
         }
         self.retrying = true;
@@ -235,6 +241,7 @@ impl RowSummaryProgress {
         if selected.is_empty() {
             return self.finish_round();
         }
+        let context = &self.context;
         let mut results = stream::iter(selected)
             .map(|selected| {
                 let position = selected.position;
@@ -263,8 +270,15 @@ impl RowSummaryProgress {
                             };
                             file
                         };
+                        let prefix = context.resolve(handle, TableId::new(file.table_id)).await?;
                         catalog
-                            .publish_registered_file(handle, data_store, data_prefix, file)
+                            .publish_file(
+                                data_store,
+                                data_prefix,
+                                &prefix,
+                                TableId::new(file.table_id),
+                                super::data_file_info(file),
+                            )
                             .await
                     }
                     .await;
@@ -294,7 +308,7 @@ impl RowSummaryProgress {
             }
         }
         if self.reported.elapsed() >= std::time::Duration::from_secs(10) {
-            tracing::info!(?self.counts, remaining_in_page = self.page.len(), retained_decoded_bytes = self.page.iter().map(DiscoveredFile::bytes).sum::<u64>(), "row summary publication advanced");
+            tracing::info!(?self.counts, table_context_loads = self.context.loads(), table_context_reuses = self.context.reuses(), remaining_in_page = self.page.len(), retained_decoded_bytes = self.page.iter().map(DiscoveredFile::bytes).sum::<u64>(), "row summary publication advanced");
             self.reported = std::time::Instant::now();
         }
         // A summary build sorts and encodes row IDs for every file in the

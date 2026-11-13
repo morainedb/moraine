@@ -93,13 +93,28 @@ impl ReadScope {
                     .await?
                 }
                 Selection::Range(kind, table) => {
-                    OwnedEntityCursor::open(handle.clone(), *kind, versions, *table).await?
+                    OwnedEntityCursor::open(
+                        handle.clone(),
+                        *kind,
+                        versions,
+                        *table,
+                        crate::read_policy::CacheAdmission::Retain,
+                    )
+                    .await?
                 }
                 Selection::Namespace(kind, ..) => {
-                    OwnedEntityCursor::open(handle.clone(), *kind, versions, None).await?
+                    OwnedEntityCursor::open(
+                        handle.clone(),
+                        *kind,
+                        versions,
+                        None,
+                        crate::read_policy::CacheAdmission::ReuseOnly,
+                    )
+                    .await?
                 }
             };
-            while let Some((record, _memory)) = cursor.next().await? {
+            while let Some(record_owner) = cursor.next().await? {
+                let record = record_owner.value().clone();
                 if selection.matches(&record)
                     && record.lifecycle().is_none_or(|(begin, end)| {
                         begin <= self.header.snapshot_id

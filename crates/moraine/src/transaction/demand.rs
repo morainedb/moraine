@@ -69,8 +69,16 @@ impl Selection {
                         return Err(Error::Corruption("invalid range selection".into()));
                     }
                 };
-                let mut cursor = EntityCursor::open(handle, kind, Versions::Live, table).await?;
-                while let Some((record, _memory)) = cursor.next().await? {
+                let mut cursor = EntityCursor::open(
+                    handle,
+                    kind,
+                    Versions::Live,
+                    table,
+                    crate::read_policy::CacheAdmission::Retain,
+                )
+                .await?;
+                while let Some(record_owner) = cursor.next().await? {
+                    let record = record_owner.value().clone();
                     if selection.matches(&record) {
                         retain(view, record)?;
                     }
@@ -232,11 +240,17 @@ impl Transaction {
     }
     async fn index(&mut self, index: IndexId) -> Result<()> {
         if !self.inner.index_tables.contains_key(&index.get()) {
-            let mut cursor =
-                EntityCursor::open(self.session.handle(), Kind::Index, Versions::Live, None)
-                    .await?;
+            let mut cursor = EntityCursor::open(
+                self.session.handle(),
+                Kind::Index,
+                Versions::Live,
+                None,
+                crate::read_policy::CacheAdmission::ReuseOnly,
+            )
+            .await?;
             let mut found = None;
-            while let Some((record, _memory)) = cursor.next().await? {
+            while let Some(record_owner) = cursor.next().await? {
+                let record = record_owner.value().clone();
                 if let EntityRecord::Index(value) = record
                     && value.index_id == index.get()
                 {

@@ -79,9 +79,16 @@ async fn index_name(handle: ReadHandle<'_>, schema: &str, name: &str) -> Result<
         return Ok(view);
     };
     point(handle, &mut view, EntityKey::Schema { schema_id }).await?;
-    let mut indexes =
-        EntityCursor::open(handle, EntityRecordKind::Index, Versions::Live, None).await?;
-    while let Some((record, _memory)) = indexes.next().await? {
+    let mut indexes = EntityCursor::open(
+        handle,
+        EntityRecordKind::Index,
+        Versions::Live,
+        None,
+        crate::read_policy::CacheAdmission::ReuseOnly,
+    )
+    .await?;
+    while let Some(record_owner) = indexes.next().await? {
+        let record = record_owner.value().clone();
         let EntityRecord::Index(index) = record else {
             continue;
         };

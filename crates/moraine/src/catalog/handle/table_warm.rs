@@ -55,13 +55,16 @@ impl ReadOnlyCatalog {
                 EntityRecordKind::Index,
                 Versions::Live,
                 Some(table.get()),
+                crate::read_policy::CacheAdmission::Retain,
             )
             .await?;
             let mut prefixes = table_probe_prefixes(table.get(), []);
             loop {
                 let next = cursor.next().await?;
                 let ended = next.is_none();
-                if let Some((EntityRecord::Index(index), _memory)) = next {
+                if let Some(owner) = next
+                    && let EntityRecord::Index(index) = owner.value()
+                {
                     let kind = if index.unique {
                         IndexKind::Unique
                     } else {

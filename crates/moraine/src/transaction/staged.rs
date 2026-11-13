@@ -674,12 +674,20 @@ impl StagedTransaction {
     ) -> Result<Vec<T>> {
         let handle = self.read_handle();
         read::consistent(handle, || async {
-            let mut cursor = read::EntityCursor::open(handle, kind, versions, scope).await?;
+            let mut cursor = read::EntityCursor::open(
+                handle,
+                kind,
+                versions,
+                scope,
+                crate::read_policy::CacheAdmission::Retain,
+            )
+            .await?;
             let mut rows = Vec::new();
             let mut memory = crate::MemoryReservation::reserve(0)?;
             let mut current_records = 0_usize;
             let mut history_records = 0_usize;
-            while let Some((record, _record_memory)) = cursor.next().await? {
+            while let Some(record_owner) = cursor.next().await? {
+                let record = record_owner.value().clone();
                 if record.lifecycle().is_some_and(|(_, end)| end.is_some()) {
                     history_records += 1;
                 } else {
