@@ -17,12 +17,13 @@ use tokio::{
     sync::{Notify, Semaphore},
     task::JoinHandle,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 const MAX_PENDING_PASSES: usize = 128;
 
 // Separate pools reserve progress for commits while backfills are saturated.
 static COMMIT_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+static WARMING_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 static BACKFILL_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
 #[derive(Clone, Copy)]
@@ -97,7 +98,8 @@ pub(super) struct Pass {
     since: Option<SnapshotId>,
     progress: Arc<tokio::sync::Mutex<Progress>>,
     files: Option<Arc<Vec<(TableId, moraine::DataFileId)>>>,
-    _memory: Option<Arc<moraine::MemoryReservation>>,
+    reservations: Vec<Arc<moraine::MemoryReservation>>,
+    warming_only: bool,
 }
 
 impl Pass {
@@ -107,7 +109,8 @@ impl Pass {
             since: None,
             progress: Arc::default(),
             files: None,
-            _memory: None,
+            reservations: Vec::new(),
+            warming_only: false,
         }
     }
 
@@ -121,36 +124,48 @@ impl Pass {
             since: Some(SnapshotId::new(committed.get().saturating_sub(1))),
             progress: Arc::default(),
             files: Some(Arc::new(files)),
-            _memory: Some(Arc::new(memory)),
+            reservations: vec![Arc::new(memory)],
+            warming_only: false,
         })
     }
 
     async fn run(self, catalog: &ReadOnlyCatalog, store: Option<&DataStore>, prefix: &str) -> bool {
         let mut progress = self.progress.lock().await;
-        let warming = progress
-            .warming
-            .get_or_insert_with(|| Warming::new(self.tables.as_ref()));
-        let mut warmed = true;
-        loop {
-            let table = match warming.next(catalog).await {
-                Ok(Some(table)) => table,
-                Ok(None) => break,
-                Err(error) => {
-                    warn!(%error, "table discovery will retry");
+        if self.warming_only {
+            let started = std::time::Instant::now();
+            info!(tables = ?self.tables, "background warming started");
+            let warming = progress
+                .warming
+                .get_or_insert_with(|| Warming::new(self.tables.as_ref()));
+            let mut warmed = true;
+            loop {
+                let table = match warming.next(catalog).await {
+                    Ok(Some(table)) => table,
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!(%error, "table discovery will retry");
+                        warmed = false;
+                        break;
+                    }
+                };
+                if let Err(error) = catalog.warm_tables(&[table]).await {
+                    warn!(%error, "table warming will retry");
                     warmed = false;
                     break;
                 }
-            };
-            if let Err(error) = catalog.warm_tables(&[table]).await {
-                warn!(%error, "table warming will retry");
-                warmed = false;
-                break;
+                warming.tables.pop_front();
+                tokio::task::yield_now().await;
             }
-            warming.tables.pop_front();
-            tokio::task::yield_now().await;
+            info!(
+                complete = warmed,
+                elapsed_seconds = started.elapsed().as_secs_f64(),
+                remaining_tables = warming.tables.len(),
+                "background warming advanced"
+            );
+            return warmed;
         }
         let Some(store) = store else {
-            return warmed;
+            return true;
         };
         let publication = progress.publishing.get_or_insert_with(|| {
             if let Some(files) = self.files {
@@ -164,7 +179,7 @@ impl Pass {
         });
         loop {
             match publication.advance(catalog, store, prefix).await {
-                Ok(true) => return warmed,
+                Ok(true) => return true,
                 Ok(false) => tokio::task::yield_now().await,
                 Err(error) => {
                     warn!(%error, "row summary publishing will retry");
@@ -182,11 +197,31 @@ struct Pending {
 }
 
 impl Pending {
-    fn push(&self, next: Pass) -> bool {
+    fn push(&self, mut next: Pass) -> bool {
         let mut pending = self
             .passes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if next.warming_only {
+            for queued in pending.iter_mut() {
+                let unstarted = queued
+                    .progress
+                    .try_lock()
+                    .is_ok_and(|progress| progress.warming.is_none());
+                if queued.warming_only
+                    && unstarted
+                    && queued.reservations.len() + next.reservations.len() <= MAX_PENDING_PASSES
+                {
+                    match (&mut queued.tables, next.tables.take()) {
+                        (Some(queued), Some(tables)) => queued.extend(tables),
+                        (tables, None) => *tables = None,
+                        (None, _) => {}
+                    }
+                    queued.reservations.append(&mut next.reservations);
+                    return true;
+                }
+            }
+        }
         if pending.len() >= MAX_PENDING_PASSES {
             return false;
         }
@@ -214,6 +249,8 @@ impl Pending {
                     break;
                 }
                 warn!(
+                    stage = if pass.warming_only { "warming" } else { "publication" },
+                    since = ?pass.since,
                     timed_out = completed.is_err(),
                     ?delay,
                     "background pass will retry"
@@ -252,10 +289,20 @@ impl Pending {
 struct Schedule {
     commits: Pending,
     backfill: Pending,
+    warming: Pending,
 }
 
 impl Schedule {
     fn push(&self, pass: Pass) {
+        if pass.tables.as_ref().is_none_or(|tables| !tables.is_empty()) {
+            let mut warming = pass.clone();
+            warming.warming_only = true;
+            warming.progress = Arc::default();
+            warming.files = None;
+            if !self.warming.push(warming) {
+                warn!("background admission full; warming was not queued");
+            }
+        }
         if pass.since.is_some() {
             if !self.commits.push(pass) {
                 warn!(
@@ -270,6 +317,8 @@ impl Schedule {
     async fn run<F: Future<Output = bool>>(&self, run: impl Fn(Pass) -> F) {
         // Keep polling backfill so it can release shared I/O permits.
         tokio::join!(
+            self.warming
+                .run_with(&run, &WARMING_SLOTS, Policy::default()),
             self.commits
                 .run_with(&run, &COMMIT_SLOTS, Policy::default()),
             self.backfill

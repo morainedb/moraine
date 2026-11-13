@@ -1,6 +1,10 @@
 //! Bounded publication steps with a resumable file frontier.
 
-use std::{collections::BTreeSet, ops::Bound};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    ops::Bound,
+    sync::Arc,
+};
 
 use futures::{StreamExt, stream};
 
@@ -17,6 +21,27 @@ use crate::store::{
 
 pub(super) type Position = (u64, u64);
 
+const DISCOVERY_FILES: usize = 128;
+const DISCOVERY_BYTES: usize = 256 * 1024;
+
+struct DiscoveredFile {
+    value: DataFileValue,
+    _memory: crate::MemoryReservation,
+}
+
+struct SelectedFile {
+    position: Position,
+    file: Option<Arc<DiscoveredFile>>,
+}
+
+#[derive(Default, Debug)]
+struct PublicationCounts {
+    discovered: u64,
+    published: u64,
+    skipped: u64,
+    failed: u64,
+}
+
 /// Progress through one selected snapshot's row-summary publication.
 /// Successful steps survive cancellation of a later step. Drop this value to
 /// release its snapshot; progress is local to this process.
@@ -30,6 +55,9 @@ pub struct RowSummaryProgress {
     retrying: bool,
     complete: bool,
     files: Option<std::collections::VecDeque<Position>>,
+    page: VecDeque<Arc<DiscoveredFile>>,
+    counts: PublicationCounts,
+    reported: std::time::Instant,
 }
 
 impl RowSummaryProgress {
@@ -47,6 +75,9 @@ impl RowSummaryProgress {
             retrying: false,
             complete: false,
             files: None,
+            page: VecDeque::new(),
+            counts: PublicationCounts::default(),
+            reported: std::time::Instant::now(),
         }
     }
 
@@ -54,6 +85,7 @@ impl RowSummaryProgress {
     #[must_use]
     pub fn for_files(files: Vec<(TableId, crate::DataFileId)>) -> Self {
         let mut progress = Self::new(None, None);
+        progress.counts.discovered = files.len() as u64;
         progress.files = Some(
             files
                 .into_iter()
@@ -66,18 +98,34 @@ impl RowSummaryProgress {
     async fn select(
         &mut self,
         handle: crate::store::handle::ReadHandle<'_>,
-    ) -> Result<Vec<Position>> {
+    ) -> Result<Vec<SelectedFile>> {
         if self.retrying {
-            return self.retries.peek(data_file::PUBLISH_CONCURRENCY).await;
+            return Ok(self
+                .retries
+                .peek(data_file::PUBLISH_CONCURRENCY)
+                .await?
+                .into_iter()
+                .map(|position| SelectedFile {
+                    position,
+                    file: None,
+                })
+                .collect());
         }
         if let Some(files) = &self.files {
             return Ok(files
                 .iter()
                 .take(data_file::PUBLISH_CONCURRENCY)
                 .copied()
+                .map(|position| SelectedFile {
+                    position,
+                    file: None,
+                })
                 .collect());
         }
 
+        if !self.page.is_empty() {
+            return Ok(self.window());
+        }
         let prefix = current_entity_kind_prefix(EntityKind::File);
         let lower = self
             .after
@@ -92,9 +140,10 @@ impl RowSummaryProgress {
                 )
             });
         let mut cursor = handle
-            .scan_prefix(prefix, (lower, Bound::Unbounded), ScanShape::Streaming)
+            .scan_prefix(prefix, (lower, Bound::Unbounded), ScanShape::Metadata)
             .await?;
-        let mut selected = Vec::new();
+        let mut selected = VecDeque::new();
+        let mut bytes = 0;
         while let Some(entry) = cursor.next().await? {
             let file: DataFileValue = value::decode_value(&entry.value)?;
             if self
@@ -110,18 +159,45 @@ impl RowSummaryProgress {
                 }
                 continue;
             }
-            selected.push((file.table_id, file.data_file_id));
-            if selected.len() == data_file::PUBLISH_CONCURRENCY {
+            let charge = entry
+                .value
+                .len()
+                .saturating_mul(3)
+                .saturating_add(size_of::<DiscoveredFile>());
+            if !selected.is_empty() && bytes + charge > DISCOVERY_BYTES {
+                break;
+            }
+            let memory = crate::MemoryReservation::reserve(charge as u64)?;
+            bytes += charge;
+            selected.push_back(Arc::new(DiscoveredFile {
+                value: file,
+                _memory: memory,
+            }));
+            if selected.len() == DISCOVERY_FILES || bytes >= DISCOVERY_BYTES {
                 break;
             }
         }
-        Ok(selected)
+        self.counts.discovered += selected.len() as u64;
+        self.page = selected;
+        Ok(self.window())
+    }
+
+    fn window(&self) -> Vec<SelectedFile> {
+        self.page
+            .iter()
+            .take(data_file::PUBLISH_CONCURRENCY)
+            .map(|file| SelectedFile {
+                position: (file.value.table_id, file.value.data_file_id),
+                file: Some(Arc::clone(file)),
+            })
+            .collect()
     }
 
     fn finish_round(&mut self) -> Result<bool> {
         self.handle = None;
         if self.failed.is_empty() {
             self.complete = true;
+            tracing::info!(?self.counts, "row summary publication completed");
             return Ok(true);
         }
         self.retrying = true;
@@ -161,7 +237,8 @@ impl RowSummaryProgress {
             return self.finish_round();
         }
         let mut results = stream::iter(selected)
-            .map(|position| {
+            .map(|selected| {
+                let position = selected.position;
                 let handle = handle.borrow();
                 async move {
                     let result = async {
@@ -170,19 +247,25 @@ impl RowSummaryProgress {
                             proto::DataFileValue,
                             read::read_singleton,
                         };
-                        let Some(file): Option<DataFileValue> = read_singleton(
-                            handle,
-                            Key::current(EntityKey::File {
-                                table_id: position.0,
-                                data_file_id: position.1,
-                            }),
-                        )
-                        .await?
-                        else {
-                            return Ok(false);
+                        let loaded;
+                        let file = if let Some(discovered) = &selected.file {
+                            &discovered.value
+                        } else {
+                            loaded = read_singleton::<DataFileValue>(
+                                handle,
+                                Key::current(EntityKey::File {
+                                    table_id: position.0,
+                                    data_file_id: position.1,
+                                }),
+                            )
+                            .await?;
+                            let Some(file) = loaded.as_ref() else {
+                                return Ok(false);
+                            };
+                            file
                         };
                         catalog
-                            .publish_registered_file(handle, data_store, data_prefix, &file)
+                            .publish_registered_file(handle, data_store, data_prefix, file)
                             .await
                     }
                     .await;
@@ -192,7 +275,13 @@ impl RowSummaryProgress {
             .buffered(data_file::PUBLISH_CONCURRENCY);
         let mut failure = None;
         while let Some((position, result)) = results.next().await {
+            match &result {
+                Ok(true) => self.counts.published += 1,
+                Ok(false) => self.counts.skipped += 1,
+                Err(_) => self.counts.failed += 1,
+            }
             if let Err(error) = result {
+                tracing::warn!(table_id = position.0, file_id = position.1, %error, ?self.counts, "row summary file will retry");
                 self.failed.push(position).await?;
                 failure.get_or_insert(error);
             }
@@ -202,7 +291,12 @@ impl RowSummaryProgress {
                 files.pop_front();
             } else {
                 self.after = Some(position);
+                self.page.pop_front();
             }
+        }
+        if self.reported.elapsed() >= std::time::Duration::from_secs(10) {
+            tracing::info!(?self.counts, remaining_in_page = self.page.len(), "row summary publication advanced");
+            self.reported = std::time::Instant::now();
         }
         // A summary build sorts and encodes row IDs for every file in the
         // window; that scratch is gone once the window is done.
@@ -220,6 +314,53 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[tokio::test]
+    async fn discovery_retains_a_page_across_unacknowledged_windows() {
+        let objects = Arc::new(object_store::memory::InMemory::new());
+        let catalog = crate::Catalog::open(objects, crate::CatalogOptions::default())
+            .await
+            .unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
+        for id in 1..=200 {
+            let file = DataFileValue {
+                table_id: 1,
+                data_file_id: id,
+                ..Default::default()
+            };
+            tx.put(
+                Key::current(EntityKey::File {
+                    table_id: 1,
+                    data_file_id: id,
+                })
+                .encode(),
+                value::encode_value(&file),
+            )
+            .unwrap();
+        }
+        catalog.commit_write_tx(tx).await.unwrap();
+        let scope = catalog.index_read_scope().await.unwrap();
+        let handle = scope.reads().owned_read_handle();
+        let mut progress = RowSummaryProgress::new(None, None);
+        let first = progress.select(handle.borrow()).await.unwrap();
+        assert_eq!(first.len(), 4);
+        assert_eq!(progress.page.len(), DISCOVERY_FILES);
+        let again = progress.select(handle.borrow()).await.unwrap();
+        assert!(Arc::ptr_eq(
+            first[0].file.as_ref().unwrap(),
+            again[0].file.as_ref().unwrap()
+        ));
+        for item in &first {
+            progress.after = Some(item.position);
+            progress.page.pop_front();
+        }
+        let next = progress.select(handle.borrow()).await.unwrap();
+        assert_eq!(next[0].position, (1, 5));
+        assert_eq!(progress.page.len(), DISCOVERY_FILES - 4);
+        drop(handle);
+        drop(scope);
+        catalog.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn empty_publication_does_not_decode_unrelated_entities() {

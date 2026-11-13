@@ -292,3 +292,31 @@ fn encoding_stops_when_its_caller_cancels() {
     assert!(result.is_err());
     assert_eq!(checks, 3);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn publication_probe_reports_io_errors_instead_of_absence() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("table")).unwrap();
+    std::os::unix::fs::symlink(
+        "data-0.parquet.rowsum",
+        root.path().join("table/data-0.parquet.rowsum"),
+    )
+    .unwrap();
+    let objects = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(root.path()).unwrap(),
+    );
+    let store = super::DataStore::new(objects);
+    let path = Path::from("table/data-0.parquet");
+    assert!(
+        sidecar::is_published(&store, &path, identity())
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(root.path().join("table/data-0.parquet.rowsum")).unwrap();
+    assert!(
+        !sidecar::is_published(&store, &path, identity())
+            .await
+            .unwrap()
+    );
+}

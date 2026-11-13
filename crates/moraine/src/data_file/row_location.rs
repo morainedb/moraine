@@ -304,7 +304,8 @@ pub(crate) async fn publish_if_missing(
     }
 
     let identity = identity_of(&file, table_id, data_file_id);
-    if sidecar::is_published(&file.store, &file.path, identity).await {
+    if sidecar::is_published(&file.store, &file.path, identity).await? {
+        tracing::debug!(path = %file.path, "row summary already published");
         return Ok(false);
     }
 
@@ -317,7 +318,7 @@ pub(crate) async fn publish_if_missing(
             .filter(|&rows| rows <= maximum_rows)
     });
     if admitted.is_none() {
-        debug!(path = %file.path, maximum_rows, "summary publication exceeds its build allowance");
+        tracing::warn!(path = %file.path, maximum_rows, "summary publication exceeds its build allowance");
         return Ok(false);
     }
     let rows = Box::pin(read_row_ids_limited(
