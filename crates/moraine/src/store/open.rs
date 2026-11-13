@@ -538,8 +538,8 @@ impl<'a> StoreBuilder<'a> {
 pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
     let read_ahead = u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap_or(u64::MAX);
     match bytes {
-        Some(bytes) if bytes <= read_ahead => ScanShape::Probe,
-        _ => ScanShape::Seek,
+        Some(bytes) if bytes <= read_ahead => ScanShape::wide().retain(),
+        _ => ScanShape::seek().retain(),
     }
 }
 
@@ -617,7 +617,9 @@ async fn warm_subspace(
         return Ok(());
     }
 
-    let mut iterator = handle.scan_prefix(&prefix, .., ScanShape::Metadata).await?;
+    let mut iterator = handle
+        .scan_prefix(&prefix, .., ScanShape::bounded().retain())
+        .await?;
     let mut visited = 0_usize;
     while iterator.next().await?.is_some() {
         visited = visited.wrapping_add(1);
@@ -646,16 +648,16 @@ mod tests {
     /// segment warms in seek shape.
     #[test]
     fn the_warm_shape_follows_the_segments_size() {
-        assert_eq!(warm_shape(Some(4 * 1024)), ScanShape::Probe);
+        assert_eq!(warm_shape(Some(4 * 1024)), ScanShape::wide().retain());
         assert_eq!(
             warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap())),
-            ScanShape::Probe
+            ScanShape::wide().retain()
         );
         assert_eq!(
             warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap() + 1)),
-            ScanShape::Seek
+            ScanShape::seek().retain()
         );
-        assert_eq!(warm_shape(None), ScanShape::Seek);
+        assert_eq!(warm_shape(None), ScanShape::seek().retain());
     }
 
     #[test]

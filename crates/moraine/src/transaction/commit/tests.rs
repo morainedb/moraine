@@ -725,7 +725,7 @@ async fn create_index_persists_definition_and_entries_without_changing_format() 
         .scan_prefix(
             index_index_prefix(IndexKind::Unique, index_id.get()),
             ..,
-            crate::store::handle::ScanShape::Bulk,
+            crate::store::handle::ScanShape::wide().reuse_only(),
         )
         .await
         .unwrap();
@@ -2567,7 +2567,7 @@ async fn scan_index_entries(
             .scan_prefix(
                 index_index_prefix(kind, index.get()),
                 ..,
-                crate::store::handle::ScanShape::Bulk,
+                crate::store::handle::ScanShape::wide().reuse_only(),
             )
             .await
             .unwrap();
@@ -2983,7 +2983,7 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
         .scan_prefix(
             index_index_prefix(IndexKind::Unique, index.get()),
             ..,
-            crate::store::handle::ScanShape::Bulk,
+            crate::store::handle::ScanShape::wide().reuse_only(),
         )
         .await
         .unwrap();
@@ -3033,7 +3033,7 @@ async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
             .scan_prefix(
                 index_kind_prefix(kind),
                 ..,
-                crate::store::handle::ScanShape::Bulk,
+                crate::store::handle::ScanShape::wide().reuse_only(),
             )
             .await
             .unwrap();

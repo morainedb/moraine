@@ -316,7 +316,11 @@ fn count(value: usize) -> u32 {
 /// occupy, in one full read of the subspace.
 pub(crate) async fn scan_live(handle: ReadHandle<'_>, subspace: Subspace) -> Result<LiveTally> {
     let mut iterator = handle
-        .scan_prefix(subspace_prefix(subspace), .., ScanShape::Bulk)
+        .scan_prefix(
+            subspace_prefix(subspace),
+            ..,
+            ScanShape::wide().reuse_only(),
+        )
         .await?;
     let mut tally = LiveTally::default();
 

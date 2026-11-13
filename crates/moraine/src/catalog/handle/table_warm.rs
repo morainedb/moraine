@@ -26,7 +26,9 @@ async fn warm_prefix(handle: ReadHandle<'_>, prefix: Vec<u8>) -> Result<()> {
         .acquire()
         .await
         .map_err(|error| crate::Error::Interrupted(format!("warming admission: {error}")))?;
-    let mut iterator = handle.scan_prefix(prefix, .., ScanShape::Seek).await?;
+    let mut iterator = handle
+        .scan_prefix(prefix, .., ScanShape::seek().retain())
+        .await?;
     iterator.next().await?;
     Ok(())
 }

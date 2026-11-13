@@ -85,7 +85,7 @@ async fn collect_immediate_backfill(
                     )
                     .with_columns(columns)
                     .with_metrics(metrics)
-                    .single_touch(),
+                    .with_range_admission(crate::read_policy::CacheAdmission::ReuseOnly),
                     positions,
                     data_file::ScopedRows::All,
                     data_file::RowIdSource::Resolve {
@@ -209,7 +209,7 @@ impl ReadOnlyCatalog {
         let entries = data_file::scoped_read_recorded_entries(
             data_file::ParquetFile::new(object_store, path.clone(), file_size, footer_size)
                 .with_metrics(self.data_read_metrics())
-                .single_touch(),
+                .with_range_admission(crate::read_policy::CacheAdmission::ReuseOnly),
             indexed_positions,
             data_file::ScopedRows::All,
             data_file::RowIdSource::Ordinal,

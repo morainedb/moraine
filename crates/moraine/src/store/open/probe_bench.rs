@@ -115,7 +115,7 @@ async fn scan_group(db: &Db, keys: &[CanonicalKey]) -> Vec<u64> {
         .scan_prefix(
             index_index_prefix(IndexKind::Multi, 1),
             (start, end),
-            ScanShape::Equality,
+            ScanShape::equality().retain(),
         )
         .await
         .unwrap();

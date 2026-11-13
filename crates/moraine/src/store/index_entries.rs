@@ -52,7 +52,7 @@ pub(crate) async fn first_index_id_from(
         .scan_prefix(
             index_kind_prefix(kind),
             index_id_suffix(kind, from)..,
-            ScanShape::Bulk,
+            ScanShape::wide().reuse_only(),
         )
         .await?
         .next()
@@ -108,8 +108,15 @@ impl StoredIndexEntries<'_> {
             let Some(kind) = self.kinds.next() else {
                 return Ok(None);
             };
-            self.entries =
-                Some(scan_index_entries(self.handle, kind, self.index_id, ScanShape::Bulk).await?);
+            self.entries = Some(
+                scan_index_entries(
+                    self.handle,
+                    kind,
+                    self.index_id,
+                    ScanShape::wide().reuse_only(),
+                )
+                .await?,
+            );
         }
     }
 }
@@ -291,7 +298,7 @@ mod tests {
             ReadHandle::Writer(&db),
             IndexKind::Unique,
             3,
-            ScanShape::Bulk,
+            ScanShape::wide().reuse_only(),
         )
         .await
         .unwrap();

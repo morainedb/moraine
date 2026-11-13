@@ -1577,7 +1577,11 @@ impl AuxiliaryCache {
     /// stopped early would otherwise be served to every later reader of
     /// that range.
     fn admit_range(&self, file: &ParquetFile, range: &std::ops::Range<u64>, bytes: &Bytes) {
-        if file.single_touch || usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
+        if usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
+            return;
+        }
+        crate::read_policy::range_completed(file.range_admission, bytes.len());
+        if !file.range_admission.retains() {
             return;
         }
 
@@ -1668,7 +1672,7 @@ impl AuxiliaryCache {
 /// object: a small file, unless the read declares it will not come back
 /// for the bytes.
 fn reads_whole_object(file: &ParquetFile) -> bool {
-    file.file_size <= WHOLE_OBJECT_READ_BYTES && !file.single_touch
+    file.file_size <= WHOLE_OBJECT_READ_BYTES && file.range_admission.retains()
 }
 
 /// `range` cut from `whole`, refused when it reaches past the recorded

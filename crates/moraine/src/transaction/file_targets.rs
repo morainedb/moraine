@@ -116,7 +116,11 @@ impl<'a> DeleteCursor<'a> {
         let records = if indexed {
             Records::Indexed(
                 handle
-                    .scan_prefix(delete_target_prefix(table, file), .., ScanShape::Streaming)
+                    .scan_prefix(
+                        delete_target_prefix(table, file),
+                        ..,
+                        ScanShape::bounded().reuse_only(),
+                    )
                     .await?,
             )
         } else {

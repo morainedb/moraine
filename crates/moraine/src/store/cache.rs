@@ -258,11 +258,11 @@ pub(crate) fn auxiliary_evicted() {
 pub struct CacheTally {
     /// Filter, index, and stats lookups the meta slot served.
     pub metadata_hits: u64,
-    /// Those it did not, each one a fetch and a decode.
+    /// Metadata lookups not served by either cache tier.
     pub metadata_misses: u64,
     /// Data-block lookups the block slot served, from either tier.
     pub block_hits: u64,
-    /// Those it did not, each one an object-store read.
+    /// Data-block misses. Adjacent misses may share an object-store request.
     pub block_misses: u64,
     /// Of `metadata_hits`, those the disk tier served after the memory
     /// tier missed; the rest were resident in memory. Zero without a disk

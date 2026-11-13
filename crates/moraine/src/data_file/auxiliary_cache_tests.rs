@@ -781,7 +781,8 @@ mod blocks {
     async fn a_single_touch_read_of_a_small_file_fetches_only_its_ranges() {
         let (store, path, bytes) = seeded(300_000).await;
         let cache = AuxiliaryCache::new(4 << 20);
-        let file = file(&store, &path, bytes.len()).single_touch();
+        let file = file(&store, &path, bytes.len())
+            .with_range_admission(crate::read_policy::CacheAdmission::ReuseOnly);
 
         let first = cache.range(&file, 1_000..5_000).await.unwrap();
         assert_eq!(first.as_ref(), &bytes[1_000..5_000]);

@@ -131,9 +131,9 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
     // A bounded walk ends within a few entries of the last target; an
     // unbounded one runs to the end of the directory.
     let shape = if width_bound.is_some() {
-        ScanShape::Seek
+        ScanShape::seek().retain()
     } else {
-        ScanShape::Probe
+        ScanShape::wide().retain()
     };
     let mut iter = handle.scan_prefix(prefix, start.., shape).await?;
     let mut locators = Vec::new();
@@ -242,7 +242,7 @@ pub(crate) async fn scan_inline_chunk_locators(
     scan_decode(
         handle,
         inline_chunk_locator_table_prefix(table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, bytes| match key {
             Key::Inline(InlineKey::ChunkLocator {
                 table_id: owner,
@@ -288,7 +288,7 @@ pub(crate) async fn scan_inline_chunk_ranges(
     scan_decode(
         handle,
         inline_chunk_locator_table_prefix(table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, _| match key {
             Key::Inline(InlineKey::ChunkLocator {
                 table_id: owner,
@@ -323,7 +323,7 @@ pub(crate) async fn scan_inline_live_schema_versions(
     let versions = scan_decode(
         handle,
         inline_chunk_locator_table_prefix(table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, _| match key {
             Key::Inline(InlineKey::ChunkLocator { schema_version, .. }) => Ok(schema_version),
             other => Err(Error::Corruption(format!(
@@ -346,7 +346,7 @@ pub(crate) async fn scan_legacy_inline_chunk_ranges(
     scan_decode(
         handle,
         inline_chunk_range_table_prefix(table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, _| match key {
             Key::Inline(InlineKey::ChunkRange {
                 table_id: owner,
@@ -370,7 +370,7 @@ pub(crate) async fn scan_inline_chunks(
     scan_decode(
         handle,
         inline_live_table_prefix(InlineOperationKind::Insert, table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
                 tracing::debug!(table_id, "reading inline chunk body");
@@ -401,7 +401,7 @@ pub(crate) async fn scan_inline_chunk_headers(
     let headers = scan_decode(
         handle,
         inline_live_table_prefix(InlineOperationKind::Insert, table_id),
-        ScanShape::Bulk,
+        ScanShape::wide().reuse_only(),
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
                 let chunk: InlineChunkValue = value::decode_owned(bytes)?;
@@ -425,7 +425,7 @@ pub(crate) async fn scan_inline_deletes(
     scan_decode(
         handle,
         inline_row_tombstone_table_prefix(table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, bytes| match key {
             Key::Inline(InlineKey::RowTombstone {
                 row_id,
@@ -457,7 +457,7 @@ pub(crate) async fn scan_inline_file_deletes(
     scan_decode(
         handle,
         inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 data_file_id,
@@ -570,7 +570,7 @@ pub(crate) async fn scan_inline_schemas(
     scan_decode(
         handle,
         inline_schema_table_prefix(table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, bytes| match key {
             Key::Inline(InlineKey::Schema { schema_version, .. }) => {
                 Ok((schema_version, value::decode_owned(bytes)?))
@@ -608,7 +608,10 @@ pub(crate) async fn scan_inline_table_keys(
     ];
 
     let scans = prefixes.into_iter().map(|prefix| async move {
-        scan_keys(handle, prefix, ScanShape::Bulk, |key| Ok(key.encode())).await
+        scan_keys(handle, prefix, ScanShape::wide().reuse_only(), |key| {
+            Ok(key.encode())
+        })
+        .await
     });
 
     Ok(futures::future::try_join_all(scans)
@@ -625,7 +628,7 @@ pub(crate) async fn scan_all_inline_schema_keys(handle: ReadHandle<'_>) -> Resul
     scan_keys(
         handle,
         inline_schema_prefix(),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key| match key {
             Key::Inline(InlineKey::Schema {
                 table_id,
@@ -677,7 +680,7 @@ pub(crate) async fn scan_inline_dropped_schemas(
     scan_decode(
         handle,
         inline_schema_dropped_table_prefix(table_id),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, _| match key {
             Key::Inline(InlineKey::SchemaDropped { schema_version, .. }) => Ok(schema_version),
             other => Err(Error::Corruption(format!(
@@ -696,7 +699,7 @@ pub(crate) async fn scan_all_inline_dropped_schemas(
     scan_decode(
         handle,
         inline_schema_dropped_prefix(),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, _| match key {
             Key::Inline(InlineKey::SchemaDropped {
                 table_id,
@@ -720,7 +723,7 @@ pub(crate) async fn scan_all_inline_schemas(
     scan_decode(
         handle,
         inline_schema_prefix(),
-        ScanShape::Probe,
+        ScanShape::wide().retain(),
         |key, bytes| match key {
             Key::Inline(InlineKey::Schema {
                 table_id,

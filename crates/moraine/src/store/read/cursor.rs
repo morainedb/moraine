@@ -74,7 +74,11 @@ impl OwnedEntityCursor {
     ) -> Result<Self> {
         let iterator = handle
             .borrow()
-            .scan_prefix(Key::current(entity).encode(), .., ScanShape::Metadata)
+            .scan_prefix(
+                Key::current(entity).encode(),
+                ..,
+                ScanShape::bounded().retain(),
+            )
             .await?;
         Ok(Self {
             handle,
@@ -83,7 +87,7 @@ impl OwnedEntityCursor {
                 history: (versions == Versions::LiveAndEnded)
                     .then(|| history_entity_prefix(entity)),
                 historical: false,
-                shape: ScanShape::Metadata,
+                shape: ScanShape::bounded().retain(),
                 visited: 0,
                 latest_only: false,
                 previous_history_entity: None,
@@ -102,7 +106,11 @@ impl OwnedEntityCursor {
             .ok_or_else(|| Error::Constraint("ended cursor requires a versioned entity".into()))?;
         let iterator = handle
             .borrow()
-            .scan_prefix(history_entity_kind_prefix(entity), .., ScanShape::Streaming)
+            .scan_prefix(
+                history_entity_kind_prefix(entity),
+                ..,
+                ScanShape::bounded().reuse_only(),
+            )
             .await?;
         Ok(Self {
             handle,
@@ -110,7 +118,7 @@ impl OwnedEntityCursor {
                 iterator,
                 history: None,
                 historical: true,
-                shape: ScanShape::Streaming,
+                shape: ScanShape::bounded().reuse_only(),
                 visited: 0,
                 latest_only: false,
                 previous_history_entity: None,
@@ -155,7 +163,7 @@ impl OwnedSnapshotCursor {
             .scan_prefix(
                 prefix,
                 (lower, std::ops::Bound::Unbounded),
-                ScanShape::Streaming,
+                ScanShape::bounded().reuse_only(),
             )
             .await?;
         Ok(Self {
@@ -220,9 +228,9 @@ impl CursorState {
         };
         let history = history.filter(|_| versions == Versions::LiveAndEnded && kind.is_versioned());
         let shape = if table.is_some() {
-            ScanShape::Metadata
+            ScanShape::bounded().retain()
         } else {
-            ScanShape::Streaming
+            ScanShape::bounded().reuse_only()
         };
         let iterator = handle.scan_prefix(current, .., shape).await?;
         Ok(Self {
@@ -270,7 +278,7 @@ impl CursorState {
                         .scan_prefix_ordered(
                             history_entity_prefix(history.entity),
                             ..,
-                            ScanShape::Seek,
+                            ScanShape::seek().retain(),
                             ScanOrder::Descending,
                         )
                         .await?;
