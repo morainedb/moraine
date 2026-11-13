@@ -237,7 +237,9 @@ impl ReadOnlyCatalog {
                     probe,
                     MAX_PREDICATE_ROWS + 1 - rows.len(),
                 )
-                .await?,
+                .await?
+                .iter()
+                .copied(),
             );
             if rows.len() > MAX_PREDICATE_ROWS {
                 return Ok(None);

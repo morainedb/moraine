@@ -23,7 +23,8 @@ impl<T> CatalogCursor<T> {
     /// # Errors
     /// Returns a store, decoding, or memory-admission error.
     pub async fn next(&mut self) -> Result<Option<T>> {
-        while let Some((record, _memory)) = self.cursor.next().await? {
+        while let Some(record_owner) = self.cursor.next().await? {
+            let record = record_owner.value().clone();
             if !self.selection.matches(&record)
                 || record.lifecycle().is_some_and(|(begin, end)| {
                     begin > self.snapshot.snapshot_id
@@ -67,6 +68,7 @@ impl ReadScope {
                 Versions::Live
             },
             table,
+            crate::read_policy::CacheAdmission::Retain,
         )
         .await?;
         Ok(CatalogCursor {

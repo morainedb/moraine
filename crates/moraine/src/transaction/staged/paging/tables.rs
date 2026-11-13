@@ -63,7 +63,8 @@ pub(super) async fn rows(
         };
         let mut cursor =
             OwnedEntityCursor::open_entity(handle.clone(), entity, Versions::LiveAndEnded).await?;
-        while let Some((record, _memory)) = cursor.next().await? {
+        while let Some(record_owner) = cursor.next().await? {
+            let record = record_owner.value().clone();
             let EntityRecord::Table(table) = record else {
                 return Err(Error::Corruption(
                     "table inheritance read a different entity".into(),

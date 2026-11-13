@@ -130,6 +130,7 @@ impl<'a> DeleteCursor<'a> {
                     EntityRecordKind::DeleteFile,
                     Versions::Live,
                     Some(table),
+                    crate::read_policy::CacheAdmission::Retain,
                 )
                 .await?,
             )
@@ -147,7 +148,11 @@ impl<'a> DeleteCursor<'a> {
     ) -> Result<Option<(Arc<DeleteFileValue>, MemoryReservation)>> {
         match &mut self.records {
             Records::Legacy(cursor) => {
-                while let Some((record, memory)) = cursor.next().await? {
+                while let Some((record, memory)) = cursor
+                    .next()
+                    .await?
+                    .map(crate::memory::Reserved::into_parts)
+                {
                     if let EntityRecord::DeleteFile(row) = record
                         && row.data_file_id == self.file
                         && row.end_snapshot.is_none()

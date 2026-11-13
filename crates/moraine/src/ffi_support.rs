@@ -125,10 +125,18 @@ async fn dump_range<T>(
     let session = catalog.begin_read().await?;
     let result = read::consistent(session.handle(), || async {
         crate::transaction::commit::refuse_mid_migration(session.handle()).await?;
-        let mut cursor = EntityCursor::open(session.handle(), kind, versions, table).await?;
+        let mut cursor = EntityCursor::open(
+            session.handle(),
+            kind,
+            versions,
+            table,
+            crate::read_policy::CacheAdmission::Retain,
+        )
+        .await?;
         let mut rows = Vec::new();
         let mut memory = crate::MemoryReservation::reserve(0)?;
-        while let Some((record, _record_memory)) = cursor.next().await? {
+        while let Some(record_owner) = cursor.next().await? {
+            let record = record_owner.value().clone();
             memory.resize(memory.bytes().saturating_add(record.estimated_bytes()))?;
             if let Some(row) = extract(&record) {
                 rows.push(row);

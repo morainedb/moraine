@@ -907,11 +907,12 @@ impl ReadOnlyCatalog {
             EntityRecordKind::File,
             Versions::Live,
             Some(table.get()),
+            crate::read_policy::CacheAdmission::ReuseOnly,
         )
         .await?;
         let remaining = futures::stream::try_unfold(records, move |mut cursor| async move {
-            while let Some((record, memory)) = cursor.next().await? {
-                let EntityRecord::File(file) = record else {
+            while let Some(record_owner) = cursor.next().await? {
+                let EntityRecord::File(file) = record_owner.value() else {
                     continue;
                 };
                 if file_cursor.is_some_and(|cursor| file.data_file_id < cursor) {
@@ -923,17 +924,18 @@ impl ReadOnlyCatalog {
                     0
                 };
                 if start < file.record_count {
-                    return Ok(Some(((file, start, memory), cursor)));
+                    let file = file.clone();
+                    return Ok(Some((record_owner.map(|_| (file, start)), cursor)));
                 }
             }
             Ok(None)
         });
         let resolve = &resolve;
         let object_store = &object_store;
-        let plans = remaining.map_ok(|(file, start, memory)| {
+        let plans = remaining.map_ok(|record| {
             let metrics = Arc::clone(&metrics);
             async move {
-                let _memory = memory;
+                let ((file, start), _memory) = record.into_parts();
                 plan_file(
                     snapshot,
                     table,
@@ -1069,6 +1071,7 @@ pub(super) async fn require_data_store_at(
             EntityRecordKind::File,
             Versions::Live,
             Some(table.get()),
+            crate::read_policy::CacheAdmission::ReuseOnly,
         )
         .await?;
         if files.next().await?.is_some() {

@@ -171,9 +171,17 @@ async fn scan(
         NameKind::Schema => EntityRecordKind::Schema,
         NameKind::Table => EntityRecordKind::Table,
     };
-    let mut cursor = EntityCursor::open(handle, record, Versions::Live, None).await?;
+    let mut cursor = EntityCursor::open(
+        handle,
+        record,
+        Versions::Live,
+        None,
+        crate::read_policy::CacheAdmission::ReuseOnly,
+    )
+    .await?;
     let mut found = None;
-    while let Some((record, _memory)) = cursor.next().await? {
+    while let Some(record_owner) = cursor.next().await? {
+        let record = record_owner.value().clone();
         match record {
             EntityRecord::Schema(row) if row.schema_name == name => found = Some(row.schema_id),
             EntityRecord::Table(row) if row.schema_id == parent && row.table_name == name => {

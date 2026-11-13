@@ -160,7 +160,8 @@ async fn latest<T: Versioned + Clone + prost::Message>(
     let rows = VersionedRows::<T>::new(operations, |_| true)?;
     let mut cursor = OwnedEntityCursor::open_entity(handle, key, Versions::LiveAndEnded).await?;
     let mut selected = None;
-    while let Some((record, _memory)) = cursor.next().await? {
+    while let Some(record_owner) = cursor.next().await? {
+        let record = record_owner.value().clone();
         let row = T::from_record(&record)
             .ok_or_else(|| Error::Corruption("invalid tag parent version".into()))?;
         if let Some(row) = rows.apply(Arc::new(row))? {

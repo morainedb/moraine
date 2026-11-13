@@ -156,9 +156,16 @@ async fn owners(
             } else {
                 EntityRecordKind::Sort
             };
-            let mut cursor =
-                OwnedEntityCursor::open(handle, kind, Versions::LiveAndEnded, scope).await?;
-            while let Some((row, _memory)) = cursor.next().await? {
+            let mut cursor = OwnedEntityCursor::open(
+                handle,
+                kind,
+                Versions::LiveAndEnded,
+                scope,
+                crate::read_policy::CacheAdmission::ReuseOnly,
+            )
+            .await?;
+            while let Some(held_record) = cursor.next().await? {
+                let row = held_record.value().clone();
                 if let Some(row) = overlay.apply(row)? {
                     record_owner(&mut owners, &row);
                 }

@@ -49,8 +49,16 @@ async fn records(
     kind: EntityRecordKind,
     table: Option<u64>,
 ) -> Result<()> {
-    let mut cursor = EntityCursor::open(handle, kind, Versions::Live, table).await?;
-    while let Some((record, _memory)) = cursor.next().await? {
+    let mut cursor = EntityCursor::open(
+        handle,
+        kind,
+        Versions::Live,
+        table,
+        crate::read_policy::CacheAdmission::Retain,
+    )
+    .await?;
+    while let Some(record_owner) = cursor.next().await? {
+        let record = record_owner.value().clone();
         retain(view, record)?;
     }
     Ok(())
@@ -87,14 +95,23 @@ pub(crate) async fn load_table(
                 EntityRecordKind::File,
                 Versions::Live,
                 Some(table_id),
+                crate::read_policy::CacheAdmission::Retain,
             )
             .await?;
-            if let Some((record, _memory)) = files.next().await? {
+            if let Some(owner) = files.next().await? {
+                let record = owner.value().clone();
                 retain(&mut view, record)?;
             }
-            let mut cursor =
-                EntityCursor::open(handle, EntityRecordKind::Table, Versions::Live, None).await?;
-            while let Some((record, _memory)) = cursor.next().await? {
+            let mut cursor = EntityCursor::open(
+                handle,
+                EntityRecordKind::Table,
+                Versions::Live,
+                None,
+                crate::read_policy::CacheAdmission::ReuseOnly,
+            )
+            .await?;
+            while let Some(record_owner) = cursor.next().await? {
+                let record = record_owner.value().clone();
                 if matches!(&record, EntityRecord::Table(value) if value.schema_id == schema_id) {
                     retain(&mut view, record)?;
                 }
@@ -148,9 +165,11 @@ pub(crate) async fn load_sources_for(
             EntityRecordKind::DeleteFile,
             Versions::Live,
             Some(table.get()),
+            crate::read_policy::CacheAdmission::Retain,
         )
         .await?;
-        while let Some((record, _memory)) = cursor.next().await? {
+        while let Some(record_owner) = cursor.next().await? {
+            let record = record_owner.value().clone();
             if let EntityRecord::DeleteFile(row) = record
                 && row.end_snapshot.is_none()
                 && files

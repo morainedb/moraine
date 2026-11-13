@@ -578,3 +578,52 @@ impl<T> std::ops::Deref for WorkingValue<T> {
         &self.0.value
     }
 }
+
+#[cfg(test)]
+mod reserved_record_tests {
+    use super::*;
+
+    #[test]
+    fn mapped_record_preserves_its_reservation() {
+        let budget = Budget::new(64);
+        let record = Reserved::new(
+            String::from("file"),
+            MemoryReservation::from_budget(64, budget.clone()).unwrap(),
+        );
+        let mapped = record.map(|value| value.len());
+        assert_eq!(*mapped.value(), 4);
+        assert!(MemoryReservation::from_budget(1, budget.clone()).is_err());
+        drop(mapped);
+        assert!(MemoryReservation::from_budget(64, budget).is_ok());
+    }
+}
+
+/// A uniquely owned decoded record with its working-memory allowance.
+#[derive(Debug)]
+pub(crate) struct Reserved<T> {
+    value: T,
+    memory: MemoryReservation,
+}
+
+impl<T> Reserved<T> {
+    pub(crate) fn new(value: T, memory: MemoryReservation) -> Self {
+        Self { value, memory }
+    }
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+    pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> Reserved<U> {
+        Reserved::new(map(self.value), self.memory)
+    }
+    /// Transfers both parts into an owner with its own accounting protocol.
+    pub(crate) fn into_parts(self) -> (T, MemoryReservation) {
+        (self.value, self.memory)
+    }
+}
+
+impl<T> std::ops::Deref for Reserved<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}

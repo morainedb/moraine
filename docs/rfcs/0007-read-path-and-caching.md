@@ -311,6 +311,12 @@ iterator opens and does not cancel them on drop, so a read-ahead shape dropped
 after one entry keeps fetching. Admission changes neither visibility nor
 completeness.
 
+Entity cursors take an explicit `CacheAdmission` from their caller. Backfill
+and sequential metadata enumeration reuse existing blocks without admitting
+misses; targeted transaction reads and table warming retain misses. Selecting
+a table no longer implicitly chooses retention. Both current and historical
+segments use the requested policy.
+
 **Read activity monitoring.** While reads arrive, an info event named
 `read cache activity: cumulative process totals` reports at most once every
 ten seconds. Counts are process-wide and cumulative: retaining and reuse-only
@@ -502,6 +508,11 @@ plain `Vec` values leave reservation to the caller.
 Decoded values passed between phases of one operation use `WorkingValue<T>`:
 an immutable shared allocation retaining its `MemoryReservation` until its last
 reader drops it. Publication pages use this owner under their pinned snapshot.
+Entity cursors return `Reserved<EntityRecord>`, binding the decoded record to
+its working allowance. Consumers keep that owner while processing; transfer
+into an already-accounted page explicitly moves both parts. Backfill queues
+carry reserved file records through their asynchronous work.
+
 Cross-operation lookup results continue to use revision-aware `RevisionMemo`
 and retention-budget `Shared<T>` ownership. Working memory and cache retention
 remain distinct allowances; sharing a value does not copy its payload or its
@@ -563,6 +574,18 @@ up to `RESIDENT_FILES`, 1,024, and spill to an anonymous temporary file beyond
 that. Retry rounds consume those ids and never rescan successful files. A
 cancelled step may repeat its in-flight window. Dropping the progress value
 releases its snapshot and spools.
+
+Publication retains one resolved table data prefix under the same read point
+as its file records. Concurrent files share the load and allocation. Switching
+tables replaces the retained context; a retry round clears it before acquiring
+a new read point. Publication logs count context loads and reuses.
+
+Index probe cache hits return shared row vectors, and cache fills retain the
+resolved vector without a second payload allocation. Internal predicate probes
+iterate that shared vector directly. Existing public methods returning `Vec`
+materialize an owned result at their boundary, moving it when uniquely owned
+and cloning it when retained elsewhere. Revision checks and retention charges
+continue to apply to every shared result.
 
 **Release hook.** `set_memory_release(hook)` installs what the process does to
 return freed pages to the kernel. The core calls it after a cold catalog view,

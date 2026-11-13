@@ -63,9 +63,16 @@ pub async fn project_snapshot(
             SnapshotProjection::ColumnsOf(table) => Some(table),
             _ => None,
         };
-        let mut cursor =
-            EntityCursor::open(session.handle(), projection.kind(), Versions::Live, table).await?;
-        while let Some((record, _memory)) = cursor.next().await? {
+        let mut cursor = EntityCursor::open(
+            session.handle(),
+            projection.kind(),
+            Versions::Live,
+            table,
+            crate::read_policy::CacheAdmission::Retain,
+        )
+        .await?;
+        while let Some(record_owner) = cursor.next().await? {
+            let record = record_owner.value().clone();
             if projection.includes(&record) {
                 view.admit(record.estimated_bytes().saturating_add(80))?;
                 view.put_record(record);
