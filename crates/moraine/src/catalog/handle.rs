@@ -997,8 +997,8 @@ impl ReadOnlyCatalog {
         Arc::clone(&self.cache)
     }
 
-    /// Physical object-store requests this catalog has issued since it
-    /// attached.
+    /// Object-store calls reported by SlateDB and logical data ranges read
+    /// since this catalog attached. Client-internal retries are not counted.
     ///
     /// Counts include retries. Moraine's WAL objects use its main physical
     /// store today, so their requests appear under `main_*`; `wal_*` is for

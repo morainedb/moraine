@@ -293,6 +293,8 @@
 
 #![forbid(unsafe_code)]
 
+mod background;
+pub use background::{BackgroundRequest, BackgroundWork};
 mod catalog;
 mod commit_log;
 mod data_file;

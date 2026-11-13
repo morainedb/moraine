@@ -1580,7 +1580,7 @@ impl AuxiliaryCache {
         if usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
             return;
         }
-        crate::read_policy::range_completed(file.range_admission, bytes.len());
+        crate::telemetry::read::range_completed(file.range_admission, bytes.len());
         if !file.range_admission.retains() {
             return;
         }

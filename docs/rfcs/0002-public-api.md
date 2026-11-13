@@ -231,3 +231,16 @@ are `#[doc(hidden)]` and outside the semver contract.
 - **A store abstraction in the signature.** `Catalog::open` taking a SlateDB
   handle or a KV trait object would expose the substrate and tie moraine's
   semver to SlateDB's. Rejected: `object_store` is the deployment primitive.
+
+## Background work
+
+`BackgroundRequest::attach(preload)` requests summary backfill and optional
+warming. `BackgroundRequest::commit(files, committed)` reserves the file input
+and requests publication and warming of touched tables. It can fail working
+memory admission. `BackgroundWork::push` enqueues best-effort work, reporting
+full queues; explicit summary backfill remains the recovery mechanism.
+
+`BackgroundWork::run(catalog, data_store, prefix)` drives three independent
+lanes until cancelled. Hosts own spawning, cancellation, and joining; the
+catalog must outlive that task. Dropping the queue releases pending inputs.
+No runtime is created by the core and no on-disk format changes.

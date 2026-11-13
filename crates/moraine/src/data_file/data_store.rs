@@ -174,8 +174,18 @@ impl DataStore {
         let bytes = ADMISSION
             .run(
                 self.background,
-                retry::retrying("a data-file read", path, || {
-                    self.store.get_range(path, range.clone())
+                retry::retrying("a data-file read", path, || async {
+                    crate::telemetry::storage::get(
+                        self.store.as_ref(),
+                        path,
+                        object_store::GetOptions {
+                            range: Some(object_store::GetRange::Bounded(range.clone())),
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+                    .bytes()
+                    .await
                 }),
             )
             .await?;
@@ -196,8 +206,7 @@ impl DataStore {
             .run(
                 self.background,
                 retry::retrying("a sidecar read", path, || async {
-                    self.store
-                        .get_opts(path, options.clone())
+                    crate::telemetry::storage::get(self.store.as_ref(), path, options.clone())
                         .await?
                         .bytes()
                         .await
@@ -246,7 +255,7 @@ impl DataStore {
             .run(
                 self.background,
                 retry::retrying("a data-file read", path, || {
-                    self.store.get_ranges(path, ranges)
+                    crate::telemetry::storage::ranges(self.store.as_ref(), path, ranges)
                 }),
             )
             .await?;

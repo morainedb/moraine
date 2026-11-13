@@ -447,3 +447,17 @@ row or per file.
 - **One runtime per process.** A shared runtime would couple every attached
   catalog's teardown and background tasks and would need a worker count serving
   an unknown number of catalogs. One runtime per attach keeps `DETACH` local.
+
+## Background maintenance ownership
+
+The core owns bounded warming, committed-file publication, and full-backfill
+jobs. Each has its own progress state and independent admission lane. Only
+unstarted warming jobs coalesce; publication retains every registered-file
+batch. Failed attempts rotate behind pending work with bounded backoff, keeping
+their acknowledged frontiers. Cancellation drops active attempts and releases
+admission; dropping the queue releases pending reservations and read scopes.
+
+The extension owns the runtime task: create `BackgroundWork`, forward
+`BackgroundRequest::attach` and `BackgroundRequest::commit`, then abort and
+join the task before closing the catalog. It contains no job selection,
+coalescing, retry, or publication policy.

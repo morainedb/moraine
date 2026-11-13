@@ -360,10 +360,11 @@ pub struct RowSummaryOccupancy {
     pub bytes: u64,
 }
 
-/// Physical object-store requests SlateDB has issued for one catalog,
-/// retries included. WAL objects land in the `main_*` fields while the WAL
-/// shares the main store. Durations sum completed request latency, so
-/// concurrent requests can exceed wall-clock time.
+/// Object-store calls reported by SlateDB for one catalog, including its
+/// retries. Client-internal retries and caches are not visible here. WAL
+/// objects land in the `main_*` fields while the WAL shares the main store.
+/// Durations sum completed request latency, so concurrent requests can exceed
+/// wall-clock time.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ObjectStoreTally {

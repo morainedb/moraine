@@ -54,6 +54,8 @@ consumer of it.
 | `transaction` | The commit protocol. Turns a catalog transaction into one atomic SlateDB write. Bridges `catalog` and `store`. |
 | `data_file` | The only module that reads Parquet: scoped reads of registered files. |
 | `commit_log` | The boundary an external commit log plugs into. |
+| `background` | Warming, committed-file publication, and backfill queues and retry protocols. |
+| `read_policy` | Cache admission vocabulary shared by catalog and Parquet reads. |
 | `memory` | Working-memory reservations and host budgets. |
 | `fault` | Crash and stall injection points used by the tests. |
 | `telemetry` | Counters and log records. |
