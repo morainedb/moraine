@@ -87,6 +87,17 @@ platform builds and passes validation, the workflow publishes the binaries
 to that GitHub release and pins the community descriptor to the built
 commit. This does not bump the crate version or publish to crates.io.
 
+A tag publishes once. Downstreams pin a release by the SHA-256 of its
+assets, so replacing those bytes changes what the tag means while its name
+stays put, and a consumer that re-downloads gets a checksum mismatch at
+best and a different binary at worst. The workflow therefore refuses to
+publish over an already-published release and tells you to rebuild under
+the next `-build.<number>`; it also clears any stale drafts left on the tag
+first, because `gh release create` adds a second draft rather than failing
+when one already exists. Turning on **Enable release immutability**
+(Settings → Releases) has GitHub enforce the same rule for every new
+release, locking its tag and assets at publication.
+
 With the `DUCKDB_EXTENSION_SIGNING_PK` repository secret set to the PEM
 private key, the workflow also publishes each build signed and gzipped, and
 the site build lays the newest release's signed builds out as the DuckDB
