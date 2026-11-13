@@ -106,6 +106,15 @@ Compaction never allocates row ids. DuckLake stages no change to
 entries name rows, and a compaction changes no row id or value, so a
 compaction-only change set stages no index work and no entry is touched.
 
+### Positional-delete validation
+
+Before publishing staged delete files or inlined file deletions, Moraine checks
+that each target data file is live in the commit's catalog view or is registered
+by the same batch. A target retired by a concurrent merge or rewrite causes a
+commit conflict, including when DuckLake opens its metadata transaction after
+the replacement committed. The client must retry against the new file layout;
+a successful commit must never leave a deletion pointing only at retired input.
+
 ### Row-id validation
 
 Before a compaction lands, the commit reads the row ids of the files it
