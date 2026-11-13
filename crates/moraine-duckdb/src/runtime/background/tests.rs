@@ -133,6 +133,9 @@ fn commits_progress_during_backfill_and_shutdown_drops_both_passes() {
                     let started = started.clone();
                     let finished = finished.clone();
                     async move {
+                        if pass.warming_only {
+                            return true;
+                        }
                         active.fetch_add(1, Ordering::SeqCst);
                         let _running = Running(active);
                         let backfill = pass.since.is_none();
@@ -289,6 +292,77 @@ async fn preload_streams_a_persisted_catalog() {
     let catalog = moraine::Catalog::open_read_only(objects, options)
         .await
         .unwrap();
-    assert!(Pass::attach(true).run(&catalog, None, "").await);
+    let mut pass = Pass::attach(true);
+    pass.warming_only = true;
+    assert!(pass.run(&catalog, None, "").await);
     catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn repeated_warming_is_coalesced_without_losing_publication_files() {
+    let schedule = super::Schedule::default();
+    schedule.push(commit(1, 1));
+    schedule.push(commit(1, 2));
+    schedule.push(commit(2, 3));
+    let warm = schedule.warming.next().await;
+    assert_eq!(warm.tables.unwrap(), [1, 2].map(TableId::new).into());
+    assert!(schedule.warming.passes.lock().unwrap().is_empty());
+    for snapshot in 1..=3 {
+        assert_eq!(
+            schedule.commits.next().await.files.unwrap()[0].1.get(),
+            snapshot
+        );
+    }
+    schedule.push(commit(1, 4));
+    assert_eq!(
+        schedule.warming.next().await.tables.unwrap(),
+        [1].map(TableId::new).into()
+    );
+}
+
+#[tokio::test]
+async fn stalled_warming_does_not_delay_publication() {
+    let schedule = std::sync::Arc::new(super::Schedule::default());
+    schedule.push(commit(1, 1));
+    let queue = schedule.clone();
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let worker = tokio::spawn(async move {
+        queue
+            .run(|pass| {
+                let send = send.clone();
+                async move {
+                    if pass.warming_only {
+                        std::future::pending::<()>().await;
+                    }
+                    send.send(pass.since).unwrap();
+                    true
+                }
+            })
+            .await;
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), receive.recv())
+            .await
+            .unwrap(),
+        Some(Some(SnapshotId::new(0)))
+    );
+    worker.abort();
+}
+
+#[tokio::test]
+async fn warming_retry_keeps_its_frontier_and_new_work_gets_another_pass() {
+    let pending = Pending::default();
+    let mut earlier = commit(1, 1);
+    earlier.warming_only = true;
+    let progress = earlier.progress.clone();
+    earlier.progress.lock().await.warming = Some(super::Warming::new(earlier.tables.as_ref()));
+    pending.push(earlier);
+    let mut later = commit(1, 2);
+    later.warming_only = true;
+    pending.push(later);
+    assert!(std::sync::Arc::ptr_eq(
+        &pending.next().await.progress,
+        &progress
+    ));
+    assert_eq!(pending.next().await.since, Some(SnapshotId::new(1)));
 }

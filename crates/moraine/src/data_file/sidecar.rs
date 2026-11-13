@@ -214,15 +214,26 @@ pub(super) async fn is_published(
     store: &DataStore,
     data_file: &Path,
     identity: SidecarIdentity<'_>,
-) -> bool {
-    let Ok(path) = path_for(data_file) else {
-        return false;
+) -> Result<bool> {
+    let path = path_for(data_file)?;
+    let prefix = match store.read_prefix(&path, IDENTITY_PREFIX_BYTES).await {
+        Ok(prefix) => prefix,
+        Err(object_store::Error::NotFound { .. }) => return Ok(false),
+        Err(error) => {
+            tracing::warn!(%path, %error, "row summary header read failed");
+            return Err(Error::Store(Box::new(
+                slatedb::Error::unavailable("reading row summary header".to_owned())
+                    .with_source(Box::new(error)),
+            )));
+        }
     };
-    let Ok(prefix) = store.read_prefix(&path, IDENTITY_PREFIX_BYTES).await else {
-        return false;
-    };
-
-    layout_of(identity, &prefix).is_ok()
+    match layout_of(identity, &prefix) {
+        Ok(_) => Ok(true),
+        Err(reason) => {
+            tracing::warn!(%path, ?reason, "published row summary rejected; rebuilding");
+            Ok(false)
+        }
+    }
 }
 
 /// What a sweep of published summaries did.

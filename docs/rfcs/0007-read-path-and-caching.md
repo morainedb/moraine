@@ -412,11 +412,20 @@ the extension's background worker in
 2. A pass over the files a commit registered, queued from
    `CommitReport::registered_files` after the commit returns.
 
-The process admits four commit passes and four backfills in separate pools.
+The process admits four commit publication passes, four backfills, and four
+warming passes in separate pools. Warming cannot delay publication. Pending,
+unstarted warming requests combine their table sets; requests arriving during
+an active pass queue a later pass. Publication retains every registered file.
+Coalescing keeps the original memory reservations and is bounded to 128
+requests per warming pass.
 Each pending lane holds at most `MAX_PENDING_PASSES`, 128. An attempt has a
 five-minute deadline, excluding admission wait, and failures retry with
 backoff from one second to one minute while attached. Detach cancels and joins
-both lanes. Summary construction admits four builders process-wide,
+all three lanes. Retry warnings identify warming versus publication and the
+commit cutoff. Publication reports its discovered, published, skipped, and
+failed attempts periodically and at completion. Existing summaries and dense
+files count as skipped; an oversized build logs its allowance separately.
+Summary construction admits four builders process-wide,
 `PUBLISH_CONCURRENCY`, of which at most two are background builds. Background
 reads take at most half the data-store admission. A refused or skipped pass
 logs a warning and leaves the file readable. The core exposes
@@ -431,6 +440,10 @@ once and deletes every `.rowsum` whose data file the same listing did not
 find, reporting a `SidecarSweep` of considered, reclaimed, and failed objects.
 It runs as a maintenance step after DuckLake's cleanup, which is what strands
 sidecars.
+
+A publication header check treats `NotFound` as absent. Other I/O failures
+propagate for retry without rebuilding the summary. Invalid headers are
+reported distinctly and may be rebuilt.
 
 **Read path.** A summary is resolved in strict fallback order.
 
@@ -511,15 +524,19 @@ unpublished. Foreground reads then resolve positions by streaming row ids.
 Blocking builders keep their permits and reservations until their synchronous
 call returns, even after the waiter is cancelled.
 
-**Publication progress.** `RowSummaryProgress::new(tables, since)` traverses
-an attach or backfill selection with an exclusive snapshot cutoff.
-`RowSummaryProgress::for_files(files)` publishes exact registered file ids
-with no traversal. Each `advance` publishes at most four files and keeps its
-snapshot between steps. Failed file ids stay resident up to `RESIDENT_FILES`,
-1,024, and spill to an anonymous temporary file beyond that. Retry rounds
-consume those ids and never rescan successful files. A cancelled step may
-repeat its in-flight window. Dropping the progress value releases its snapshot
-and spools.
+**Publication progress.** `RowSummaryProgress::new(tables, since)` traverses an
+attach or backfill selection with an exclusive snapshot cutoff.
+`RowSummaryProgress::for_files(files)` publishes exact registered file ids with
+no traversal. Discovery retains up to 128 decoded file records and an estimated
+256 KiB per page, admitting one oversized record only under the working-memory
+budget. It uses a cache-admitting metadata scan. Each `advance` publishes at
+most four files from that page and keeps its snapshot between steps. Discovery
+and publication reuse the same decoded file value. Only acknowledged files leave
+the page, so cancellation retains unfinished work. Failed file ids stay resident
+up to `RESIDENT_FILES`, 1,024, and spill to an anonymous temporary file beyond
+that. Retry rounds consume those ids and never rescan successful files. A
+cancelled step may repeat its in-flight window. Dropping the progress value
+releases its snapshot and spools.
 
 **Release hook.** `set_memory_release(hook)` installs what the process does to
 return freed pages to the kernel. The core calls it after a cold catalog view,

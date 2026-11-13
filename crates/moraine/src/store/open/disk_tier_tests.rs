@@ -5,6 +5,80 @@ use slatedb::config::{FlushOptions, FlushType};
 
 use super::*;
 
+/// Non-admitting scans reuse disk entries but leave cold data blocks uncached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_admitting_scans_reuse_disk_blocks_but_do_not_fill_misses() {
+    let directory = std::env::temp_dir().join(format!("moraine-scan-tier-{}", Uuid::new_v4()));
+    let cache = cache::TestCache::new(64 * 1024 * 1024, Some(directory.as_path())).await;
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let options = StoreBuilder::new("scan-tier", Arc::clone(&objects)).cache_puts(false);
+    let db = Db::builder("scan-tier", objects)
+        .with_settings(Settings {
+            compactor_options: None,
+            ..options.settings()
+        })
+        .with_sst_block_size(SST_BLOCK_SIZE)
+        .with_block_cache_policy(options.block_cache_policy())
+        .with_db_cache(cache.handle.clone(), 1)
+        .with_metrics_recorder(cache::recorder(Arc::clone(&cache.counters)))
+        .build()
+        .await
+        .unwrap();
+    let mut batch = slatedb::WriteBatch::new();
+    for key in 0_u64..4096 {
+        batch.put(key.to_be_bytes(), [7_u8; 64]);
+    }
+    db.write(batch).await.unwrap();
+    db.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+
+    for (pass, admit) in [false, false, true, false].into_iter().enumerate() {
+        if pass == 3 {
+            settled_disk_writes(&cache).await;
+            cache.resize(0);
+            cache.resize(64 * 1024 * 1024);
+        }
+        let before = cache.counters.tally();
+        let mut scan = db
+            .scan_with_options(
+                ..,
+                &slatedb::config::ScanOptions {
+                    cache_blocks: admit,
+                    read_ahead_bytes: 256 * 1024,
+                    max_fetch_tasks: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut rows = 0;
+        while scan.next().await.unwrap().is_some() {
+            rows += 1;
+        }
+        assert_eq!(rows, 4096);
+        let served = cache.counters.tally().since(before);
+        eprintln!("scan {pass}, admit={admit}: {served:?}");
+        if pass < 3 {
+            assert!(served.block_misses > 0, "cold blocks must reach storage");
+            assert_eq!(served.block_hits, 0, "earlier scans admitted nothing");
+        } else {
+            assert_eq!(
+                served.block_misses, 0,
+                "the admitted blocks survived on disk"
+            );
+            assert!(
+                served.block_disk_hits > 0,
+                "the scan must consult the disk tier"
+            );
+        }
+    }
+    db.close().await.unwrap();
+    let _ = std::fs::remove_dir_all(directory);
+}
+
 /// Polls until the disk tier's write counter stops moving, so a later
 /// sample is not racing the flusher finishing earlier work.
 async fn settled_disk_writes(cache: &cache::TestCache) -> usize {
