@@ -55,6 +55,54 @@ runs:
         printf '%s\n' "$SIGNING_KEY" > "$key"
         cargo run -q -p xtask -- sign-release-assets dist signed "$key"
         rm -f "$key" "$key.pub"
+    # A published ext-v* release is a pin: downstreams record its checksums
+    # and build against those exact bytes. Publishing over one changes what
+    # the tag means without changing its name, which is how four feature
+    # merges each silently re-pointed ext-v0.8.1 and cost three re-pin PRs
+    # downstream. The trigger no longer fires on ordinary merges, so this is
+    # the second line of defence: a rebuild of an already-published version
+    # stops here instead of overwriting it.
+    - name: Refuse to publish over an existing release, and clear stale drafts
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ inputs.tag }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        # One line per release carrying this tag -- `gh release view` would
+        # pick just one, and a tag can hold several. The filter emits
+        # elements for the shell to count because `--paginate` runs it once
+        # per page: an aggregate like `length` returns a count per page, not
+        # a total.
+        releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+          --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"')
+        published=$(printf '%s\n' "$releases" | awk '$2 == "false" { print $1 }')
+        if [ -n "$published" ]; then
+          echo "::error::$TAG is already published. Its bytes may already be" \
+            "pinned downstream, so replacing them would change what the tag" \
+            "means. Publish under a new tag instead: run the Extension" \
+            "workflow with ext-v<version>-build.<next>." >&2
+          exit 1
+        fi
+        # `gh release create` on a tag that already has a draft adds another
+        # draft rather than failing, which is how one tag accumulated five
+        # empty drafts. Clearing them leaves the upload below one target.
+        for id in $(printf '%s\n' "$releases" | awk '$2 == "true" { print $1 }'); do
+          echo "deleting stale draft release $id for $TAG"
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+        done
+        # `gh release create` reuses an existing tag and ignores --target, so
+        # a tag left at another commit would publish binaries under a name
+        # claiming a different source. `commits/<tag>` dereferences
+        # lightweight and annotated tags alike; its 404 body goes to stdout,
+        # so the sha is read only when the call succeeds.
+        if at=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha' 2>/dev/null); then
+          if [ "$at" != "$TARGET" ]; then
+            echo "::error::tag $TAG already points at $at, not $TARGET." >&2
+            exit 1
+          fi
+        fi
     - name: Create draft release, attach binaries, reveal
       shell: bash
       env:
@@ -64,13 +112,14 @@ runs:
           | sed -E 's/^moraine\.(v[0-9.]+)\..*/\1/' | sort -u | paste -sd', ' -)
         gh release create "${{ inputs.tag }}" --target "${{ inputs.target }}" --draft \
           --title "${{ inputs.tag }}" \
-          --notes "moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs DuckDB started with unsigned extensions allowed. The .gz assets are the same builds signed for the extension repository at https://morainedb.com/ext, which installs them with no flag: see https://morainedb.com/guide/getting-started/#install-the-extension." \
-          || true
+          --notes "moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs DuckDB started with unsigned extensions allowed. The .gz assets are the same builds signed for the extension repository at https://morainedb.com/ext, which installs them with no flag: see https://morainedb.com/guide/getting-started/#install-the-extension."
         # The upload has hung indefinitely against the releases API on a
         # payload it usually moves in under a minute, leaving a draft that
         # never reveals and a job with nothing to read. Each attempt is
         # bounded and retried; `--clobber` makes a partial upload safe to
-        # repeat, so a retry costs transfer rather than correctness.
+        # repeat, so a retry costs transfer rather than correctness. It can
+        # only ever overwrite the draft created just above -- the step before
+        # it rejects a tag that is already published.
         uploaded=false
         for attempt in 1 2 3; do
           if timeout 600 gh release upload "${{ inputs.tag }}" \
