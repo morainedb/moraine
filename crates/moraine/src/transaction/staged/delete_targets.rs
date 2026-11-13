@@ -1,6 +1,8 @@
 //! Positional deletions must name data files still present at publication.
 
-use super::*;
+use std::collections::BTreeSet;
+
+use super::{CatalogSnapshot, Error, Rebase, Result, RowOperation, TableKind, decode};
 
 pub(super) fn validate(
     base: &CatalogSnapshot,
