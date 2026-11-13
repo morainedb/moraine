@@ -301,6 +301,7 @@ mod fault;
 #[doc(hidden)]
 pub mod ffi_support;
 mod memory;
+mod read_policy;
 mod store;
 mod telemetry;
 pub use memory::{

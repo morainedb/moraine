@@ -35,7 +35,11 @@ impl InlineChunks {
         });
         Ok(Self(
             handle
-                .scan_prefix(prefix, (start, Bound::Unbounded), ScanShape::Streaming)
+                .scan_prefix(
+                    prefix,
+                    (start, Bound::Unbounded),
+                    ScanShape::bounded().reuse_only(),
+                )
                 .await?,
         ))
     }
@@ -82,7 +86,7 @@ impl InlineTombstones {
             .scan_prefix(
                 &prefix,
                 key(start, 0)..=key(end, u64::MAX),
-                ScanShape::Streaming,
+                ScanShape::bounded().reuse_only(),
             )
             .await?;
         let mut tombstones = Self {
@@ -159,7 +163,11 @@ pub(crate) async fn file_delete_positions(
             .to_vec()
     };
     let mut iterator = handle
-        .scan_prefix(&prefix, key(0)..=key(u64::MAX), ScanShape::Streaming)
+        .scan_prefix(
+            &prefix,
+            key(0)..=key(u64::MAX),
+            ScanShape::bounded().reuse_only(),
+        )
         .await?;
     let mut positions = std::collections::HashSet::new();
     while let Some(entry) = iterator.next().await? {

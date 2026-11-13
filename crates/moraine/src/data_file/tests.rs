@@ -548,8 +548,10 @@ async fn a_single_touch_read_fetches_its_ranges_again() {
     let path = Path::from("single-touch-wide.parquet");
     let (object_len, footer_size) =
         write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
-    let file =
-        || ParquetFile::new(data.clone(), path.clone(), object_len, footer_size).single_touch();
+    let file = || {
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size)
+            .with_range_admission(crate::read_policy::CacheAdmission::ReuseOnly)
+    };
 
     let first = scoped_read_recorded_entries(file(), &[0], ScopedRows::All, RowIdSource::Ordinal)
         .await

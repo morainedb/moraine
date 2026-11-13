@@ -22,7 +22,7 @@ impl SchemaVersionCursor {
             .scan_prefix(
                 subspace_prefix(Subspace::SchemaVersion),
                 ..,
-                ScanShape::Streaming,
+                ScanShape::bounded().reuse_only(),
             )
             .await?;
         Ok(Self { handle, iterator })
@@ -31,7 +31,11 @@ impl SchemaVersionCursor {
     pub(crate) async fn open_table(handle: OwnedReadHandle, table_id: u64) -> Result<Self> {
         let iterator = handle
             .borrow()
-            .scan_prefix(schema_version_table_prefix(table_id), .., ScanShape::Seek)
+            .scan_prefix(
+                schema_version_table_prefix(table_id),
+                ..,
+                ScanShape::seek().retain(),
+            )
             .await?;
         Ok(Self { handle, iterator })
     }
@@ -86,7 +90,11 @@ pub(crate) async fn exists(
 
 pub(crate) async fn first(handle: ReadHandle<'_>, table_id: u64) -> Result<Option<(u64, u64)>> {
     let mut cursor = handle
-        .scan_prefix(schema_version_table_prefix(table_id), .., ScanShape::Seek)
+        .scan_prefix(
+            schema_version_table_prefix(table_id),
+            ..,
+            ScanShape::seek().retain(),
+        )
         .await?;
     let Some(entry) = cursor.next().await? else {
         return Ok(None);

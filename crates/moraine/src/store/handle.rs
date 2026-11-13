@@ -39,24 +39,36 @@ pub(crate) const SCAN_SPLIT: usize = 8;
 /// remainder is split: one read-ahead, the span one round trip covers.
 const SCAN_SPLIT_BYTES: usize = SCAN_READ_AHEAD_BYTES;
 
-/// The shape of a scan, which decides its block-cache admission.
+/// Fetch geometry and admission, selected independently at each call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScanShape {
-    /// A whole-subspace walk; its blocks are not admitted.
-    Bulk,
-    /// A sequential walk with bounded read-ahead and no cache admission, for
-    /// a consumer that derives as it goes.
-    Streaming,
-    /// A table's metadata: bounded read-ahead with block-cache admission.
-    Metadata,
-    /// A targeted lookup; its blocks are admitted.
-    Probe,
-    /// One equality prefix, with bounded read-ahead and cache admission.
+pub(crate) struct ScanShape {
+    fetch: FetchShape,
+    admission: crate::read_policy::CacheAdmission,
+}
+
+/// Read-ahead geometry without an implicit retention policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FetchShape {
+    Wide,
+    Bounded,
     Equality,
-    /// One or a few entries from a wide range: one block fetched at a time,
-    /// admitted. A read-ahead shape here keeps fetching after the iterator
-    /// is dropped.
     Seek,
+}
+
+impl FetchShape {
+    pub(crate) fn retain(self) -> ScanShape {
+        ScanShape {
+            fetch: self,
+            admission: crate::read_policy::CacheAdmission::Retain,
+        }
+    }
+
+    pub(crate) fn reuse_only(self) -> ScanShape {
+        ScanShape {
+            fetch: self,
+            admission: crate::read_policy::CacheAdmission::ReuseOnly,
+        }
+    }
 }
 
 /// The direction SlateDB traverses a scan range.
@@ -87,23 +99,30 @@ impl ScanOrder {
 }
 
 impl ScanShape {
-    /// Scan options for this shape: how far it reads ahead, how many
-    /// fetches it keeps in flight, and whether its blocks are admitted.
+    pub(crate) fn wide() -> FetchShape {
+        FetchShape::Wide
+    }
+    pub(crate) fn bounded() -> FetchShape {
+        FetchShape::Bounded
+    }
+    pub(crate) fn equality() -> FetchShape {
+        FetchShape::Equality
+    }
+    pub(crate) fn seek() -> FetchShape {
+        FetchShape::Seek
+    }
+
     fn options(self, order: ScanOrder) -> ScanOptions {
-        let (read_ahead_bytes, max_fetch_tasks) = match self {
-            Self::Bulk | Self::Probe => (SCAN_READ_AHEAD_BYTES, SCAN_FETCH_TASKS),
-            Self::Streaming | Self::Metadata => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
-            Self::Equality => (EQUALITY_READ_AHEAD_BYTES, 2),
-            // SlateDB rounds the read-ahead up to one block.
-            Self::Seek => (1, 1),
+        let (read_ahead_bytes, max_fetch_tasks) = match self.fetch {
+            FetchShape::Wide => (SCAN_READ_AHEAD_BYTES, SCAN_FETCH_TASKS),
+            FetchShape::Bounded => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
+            FetchShape::Equality => (EQUALITY_READ_AHEAD_BYTES, 2),
+            FetchShape::Seek => (1, 1),
         };
         ScanOptions {
             read_ahead_bytes,
             max_fetch_tasks,
-            cache_blocks: matches!(
-                self,
-                Self::Probe | Self::Equality | Self::Seek | Self::Metadata
-            ),
+            cache_blocks: self.admission.retains(),
             order: order.iteration_order(),
             ..ScanOptions::default()
         }
@@ -234,6 +253,7 @@ impl ReadHandle<'_> {
                     .await
             }
         }?;
+        crate::read_policy::scan_opened(shape.admission);
         Ok(ScanIterator {
             iterator,
             checkpoint: match self {
@@ -247,7 +267,12 @@ impl ReadHandle<'_> {
     /// key: one seek from the end.
     async fn highest_suffix(&self, prefix: &[u8]) -> Result<Option<Vec<u8>>, slatedb::Error> {
         let mut descending = self
-            .scan_prefix_ordered(prefix, .., ScanShape::Seek, ScanOrder::Descending)
+            .scan_prefix_ordered(
+                prefix,
+                ..,
+                ScanShape::seek().retain(),
+                ScanOrder::Descending,
+            )
             .await?;
         Ok(descending
             .next()
@@ -443,6 +468,7 @@ mod tests {
     /// empty, hold one entry, or are cut into every sub-range.
     #[tokio::test]
     async fn a_split_scan_yields_what_one_iterator_yields() {
+        let policy = ScanShape::wide().reuse_only();
         let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
@@ -496,11 +522,7 @@ mod tests {
         let handle = ReadHandle::Tx(&tx);
         let prefix = key::subspace_prefix(Subspace::Current);
         let plain = handle
-            .collect_range(
-                &prefix,
-                (Bound::Unbounded, Bound::Unbounded),
-                ScanShape::Bulk,
-            )
+            .collect_range(&prefix, (Bound::Unbounded, Bound::Unbounded), policy)
             .await
             .unwrap();
         assert_eq!(plain.len(), 3 + 3 + (3 + 7 + 9) + 30 * (3 + 7 + 9) + 1);
@@ -508,7 +530,7 @@ mod tests {
 
         for threshold in [0, 64, usize::MAX] {
             let split = handle
-                .scan_prefix_split_over(&prefix, &splits, ScanShape::Bulk, threshold)
+                .scan_prefix_split_over(&prefix, &splits, policy, threshold)
                 .await
                 .unwrap();
             assert_eq!(split.len(), plain.len(), "threshold {threshold}");
@@ -524,15 +546,11 @@ mod tests {
         // One kind on its own, split against its own prefix.
         let files = key::current_entity_kind_prefix(EntityKind::File);
         let plain_files = handle
-            .collect_range(
-                &files,
-                (Bound::Unbounded, Bound::Unbounded),
-                ScanShape::Bulk,
-            )
+            .collect_range(&files, (Bound::Unbounded, Bound::Unbounded), policy)
             .await
             .unwrap();
         let split_files = handle
-            .scan_prefix_split_over(&files, std::slice::from_ref(&files), ScanShape::Bulk, 0)
+            .scan_prefix_split_over(&files, std::slice::from_ref(&files), policy, 0)
             .await
             .unwrap();
         assert_eq!(split_files.len(), plain_files.len());
@@ -547,10 +565,27 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    #[test]
+    fn admission_does_not_change_fetch_geometry() {
+        for fetch in [
+            ScanShape::wide(),
+            ScanShape::bounded(),
+            ScanShape::equality(),
+            ScanShape::seek(),
+        ] {
+            let retained = fetch.retain().options(ScanOrder::Ascending);
+            let transient = fetch.reuse_only().options(ScanOrder::Ascending);
+            assert_eq!(retained.read_ahead_bytes, transient.read_ahead_bytes);
+            assert_eq!(retained.max_fetch_tasks, transient.max_fetch_tasks);
+            assert!(retained.cache_blocks);
+            assert!(!transient.cache_blocks);
+        }
+    }
+
     /// A bulk scan reads ahead but admits nothing.
     #[test]
     fn bulk_scans_read_ahead_and_admit_nothing() {
-        let options = ScanShape::Bulk.options(ScanOrder::Ascending);
+        let options = ScanShape::wide().reuse_only().options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
         assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
         assert!(!options.cache_blocks);
@@ -559,7 +594,7 @@ mod tests {
     /// A probe admits its blocks and keeps the read-ahead.
     #[test]
     fn probe_scans_admit_their_blocks() {
-        let options = ScanShape::Probe.options(ScanOrder::Ascending);
+        let options = ScanShape::wide().retain().options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
         assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
         assert!(options.cache_blocks);
@@ -568,7 +603,7 @@ mod tests {
     /// Equality scans bound buffering independently of range probes.
     #[test]
     fn equality_scans_bound_read_ahead_and_admit_blocks() {
-        let options = ScanShape::Equality.options(ScanOrder::Ascending);
+        let options = ScanShape::equality().retain().options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, 1024 * 1024);
         assert_eq!(options.max_fetch_tasks, 2);
         assert!(options.cache_blocks);
@@ -578,7 +613,9 @@ mod tests {
     /// and admits nothing.
     #[test]
     fn streaming_scans_read_ahead_a_bounded_window_and_admit_nothing() {
-        let options = ScanShape::Streaming.options(ScanOrder::Ascending);
+        let options = ScanShape::bounded()
+            .reuse_only()
+            .options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, 256 * 1024);
         assert_eq!(options.max_fetch_tasks, 2);
         assert!(!options.cache_blocks);
@@ -587,7 +624,7 @@ mod tests {
     /// A seek fetches one block, one fetch at a time, and admits it.
     #[test]
     fn seeks_fetch_one_block_and_admit_it() {
-        let options = ScanShape::Seek.options(ScanOrder::Ascending);
+        let options = ScanShape::seek().retain().options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, 1);
         assert_eq!(options.max_fetch_tasks, 1);
         assert!(options.cache_blocks);
@@ -596,7 +633,7 @@ mod tests {
     /// A descending probe asks SlateDB to iterate backwards.
     #[test]
     fn descending_probes_request_descending_iteration() {
-        let options = ScanShape::Probe.options(ScanOrder::Descending);
+        let options = ScanShape::wide().retain().options(ScanOrder::Descending);
         assert!(matches!(options.order, IterationOrder::Descending));
     }
 }

@@ -56,7 +56,7 @@ fn step<'a>(session: &'a CommitSession, cursor: &'a [u8]) -> BoxFuture<'a, Resul
                 .scan_prefix(
                     prefix,
                     (lower, Bound::<Vec<u8>>::Unbounded),
-                    ScanShape::Streaming,
+                    ScanShape::bounded().reuse_only(),
                 )
                 .await?;
             while let Some(row) = rows.next().await? {

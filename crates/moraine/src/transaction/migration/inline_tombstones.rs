@@ -53,7 +53,7 @@ fn step<'a>(tx: &'a CommitSession, cursor: &'a [u8]) -> BoxFuture<'a, Result<Ste
             .scan_prefix(
                 prefix,
                 (lower, Bound::<Vec<u8>>::Unbounded),
-                ScanShape::Bulk,
+                ScanShape::wide().reuse_only(),
             )
             .await?;
         let mut staged = StagedBytes::default();

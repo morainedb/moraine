@@ -502,7 +502,11 @@ impl Catalog {
             }
             let mut entries = session
                 .handle()
-                .scan_prefix(index_index_prefix(kind, index.get()), .., ScanShape::Bulk)
+                .scan_prefix(
+                    index_index_prefix(kind, index.get()),
+                    ..,
+                    ScanShape::wide().reuse_only(),
+                )
                 .await?;
             while deletes.len() < limit {
                 match entries.next().await? {
@@ -587,7 +591,7 @@ impl Catalog {
             .scan_prefix(
                 crate::store::key::current_entity_kind_prefix(EntityKind::Index),
                 ..,
-                ScanShape::Streaming,
+                ScanShape::bounded().reuse_only(),
             )
             .await?;
         while let Some(entry) = records.next().await? {
@@ -844,7 +848,7 @@ impl Catalog {
             .scan_prefix(
                 crate::store::key::current_entity_kind_prefix(EntityKind::Table),
                 ..,
-                ScanShape::Streaming,
+                ScanShape::bounded().reuse_only(),
             )
             .await?;
         while let Some(entry) = current.next().await? {
@@ -935,7 +939,7 @@ impl Catalog {
             .scan_prefix(
                 crate::store::key::current_entity_kind_prefix(EntityKind::FileColumnStats),
                 ..,
-                ScanShape::Streaming,
+                ScanShape::bounded().reuse_only(),
             )
             .await?;
         let mut last_file = None;
@@ -971,7 +975,7 @@ impl Catalog {
                         .scan_prefix(
                             crate::store::key::history_entity_prefix(file),
                             ..,
-                            ScanShape::Seek,
+                            ScanShape::seek().retain(),
                         )
                         .await?
                         .next()
@@ -1025,7 +1029,11 @@ impl Catalog {
         let session = self.begin_read().await?;
         let mut entries = session
             .handle()
-            .scan_prefix(index_index_prefix(kind, index_id), .., ScanShape::Bulk)
+            .scan_prefix(
+                index_index_prefix(kind, index_id),
+                ..,
+                ScanShape::wide().reuse_only(),
+            )
             .await?;
 
         let mut total = 0u64;

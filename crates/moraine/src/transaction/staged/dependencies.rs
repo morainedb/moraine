@@ -325,7 +325,9 @@ async fn scan(
     prefix: Vec<u8>,
     include: impl Fn(&EntityRecord) -> bool,
 ) -> Result<()> {
-    let mut cursor = handle.scan_prefix(prefix, .., ScanShape::Metadata).await?;
+    let mut cursor = handle
+        .scan_prefix(prefix, .., ScanShape::bounded().retain())
+        .await?;
     while let Some(entry) = cursor.next().await? {
         handle.validate()?;
         let record = read::decode_current_record(Key::decode(&entry.key)?, &entry.value)?;

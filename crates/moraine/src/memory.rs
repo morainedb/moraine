@@ -525,3 +525,56 @@ mod release_tests {
         assert_eq!(RELEASES.load(Ordering::Relaxed), before + 1);
     }
 }
+
+#[cfg(test)]
+mod working_value_tests {
+    use super::*;
+
+    #[test]
+    fn shared_work_keeps_its_charge_until_the_last_reader_drops() {
+        let budget = Budget::new(128);
+        let value = WorkingValue::new(
+            String::from("decoded"),
+            MemoryReservation::from_budget(128, budget.clone()).unwrap(),
+        );
+        let reader = value.clone();
+        drop(value);
+        assert!(MemoryReservation::from_budget(1, budget.clone()).is_err());
+        assert_eq!(reader.as_str(), "decoded");
+        drop(reader);
+        assert!(MemoryReservation::from_budget(128, budget).is_ok());
+    }
+}
+
+/// A decoded working value whose reservation follows its last reader.
+#[derive(Debug)]
+pub(crate) struct WorkingValue<T>(Arc<WorkingAllocation<T>>);
+
+#[derive(Debug)]
+struct WorkingAllocation<T> {
+    value: T,
+    memory: MemoryReservation,
+}
+
+impl<T> WorkingValue<T> {
+    pub(crate) fn new(value: T, memory: MemoryReservation) -> Self {
+        Self(Arc::new(WorkingAllocation { value, memory }))
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.memory.bytes()
+    }
+}
+
+impl<T> Clone for WorkingValue<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for WorkingValue<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0.value
+    }
+}

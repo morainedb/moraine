@@ -997,8 +997,13 @@ async fn establish_filter(
     filter: &mut BuildFilter,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut keys =
-        scan_index_entries(handle, IndexKind::Unique, index.get(), ScanShape::Bulk).await?;
+    let mut keys = scan_index_entries(
+        handle,
+        IndexKind::Unique,
+        index.get(),
+        ScanShape::wide().reuse_only(),
+    )
+    .await?;
     let mut scanned = 0u64;
     while let Some(entry) = keys.next().await? {
         filter.insert(&entry.key);
@@ -1035,7 +1040,7 @@ async fn plan_file(
         file.footer_size,
     )
     .with_metrics(Arc::clone(&metrics))
-    .single_touch();
+    .with_range_admission(crate::read_policy::CacheAdmission::ReuseOnly);
 
     let columns = snapshot.file_read_columns_at(handle, table, file);
     let dead = backfill::dead_positions(handle, table, file_id, object_store, metrics, resolve);

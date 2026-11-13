@@ -316,7 +316,7 @@ async fn a_pinned_reader_refuses_reads_past_its_deadline() {
     assert!(left > READ_GRACE / 2 && left < READ_GRACE);
 
     let mut entries = crate::store::handle::ReadHandle::Checkpoint(&scope)
-        .scan_prefix(b"", .., crate::store::handle::ScanShape::Metadata)
+        .scan_prefix(b"", .., crate::store::handle::ScanShape::bounded().retain())
         .await
         .unwrap();
     assert_eq!(

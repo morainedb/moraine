@@ -3,7 +3,6 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     ops::Bound,
-    sync::Arc,
 };
 
 use futures::{StreamExt, stream};
@@ -24,14 +23,11 @@ pub(super) type Position = (u64, u64);
 const DISCOVERY_FILES: usize = 128;
 const DISCOVERY_BYTES: usize = 256 * 1024;
 
-struct DiscoveredFile {
-    value: DataFileValue,
-    _memory: crate::MemoryReservation,
-}
+type DiscoveredFile = crate::memory::WorkingValue<DataFileValue>;
 
 struct SelectedFile {
     position: Position,
-    file: Option<Arc<DiscoveredFile>>,
+    file: Option<DiscoveredFile>,
 }
 
 #[derive(Default, Debug)]
@@ -55,7 +51,7 @@ pub struct RowSummaryProgress {
     retrying: bool,
     complete: bool,
     files: Option<std::collections::VecDeque<Position>>,
-    page: VecDeque<Arc<DiscoveredFile>>,
+    page: VecDeque<DiscoveredFile>,
     counts: PublicationCounts,
     reported: std::time::Instant,
 }
@@ -124,6 +120,7 @@ impl RowSummaryProgress {
         }
 
         if !self.page.is_empty() {
+            crate::read_policy::decoded_reused(self.page.len().min(data_file::PUBLISH_CONCURRENCY));
             return Ok(self.window());
         }
         let prefix = current_entity_kind_prefix(EntityKind::File);
@@ -140,7 +137,11 @@ impl RowSummaryProgress {
                 )
             });
         let mut cursor = handle
-            .scan_prefix(prefix, (lower, Bound::Unbounded), ScanShape::Metadata)
+            .scan_prefix(
+                prefix,
+                (lower, Bound::Unbounded),
+                ScanShape::bounded().retain(),
+            )
             .await?;
         let mut selected = VecDeque::new();
         let mut bytes = 0;
@@ -159,24 +160,22 @@ impl RowSummaryProgress {
                 }
                 continue;
             }
-            let charge = entry
-                .value
-                .len()
-                .saturating_mul(3)
-                .saturating_add(size_of::<DiscoveredFile>());
+            let charge = entry.value.len().saturating_mul(3).saturating_add(
+                size_of::<DataFileValue>()
+                    + size_of::<crate::MemoryReservation>()
+                    + 2 * size_of::<usize>(),
+            );
             if !selected.is_empty() && bytes + charge > DISCOVERY_BYTES {
                 break;
             }
             let memory = crate::MemoryReservation::reserve(charge as u64)?;
             bytes += charge;
-            selected.push_back(Arc::new(DiscoveredFile {
-                value: file,
-                _memory: memory,
-            }));
+            selected.push_back(DiscoveredFile::new(file, memory));
             if selected.len() == DISCOVERY_FILES || bytes >= DISCOVERY_BYTES {
                 break;
             }
         }
+        crate::read_policy::decoded_page(selected.len(), bytes);
         self.counts.discovered += selected.len() as u64;
         self.page = selected;
         Ok(self.window())
@@ -187,8 +186,8 @@ impl RowSummaryProgress {
             .iter()
             .take(data_file::PUBLISH_CONCURRENCY)
             .map(|file| SelectedFile {
-                position: (file.value.table_id, file.value.data_file_id),
-                file: Some(Arc::clone(file)),
+                position: (file.table_id, file.data_file_id),
+                file: Some(file.clone()),
             })
             .collect()
     }
@@ -249,7 +248,7 @@ impl RowSummaryProgress {
                         };
                         let loaded;
                         let file = if let Some(discovered) = &selected.file {
-                            &discovered.value
+                            &**discovered
                         } else {
                             loaded = read_singleton::<DataFileValue>(
                                 handle,
@@ -295,7 +294,7 @@ impl RowSummaryProgress {
             }
         }
         if self.reported.elapsed() >= std::time::Duration::from_secs(10) {
-            tracing::info!(?self.counts, remaining_in_page = self.page.len(), "row summary publication advanced");
+            tracing::info!(?self.counts, remaining_in_page = self.page.len(), retained_decoded_bytes = self.page.iter().map(DiscoveredFile::bytes).sum::<u64>(), "row summary publication advanced");
             self.reported = std::time::Instant::now();
         }
         // A summary build sorts and encodes row IDs for every file in the
@@ -346,9 +345,9 @@ mod tests {
         assert_eq!(first.len(), 4);
         assert_eq!(progress.page.len(), DISCOVERY_FILES);
         let again = progress.select(handle.borrow()).await.unwrap();
-        assert!(Arc::ptr_eq(
-            first[0].file.as_ref().unwrap(),
-            again[0].file.as_ref().unwrap()
+        assert!(std::ptr::eq(
+            &raw const **first[0].file.as_ref().unwrap(),
+            &raw const **again[0].file.as_ref().unwrap()
         ));
         for item in &first {
             progress.after = Some(item.position);

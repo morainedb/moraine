@@ -290,22 +290,40 @@ in-memory attachments and opens without an identity receive. Credentials are
 excluded so rotation preserves reuse. Display strings never determine
 equivalence.
 
-**Admission by read shape.** Every read path names a `ScanShape`, which fixes
-its read-ahead and its admission. Foyer's admission picker repeats the rule at
-the disk device.
+**Admission by read shape.** Every catalog scan selects fetch geometry and then
+explicitly chooses `retain()` or `reuse_only()`. Both consult existing cache
+entries; only the former admits missed blocks. `ScanShape` carries these
+independent decisions. Parquet range reads use the same `CacheAdmission` policy;
+parsed footers and summaries retain their separate metadata admission rules.
+Foyer's admission picker repeats the rule at the disk device.
 
 | Shape | Read-ahead | Fetches in flight | Admits blocks | Used for |
 |---|---|---|---|---|
-| `Bulk` | 8 MiB | 32 | no | whole-subspace walks, cascades, expiry, backfills |
-| `Probe` | 8 MiB | 32 | yes | targeted lookups and range probes |
-| `Streaming` | 256 KiB | 2 | no | a sequential consumer deriving as it goes |
-| `Metadata` | 256 KiB | 2 | yes | a table's metadata reads |
-| `Equality` | 1 MiB | 2 | yes | one equality prefix |
-| `Seek` | one block | 1 | yes | one or a few entries from a wide range |
+| `wide().reuse_only()` | 8 MiB | 32 | no | whole-subspace walks, cascades, expiry, backfills |
+| `wide().retain()` | 8 MiB | 32 | yes | targeted lookups and range probes |
+| `bounded().reuse_only()` | 256 KiB | 2 | no | a sequential consumer deriving as it goes |
+| `bounded().retain()` | 256 KiB | 2 | yes | a table's metadata reads |
+| `equality().retain()` | 1 MiB | 2 | yes | one equality prefix |
+| `seek().retain()` | one block | 1 | yes | one or a few entries from a wide range |
 
-`Seek` exists because SlateDB spawns read-ahead fetches when an iterator opens
-and does not cancel them on drop, so a read-ahead shape dropped after one
-entry keeps fetching. Admission changes neither visibility nor completeness.
+`seek().retain()` exists because SlateDB spawns read-ahead fetches when an
+iterator opens and does not cancel them on drop, so a read-ahead shape dropped
+after one entry keeps fetching. Admission changes neither visibility nor
+completeness.
+
+**Read activity monitoring.** While reads arrive, an info event named
+`read cache activity: cumulative process totals` reports at most once every
+ten seconds. Counts are process-wide and cumulative: retaining and reuse-only
+catalog scans opened, complete Parquet range bytes submitted for admission or
+bypassed by policy, and publication decoded-page records, estimated bytes, and
+selections reused from an existing page. They are activity counts, not cache
+occupancy or physical requests. Repeated selections after cancellation count
+again. Short operations may finish before the next report.
+
+Publication progress separately reports the current page's retained decoded
+bytes. Existing cache tallies report hits and misses; `ObjectStoreTally`
+reports physical requests, including retries. Several block misses can share
+one coalesced request, so a block miss must never be described as one S3 GET.
 
 **Adaptive split.** A SlateDB iterator is one sequential cursor however far it
 prefetches. A scan over a kind whose record count scales with the data
@@ -328,11 +346,11 @@ implementation constants and have no attach option.
 **Warming.** `CACHE_PRELOAD` warms inside the open: `CachePreload::L0` touches
 every subspace far enough to pull its SST metadata, and `CachePreload::All`
 additionally walks the scan-shaped subspaces whole. Neither walks the `index`
-subspace's data. `ReadOnlyCatalog::warm_tables` reads, in `Seek` shape, the
-first entry of each named table's index and inline ranges, eight ranges at a
-time process-wide. The extension runs it after a commit for the tables the
-commit wrote, and with `CACHE_PRELOAD` set, for every table in the background
-after the open.
+subspace's data. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
+shape, the first entry of each named table's index and inline ranges, eight
+ranges at a time process-wide. The extension runs it after a commit for the
+tables the commit wrote, and with `CACHE_PRELOAD` set, for every table in the
+background after the open.
 
 **Lookup retention.** Row-lookup directories and revision-keyed probe memos
 share the lookup allowance. Directories additionally keep local ceilings of
@@ -480,6 +498,14 @@ the allowance until the last owner drops. `working_memory_usage()` returns
 reserved bytes and capacity. A caller materializing a `CatalogSnapshot` admits
 its copies with `CatalogSnapshot::reserve_copy`. Legacy methods returning
 plain `Vec` values leave reservation to the caller.
+
+Decoded values passed between phases of one operation use `WorkingValue<T>`:
+an immutable shared allocation retaining its `MemoryReservation` until its last
+reader drops it. Publication pages use this owner under their pinned snapshot.
+Cross-operation lookup results continue to use revision-aware `RevisionMemo`
+and retention-budget `Shared<T>` ownership. Working memory and cache retention
+remain distinct allowances; sharing a value does not copy its payload or its
+reservation.
 
 Each budget is a `MemoryBudgets` field a host sets once per process through
 `configure_memory`, which the extension fills from its `moraine_*_memory`

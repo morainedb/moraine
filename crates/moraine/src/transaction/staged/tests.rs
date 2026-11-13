@@ -1264,7 +1264,7 @@ async fn index_entry_keys(catalog: &Catalog, unique: bool, index_id: u64) -> Vec
         .scan_prefix(
             index_index_prefix(kind, index_id),
             ..,
-            crate::store::handle::ScanShape::Bulk,
+            crate::store::handle::ScanShape::wide().reuse_only(),
         )
         .await
         .unwrap();
@@ -3056,7 +3056,7 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
         .scan_prefix(
             index_index_prefix(IndexKind::Unique, index_id),
             ..,
-            crate::store::handle::ScanShape::Bulk,
+            crate::store::handle::ScanShape::wide().reuse_only(),
         )
         .await
         .unwrap();

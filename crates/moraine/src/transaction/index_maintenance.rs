@@ -887,7 +887,7 @@ pub(crate) async fn lookup_row_ids_limited(
 
     let prefix = index_multi_value_prefix(index_id, key);
     let mut iter = reader
-        .scan_prefix(prefix, .., ScanShape::Equality)
+        .scan_prefix(prefix, .., ScanShape::equality().retain())
         .await
         .map_err(Error::from)?;
 
@@ -963,7 +963,7 @@ pub(crate) async fn range_row_ids_limited(
     };
 
     let mut iter = reader
-        .scan_prefix_ordered(prefix, (start, end), ScanShape::Probe, order)
+        .scan_prefix_ordered(prefix, (start, end), ScanShape::wide().retain(), order)
         .await
         .map_err(Error::from)?;
     if !unique {
@@ -1007,7 +1007,7 @@ pub(crate) async fn null_prefix_row_ids_limited(
     scan_prefix.pop();
 
     let mut iter = reader
-        .scan_prefix_ordered(scan_prefix, .., ScanShape::Probe, order)
+        .scan_prefix_ordered(scan_prefix, .., ScanShape::wide().retain(), order)
         .await
         .map_err(Error::from)?;
 

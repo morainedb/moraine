@@ -127,7 +127,7 @@ pub(crate) async fn lookup(
         .scan_prefix_ordered(
             name_prefix(kind, parent, name),
             ..,
-            ScanShape::Seek,
+            ScanShape::seek().retain(),
             ScanOrder::Descending,
         )
         .await?;

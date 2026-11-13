@@ -274,7 +274,11 @@ pub(crate) async fn visit_history_keys(
     mut visit: impl FnMut(HistoryKey),
 ) -> Result<()> {
     let mut iter = handle
-        .scan_prefix(history_entity_kind_prefix(kind), .., ScanShape::Bulk)
+        .scan_prefix(
+            history_entity_kind_prefix(kind),
+            ..,
+            ScanShape::wide().reuse_only(),
+        )
         .await?;
     while let Some(entry) = iter.next().await? {
         match Key::decode(&entry.key)? {
@@ -300,7 +304,7 @@ async fn scan_decode_split<T>(
     mut extract: impl FnMut(Bytes, Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
     handle
-        .scan_prefix_split(&prefix, splits, ScanShape::Bulk)
+        .scan_prefix_split(&prefix, splits, ScanShape::wide().reuse_only())
         .await?
         .into_iter()
         .map(|entry| {
@@ -334,7 +338,7 @@ async fn scan_decode_kind<T>(
     mut extract: impl FnMut(Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
     if !SPLIT_SCAN_KINDS.contains(&kind) {
-        return scan_decode(handle, prefix, ScanShape::Bulk, extract).await;
+        return scan_decode(handle, prefix, ScanShape::wide().reuse_only(), extract).await;
     }
     let splits = [prefix.clone()];
 
@@ -445,7 +449,7 @@ pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<Snapsho
     scan_decode(
         handle,
         subspace_prefix(Subspace::Snapshot),
-        ScanShape::Bulk,
+        ScanShape::wide().reuse_only(),
         |key, bytes| match key {
             Key::Snapshot { .. } => value::decode_value(&bytes),
             other => Err(Error::Corruption(format!(
@@ -495,7 +499,7 @@ pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(
     scan_decode(
         handle,
         subspace_prefix(Subspace::SchemaVersion),
-        ScanShape::Bulk,
+        ScanShape::wide().reuse_only(),
         |key, bytes| match key {
             Key::SchemaVersion {
                 table_id,
@@ -558,7 +562,11 @@ pub(crate) async fn visit_entity_records(
         Subspace::Current
     };
     let mut iterator = handle
-        .scan_prefix(subspace_prefix(subspace), .., ScanShape::Streaming)
+        .scan_prefix(
+            subspace_prefix(subspace),
+            ..,
+            ScanShape::bounded().reuse_only(),
+        )
         .await?;
     let mut count = 0_usize;
     while let Some(entry) = iterator.next().await? {
@@ -661,7 +669,7 @@ pub(crate) async fn scan_entity_kind(
         return scan_decode(
             handle,
             crate::store::key::current_gc_file_prefix(),
-            ScanShape::Bulk,
+            ScanShape::wide().reuse_only(),
             |key, bytes| match key {
                 Key::Current(CurrentKey::GcFile { .. }) => {
                     Ok(EntityRecord::GcFile(decode_shared(&bytes)?))
@@ -1033,7 +1041,7 @@ mod tests {
             scan_decode(
                 handle,
                 subspace_prefix(subspace),
-                ScanShape::Bulk,
+                ScanShape::wide().reuse_only(),
                 |key, bytes| match key {
                     Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
                     Key::History(history) => decode_entity(history.entity, &bytes),
@@ -1140,7 +1148,7 @@ mod tests {
 
         let started = Instant::now();
         let entries = handle
-            .scan_prefix_split(&prefix, &splits, ScanShape::Bulk)
+            .scan_prefix_split(&prefix, &splits, ScanShape::wide().reuse_only())
             .await
             .unwrap();
         let scanned = started.elapsed();
