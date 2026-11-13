@@ -167,7 +167,7 @@ impl RowSummaryProgress {
 
     fn finish_round(&mut self) -> Result<bool> {
         if let Some(context) = self.read.take() {
-            tracing::debug!(
+            tracing::info!(
                 table_context_loads = context.loads(),
                 table_context_reuses = context.reuses(),
                 "publication read scope released"
@@ -275,7 +275,7 @@ impl RowSummaryProgress {
             }
         }
         if self.reported.elapsed() >= std::time::Duration::from_secs(10) {
-            tracing::info!(?self.counts, remaining_in_page = self.page.len(), retained_decoded_bytes = self.page.iter().map(DiscoveredFile::bytes).sum::<u64>(), "row summary publication advanced");
+            tracing::info!(?self.counts, table_context_loads = context.loads(), table_context_reuses = context.reuses(), remaining_in_page = self.page.len(), retained_decoded_bytes = self.page.iter().map(DiscoveredFile::bytes).sum::<u64>(), "row summary publication advanced");
             self.reported = std::time::Instant::now();
         }
         // A summary build sorts and encodes row IDs for every file in the
