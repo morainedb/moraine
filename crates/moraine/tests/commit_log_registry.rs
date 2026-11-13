@@ -48,7 +48,6 @@ impl CommitLogProvider for Counting {
         &self,
         _log_store: Arc<dyn ObjectStore>,
         _path: &str,
-        _tail: bool,
     ) -> Arc<dyn ReaderSession> {
         *self.readers.lock().unwrap() += 1;
         Arc::new(EmptySession)

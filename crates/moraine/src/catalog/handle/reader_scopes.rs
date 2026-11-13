@@ -1,4 +1,4 @@
-//! Shares pinned readers across transactions starting at a published revision.
+//! Acquires fixed log views or shares native published readers.
 
 use std::{
     sync::{Arc, Weak},
@@ -80,7 +80,7 @@ impl ReaderScopes {
             .cache_auxiliary_percent(self.options.cache_auxiliary_percent)
             .cache_puts(self.options.cache_puts)
             .cache_compaction_puts(self.options.cache_compaction_puts);
-        let session = reader_session(self.objects.clone(), &self.options, true);
+        let session = reader_session(self.objects.clone(), &self.options);
         builder.reader_session(session)
     }
 
@@ -102,23 +102,13 @@ impl ReaderScopes {
         if let Some(explicit) = &self.explicit {
             return Ok(explicit.clone());
         }
+        if self.captures_log() {
+            // Replay bytes are admitted by the process working-memory budget.
+            let (reader, _) = self.builder().open_fixed_reader().await?;
+            return Ok(CheckpointReader::fixed(reader));
+        }
         let mut readers = self.readers.lock().await;
         if let Some(reader) = self.unexpired(&readers) {
-            return Ok(reader);
-        }
-        if self.captures_log() {
-            // Log scopes capture on every acquisition, including read-only catalogs.
-            readers
-                .generations
-                .retain(|reader| reader.strong_count() != 0);
-            if readers.generations.len() >= MAX_READER_GENERATIONS {
-                return Err(Error::Constraint(
-                    "catalog read generation limit reached; finish an older transaction".into(),
-                ));
-            }
-            let (reader, _) = self.builder().open_fixed_reader().await?;
-            let reader = CheckpointReader::fixed(reader);
-            readers.generations.push(Arc::downgrade(&reader));
             return Ok(reader);
         }
         let admin = Arc::new(self.builder().admin());

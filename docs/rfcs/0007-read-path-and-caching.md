@@ -111,12 +111,18 @@ Reader acquisition works as follows.
    telling the caller to restart the transaction. A transaction therefore
    cannot outlive `READ_GRACE`.
 
-At most `MAX_READER_GENERATIONS` reader generations, eight, may be live in one
-handle. Acquiring another is refused with `Constraint` until an older
-transaction or cursor finishes. An unshared older generation is retired before
-its replacement reserves replay memory. A new generation never changes what an
-existing transaction sees. An explicit checkpoint attach, named through the
-`checkpoint` attach option, uses an external reader that no deadline governs.
+For native published readers, at most `MAX_READER_GENERATIONS` generations,
+eight, may be live in one handle. Acquiring another is refused with `Constraint`
+until an older transaction or cursor finishes. An unshared older generation is
+retired before its replacement reserves replay memory. A new generation never
+changes what an existing transaction sees. An explicit checkpoint attach, named
+through the `checkpoint` attach option, uses an external reader that no deadline
+governs.
+
+Logged fixed scopes do not use this generation-count cap. Each acquisition
+opens independently, and WAL replay bytes share the process working-memory
+budget through `AdmittedReader`; memory exhaustion refuses acquisition. Dropping
+the final scope closes its reader and releases retained replay allocations.
 
 SlateDB checkpoints protect store files only. DuckLake's external Parquet
 files are retained under [maintenance](0010-maintenance.md), which is a
