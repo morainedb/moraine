@@ -461,6 +461,30 @@ transaction paid, and a cold handle 28.3 and 18.3. Metadata reads within the
 interval require no endpoint round trip; checking for a new publication requires
 a manifest read.
 
+### Decoded value ownership
+
+Question: how much synchronous CPU and allocation does decoding one file
+record cost compared with deep cloning or sharing an existing value?
+
+```text
+cargo test -p moraine --lib --release --locked measure_decoding_and_shared_reuse -- --ignored --nocapture --test-threads=1
+```
+
+2026-11-13, commit `30c961a`, 8-vCPU x86-64 Linux sandbox, Intel Xeon
+2.90 GHz, Rust 1.96.1 release build with the test allocation counter. Each
+mode runs 100,000 iterations over a 69-byte framed `DataFileValue` containing
+one path string. CPU is measured on the calling thread; no store or I/O is
+involved.
+
+| operation | CPU per record | allocations per record | allocated bytes per record |
+|---|---:|---:|---:|
+| protobuf decode | 99 ns | 1 | 50 |
+| deep clone | 45 ns | 1 | 50 |
+| shared ownership clone | 11 ns | 0 | 0 |
+
+This small-record fixture isolates ownership costs. It does not measure a
+catalog lookup, larger nested records, or the benefit of a decoded-value cache.
+
 ### Staged conflict check
 
 `measure_staged_conflict_check_by_retained_snapshots` seeds 128, 512, and 2,048
