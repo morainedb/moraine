@@ -42,6 +42,52 @@ mod tests {
     use crate::store::proto::*;
 
     #[test]
+    #[ignore = "CPU and allocation measurement; run alone in release mode"]
+    fn measure_decoding_and_shared_reuse() {
+        use std::{hint::black_box, sync::Arc};
+
+        use stats_alloc::{INSTRUMENTED_SYSTEM, Region};
+
+        const ITERATIONS: u32 = 100_000;
+        let value = DataFileValue {
+            table_id: 42,
+            data_file_id: 512,
+            path: "org/example/schema/table/data/part-0000512.parquet".into(),
+            record_count: 10_000,
+            file_size_bytes: 1_048_576,
+            ..Default::default()
+        };
+        let encoded = encode_value(&value);
+        let shared = Arc::new(value.clone());
+        for mode in ["decode", "clone", "share"] {
+            let allocations = Region::new(&INSTRUMENTED_SYSTEM);
+            let started = cpu_time::ThreadTime::now();
+            for _ in 0..ITERATIONS {
+                match mode {
+                    "decode" => {
+                        black_box(decode_value::<DataFileValue>(black_box(&encoded)).unwrap());
+                    }
+                    "clone" => {
+                        black_box(black_box(&value).clone());
+                    }
+                    _ => {
+                        black_box(Arc::clone(black_box(&shared)));
+                    }
+                }
+            }
+            let elapsed = started.elapsed();
+            let measured = allocations.change();
+            println!(
+                "{mode}: iterations={ITERATIONS} encoded_bytes={} cpu_ns_per_record={} allocations_per_record={} allocated_bytes_per_record={}",
+                encoded.len(),
+                elapsed.as_nanos() / u128::from(ITERATIONS),
+                measured.allocations / ITERATIONS as usize,
+                measured.bytes_allocated / ITERATIONS as usize
+            );
+        }
+    }
+
+    #[test]
     fn decode_rejects_unframed_bytes() {
         let err = decode_value::<HeadValue>(b"not framed").unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));

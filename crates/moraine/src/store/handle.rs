@@ -178,6 +178,7 @@ impl ReadHandle<'_> {
         &self,
         key: K,
     ) -> Result<Option<Bytes>, slatedb::Error> {
+        crate::telemetry::read::point_read();
         match self {
             Self::Tx(tx) => tx.get(key).await,
             Self::Snapshot(snapshot) => snapshot.get(key).await,
@@ -253,7 +254,7 @@ impl ReadHandle<'_> {
                     .await
             }
         }?;
-        crate::read_policy::scan_opened(shape.admission);
+        crate::telemetry::read::scan_opened(shape.admission);
         Ok(ScanIterator {
             iterator,
             checkpoint: match self {

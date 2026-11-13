@@ -11,6 +11,7 @@ use tracing::debug;
 use crate::store::key::current_entity_kind_prefix;
 
 mod cursor;
+pub(crate) mod files;
 pub(crate) mod schema_versions;
 pub(crate) use cursor::{EntityCursor, OwnedEntityCursor, OwnedSnapshotCursor};
 

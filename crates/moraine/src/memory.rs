@@ -615,6 +615,11 @@ impl<T> Reserved<T> {
     pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> Reserved<U> {
         Reserved::new(map(self.value), self.memory)
     }
+    /// Shares the allocation without releasing its working allowance.
+    pub(crate) fn into_shared(self) -> WorkingValue<T> {
+        WorkingValue::new(self.value, self.memory)
+    }
+
     /// Transfers both parts into an owner with its own accounting protocol.
     pub(crate) fn into_parts(self) -> (T, MemoryReservation) {
         (self.value, self.memory)

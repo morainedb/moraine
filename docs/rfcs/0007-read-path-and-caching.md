@@ -328,8 +328,10 @@ again. Short operations may finish before the next report.
 
 Publication progress separately reports the current page's retained decoded
 bytes. Existing cache tallies report hits and misses; `ObjectStoreTally`
-reports physical requests, including retries. Several block misses can share
-one coalesced request, so a block miss must never be described as one S3 GET.
+reports SlateDB object-store calls, including its retries, and logical data
+ranges. Neither sees HTTP retries or caching internal to a supplied store.
+Several block misses can share one coalesced request, so a block miss must
+never be described as one S3 GET.
 
 **Adaptive split.** A SlateDB iterator is one sequential cursor however far it
 prefetches. A scan over a kind whose record count scales with the data
@@ -636,3 +638,114 @@ container ceiling remains the final boundary.
   whole budget. Eviction priority lets idle metadata space go to blocks.
 - **Retained decoded catalog maps.** Rejected: memory proportional to catalog
   size, duplicating the block cache's reuse layer.
+
+## Read execution ownership
+
+### The read scope owns validity
+
+`transaction/read_scope.rs` already supplies a pinned store revision and a
+historical snapshot selection. That scope remains the validity boundary.
+Operations borrow its read handle and checkpoint protection; they do not
+invent another independent session or revision identifier.
+
+A logical operation selects its required records once. Bounded cursors carry
+the decoded records into consumers. Passing an identifier downstream and
+looking up the same selected record again is reserved for protocols that
+intentionally reacquire a read point, such as a publication retry round.
+Derived table context belongs to that operation. Acquiring a new read point
+clears context derived under the previous one.
+
+Mutable transaction overlays remain separate from cached committed state.
+Reusing a base record never bypasses an overlay or checkpoint validation.
+
+### The typed store boundary owns reading mechanics
+
+`store/read.rs` and its cursors own key construction, scan bounds, framing,
+protobuf decoding, and admission of decoded working allocations. Transaction
+read adapters perform domain projection. Catalog consumers request typed
+records rather than assembling raw keys and repeating decoding logic.
+
+Fetch geometry and cache admission remain independent. Callers choose their
+read intent at the operation boundary, and the typed reader carries that
+choice through all scan segments. Specialized point readers can select a
+fixed seek policy. Selecting a table is not itself a retention policy.
+
+The execution sequence is:
+
+```text
+pinned read scope
+  -> typed read request and explicit policy
+  -> bounded cursor of reserved decoded records
+  -> domain consumer
+```
+
+Parquet access remains exclusively in `data_file`. It uses the same admission
+vocabulary without acquiring catalog keyspace knowledge.
+
+### Ownership follows useful lifetimes
+
+Three lifetimes remain explicit:
+
+| Lifetime | Owner and validity |
+|---|---|
+| Storage reuse | Existing per-store Foyer block cache and immutable block identity |
+| Cross-operation derived results | Existing revision-aware lookup facilities and retention budget |
+| One operation | Bounded records and table context under its pinned read point |
+
+`Reserved<T>` carries a uniquely owned record and working allowance.
+`WorkingValue<T>` is used when operation consumers genuinely share an
+allocation. Existing retention-budget `Shared<T>` carries cached lookup
+results, including values held after eviction. These have different admission
+and failure rules; they are not collapsed into one universal cache wrapper.
+
+Consumers borrow or share decoded values through internal stages. Ownership
+conversion occurs at a mutation or public API boundary that requires it.
+An explicit transfer into a separately accounted page moves the value and
+its reservation together. No new helper is introduced for each record kind.
+
+### Keep the cache architecture
+
+Keep the per-store Foyer block cache and Parquet auxiliary cache, with their
+existing process budget shares. They serve different storage representations.
+The block cache cannot replace domain-level snapshot checks, and the auxiliary
+cache does not become a catalog-record repository.
+
+There is no general decoded catalog cache added by this refactor. Existing
+revision-aware results remain shared, and bounded operation-local reuse
+removes known duplicate work. A new cross-operation cache must demonstrate
+that avoided lookup, decoding, and allocation costs exceed cache lookup,
+retention, and memory-pressure costs.
+
+### Telemetry follows the operation and storage boundary
+
+Policy types contain policy only. `telemetry` owns counters and reporting;
+operations identify their store, job or operation kind, and read revision
+where applicable. High-cardinality identifiers belong in diagnostic traces,
+not unbounded metric labels.
+
+Report logical lookup and scan counts, cache hits by tier, admission and
+bypass activity, decoded records and estimated live bytes, and physical
+remote requests separately. Instrument requests at the remote boundary so
+future local object-store caching cannot make local hits look like S3 GETs.
+
+Use sampled CPU profiles and dedicated harnesses to separate protobuf decode,
+allocation, and copying from I/O wait. Timed asynchronous reads are wall time,
+not decode CPU time. Validate reporting overhead alongside its usefulness.
+
+Compare cold reads, warm repeated reads, bulk backfill, concurrent commits,
+and revision churn. Record latency, remote requests and bytes, CPU time,
+and peak retained memory at the same memory budget. Results and reproducible
+commands belong in `docs/benchmarks.md`; the evaluation narrative belongs in
+the implementing PR.
+
+Object-store GET telemetry counts calls below Moraine's caches, including
+explicit retries. The supplied store may itself cache or retry; these counters
+are not an HTTP request census. Conditional GETs and `NotModified` responses
+are reported separately and do not imply timer polling. Multi-range data
+reads are counted as batch calls, preserving the supplied store's coalescing.
+Use endpoint access logs for exact remote request counts.
+
+`store::value::tests::measure_decoding_and_shared_reuse` measures synchronous
+thread CPU and allocations for decode, deep clone, and shared ownership. It
+excludes I/O; asynchronous scan latency is not decode CPU. Existing reader,
+lookup, and publication harnesses cover the end-to-end paths at fixed budgets.

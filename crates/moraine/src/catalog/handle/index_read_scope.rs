@@ -116,6 +116,7 @@ impl ReadOnlyCatalog {
         };
         let mut reads = self.clone();
         reads.pinned = Some(Arc::new(PinnedRead { handle, revision }));
+        tracing::debug!(store = ?Arc::as_ptr(&self.store), revision, "catalog read scope acquired");
         Ok(IndexReadScope { reads, identity })
     }
 }

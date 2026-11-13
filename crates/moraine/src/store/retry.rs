@@ -111,7 +111,7 @@ impl Store {
     /// through, or that ends short of the range the store said it was
     /// serving, fails this attempt rather than the caller's read.
     async fn read(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
-        let result = self.inner.get_opts(location, options).await?;
+        let result = crate::telemetry::storage::get(self.inner.as_ref(), location, options).await?;
 
         let meta = result.meta.clone();
         let range = result.range.clone();
@@ -176,7 +176,7 @@ impl ObjectStore for Store {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         if options.head || options.range.is_some() {
-            return self.inner.get_opts(location, options).await;
+            return crate::telemetry::storage::get(self.inner.as_ref(), location, options).await;
         }
         retrying("a read", location, || self.read(location, options.clone())).await
     }
@@ -297,7 +297,8 @@ mod tests {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            let result = self.inner.get_opts(location, options).await?;
+            let result =
+                crate::telemetry::storage::get(self.inner.as_ref(), location, options).await?;
             let dropping = self
                 .failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {

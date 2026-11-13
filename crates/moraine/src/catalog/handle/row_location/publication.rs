@@ -1,9 +1,6 @@
 //! Bounded publication steps with a resumable file frontier.
 
-use std::{
-    collections::{BTreeSet, VecDeque},
-    ops::Bound,
-};
+use std::collections::{BTreeSet, VecDeque};
 
 use futures::{StreamExt, stream};
 
@@ -11,12 +8,7 @@ use super::{
     DataStore, Error, ReadOnlyCatalog, Result, SnapshotId, TableId, data_file,
     retry_queue::RetryQueue,
 };
-use crate::store::{
-    handle::ScanShape,
-    key::{EntityKey, EntityKind, Key, current_entity_kind_prefix},
-    proto::DataFileValue,
-    value,
-};
+use crate::store::{handle::ScanShape, proto::DataFileValue, read::files::CurrentFiles};
 
 mod context;
 pub(super) use context::TableContext;
@@ -45,7 +37,7 @@ struct PublicationCounts {
 /// Successful steps survive cancellation of a later step. Drop this value to
 /// release its snapshot; progress is local to this process.
 pub struct RowSummaryProgress {
-    handle: Option<crate::store::handle::OwnedReadHandle>,
+    read: Option<TableContext>,
     tables: Option<BTreeSet<TableId>>,
     since: Option<SnapshotId>,
     after: Option<Position>,
@@ -57,7 +49,6 @@ pub struct RowSummaryProgress {
     page: VecDeque<DiscoveredFile>,
     counts: PublicationCounts,
     reported: std::time::Instant,
-    context: context::TableContext,
 }
 
 impl RowSummaryProgress {
@@ -66,7 +57,7 @@ impl RowSummaryProgress {
     #[must_use]
     pub fn new(tables: Option<Vec<TableId>>, since: Option<SnapshotId>) -> Self {
         Self {
-            handle: None,
+            read: None,
             tables: tables.map(|tables| tables.into_iter().collect()),
             since,
             after: None,
@@ -78,7 +69,6 @@ impl RowSummaryProgress {
             page: VecDeque::new(),
             counts: PublicationCounts::default(),
             reported: std::time::Instant::now(),
-            context: context::TableContext::default(),
         }
     }
 
@@ -125,33 +115,16 @@ impl RowSummaryProgress {
         }
 
         if !self.page.is_empty() {
-            crate::read_policy::decoded_reused(self.page.len().min(data_file::PUBLISH_CONCURRENCY));
+            crate::telemetry::read::decoded_reused(
+                self.page.len().min(data_file::PUBLISH_CONCURRENCY),
+            );
             return Ok(self.window());
         }
-        let prefix = current_entity_kind_prefix(EntityKind::File);
-        let lower = self
-            .after
-            .map_or(Bound::Unbounded, |(table_id, data_file_id)| {
-                Bound::Excluded(
-                    Key::current(EntityKey::File {
-                        table_id,
-                        data_file_id,
-                    })
-                    .encode()[prefix.len()..]
-                        .to_vec(),
-                )
-            });
-        let mut cursor = handle
-            .scan_prefix(
-                prefix,
-                (lower, Bound::Unbounded),
-                ScanShape::bounded().retain(),
-            )
-            .await?;
+        let mut cursor =
+            CurrentFiles::open(handle, self.after, ScanShape::bounded().retain()).await?;
         let mut selected = VecDeque::new();
         let mut bytes = 0;
-        while let Some(entry) = cursor.next().await? {
-            let file: DataFileValue = value::decode_value(&entry.value)?;
+        while let Some(file) = cursor.next().await? {
             if self
                 .tables
                 .as_ref()
@@ -165,22 +138,17 @@ impl RowSummaryProgress {
                 }
                 continue;
             }
-            let charge = entry.value.len().saturating_mul(3).saturating_add(
-                size_of::<DataFileValue>()
-                    + size_of::<crate::MemoryReservation>()
-                    + 2 * size_of::<usize>(),
-            );
+            let charge = usize::try_from(file.bytes()).unwrap_or(usize::MAX);
             if !selected.is_empty() && bytes + charge > DISCOVERY_BYTES {
                 break;
             }
-            let memory = crate::MemoryReservation::reserve(charge as u64)?;
             bytes += charge;
-            selected.push_back(DiscoveredFile::new(file, memory));
+            selected.push_back(file);
             if selected.len() == DISCOVERY_FILES || bytes >= DISCOVERY_BYTES {
                 break;
             }
         }
-        crate::read_policy::decoded_page(selected.len(), bytes);
+        crate::telemetry::read::decoded_page(selected.len(), bytes);
         self.counts.discovered += selected.len() as u64;
         self.page = selected;
         Ok(self.window())
@@ -198,11 +166,16 @@ impl RowSummaryProgress {
     }
 
     fn finish_round(&mut self) -> Result<bool> {
-        self.context.clear();
-        self.handle = None;
+        if let Some(context) = self.read.take() {
+            tracing::debug!(
+                table_context_loads = context.loads(),
+                table_context_reuses = context.reuses(),
+                "publication read scope released"
+            );
+        }
         if self.failed.is_empty() {
             self.complete = true;
-            tracing::info!(?self.counts, table_context_loads = self.context.loads(), table_context_reuses = self.context.reuses(), "row summary publication completed");
+            tracing::info!(?self.counts, "row summary publication completed");
             return Ok(true);
         }
         self.retrying = true;
@@ -229,48 +202,42 @@ impl RowSummaryProgress {
         if self.complete {
             return Ok(true);
         }
-        if self.handle.is_none() {
-            let scope = catalog.index_read_scope().await?;
-            self.handle = Some(scope.reads().owned_read_handle());
+        if self.read.is_none() {
+            self.read = Some(TableContext::new(catalog.read_scope().await?));
         }
         let handle = self
-            .handle
-            .clone()
-            .ok_or_else(|| Error::Corruption("publication has no read scope".into()))?;
+            .read
+            .as_ref()
+            .ok_or_else(|| Error::Corruption("publication has no read scope".into()))?
+            .reads()
+            .owned_read_handle();
         let selected = self.select(handle.borrow()).await?;
         if selected.is_empty() {
             return self.finish_round();
         }
-        let context = &self.context;
+        let context = self
+            .read
+            .as_ref()
+            .ok_or_else(|| Error::Corruption("publication has no read scope".into()))?;
         let mut results = stream::iter(selected)
             .map(|selected| {
                 let position = selected.position;
                 let handle = handle.borrow();
                 async move {
                     let result = async {
-                        use crate::store::{
-                            key::{EntityKey, Key},
-                            proto::DataFileValue,
-                            read::read_singleton,
-                        };
                         let loaded;
                         let file = if let Some(discovered) = &selected.file {
                             &**discovered
                         } else {
-                            loaded = read_singleton::<DataFileValue>(
-                                handle,
-                                Key::current(EntityKey::File {
-                                    table_id: position.0,
-                                    data_file_id: position.1,
-                                }),
-                            )
-                            .await?;
+                            loaded =
+                                crate::store::read::files::file(handle, position.0, position.1)
+                                    .await?;
                             let Some(file) = loaded.as_ref() else {
                                 return Ok(false);
                             };
                             file
                         };
-                        let prefix = context.resolve(handle, TableId::new(file.table_id)).await?;
+                        let prefix = context.resolve(TableId::new(file.table_id)).await?;
                         catalog
                             .publish_file(
                                 data_store,
@@ -308,7 +275,7 @@ impl RowSummaryProgress {
             }
         }
         if self.reported.elapsed() >= std::time::Duration::from_secs(10) {
-            tracing::info!(?self.counts, table_context_loads = self.context.loads(), table_context_reuses = self.context.reuses(), remaining_in_page = self.page.len(), retained_decoded_bytes = self.page.iter().map(DiscoveredFile::bytes).sum::<u64>(), "row summary publication advanced");
+            tracing::info!(?self.counts, remaining_in_page = self.page.len(), retained_decoded_bytes = self.page.iter().map(DiscoveredFile::bytes).sum::<u64>(), "row summary publication advanced");
             self.reported = std::time::Instant::now();
         }
         // A summary build sorts and encodes row IDs for every file in the
@@ -327,6 +294,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::store::{
+        key::{EntityKey, Key},
+        value,
+    };
 
     #[tokio::test]
     async fn discovery_retains_a_page_across_unacknowledged_windows() {

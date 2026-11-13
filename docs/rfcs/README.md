@@ -46,7 +46,8 @@ Rust embedders.
 ### Reads and durability
 
 - [Read path, caching, and memory](0007-read-path-and-caching.md) — read
-  revisions, the block cache, row summaries, working memory
+  revisions, the block cache, row summaries, working memory,
+  operation lifetimes, background jobs, and cost attribution
 - [Crash recovery](0008-crash-recovery.md) — what must hold after a
   process dies mid-operation
 - [Testing](0012-testing.md) — the guarantees under test, how crashes and

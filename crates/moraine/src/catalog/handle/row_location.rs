@@ -828,7 +828,7 @@ impl ReadOnlyCatalog {
         since: Option<SnapshotId>,
     ) -> Result<RowSummaryPublish> {
         use crate::store::read::{EntityRecord, EntityRecordKind, OwnedEntityCursor, Versions};
-        let scope = self.index_read_scope().await?;
+        let scope = self.read_scope().await?;
         let handle = scope.reads().owned_read_handle();
         let mut cursor = OwnedEntityCursor::open(
             handle.clone(),
@@ -839,7 +839,7 @@ impl ReadOnlyCatalog {
         )
         .await?;
         let tables: Option<HashSet<TableId>> = tables.map(|tables| tables.into_iter().collect());
-        let context = publication::TableContext::default();
+        let context = publication::TableContext::new(scope);
         let mut total = RowSummaryPublish::default();
         let mut done = false;
         while !done {
@@ -869,12 +869,11 @@ impl ReadOnlyCatalog {
             }
             let mut results = stream::iter(files)
                 .map(|(file, memory)| {
-                    let handle = handle.borrow();
                     let context = &context;
                     async move {
                         let result = async {
                             let table = TableId::new(file.table_id);
-                            let prefix = context.resolve(handle, table).await?;
+                            let prefix = context.resolve(table).await?;
                             self.publish_file(
                                 data_store,
                                 data_prefix,
@@ -906,27 +905,12 @@ impl ReadOnlyCatalog {
     }
 
     async fn publication_table_prefix(handle: ReadHandle<'_>, table: TableId) -> Result<String> {
-        use crate::store::{
-            key::{EntityKey, Key},
-            proto::{SchemaValue, TableValue},
-            read::read_singleton,
-        };
-        let descriptor: TableValue = read_singleton(
-            handle,
-            Key::current(EntityKey::Table {
-                table_id: table.get(),
-            }),
-        )
-        .await?
-        .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
-        let schema: SchemaValue = read_singleton(
-            handle,
-            Key::current(EntityKey::Schema {
-                schema_id: descriptor.schema_id,
-            }),
-        )
-        .await?
-        .ok_or_else(|| Error::Corruption("table references a missing schema".into()))?;
+        let descriptor = crate::store::read::files::table(handle, table.get())
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
+        let schema = crate::store::read::files::schema(handle, descriptor.schema_id)
+            .await?
+            .ok_or_else(|| Error::Corruption("table references a missing schema".into()))?;
         Ok(format!("{}{}", schema.path, descriptor.path))
     }
 
