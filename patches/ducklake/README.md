@@ -113,6 +113,14 @@ verbs remain withdrawn; ordinary `DELETE ... WHERE` selects this path without
 a caller naming row positions. UPDATE retains DuckLake's operator with
 index-derived scan filters.
 
+`0011-perf-stage-snapshots-and-defer-inline-appends.patch` adds optional
+metadata-manager hooks for staging a finalized snapshot without SQL and
+appending inline chunks after the commit batch creates their tables. The
+snapshot hook runs after changes finalize the next-id counters and schema
+version. Both paths remain inside the metadata transaction; rollback clears
+queued appends before retry. Other backends retain their SQL path. Query-log
+regressions and inline roundtrips in `cargo xtask e2e` cover the Moraine path.
+
 A later patch edits files an earlier one creates, so the series is applied in
 one `git apply` invocation rather than one per file.
 
@@ -233,3 +241,12 @@ the bundle for the version in `.github/duckdb-versions` on the four native
 platforms, each build running the row-ID statistics, one-file pruning, and
 positional-delete smoke (`release-smoke.sql`) against itself, through
 `cargo xtask validate-release-artifact`.
+
+`0012-perf-scope-and-stage-append-statistics.patch` lets a metadata manager read
+statistics for one table and cache only that result. Optional write hooks stage
+append statistics and snapshot changes through the backend's existing row
+contract. Direct statistics writes apply to appends without schema, deletion,
+or maintenance changes; other commits retain SQL ordering. Pending statistics
+flush after successful SQL execution and clear on rollback. Empty SQL batches
+still run the pending writes and commit the metadata transaction. Default hooks
+retain DuckLake's SQL behavior for other metadata backends.

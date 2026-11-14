@@ -43,6 +43,10 @@ namespace moraine_duckdb {
 
 struct MetadataTableSpec;
 
+// Stages a full row through the same cell conversion as metadata DML.
+void StageMetadataInsert(MoraineTxHandle *transaction, const MetadataTableSpec &spec,
+                         const std::vector<duckdb::Value> &values);
+
 // Builds the physical operator `MoraineCatalog::PlanInsert` returns for an
 // INSERT into a writable `MoraineMetadataTableEntry` (`spec.write_table_kind
 // != kNotWritable`): a Sink-only translator feeding rows to

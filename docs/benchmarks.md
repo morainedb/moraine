@@ -211,6 +211,7 @@ ratio against moraine, also written to `target/bench/report.json`.
 |---|---|
 | `bulk_load` | `CREATE TABLE` plus one large `INSERT` |
 | `small_commits` | K single-row inserts; the headline latency number |
+| `first_inline_write` | T × create a table with 1,000 inline rows; explicitly raises the inline limit |
 | `many_tables` | T × `CREATE TABLE` |
 | `scan` | full and filtered scans, time travel, snapshot listing |
 | `maintenance` | `merge_adjacent_files`, `expire_snapshots`, `cleanup_old_files` |
@@ -245,6 +246,30 @@ three repeats<!-- site:omit -->, 2026-11-11 at commit
 Serial commits pay moraine's flush each, at the 1 ms interval the latency
 workloads pin; a loopback Postgres commits in about 7 ms and a DuckDB file
 in about 11 ms.
+
+### Small commits and first inline writes
+
+How much fixed metadata work does a small write pay? `small_commits` measures
+twenty single-row INSERT commits into a two-column table. `wide_small_commits`
+uses 32 BIGINT columns and checks counts and sums outside timing.
+`first_inline_write` sets the inlining limit to 1,000 rows, creates ten tables
+with 1,000 rows each, and checks row counts and sums outside the timed phase.
+
+```bash
+cargo xtask bench --backends moraine --workloads small_commits,wide_small_commits,first_inline_write --scale small --repeat 9
+```
+
+2026-11-14 at `a4b2c8` plus scoped statistics reads, direct append metadata
+staging, and the preceding metadata/Appender changes; Amazon Linux cloud VM,
+Intel Xeon 2.90 GHz, 8 logical CPUs, 16 GiB RAM, local
+filesystem, DuckDB one thread, metadata flush interval 1 ms. Nine runs,
+excluding attach:
+
+| Workload | Median | Min–max |
+|---|---:|---:|
+| Twenty single-row inserts, two columns | 101 ms | 97–109 ms |
+| Twenty single-row inserts, 32 BIGINT columns | 168 ms | 161–187 ms |
+| Ten table creations with 1,000 inline rows each | 488 ms | 471–537 ms |
 
 ### Concurrent writers
 
