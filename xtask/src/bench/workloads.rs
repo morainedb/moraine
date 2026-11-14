@@ -105,6 +105,61 @@ fn partition_by_key(table: &str) -> String {
     format!("ALTER TABLE lake.main.{table} SET PARTITIONED BY (k);")
 }
 
+fn wide_small_commits(scale: &Scale) -> Workload {
+    let columns = (0..32)
+        .map(|index| format!("c{index} BIGINT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Workload {
+        name: "wide_small_commits",
+        seed: Vec::new(),
+        measured: std::iter::once(Statement::setup(format!("CREATE TABLE lake.main.events ({columns});")))
+            .chain((0..scale.small_commits).map(|index| {
+                let values = vec![index.to_string(); 32].join(", ");
+                Statement::measured("inserts", format!("INSERT INTO lake.main.events VALUES ({values});"))
+            }))
+            .chain(std::iter::once(Statement::setup(format!(
+                "SELECT CASE WHEN count(*) = {} AND sum(c0) = {} AND sum(c31) = {} THEN true ELSE error('wide inserts lost rows') END FROM lake.main.events;",
+                scale.small_commits, scale.small_commits * (scale.small_commits - 1) / 2,
+                scale.small_commits * (scale.small_commits - 1) / 2
+            ))))
+            .collect(),
+        moraine_only: false,
+    }
+}
+
+fn first_inline_write(scale: &Scale) -> Workload {
+    let rows = 1_000;
+    Workload {
+        name: "first_inline_write",
+        seed: Vec::new(),
+        measured: std::iter::once(Statement::setup(format!(
+            "CALL ducklake_set_option('lake', 'data_inlining_row_limit', {rows});"
+        )))
+        .chain((0..scale.tables).map(|index| {
+            Statement::measured(
+                "creates_with_rows",
+                format!(
+                    "CREATE TABLE lake.main.table_{index} AS \
+                         SELECT i AS id, 'event' AS note FROM range({rows}) t(i);"
+                ),
+            )
+        }))
+        .chain(std::iter::once(Statement::setup(format!(
+            "SELECT CASE WHEN count(*) = {} AND sum(id) = {} THEN true \
+                 ELSE error('first inline write lost rows') END FROM ({});",
+            scale.tables * rows,
+            scale.tables * rows * (rows - 1) / 2,
+            (0..scale.tables)
+                .map(|index| format!("SELECT id FROM lake.main.table_{index}"))
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ")
+        ))))
+        .collect(),
+        moraine_only: false,
+    }
+}
+
 /// Every workload at `scale`, in report order.
 pub fn workloads(scale: &Scale) -> Vec<Workload> {
     let [create_items, insert_items] = bulk_create_and_insert(scale.bulk_rows);
@@ -198,7 +253,15 @@ pub fn workloads(scale: &Scale) -> Vec<Workload> {
         moraine_only: false,
     };
 
-    let mut all = vec![bulk_load, small_commits, many_tables, scan, maintenance];
+    let mut all = vec![
+        bulk_load,
+        small_commits,
+        wide_small_commits(scale),
+        first_inline_write(scale),
+        many_tables,
+        scan,
+        maintenance,
+    ];
     all.extend(delete_workloads(scale));
     all
 }
@@ -340,6 +403,8 @@ mod tests {
             [
                 "bulk_load",
                 "small_commits",
+                "wide_small_commits",
+                "first_inline_write",
                 "many_tables",
                 "scan",
                 "maintenance",
@@ -366,6 +431,8 @@ mod tests {
         };
         assert_eq!(phases("bulk_load"), ["create_table", "insert"]);
         assert_eq!(phases("small_commits"), ["inserts"]);
+        assert_eq!(phases("wide_small_commits"), ["inserts"]);
+        assert_eq!(phases("first_inline_write"), ["creates_with_rows"]);
         assert_eq!(phases("many_tables"), ["creates"]);
         assert_eq!(
             phases("scan"),

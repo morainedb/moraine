@@ -250,11 +250,13 @@ fn ducklakes_catalog_access_set_is_pinned() {
         "ducklake_schema RW",
         "ducklake_schema_versions RW",
         "ducklake_snapshot RW",
-        "ducklake_snapshot_changes RW",
+        // Change records are staged directly; only their reads execute SQL.
+        "ducklake_snapshot_changes R",
         "ducklake_sort_expression R",
         "ducklake_sort_info R",
         "ducklake_table RW",
-        "ducklake_table_column_stats RW",
+        // Table-statistics reads use scoped cursors; non-append writes retain SQL.
+        "ducklake_table_column_stats W",
         "ducklake_table_stats RW",
         "ducklake_tag RW",
         "ducklake_view RW",
@@ -452,4 +454,280 @@ fn duckdb_pin() -> &'static str {
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .and_then(|entry| entry.split_whitespace().next())
         .expect(".github/duckdb-versions lists no DuckDB version")
+}
+
+/// Commit snapshots use the typed staging path instead of binding an INSERT.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn snapshot_commit_avoids_metadata_insert_sql() {
+    let store = TempDir::new("snapshot-direct");
+    let data = TempDir::new("snapshot-direct-data");
+    let queries = query_log(
+        store.path(),
+        data.path(),
+        "lake",
+        &[
+            "CREATE TABLE lake.main.t(i BIGINT);",
+            "INSERT INTO lake.main.t VALUES (1);",
+        ],
+    );
+    assert!(
+        !queries
+            .iter()
+            .any(|query| query.contains("ducklake_snapshot VALUES")),
+        "{queries:#?}"
+    );
+    let rows = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT count(*), count(snapshot_time), max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot;",
+    ));
+    assert_eq!(rows, vec![vec!["3", "3", "2"]]);
+}
+
+/// New inline tables accept chunks without generating per-row SQL.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn first_inline_write_avoids_values_sql() {
+    let store = TempDir::new("first-inline-append");
+    let data = TempDir::new("first-inline-append-data");
+    let queries = query_log(
+        store.path(),
+        data.path(),
+        "lake",
+        &[
+            "BEGIN; CREATE TABLE lake.main.t(i BIGINT, s VARCHAR); INSERT INTO lake.main.t VALUES (1, 'first'), (2, NULL); COMMIT;",
+            "BEGIN; ALTER TABLE lake.main.t ADD COLUMN extra BIGINT; INSERT INTO lake.main.t VALUES (3, 'new schema', 9); COMMIT;",
+            "BEGIN; CREATE TABLE lake.main.discarded(i BIGINT); INSERT INTO lake.main.discarded VALUES (99); ROLLBACK;",
+        ],
+    );
+    assert!(
+        !queries.iter().any(|query| query.contains("INSERT INTO")
+            && query.contains(".ducklake_inlined_data_")
+            && !query.contains(".ducklake_inlined_data_tables")
+            && query.contains("VALUES")),
+        "{queries:#?}"
+    );
+    let rows = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT rowid, i, s, extra FROM lake.main.t ORDER BY i;",
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            vec!["0", "1", "first", "NULL"],
+            vec!["1", "2", "NULL", "NULL"],
+            vec!["2", "3", "new schema", "9"]
+        ]
+    );
+    let discarded = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND table_name = 'discarded';",
+    ));
+    assert_eq!(discarded, vec![vec!["0"]]);
+}
+
+/// Snapshot lookup uses the pinned metadata provider without binding SQL.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn snapshot_lookup_avoids_metadata_select_sql() {
+    let store = TempDir::new("snapshot-lookup-direct");
+    let data = TempDir::new("snapshot-lookup-direct-data");
+    let queries = query_log(
+        store.path(),
+        data.path(),
+        "lake",
+        &[
+            "CREATE TABLE lake.main.t(i BIGINT);",
+            "INSERT INTO lake.main.t VALUES (1);",
+            "INSERT INTO lake.main.t VALUES (2);",
+        ],
+    );
+    assert!(
+        !queries.iter().any(|query| query
+            .contains("SELECT snapshot_id, schema_version, next_catalog_id, next_file_id,")
+            && query.contains("MAX(value)")),
+        "{queries:#?}"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT i FROM lake.main.t ORDER BY i;"
+        )),
+        vec![vec!["1"], vec!["2"]]
+    );
+}
+
+/// Snapshot lookup retains DuckLake's maximum-version check across option
+/// scopes.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn snapshot_lookup_checks_catalog_version() {
+    let store = TempDir::new("snapshot-lookup-version");
+    let data = TempDir::new("snapshot-lookup-version-data");
+    let output = run_session(&Attach::Moraine {
+        store_dir: store.path(), data_path: data.path(), options: "", read_only: false,
+    }, "CREATE TABLE lake.main.t(i BIGINT);
+        INSERT INTO __ducklake_metadata_lake.ducklake_metadata VALUES ('version', '9.9', 'table', 1);
+        INSERT INTO lake.main.t VALUES (1);");
+    assert!(!output.status.success(), "{}", combined_output(&output));
+    assert!(
+        combined_output(&output)
+            .contains("The catalog was migrated by another connection from version 1.0 to 9.9"),
+        "{}",
+        combined_output(&output)
+    );
+}
+
+/// Inline appends resolve the latest registered schema without metadata SQL.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn inline_append_avoids_registry_select_sql() {
+    let store = TempDir::new("inline-registry-direct");
+    let data = TempDir::new("inline-registry-direct-data");
+    let queries = query_log(
+        store.path(),
+        data.path(),
+        "lake",
+        &[
+            "CREATE TABLE lake.main.t(i BIGINT);",
+            "INSERT INTO lake.main.t VALUES (1);",
+            "ALTER TABLE lake.main.t ADD COLUMN s VARCHAR;",
+            "INSERT INTO lake.main.t VALUES (2, 'new');",
+            "INSERT INTO lake.main.t VALUES (3, NULL);",
+        ],
+    );
+    assert!(
+        !queries.iter().any(
+            |query| query.contains("SELECT table_name, schema_version FROM")
+                && query.contains("ducklake_inlined_data_tables")
+        ),
+        "{queries:#?}"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT rowid, i, s FROM lake.main.t ORDER BY i;"
+        )),
+        vec![
+            vec!["0", "1", "NULL"],
+            vec!["1", "2", "new"],
+            vec!["2", "3", "NULL"]
+        ]
+    );
+}
+
+/// Appends fetch only their statistics and stage their metadata without SQL.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn append_statistics_avoid_metadata_sql() {
+    let store = TempDir::new("append-statistics-direct");
+    let data = TempDir::new("append-statistics-direct-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(i BIGINT, s VARCHAR, f DOUBLE);
+         CREATE TABLE lake.main.other(i BIGINT);
+         INSERT INTO lake.main.t VALUES (1, 'seed', 1.0);
+         INSERT INTO lake.main.other VALUES (100);",
+    );
+    let queries = query_log(
+        store.path(),
+        data.path(),
+        "lake",
+        &[
+            "INSERT INTO lake.main.t VALUES (2, NULL, 'NaN');",
+            "BEGIN; CALL ducklake_set_commit_message('lake', 'writer', 'append', extra_info => 'details'); INSERT INTO lake.main.t VALUES (3, 'quoted '' long string payload', NULL); COMMIT;",
+            "INSERT INTO lake.main.other VALUES (101);",
+        ],
+    );
+    for query in &queries {
+        assert!(
+            !query.contains("SELECT table_id, column_id, record_count"),
+            "{query}"
+        );
+        assert!(
+            !query.contains("UPDATE") || !query.contains("ducklake_table_stats"),
+            "{query}"
+        );
+        assert!(
+            !query.contains("UPDATE") || !query.contains("ducklake_table_column_stats"),
+            "{query}"
+        );
+        assert!(
+            !query.contains("INSERT INTO") || !query.contains("ducklake_snapshot_changes"),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT record_count, next_row_id FROM __ducklake_metadata_lake.ducklake_table_stats ORDER BY table_id;"
+        )),
+        vec![vec!["3", "3"], vec!["2", "2"]]
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT rowid, i FROM lake.main.t ORDER BY i;"
+        )),
+        vec![vec!["0", "1"], vec!["1", "2"], vec!["2", "3"]]
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT author, commit_message, commit_extra_info FROM __ducklake_metadata_lake.ducklake_snapshot_changes WHERE author = 'writer';"
+        )),
+        vec![vec!["writer", "append", "details"]]
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT column_id, contains_null, contains_nan, min_value, max_value FROM __ducklake_metadata_lake.ducklake_table_column_stats WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = 't') ORDER BY column_id;"
+        )),
+        vec![
+            vec!["1", "false", "NULL", "1", "3"],
+            vec![
+                "2",
+                "true",
+                "NULL",
+                "\"quoted ' long string payload\"",
+                "seed"
+            ],
+            vec!["3", "true", "true", "1.0", "nan"]
+        ]
+    );
+}
+
+/// A statistics lookup does not deserialize another table's statistics.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn append_statistics_are_table_scoped() {
+    let store = TempDir::new("statistics-scope");
+    let data = TempDir::new("statistics-scope-data");
+    run_ducklake_sql(store.path(), data.path(),
+        "CREATE TABLE lake.main.t(i BIGINT);
+         CREATE TABLE lake.main.unrelated(g GEOMETRY);
+         INSERT INTO lake.main.t VALUES (1);
+         INSERT INTO lake.main.unrelated VALUES ('POINT(1 2)'::GEOMETRY);
+         BEGIN;
+         INSERT INTO __ducklake_metadata_lake.ducklake_snapshot SELECT snapshot_id + 1, now(), schema_version, next_catalog_id, next_file_id FROM __ducklake_metadata_lake.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1;
+         INSERT INTO __ducklake_metadata_lake.ducklake_snapshot_changes SELECT max(snapshot_id) + 1, 'inserted_into_table:2', NULL, NULL, NULL FROM __ducklake_metadata_lake.ducklake_snapshot;
+         UPDATE __ducklake_metadata_lake.ducklake_table_column_stats SET extra_stats = 'invalid-json' WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = 'unrelated'); COMMIT;");
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "INSERT INTO lake.main.t VALUES (2); SELECT rowid, i FROM lake.main.t ORDER BY i;"
+        )),
+        vec![vec!["0", "1"], vec!["1", "2"]]
+    );
 }

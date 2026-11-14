@@ -1,0 +1,78 @@
+--- a/src/include/storage/ducklake_metadata_manager.hpp
++++ b/src/include/storage/ducklake_metadata_manager.hpp
+@@ -515,6 +515,16 @@
+ 	//! SQL templates with {METADATA_CATALOG} / {SNAPSHOT_ID} placeholders, shared with the
+ 	//! server-side commit path.
+ 	static string InsertSnapshotSql();
++	//! Stages the finalized snapshot directly; false retains the SQL insertion.
++	virtual bool TryWriteSnapshot(DuckLakeSnapshot snapshot) {
++		return false;
++	}
++	//! Appends queued inline chunks after the commit batch creates their tables.
++	virtual void FlushInlinedAppends(DuckLakeSnapshot snapshot) {
++	}
++	//! Discards queued inline appends before rollback or retry.
++	virtual void ClearInlinedAppends() {
++	}
+ 	static string WriteSnapshotChangesSql(const SnapshotChangeInfo &change_info,
+ 	                                      const DuckLakeSnapshotCommit &commit_info);
+ 	static string UpdateGlobalTableStatsSql(const DuckLakeGlobalStatsInfo &stats, bool write_stats_exactness);
+--- a/src/include/storage/ducklake_transaction_state.hpp
++++ b/src/include/storage/ducklake_transaction_state.hpp
+@@ -33,6 +33,8 @@
+ 	//! Rewrites the delete files whose new deletes are not dated to the commit snapshot.
+ 	std::function<void(idx_t)> set_delete_commit_snapshot = [](idx_t) {
+ 	};
++	//! Stages the finalized snapshot without SQL when the metadata backend supports it.
++	std::function<bool(DuckLakeSnapshot)> try_write_snapshot = [](DuckLakeSnapshot) { return false; };
+ 	//! Executes the batched snapshot/changes SQL against the metadata DB.
+ 	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string &)> execute_commit_batch;
+ 	//! Classifies metadata-catalog errors that are safe to retry.
+--- a/src/storage/ducklake_transaction.cpp
++++ b/src/storage/ducklake_transaction.cpp
+@@ -1519,6 +1519,9 @@
+ 		// the client context has no active transaction during the commit
+ 		state->local_changes.SetDeleteCommitSnapshot(*GetConnection().context, *this, commit_snapshot);
+ 	};
++	context.try_write_snapshot = [&](DuckLakeSnapshot snapshot) {
++		return metadata_manager->TryWriteSnapshot(snapshot);
++	};
+ 	context.execute_commit_batch = [&](DuckLakeSnapshot snapshot, string &query) {
+ 		auto result = metadata_manager->Execute(snapshot, query);
+ 		for (auto &insert : inlined_inserts) {
+@@ -1529,6 +1532,9 @@
+ 			result = connection->Query(std::move(insert));
+ 		}
+ 		inlined_inserts.clear();
++		if (!result->HasError()) {
++			metadata_manager->FlushInlinedAppends(snapshot);
++		}
+ 		return result;
+ 	};
+ 	context.is_retryable_metadata_error = [&](const string &message) {
+@@ -1543,6 +1549,7 @@
+ 		connection->Commit();
+ 	};
+ 	context.try_rollback = [&]() {
++		metadata_manager->ClearInlinedAppends();
+ 		if (connection->context->transaction.HasActiveTransaction()) {
+ 			connection->Rollback();
+ 		}
+--- a/src/storage/ducklake_transaction_state.cpp
++++ b/src/storage/ducklake_transaction_state.cpp
+@@ -2686,10 +2686,12 @@
+ 			can_retry = true;
+ 			context.set_delete_commit_snapshot(commit_snapshot.snapshot_id);
+ 			DuckLakeCommitState commit_state(commit_snapshot);
+-			// write the new snapshot
+-			string batch_queries = DuckLakeMetadataManager::InsertSnapshotSql();
+-			batch_queries += CommitChanges(commit_state, attempt_changes, stats, context, attempt_dropped_file_stats);
++			string batch_queries = CommitChanges(commit_state, attempt_changes, stats, context, attempt_dropped_file_stats);
+ 			batch_queries += WriteSnapshotChanges(commit_state, attempt_changes, context.commit_info);
++			// Changes finalize the snapshot's schema version and next-id counters.
++			if (!context.try_write_snapshot(commit_snapshot)) {
++				batch_queries = DuckLakeMetadataManager::InsertSnapshotSql() + batch_queries;
++			}
+ 			auto res = context.execute_commit_batch(commit_snapshot, batch_queries);
+ 			if (res->HasError()) {
+ 				auto &commit_error = res->GetErrorObject();

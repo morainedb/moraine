@@ -181,6 +181,15 @@ fn a_raised_store_still_serves_the_lake() {
         vec![vec!["1"], vec!["2"], vec!["3"]],
         "the raised store takes a write and reads back every row"
     );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT min_value, max_value, min_is_exact, max_is_exact FROM __ducklake_metadata_lake.ducklake_table_column_stats;"
+        )),
+        vec![vec!["1", "3", "true", "true"]],
+        "the raised shape stores DuckLake's numeric-bound exactness"
+    );
 }
 
 /// Extended file columns survive every staged metadata reader.

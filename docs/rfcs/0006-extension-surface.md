@@ -206,6 +206,47 @@ values DuckLake stamped and re-drives a benign lost race itself, as
 data-only cannot be rebased, so a lost race returns `COMMIT_CONFLICT` and
 DuckLake's loop re-drives it.
 
+The metadata manager reads the latest snapshot through a metadata cursor at the
+transaction's pinned head, avoiding SQL planning and a scan of retained history.
+It checks the served catalog version using the same metadata rows as the SQL
+path, including scoped version options and the attach-pinned table shape. A
+transaction with staged writes, or without a pinned head, retains DuckLake's
+SQL path. Time-travel snapshot lookup continues through DuckLake. Inline writes
+resolve the highest registered schema version through the same pinned registry
+provider as the metadata table, without executing the aggregate lookup SQL.
+
+On a table-statistics cache miss, the manager reads the table and column rows
+through table-scoped metadata cursors at the same pinned read point, including
+staged writes. DuckLake still converts the rows into optimizer statistics and
+keys its cache by the file counter and schema version. A scoped response
+caches only the requested table, including an absent result; other tables remain
+uncached. Conflict-resolution statistics retain DuckLake's existing query.
+
+Append-only commits without schema, deletion, or maintenance changes queue
+DuckLake's calculated statistics for direct staging after the SQL batch. The
+shim uses the existing metadata cell conversion and `moraine_tx_stage`,
+preserving UPDATE's treatment of absent rows, nullable fields, exactness, and
+serialized extra statistics. Schema changes, deletes, and maintenance retain
+their SQL ordering. Rollback clears the queue, and retries calculate fresh
+statistics. Snapshot change records use the same direct row contract while
+DuckLake retains ownership of their grammar and commit information. An empty SQL
+batch still flushes pending rows and commits the metadata transaction.
+
+The metadata manager stages the finalized snapshot through `moraine_tx_stage`
+instead of binding an INSERT. DuckLake calls `TryWriteSnapshot` after generating
+changes, when the schema version and next-id counters are final. The timestamp
+is the metadata transaction's start time, matching SQL `NOW()`. Other metadata
+backends retain the snapshot INSERT through the default hook.
+
+Inline writes queue references to the transaction-owned data and their resolved
+table names. `FlushInlinedAppends` runs after the commit SQL successfully
+creates the inline tables, but before committing the metadata connection. Every
+chunk then goes through the Appender, including tables created by this commit.
+The queue is consumed before appending and cleared on rollback; a retry
+constructs it afresh. An append failure rolls back the snapshot, table
+definitions, and all preceding appends together. The shim only translates rows;
+validation, conflict detection, and publication remain in the core.
+
 `moraine_tx_commit` returns the snapshot id the commit landed. After the loop
 the shim reads the catalog's last committed snapshot and, if it exceeds the id
 DuckLake recorded, calls `SetCommittedSnapshotId` so DuckLake adopts the
