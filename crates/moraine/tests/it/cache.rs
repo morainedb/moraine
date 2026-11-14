@@ -76,14 +76,8 @@ async fn a_read_only_handle_materializes_once() {
     );
 }
 
-/// A whole-subspace scan reads ahead rather than paying a round trip per
+/// A file scan at a fixed checkpoint reads ahead instead of fetching each
 /// block.
-///
-/// SlateDB's scan default is one block, fetched serially — invisible on
-/// local storage and ruinous on remote, where a 12.8 MB subspace measured
-/// 276 s at ~46 KB/s, which is 3 200 sequential fetches and nothing else.
-/// The assertion counts reads rather than timing them, because on an
-/// in-memory store the defect costs nothing observable.
 #[tokio::test]
 async fn a_materialization_reads_ahead_rather_than_block_by_block() {
     let object_store = Arc::new(InMemory::new());
@@ -113,19 +107,25 @@ async fn a_materialization_reads_ahead_rather_than_block_by_block() {
         })
         .await
         .unwrap();
+    // Pin the storage view so publication discovery is outside the measurement.
+    let checkpoint = writer.create_checkpoint(None).await.unwrap();
     writer.close().await.unwrap();
 
     let counting = Arc::new(CountingStore::new(object_store));
     let reader = Catalog::open_read_only(
         Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
-        CatalogOptions::default(),
+        {
+            let mut options = CatalogOptions::default();
+            options.checkpoint = Some(checkpoint);
+            options
+        },
     )
     .await
     .unwrap();
     counting.take_reads();
 
     let view = reader.read_scope().await.unwrap();
-    let reads = counting.take_reads();
+
     let tables = view
         .tables_in(view.schemas().await.unwrap()[0].id)
         .await
@@ -136,26 +136,16 @@ async fn a_materialization_reads_ahead_rather_than_block_by_block() {
         0
     };
 
+    let reads = counting.take_reads();
     assert!(files >= 4_000, "seed did not land: {files} files");
-    // One round trip per 4 KiB block would be in the thousands here. The
-    // bound is deliberately loose: it catches the defect's order of
-    // magnitude without pinning SlateDB's block size or layout.
-    // Measured: 5 reads with read-ahead, 89 without, on this seed. The
-    // bound sits between them with headroom, so it catches the defect's
-    // order of magnitude without pinning SlateDB's block size or layout.
+    // A block-at-a-time scan exceeds this bound on the seeded file range.
     assert!(
         reads < 20,
         "materialization issued {reads} reads for {files} files — scanning block by block"
     );
 }
 
-/// A read-only handle scans once for a whole population of DuckLake's
-/// metadata tables, not once per `dump_*` call.
-///
-/// DuckLake issues roughly two dozen dumps to populate its metadata, and
-/// each one used to rescan `current` *and* `history` on a reader — the
-/// entity projection was gated on holding the writer. That is the cost a
-/// query pays on every execution, not just at attach.
+/// Repeated dumps at a fixed checkpoint reuse cached storage blocks.
 #[tokio::test]
 async fn a_read_only_handle_scans_once_for_many_dumps() {
     let object_store = Arc::new(InMemory::new());
@@ -181,17 +171,24 @@ async fn a_read_only_handle_scans_once_for_many_dumps() {
         })
         .await
         .unwrap();
+    // Pin the storage view so publication discovery is outside the measurement.
+    let checkpoint = writer.create_checkpoint(None).await.unwrap();
     writer.close().await.unwrap();
 
     let counting = Arc::new(CountingStore::new(object_store));
     let reader = Catalog::open_read_only(
         Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
-        CatalogOptions::default(),
+        {
+            let mut options = CatalogOptions::default();
+            options.checkpoint = Some(checkpoint);
+            options
+        },
     )
     .await
     .unwrap();
+    counting.take_reads();
 
-    // The first dump scans; it is the one that installs the projection.
+    // Reader discovery is excluded; only the dump populates this measurement.
     let first = moraine::ffi_support::dump_data_files(&reader)
         .await
         .unwrap();
@@ -199,7 +196,7 @@ async fn a_read_only_handle_scans_once_for_many_dumps() {
     assert!(!first.is_empty(), "seed did not land");
     assert!(cold > 0, "a cold dump read nothing");
 
-    // A population's worth of further dumps must not rescan.
+    // Repeated dumps must reuse the blocks populated by the first dump.
     for _ in 0..12 {
         let again = moraine::ffi_support::dump_data_files(&reader)
             .await
