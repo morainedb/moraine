@@ -3204,6 +3204,9 @@ async fn removing_inlined_file_deletes_drops_only_the_named_records() {
         async move {
             let db_tx = catalog.begin_write_tx()?;
             let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
+            if snapshot_id == 1 {
+                tx.stage(insert_row(TableKind::DataFile, data_file_row(7, 1, 1)));
+            }
             for op in ops {
                 tx.stage(op);
             }
@@ -3302,6 +3305,11 @@ async fn hard_deleting_a_data_file_drops_the_inlined_deletions_against_it() {
         async move {
             let db_tx = catalog.begin_write_tx()?;
             let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
+            if snapshot_id == 1 {
+                tx.stage(insert_row(TableKind::DataFile, data_file_row(7, 1, 1)));
+                tx.stage(insert_row(TableKind::DataFile, data_file_row(9, 1, 1)));
+                tx.stage(insert_row(TableKind::DataFile, data_file_row(7, 2, 1)));
+            }
             for op in ops {
                 tx.stage(op);
             }
@@ -3466,6 +3474,9 @@ async fn the_inlined_deletion_table_exists_from_its_first_deletion_until_the_dro
         async move {
             let db_tx = catalog.begin_write_tx()?;
             let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
+            if snapshot_id == 1 {
+                tx.stage(insert_row(TableKind::DataFile, data_file_row(7, 1, 1)));
+            }
             tx.stage(op);
             tx.stage(insert_row(
                 TableKind::Snapshot,
@@ -4575,6 +4586,7 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
 
     let db_tx1 = catalog.begin_write_tx().unwrap();
     let mut setup = StagedTransaction::begin_detached(&catalog, db_tx1);
+    setup.stage(insert_row(TableKind::DataFile, data_file_row(9, 1, 1)));
     setup.stage(RowOperation::InlineSchema {
         table_id: 1,
         schema_version: 0,
@@ -8237,6 +8249,7 @@ async fn clearing_inlined_file_deletions_costs_one_operation() {
     let catalog = open().await;
     let db_tx = catalog.begin_write_tx().unwrap();
     let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(insert_row(TableKind::DataFile, data_file_row(7, 1, 1)));
     for row_id in 0..4u64 {
         tx.stage(RowOperation::InlineFileDelete {
             table_id: 1,
@@ -8304,6 +8317,9 @@ async fn dropping_the_inlined_deletion_table_takes_its_records_and_marker() {
         async move {
             let db_tx = catalog.begin_write_tx()?;
             let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
+            if snapshot_id == 1 {
+                tx.stage(insert_row(TableKind::DataFile, data_file_row(7, 1, 1)));
+            }
             tx.stage(op);
             tx.stage(insert_row(
                 TableKind::Snapshot,
@@ -8467,4 +8483,34 @@ async fn view_column_tags_end_in_place() {
     assert_eq!(rows[0].value, "dollars");
     tx.rollback();
     catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn staged_deletes_refuse_retired_data_files() {
+    for inlined in [false, true] {
+        let catalog = open().await;
+        seed_expired_file(&catalog).await;
+        let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap());
+        if inlined {
+            tx.stage(RowOperation::InlineFileDelete {
+                table_id: 1,
+                data_file_id: 9,
+                row_id: 0,
+                begin_snapshot: 3,
+            });
+        } else {
+            tx.stage(insert_row(
+                TableKind::DeleteFile,
+                delete_file_row(20, 1, 9, 3),
+            ));
+        }
+        tx.stage(insert_row(TableKind::Snapshot, snapshot_row(3, 1, 21)));
+        tx.stage(insert_row(
+            TableKind::SnapshotChanges,
+            snapshot_changes_row(3, "deleted_from_table:1"),
+        ));
+        let error = tx.commit().await.unwrap_err();
+        assert!(matches!(error, Error::CommitConflict(_)), "{error:?}");
+        catalog.close().await.unwrap();
+    }
 }

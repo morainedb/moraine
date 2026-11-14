@@ -842,6 +842,27 @@ mod tests {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: vec![
+                Cell::U64(7),
+                Cell::U64(1),
+                Cell::U64(6),
+                Cell::Null,
+                Cell::Null,
+                Cell::Str("data.parquet".into()),
+                Cell::Bool(true),
+                Cell::Str("parquet".into()),
+                Cell::U64(3),
+                Cell::U64(128),
+                Cell::U64(32),
+                Cell::U64(0),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
 
         tx.stage(RowOperation::InlineFileDelete {
             table_id: 1,

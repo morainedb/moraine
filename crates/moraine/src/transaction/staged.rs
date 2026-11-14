@@ -58,6 +58,7 @@ use crate::{
 
 mod apply;
 mod decode;
+mod delete_targets;
 pub(crate) mod dependencies;
 mod index_upkeep;
 pub(crate) mod inline;
@@ -1635,6 +1636,7 @@ async fn stage_rows(
 ) -> Result<RowsStaged> {
     db_tx.reserve_translation(memory::authored_bytes(ops).saturating_mul(4))?;
     let ops = rebase.inline_ops(ops);
+    delete_targets::validate(base, &ops, rebase)?;
     let store = context.data_store.as_ref();
     let read_metrics = Arc::new(data_file::ScopedReadMetrics::reporting_to(Arc::clone(
         &context.data_reads,
