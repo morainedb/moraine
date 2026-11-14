@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/morainedb/moraine/compare/v0.9.0...v0.9.1) - 2026-11-14
+
+### Fixed
+
+- reject positional deletes targeting retired files ([#441](https://github.com/morainedb/moraine/pull/441))
+- reduce background catalog reads and unblock row summaries ([#435](https://github.com/morainedb/moraine/pull/435))
+
+### Other
+
+- centralize read execution and background maintenance ([#440](https://github.com/morainedb/moraine/pull/440))
+- reuse catalog context and bind decoded record ownership ([#437](https://github.com/morainedb/moraine/pull/437))
+- make cache admission and decoded ownership explicit ([#436](https://github.com/morainedb/moraine/pull/436))
+
 ## [0.9.0](https://github.com/morainedb/moraine/compare/v0.8.1...v0.9.0) - 2026-11-12
 
 ### Added
