@@ -536,3 +536,32 @@ fn ducklake_commit_retry_contract_and_change_grammar_hold() {
         "300"
     );
 }
+
+/// Direct append statistics retain SQL's null, missing-row, and rollback
+/// behavior.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn append_statistics_match_sql_after_schema_changes_and_rollback() {
+    let twin = Twin::new("append-statistics");
+    twin.apply(
+        "CREATE TABLE lake.main.t(i BIGINT, s VARCHAR, f DOUBLE);
+                INSERT INTO lake.main.t VALUES (10, 'seed', 1.0);
+                INSERT INTO lake.main.t VALUES (20, NULL, 'NaN');
+                INSERT INTO lake.main.t VALUES (30, 'a' || chr(0) || 'b', NULL);
+                BEGIN; INSERT INTO lake.main.t VALUES (999, 'rolled back', 999); ROLLBACK;
+                ALTER TABLE lake.main.t ADD COLUMN added BIGINT DEFAULT 42;
+                INSERT INTO lake.main.t VALUES (40, 'quoted '' long string', 4.0, 43);
+                DELETE FROM lake.main.t WHERE i = 10;
+                INSERT INTO lake.main.t VALUES (50, 'last', 5.0, 44);",
+    );
+    twin.probe("SELECT record_count, next_row_id FROM __ducklake_metadata_lake.ducklake_table_stats ORDER BY table_id;");
+    twin.probe("SELECT table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats FROM __ducklake_metadata_lake.ducklake_table_column_stats ORDER BY table_id, column_id;");
+    twin.probe("SELECT rowid, i, s, f, added FROM lake.main.t ORDER BY rowid;");
+    twin.probe("SELECT snapshot_id, changes_made, author, commit_message, commit_extra_info FROM __ducklake_metadata_lake.ducklake_snapshot_changes ORDER BY snapshot_id;");
+
+    twin.apply(
+        "DELETE FROM __ducklake_metadata_lake.ducklake_table_column_stats WHERE column_id = 2;
+                INSERT INTO lake.main.t VALUES (60, 'missing stats stay missing', 6.0, 45);",
+    );
+    twin.probe("SELECT column_id, min_value, max_value FROM __ducklake_metadata_lake.ducklake_table_column_stats ORDER BY column_id;");
+}

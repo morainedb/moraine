@@ -1,10 +1,11 @@
 //! What a batch stages against and commits through: the folder's snapshot
 //! transaction, or a committer's tailing reader, whose batch is a slot
-//! alone. Every write a batch stages passes through here, so the slot the
-//! batch becomes carries all of it, index entries included.
+//! alone. Sessions that offer log slots record every write; direct writers
+//! retain writes only in their store transaction.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use bytes::Bytes;
 use slatedb::{DbTransaction, WriteHandle};
 
 use crate::{
@@ -17,9 +18,10 @@ use crate::{
 /// One batch's session with the store.
 pub(crate) struct CommitSession {
     inner: Inner,
-    /// Every write staged, in order, for the slot the batch becomes.
+    /// Memory admission and any writes to be offered to a log slot.
     staged: Mutex<Staged>,
     memory_limit: u64,
+    record_writes: bool,
 }
 
 #[derive(Default)]
@@ -56,7 +58,14 @@ impl std::fmt::Debug for CommitSession {
 }
 
 impl CommitSession {
-    /// The folder's session over `tx`.
+    /// A direct store writer whose batch will not be offered to a commit log.
+    pub(crate) fn direct(tx: DbTransaction) -> Self {
+        let mut session = Self::folder(tx);
+        session.record_writes = false;
+        session
+    }
+
+    /// A store transaction that also records writes for a possible log slot.
     pub(crate) fn folder(tx: DbTransaction) -> Self {
         Self::new(Inner::Folder(tx))
     }
@@ -81,6 +90,7 @@ impl CommitSession {
             inner,
             staged: Mutex::new(staged),
             memory_limit: memory_limit.unwrap_or(0),
+            record_writes: true,
         }
     }
 
@@ -106,6 +116,19 @@ impl CommitSession {
         self.record(key.as_ref(), Some(value.as_ref()))
     }
 
+    /// Stages a put using owned buffers.
+    pub(crate) fn put_bytes(&self, key: Bytes, value: Bytes) -> Result<()> {
+        self.with_admission(key.len(), value.len(), |staged| {
+            if self.record_writes {
+                staged.writes.push((key.to_vec(), Some(value.to_vec())));
+            }
+            if let Inner::Folder(tx) = &self.inner {
+                tx.put_bytes(key, value).map_err(Error::from)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Stages one delete.
     ///
     /// # Errors
@@ -116,14 +139,7 @@ impl CommitSession {
     }
 
     fn record(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
-        staged.check()?;
-        let result: Result<()> = (|| {
-            let added = (key.len() as u64)
-                .saturating_add(value.map_or(0, |value| value.len() as u64))
-                .saturating_add(128 + size_of::<StagedWrite>() as u64)
-                .saturating_mul(2);
-            self.admit(&mut staged, added)?;
+        self.with_admission(key.len(), value.map_or(0, <[u8]>::len), |staged| {
             if let Inner::Folder(tx) = &self.inner {
                 match value {
                     Some(value) => tx.put(key, value),
@@ -131,11 +147,30 @@ impl CommitSession {
                 }
                 .map_err(Error::from)?;
             }
-            staged
-                .writes
-                .push((key.to_vec(), value.map(<[u8]>::to_vec)));
+            if self.record_writes {
+                staged
+                    .writes
+                    .push((key.to_vec(), value.map(<[u8]>::to_vec)));
+            }
             Ok(())
-        })();
+        })
+    }
+
+    fn with_admission(
+        &self,
+        key_bytes: usize,
+        value_bytes: usize,
+        write: impl FnOnce(&mut Staged) -> Result<()>,
+    ) -> Result<()> {
+        let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
+        staged.check()?;
+        let added = (key_bytes as u64)
+            .saturating_add(value_bytes as u64)
+            .saturating_add(128 + size_of::<StagedWrite>() as u64)
+            .saturating_mul(2);
+        let result = self
+            .admit(&mut staged, added)
+            .and_then(|()| write(&mut staged));
         if let Err(error) = &result {
             staged.failure = Some(error.to_string());
         }
@@ -238,17 +273,75 @@ mod tests {
         assert!(!session.is_folder());
         session.put(b"k", b"v").unwrap();
         session.delete(b"gone").unwrap();
+        session
+            .put_bytes(
+                bytes::Bytes::from_static(b"owned"),
+                bytes::Bytes::from_static(b"buffer"),
+            )
+            .unwrap();
         assert_eq!(
             session.take_staged().unwrap().0,
             vec![
                 (b"k".to_vec(), Some(b"v".to_vec())),
-                (b"gone".to_vec(), None)
+                (b"gone".to_vec(), None),
+                (b"owned".to_vec(), Some(b"buffer".to_vec()))
             ]
         );
 
         assert!(session.commit().await.unwrap().is_none());
         assert!(reader.get(b"k").await.unwrap().is_none());
+        assert!(reader.get(b"owned").await.unwrap().is_none());
         reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_writer_keeps_writes_only_in_its_transaction() {
+        let db = Db::builder("folder-ledger", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap();
+        let mut session =
+            CommitSession::direct(db.begin(slatedb::IsolationLevel::Snapshot).unwrap());
+        session.put(b"kept", b"value").unwrap();
+        session.put(b"removed", b"old").unwrap();
+        session.delete(b"removed").unwrap();
+        assert_eq!(
+            session.handle().get(b"kept").await.unwrap().unwrap(),
+            &b"value"[..]
+        );
+        assert!(session.handle().get(b"removed").await.unwrap().is_none());
+        let (writes, memory) = session.take_staged().unwrap();
+        assert!(
+            writes.is_empty(),
+            "a direct writer needs no external-log ledger"
+        );
+        assert!(memory.unwrap().bytes() > 0, "store writes remain admitted");
+        session.commit().await.unwrap();
+        assert_eq!(db.get(b"kept").await.unwrap().unwrap(), &b"value"[..]);
+        assert!(db.get(b"removed").await.unwrap().is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_writer_owned_put_preserves_the_value_buffer() {
+        let db = Db::builder("owned-put", Arc::new(InMemory::new()))
+            .build()
+            .await
+            .unwrap();
+        let session = CommitSession::direct(db.begin(slatedb::IsolationLevel::Snapshot).unwrap());
+        let key = bytes::Bytes::from(vec![1; 32]);
+        let value = bytes::Bytes::from(vec![2; 4096]);
+        session.put_bytes(key.clone(), value.clone()).unwrap();
+        let found = session.handle().get(&key).await.unwrap().unwrap();
+        assert_eq!(found, value);
+        assert_eq!(
+            found.as_ptr(),
+            value.as_ptr(),
+            "staging must retain the owned buffer"
+        );
+        session.commit().await.unwrap();
+        assert_eq!(db.get(&key).await.unwrap().unwrap(), value);
+        db.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -259,10 +352,18 @@ mod tests {
             .await
             .unwrap();
         let mut session =
-            CommitSession::folder(db.begin(slatedb::IsolationLevel::Snapshot).unwrap());
+            CommitSession::direct(db.begin(slatedb::IsolationLevel::Snapshot).unwrap());
         session.memory_limit = 1024;
         session.put(b"first", b"small").unwrap();
-        assert!(session.put(b"large", vec![0; 4096]).is_err());
+        assert!(
+            session
+                .put_bytes(
+                    bytes::Bytes::from_static(b"large"),
+                    bytes::Bytes::from(vec![0; 4096])
+                )
+                .is_err()
+        );
+        assert!(session.put(b"later", b"small").is_err());
         assert!(session.commit().await.is_err());
         assert!(db.get(b"first").await.unwrap().is_none());
         db.close().await.unwrap();

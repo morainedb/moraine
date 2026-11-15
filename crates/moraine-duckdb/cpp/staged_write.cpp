@@ -417,6 +417,25 @@ std::vector<duckdb::idx_t> ExtractSetRefs(duckdb::LogicalUpdate &op) {
 
 } // namespace
 
+void StageMetadataInsert(MoraineTxHandle *transaction, const MetadataTableSpec &spec,
+                         const std::vector<duckdb::Value> &values) {
+	if (values.size() != spec.columns.size()) {
+		throw duckdb::InternalException("moraine: direct metadata row has the wrong column count");
+	}
+	std::deque<std::string> string_storage;
+	std::vector<MoraineCell> cells;
+	cells.reserve(values.size());
+	for (duckdb::idx_t column = 0; column < values.size(); column++) {
+		cells.push_back(
+		    CellFromValue(values[column], MapColumnType(spec.columns[column].ducklake_type), string_storage));
+	}
+	MoraineError error {};
+	if (moraine_tx_stage(transaction, spec.write_table_kind, /* insert */ 0, cells.data(), cells.size(), &error) !=
+	    MORAINE_OK) {
+		ThrowMoraineError(error);
+	}
+}
+
 duckdb::PhysicalOperator &PlanMetadataInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
                                              const MetadataTableSpec &spec) {
 	if (spec.write_table_kind == kVoidInsertable) {

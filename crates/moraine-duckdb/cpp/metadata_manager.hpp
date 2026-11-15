@@ -7,6 +7,8 @@
 
 namespace moraine_duckdb {
 
+struct MetadataTableSpec;
+
 //! Names the context whose statement is driving the metadata connection
 //! this is registered on. DuckLake creates that connection and never hands
 //! it out, so its own interrupt flag is one nobody can set; work blocking
@@ -36,6 +38,11 @@ public:
 	duckdb::unique_ptr<duckdb::QueryResult> Query(duckdb::string &query) override;
 	duckdb::unique_ptr<duckdb::QueryResult> AttachMetadata(const duckdb::string &attach_query) override;
 
+	using duckdb::DuckLakeMetadataManager::GetSnapshot;
+
+	//! Reads the pinned head and catalog version without planning metadata SQL.
+	duckdb::unique_ptr<duckdb::DuckLakeSnapshot> GetSnapshot() override;
+
 	//! The head snapshot by the id the metadata transaction pinned when it
 	//! began, which is what DuckLake's `MAX(snapshot_id)` over every retained
 	//! snapshot resolves to at that read point.
@@ -53,9 +60,21 @@ public:
 	                            const duckdb::TransactionChangeInformation &transaction_changes,
 	                            const duckdb::DuckLakeRetryConfig &retry_config) override;
 
-	//! Writes each table's inlined rows through the Appender API, falling
-	//! back to the base `INSERT ... VALUES` batch for a table the same
-	//! commit still has to create.
+	bool TryGetTableStats(duckdb::DuckLakeSnapshot snapshot, duckdb::TableIndex table_id,
+	                      duckdb::vector<duckdb::DuckLakeGlobalStatsInfo> &stats) override;
+	bool TryWriteAppendStats(const duckdb::DuckLakeGlobalStatsInfo &stats) override;
+	void FlushAppendStats() override;
+	void ClearAppendStats() override;
+	bool TryWriteSnapshotChanges(duckdb::DuckLakeSnapshot snapshot, const duckdb::SnapshotChangeInfo &changes,
+	                             const duckdb::DuckLakeSnapshotCommit &commit_info) override;
+
+	//! Stages the snapshot using the same row contract as metadata INSERT.
+	bool TryWriteSnapshot(duckdb::DuckLakeSnapshot snapshot) override;
+	//! Appends inline chunks after their table definitions have been staged.
+	void FlushInlinedAppends(duckdb::DuckLakeSnapshot snapshot) override;
+	void ClearInlinedAppends() override;
+
+	//! Queues inline chunks and returns any table-creation SQL they require.
 	duckdb::string
 	WriteNewInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,
 	                    const duckdb::vector<duckdb::DuckLakeInlinedDataInfo> &new_data,
@@ -64,8 +83,21 @@ public:
 	                    duckdb::vector<duckdb::unique_ptr<duckdb::SQLStatement>> &inlined_inserts) override;
 
 private:
-	//! One table's rows through the Appender. False means the caller must
-	//! emit the SQL instead: no appender, or no rows.
+	const MetadataTableSpec &MetadataSpec(const char *name);
+	std::vector<std::vector<duckdb::Value>> TableStatisticsRows(const char *name, duckdb::TableIndex table_id);
+	duckdb::vector<duckdb::DuckLakeGlobalStatsInfo> pending_statistics;
+
+	struct PendingInlineAppend {
+		duckdb::string table_name;
+		// The transaction owns the data until its commit attempt completes.
+		duckdb::DuckLakeInlinedDataInfo entry;
+	};
+	duckdb::vector<PendingInlineAppend> pending_inline_appends;
+
+	//! Returns the latest committed inline registration at the pinned read point.
+	duckdb::string LatestInlineTableName(duckdb::idx_t table_id);
+
+	//! Appends one table's rows; false if there is no Appender support or no rows.
 	bool TryAppendInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot, const duckdb::string &inlined_table_name,
 	                          const duckdb::DuckLakeInlinedDataInfo &entry, bool has_preserved_row_ids);
 

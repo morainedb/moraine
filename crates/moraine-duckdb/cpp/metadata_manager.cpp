@@ -3,8 +3,8 @@
 #include "catalog.hpp"
 #include "transaction_manager.hpp"
 
-#include "common/ducklake_util.hpp"
 #include "common/index.hpp"
+#include "common/ducklake_util.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_inlined_data.hpp"
 #include "storage/ducklake_table_entry.hpp"
@@ -14,11 +14,24 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/appender.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
+#include <algorithm>
+#include <array>
 #include <mutex>
-#include <set>
 
 namespace moraine_duckdb {
+
+const MetadataTableSpec &MoraineMetadataManager::MetadataSpec(const char *name) {
+	auto &context = *transaction.GetConnection().context;
+	auto &catalog = ResolveMoraineCatalog(context, transaction.GetCatalog().MetadataDatabaseName());
+	for (const auto &spec : MoraineMetadataTableSpecs(catalog.ServesExtendedCatalog())) {
+		if (std::string(spec.name) == name) {
+			return spec;
+		}
+	}
+	throw duckdb::InternalException("moraine: missing metadata table %s", name);
+}
 
 MoraineMetadataManager::MoraineMetadataManager(duckdb::DuckLakeTransaction &transaction)
     : duckdb::DuckLakeMetadataManager(transaction) {
@@ -45,6 +58,52 @@ void MoraineMetadataManager::FlushChangesServerSide(duckdb::DuckLakeTransaction 
 	if (landed > current) {
 		lake.SetCommittedSnapshotId(static_cast<duckdb::idx_t>(landed));
 	}
+}
+
+duckdb::unique_ptr<duckdb::DuckLakeSnapshot> MoraineMetadataManager::GetSnapshot() {
+	RecordDrivingContext();
+	auto &context = *transaction.GetConnection().context;
+	auto &catalog = ResolveMoraineCatalog(context, transaction.GetCatalog().MetadataDatabaseName());
+	auto &moraine_transaction = catalog.GetCatalogTransaction(context).transaction->Cast<MoraineTransaction>();
+	uint64_t snapshot_id = 0;
+	uint64_t batch_seq = 0;
+	if (moraine_transaction.StagedTxIfOpen() || !moraine_transaction.SnapshotStamp(snapshot_id, batch_seq)) {
+		return duckdb::DuckLakeMetadataManager::GetSnapshot();
+	}
+
+	const auto &snapshot_spec = MetadataSpec("ducklake_snapshot");
+	MoraineMetadataCursor *cursor = nullptr;
+	MoraineError error {};
+	if (moraine_metadata_cursor_open(moraine_transaction.ReadHandle(), snapshot_spec.write_table_kind, kEveryVersion,
+	                                 snapshot_id, &cursor, moraine_shim_is_interrupted, &context,
+	                                 &error) != MORAINE_OK) {
+		ThrowMoraineError(error);
+	}
+	std::unique_ptr<MoraineMetadataCursor, decltype(&moraine_metadata_cursor_free)> owned_cursor(
+	    cursor, moraine_metadata_cursor_free);
+	auto snapshots = snapshot_spec.page_provider(cursor, moraine_shim_is_interrupted, &context);
+	if (snapshots.size() != 1 || snapshots[0][0].GetValue<uint64_t>() != snapshot_id) {
+		throw duckdb::InvalidInputException("Corrupt DuckLake - pinned head snapshot is missing or ambiguous");
+	}
+
+	const auto &metadata_spec = MetadataSpec("ducklake_metadata");
+	auto metadata = MetadataRowsFor(context, catalog, metadata_spec);
+	duckdb::string catalog_version;
+	for (const auto &row : *metadata) {
+		if (!row[0].IsNull() && row[0].GetValue<duckdb::string>() == "version" && !row[1].IsNull()) {
+			catalog_version = std::max(catalog_version, row[1].GetValue<duckdb::string>());
+		}
+	}
+	auto attached_version = duckdb::DuckLakeVersionToString(transaction.GetCatalog().GetDuckLakeVersion());
+	if (!catalog_version.empty() && catalog_version != attached_version) {
+		throw duckdb::InvalidInputException(
+		    "The catalog was migrated by another connection from version %s to %s, reattach to pick up the new version",
+		    attached_version, catalog_version);
+	}
+	const auto &row = snapshots[0];
+	return duckdb::make_uniq<duckdb::DuckLakeSnapshot>(
+	    row[0].GetValue<duckdb::idx_t>(), row[2].GetValue<duckdb::idx_t>(), row[3].GetValue<duckdb::idx_t>(),
+	    row[4].GetValue<duckdb::idx_t>());
 }
 
 duckdb::string MoraineMetadataManager::GetLatestSnapshotQuery() const {
@@ -82,6 +141,61 @@ duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::Query(duckdb::st
 duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::AttachMetadata(const duckdb::string &attach_query) {
 	RecordDrivingContext();
 	return duckdb::DuckLakeMetadataManager::AttachMetadata(attach_query);
+}
+
+bool MoraineMetadataManager::TryWriteSnapshot(duckdb::DuckLakeSnapshot snapshot) {
+	auto &context = *transaction.GetConnection().context;
+	auto &catalog = ResolveMoraineCatalog(context, transaction.GetCatalog().MetadataDatabaseName());
+	auto &moraine_transaction = catalog.GetCatalogTransaction(context).transaction->Cast<MoraineTransaction>();
+	std::array<MoraineCell, 5> cells {};
+	for (auto &cell : cells) {
+		cell.kind = 1;
+	}
+	cells[0].u64_value = snapshot.snapshot_id;
+	cells[1].kind = 2;
+	cells[1].i64_value = duckdb::MetaTransaction::Get(context).GetCurrentTransactionStartTimestamp().value;
+	cells[2].u64_value = snapshot.schema_version;
+	cells[3].u64_value = snapshot.next_catalog_id;
+	cells[4].u64_value = snapshot.next_file_id;
+	MoraineError error {};
+	if (moraine_tx_stage(moraine_transaction.StagedTx(), /* snapshot */ 0, /* insert */ 0, cells.data(), cells.size(),
+	                     &error) != MORAINE_OK) {
+		ThrowMoraineError(error);
+	}
+	return true;
+}
+
+void MoraineMetadataManager::ClearInlinedAppends() {
+	pending_inline_appends.clear();
+}
+
+void MoraineMetadataManager::FlushInlinedAppends(duckdb::DuckLakeSnapshot snapshot) {
+	auto appends = std::move(pending_inline_appends);
+	pending_inline_appends.clear();
+	for (auto &append : appends) {
+		if (!TryAppendInlinedData(snapshot, append.table_name, append.entry, append.entry.data->HasPreservedRowIds())) {
+			throw duckdb::InternalException("moraine: queued inline data could not be appended");
+		}
+	}
+}
+
+duckdb::string MoraineMetadataManager::LatestInlineTableName(duckdb::idx_t table_id) {
+	auto &context = *transaction.GetConnection().context;
+	auto &catalog = ResolveMoraineCatalog(context, transaction.GetCatalog().MetadataDatabaseName());
+	auto rows = MetadataRowsFor(context, catalog, MetadataSpec("ducklake_inlined_data_tables"));
+	duckdb::optional_idx latest_version;
+	duckdb::string table_name;
+	for (const auto &row : *rows) {
+		if (row[0].GetValue<duckdb::idx_t>() != table_id) {
+			continue;
+		}
+		auto version = row[2].GetValue<duckdb::idx_t>();
+		if (!latest_version.IsValid() || version > latest_version.GetIndex()) {
+			latest_version = version;
+			table_name = row[1].GetValue<duckdb::string>();
+		}
+	}
+	return table_name;
 }
 
 bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,
@@ -158,7 +272,6 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
     duckdb::vector<duckdb::unique_ptr<duckdb::SQLStatement>> &inlined_inserts) {
 	using duckdb::DuckLakeTableEntry;
 	using duckdb::DuckLakeTableInfo;
-	using duckdb::DuckLakeUtil;
 	using duckdb::InternalException;
 
 	duckdb::string batch_query;
@@ -166,16 +279,11 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 		return batch_query;
 	}
 
-	// Appends run now; the batch this builds runs later. A table the batch
-	// still has to CREATE is therefore not appendable yet, and those rows keep
-	// taking the SQL path.
-	std::set<duckdb::string> created_in_batch;
 	for (auto &entry : new_data) {
 		duckdb::string inlined_table_name;
 		for (auto &inlined_table : new_inlined_data_tables_result) {
 			if (inlined_table.id == entry.table_id) {
 				inlined_table_name = InlinedTableNameFor(inlined_table.id.index, commit_snapshot.schema_version);
-				created_in_batch.insert(inlined_table_name);
 			}
 		}
 		if (inlined_table_name.empty()) {
@@ -186,10 +294,8 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 			}
 		}
 		if (inlined_table_name.empty()) {
-			auto query = LatestInlinedTableQuery(entry.table_id.index) + ";";
-			auto result = Query(commit_snapshot, query);
-			for (auto &row : *result) {
-				inlined_table_name = row.GetValue<duckdb::string>(0);
+			inlined_table_name = LatestInlineTableName(entry.table_id.index);
+			if (!inlined_table_name.empty()) {
 				insert_inlined_table_name_cache[entry.table_id.index] = inlined_table_name;
 			}
 		}
@@ -225,19 +331,11 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries);
 			batch_query += InsertValuesSql("ducklake_inlined_data_tables", inlined_tables);
 			batch_query += inlined_table_queries;
-			created_in_batch.insert(inlined_table_name);
 		}
 
-		const bool has_preserved_row_ids = entry.data->HasPreservedRowIds();
-		if (!created_in_batch.count(inlined_table_name) &&
-		    TryAppendInlinedData(commit_snapshot, inlined_table_name, entry, has_preserved_row_ids)) {
-			continue;
+		if (entry.data && entry.data->data && entry.data->data->Count() > 0) {
+			pending_inline_appends.push_back({inlined_table_name, entry});
 		}
-
-		// One cell list per row, then formatting deferred to the shared helper.
-		auto cells_per_row = DuckLakeUtil::InlinedDataToSQL(transaction, *entry.data->data);
-		batch_query += FormatInlinedDataInsert(inlined_table_name, entry.row_id_start, has_preserved_row_ids,
-		                                       has_preserved_row_ids ? &entry.data->row_ids : nullptr, cells_per_row);
 	}
 	return batch_query;
 }

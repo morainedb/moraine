@@ -1,0 +1,190 @@
+--- a/src/include/storage/ducklake_metadata_manager.hpp
++++ b/src/include/storage/ducklake_metadata_manager.hpp
+@@ -515,6 +515,16 @@
+ 	//! SQL templates with {METADATA_CATALOG} / {SNAPSHOT_ID} placeholders, shared with the
+ 	//! server-side commit path.
+ 	static string InsertSnapshotSql();
++	//! Returns only the requested table's statistics when supported by the backend.
++	virtual bool TryGetTableStats(DuckLakeSnapshot snapshot, TableIndex table_id,
++	                              vector<DuckLakeGlobalStatsInfo> &stats) { return false; }
++	//! Queues append statistics for staging after the commit SQL succeeds.
++	virtual bool TryWriteAppendStats(const DuckLakeGlobalStatsInfo &stats) { return false; }
++	virtual void FlushAppendStats() {}
++	virtual void ClearAppendStats() {}
++	//! Stages the change record without generating SQL.
++	virtual bool TryWriteSnapshotChanges(DuckLakeSnapshot snapshot, const SnapshotChangeInfo &changes,
++	                                     const DuckLakeSnapshotCommit &commit_info) { return false; }
+ 	//! Stages the finalized snapshot directly; false retains the SQL insertion.
+ 	virtual bool TryWriteSnapshot(DuckLakeSnapshot snapshot) {
+ 		return false;
+--- a/src/include/storage/ducklake_transaction_state.hpp
++++ b/src/include/storage/ducklake_transaction_state.hpp
+@@ -35,7 +35,14 @@
+ 	};
+ 	//! Stages the finalized snapshot without SQL when the metadata backend supports it.
+ 	std::function<bool(DuckLakeSnapshot)> try_write_snapshot = [](DuckLakeSnapshot) { return false; };
+-	//! Executes the batched snapshot/changes SQL against the metadata DB.
++	//! Enabled only for appends without schema, deletion, or maintenance changes.
++	bool allow_direct_statistics = false;
++	std::function<bool(const DuckLakeGlobalStatsInfo &)> try_write_append_stats =
++	    [](const DuckLakeGlobalStatsInfo &) { return false; };
++	std::function<bool(DuckLakeSnapshot, const SnapshotChangeInfo &, const DuckLakeSnapshotCommit &)>
++	    try_write_snapshot_changes = [](DuckLakeSnapshot, const SnapshotChangeInfo &,
++	                                    const DuckLakeSnapshotCommit &) { return false; };
++	//! Executes the commit batch; a null result means there was no SQL to execute.
+ 	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string &)> execute_commit_batch;
+ 	//! Classifies metadata-catalog errors that are safe to retry.
+ 	std::function<bool(const string &)> is_retryable_metadata_error = [](const string &) {
+@@ -175,7 +182,7 @@
+ 	GetFilesDeletedOrDroppedAfterSnapshot(const std::function<unique_ptr<QueryResult>(string)> &executor);
+ 
+ 	string WriteSnapshotChanges(DuckLakeCommitState &commit_state, TransactionChangeInformation &changes,
+-	                            const DuckLakeSnapshotCommit &commit_info) const;
++	                            const DuckLakeCommitContext &context) const;
+ 
+ 	string CommitChanges(DuckLakeCommitState &commit_state, TransactionChangeInformation &transaction_changes,
+ 	                     optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats, const DuckLakeCommitContext &context,
+--- a/src/storage/ducklake_catalog.cpp
++++ b/src/storage/ducklake_catalog.cpp
+@@ -986,13 +986,18 @@
+ 		// a table that is not part of the snapshot, e.g. one created in this transaction, has no stats in it
+ 		return nullptr;
+ 	}
+-	// one query for the whole snapshot, caching the tables without stats as well
+-	auto global_stats = transaction.GetMetadataManager().GetGlobalTableStats(snapshot);
++	vector<DuckLakeGlobalStatsInfo> global_stats;
++	auto &manager = transaction.GetMetadataManager();
++	bool scoped = manager.TryGetTableStats(snapshot, table_id, global_stats);
++	if (!scoped) {
++		global_stats = manager.GetGlobalTableStats(snapshot);
++	}
+ 	auto lake_stats = ConstructStatsMap(global_stats, schema_entry->catalog_set);
+ 
+ 	shared_ptr<DuckLakeTableStatsCacheEntry> requested_entry;
+-	for (auto &table_entry : table_map) {
+-		auto current_id = table_entry.first;
++	auto table_entry = scoped ? table_map.find(table_id) : table_map.begin();
++	for (; table_entry != table_map.end(); ++table_entry) {
++		auto current_id = table_entry->first;
+ 		shared_ptr<DuckLakeTableStatsCacheEntry> entry;
+ 		auto stats_entry = lake_stats->table_stats.find(current_id);
+ 		if (stats_entry == lake_stats->table_stats.end()) {
+@@ -1006,6 +1011,9 @@
+ 			requested_entry = entry;
+ 		}
+ 		cache.Put(StatsCacheKey(snapshot.next_file_id, current_id), std::move(entry));
++		if (scoped) {
++			break;
++		}
+ 	}
+ 	if (!requested_entry || !requested_entry->has_stats) {
+ 		return nullptr;
+--- a/src/storage/ducklake_transaction.cpp
++++ b/src/storage/ducklake_transaction.cpp
+@@ -1522,17 +1522,28 @@
+ 	context.try_write_snapshot = [&](DuckLakeSnapshot snapshot) {
+ 		return metadata_manager->TryWriteSnapshot(snapshot);
+ 	};
++	context.try_write_append_stats = [&](const DuckLakeGlobalStatsInfo &stats) {
++		return metadata_manager->TryWriteAppendStats(stats);
++	};
++	context.try_write_snapshot_changes = [&](DuckLakeSnapshot snapshot, const SnapshotChangeInfo &changes,
++	                                         const DuckLakeSnapshotCommit &commit_info) {
++		return metadata_manager->TryWriteSnapshotChanges(snapshot, changes, commit_info);
++	};
+ 	context.execute_commit_batch = [&](DuckLakeSnapshot snapshot, string &query) {
+-		auto result = metadata_manager->Execute(snapshot, query);
++		unique_ptr<QueryResult> result;
++		if (!query.empty()) {
++			result = metadata_manager->Execute(snapshot, query);
++		}
+ 		for (auto &insert : inlined_inserts) {
+-			if (result->HasError()) {
++			if (result && result->HasError()) {
+ 				break;
+ 			}
+ 			// Table creation must finish before binding the inlined INSERT.
+ 			result = connection->Query(std::move(insert));
+ 		}
+ 		inlined_inserts.clear();
+-		if (!result->HasError()) {
++		if (!result || !result->HasError()) {
++			metadata_manager->FlushAppendStats();
+ 			metadata_manager->FlushInlinedAppends(snapshot);
+ 		}
+ 		return result;
+@@ -1550,6 +1561,7 @@
+ 	};
+ 	context.try_rollback = [&]() {
+ 		metadata_manager->ClearInlinedAppends();
++		metadata_manager->ClearAppendStats();
+ 		if (connection->context->transaction.HasActiveTransaction()) {
+ 			connection->Rollback();
+ 		}
+--- a/src/storage/ducklake_transaction_state.cpp
++++ b/src/storage/ducklake_transaction_state.cpp
+@@ -387,7 +387,7 @@
+ 
+ string DuckLakeTransactionState::WriteSnapshotChanges(DuckLakeCommitState &commit_state,
+                                                       TransactionChangeInformation &changes,
+-                                                      const DuckLakeSnapshotCommit &commit_info) const {
++                                                      const DuckLakeCommitContext &context) const {
+ 	// re-add all inserted tables - transaction-local table identifiers should have been converted at this stage
+ 	changes.tables_deleted_from = tables_deleted_from;
+ 	for (auto &entry : local_changes.Changes()) {
+@@ -426,7 +426,10 @@
+ 	AddChangeInfo(commit_state, changes_made, changes.tables_rewrite_delete, "rewrite_delete");
+ 	SnapshotChangeInfo change_info;
+ 	change_info.changes_made = StringUtil::Join(changes_made, ",");
+-	return DuckLakeMetadataManager::WriteSnapshotChangesSql(change_info, commit_info);
++	if (context.try_write_snapshot_changes(commit_state.commit_snapshot, change_info, context.commit_info)) {
++		return string();
++	}
++	return DuckLakeMetadataManager::WriteSnapshotChangesSql(change_info, context.commit_info);
+ }
+ 
+ static bool UpdateNestedField(vector<DuckLakeColumnInfo> &fields, FieldIndex parent_id, FieldIndex field_id,
+@@ -1228,8 +1231,11 @@
+ 	if (clear_column_stats) {
+ 		new_globals.stats.column_stats.clear();
+ 	}
+-	auto result = DuckLakeMetadataManager::UpdateGlobalTableStatsSql(
+-	    DuckLakeTransaction::ConvertNewGlobalStats(table_id, new_globals), context.supports_v1_1_metadata);
++	auto stats = DuckLakeTransaction::ConvertNewGlobalStats(table_id, new_globals);
++	if (context.allow_direct_statistics && !clear_column_stats && context.try_write_append_stats(stats)) {
++		return string();
++	}
++	auto result = DuckLakeMetadataManager::UpdateGlobalTableStatsSql(stats, context.supports_v1_1_metadata);
+ 	if (clear_column_stats) {
+ 		result += DeleteTableColumnStatsSql(table_id);
+ 	}
+@@ -2686,14 +2692,26 @@
+ 			can_retry = true;
+ 			context.set_delete_commit_snapshot(commit_snapshot.snapshot_id);
+ 			DuckLakeCommitState commit_state(commit_snapshot);
+-			string batch_queries = CommitChanges(commit_state, attempt_changes, stats, context, attempt_dropped_file_stats);
+-			batch_queries += WriteSnapshotChanges(commit_state, attempt_changes, context.commit_info);
++			auto attempt_context = context;
++			attempt_context.allow_direct_statistics = !SchemaChangesMade() && attempt_changes.altered_tables.empty() &&
++			    tables_delete_attempted.empty() && tables_deleted_from.empty() && dropped_files.empty() &&
++			    dropped_file_stats.empty() && flushed_inlined_tables.empty() && flushed_inlined_file_deletions.empty() &&
++			    added_field_stats.empty() && refreshed_table_sizes.empty();
++			for (auto &entry : local_changes.Changes()) {
++				auto &changes = entry.second;
++				if (!changes.new_delete_files.empty() || !changes.new_inlined_data_deletes.empty() ||
++				    changes.new_inlined_file_deletes || !changes.compactions.empty() || !changes.compacted_files.empty()) {
++					attempt_context.allow_direct_statistics = false;
++				}
++			}
++			string batch_queries = CommitChanges(commit_state, attempt_changes, stats, attempt_context, attempt_dropped_file_stats);
++			batch_queries += WriteSnapshotChanges(commit_state, attempt_changes, context);
+ 			// Changes finalize the snapshot's schema version and next-id counters.
+ 			if (!context.try_write_snapshot(commit_snapshot)) {
+ 				batch_queries = DuckLakeMetadataManager::InsertSnapshotSql() + batch_queries;
+ 			}
+ 			auto res = context.execute_commit_batch(commit_snapshot, batch_queries);
+-			if (res->HasError()) {
++			if (res && res->HasError()) {
+ 				auto &commit_error = res->GetErrorObject();
+ 				retryable_metadata_error = context.is_retryable_metadata_error(commit_error.RawMessage());
+ 				commit_error.Throw("Failed to flush changes into DuckLake: ");

@@ -494,8 +494,8 @@ fn stage_probe_put(
     let value_bytes = row_id.map_or(0, |_| size_of::<u64>());
     staged.add(key.len(), value_bytes);
     match row_id {
-        Some(row_id) => db_tx.put(key, encode_row_id(row_id)),
-        None => db_tx.put(key, []),
+        Some(row_id) => db_tx.put_bytes(key, Bytes::copy_from_slice(&encode_row_id(row_id))),
+        None => db_tx.put_bytes(key, Bytes::new()),
     }
 }
 
