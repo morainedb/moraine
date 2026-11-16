@@ -4,20 +4,27 @@
 
 use std::fmt::Write as _;
 
-use super::timing::{median, spread};
+use super::{
+    endpoints::Endpoint,
+    timing::{median, spread},
+};
 
-/// Per-repeat seconds for one (workload, phase, backend) cell.
+/// Per-repeat seconds for one (workload, phase, backend) cell, with the
+/// commits each repeat performed where the workload counts them.
 pub struct Row {
     pub workload: String,
     pub phase: String,
     pub backend: String,
     pub seconds: Vec<f64>,
+    pub commits: Vec<u64>,
 }
 
-/// A full bench run: the knobs it ran with and every timed cell.
+/// A full bench run: the knobs it ran with, the latency of every endpoint
+/// it talked to, and every timed cell.
 pub struct Report {
     pub scale: String,
     pub repeat: usize,
+    pub endpoints: Vec<Endpoint>,
     pub rows: Vec<Row>,
 }
 
@@ -33,8 +40,27 @@ pub fn format_duration(seconds: f64) -> String {
     }
 }
 
-/// One rendered cell: `median (min…max)` over repeats, or `skipped` when
-/// the backend didn't run this workload.
+/// The median commits per second over a row's repeats, for a workload
+/// that counts its commits.
+fn cell_rate(row: &Row) -> Option<f64> {
+    if row.commits.len() != row.seconds.len() || row.commits.is_empty() {
+        return None;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let mut rates: Vec<f64> = row
+        .commits
+        .iter()
+        .zip(&row.seconds)
+        .filter(|&(_, &seconds)| seconds > 0.0)
+        .map(|(&commits, &seconds)| commits as f64 / seconds)
+        .collect();
+    median(&mut rates).ok()
+}
+
+/// One rendered cell: `median (min…max)` over repeats, and the commit
+/// rate where the workload has one, or `skipped` when the backend didn't
+/// run this workload.
 fn cell(report: &Report, workload: &str, phase: &str, backend: &str) -> anyhow::Result<String> {
     let Some(row) = report
         .rows
@@ -46,8 +72,12 @@ fn cell(report: &Report, workload: &str, phase: &str, backend: &str) -> anyhow::
     let mut samples = row.seconds.clone();
     let mid = median(&mut samples)?;
     let (min, max) = spread(&samples)?;
+    let rate = match cell_rate(row) {
+        Some(rate) => format!(" {rate:.0}/s"),
+        None => String::new(),
+    };
     Ok(format!(
-        "{} ({}…{})",
+        "{} ({}…{}){rate}",
         format_duration(mid),
         format_duration(min),
         format_duration(max)
@@ -62,6 +92,23 @@ fn cell_median(report: &Report, workload: &str, phase: &str, backend: &str) -> O
         .find(|row| row.workload == workload && row.phase == phase && row.backend == backend)?;
     let mut samples = row.seconds.clone();
     median(&mut samples).ok()
+}
+
+/// Renders one line per probed endpoint. A table of catalog timings is
+/// only readable beside the latency of what served it.
+pub fn render_endpoints(report: &Report) -> String {
+    let mut rendered = String::new();
+    for endpoint in &report.endpoints {
+        // write! to a String cannot fail.
+        let _ = writeln!(
+            rendered,
+            "{}: {} to {}, one TCP connect",
+            endpoint.name,
+            format_duration(endpoint.seconds),
+            endpoint.target
+        );
+    }
+    rendered
 }
 
 /// Renders the aligned comparison table: one row per `workload/phase`,
@@ -167,21 +214,45 @@ pub fn render_json(report: &Report) -> String {
             results.push_str(",\n");
         }
         let seconds: Vec<String> = row.seconds.iter().map(ToString::to_string).collect();
+        let commits: Vec<String> = row.commits.iter().map(ToString::to_string).collect();
+        let commits = if commits.is_empty() {
+            String::new()
+        } else {
+            format!(", \"commits\": [{}]", commits.join(", "))
+        };
         // write! to a String cannot fail.
         let _ = write!(
             results,
             "    {{\"workload\": \"{}\", \"phase\": \"{}\", \"backend\": \"{}\", \
-             \"seconds\": [{}]}}",
+             \"seconds\": [{}]{commits}}}",
             json_escape(&row.workload),
             json_escape(&row.phase),
             json_escape(&row.backend),
             seconds.join(", ")
         );
     }
+
+    let mut endpoints = String::new();
+    for (index, endpoint) in report.endpoints.iter().enumerate() {
+        if index > 0 {
+            endpoints.push_str(",\n");
+        }
+        // write! to a String cannot fail.
+        let _ = write!(
+            endpoints,
+            "    {{\"name\": \"{}\", \"target\": \"{}\", \"connect_seconds\": {}}}",
+            json_escape(&endpoint.name),
+            json_escape(&endpoint.target),
+            endpoint.seconds
+        );
+    }
+
     format!(
-        "{{\n  \"scale\": \"{}\",\n  \"repeat\": {},\n  \"results\": [\n{}\n  ]\n}}\n",
+        "{{\n  \"scale\": \"{}\",\n  \"repeat\": {},\n  \"endpoints\": [\n{}\n  ],\n  \
+         \"results\": [\n{}\n  ]\n}}\n",
         json_escape(&report.scale),
         report.repeat,
+        endpoints,
         results
     )
 }
@@ -201,18 +272,32 @@ mod tests {
         Report {
             scale: "small".to_owned(),
             repeat: 2,
+            endpoints: vec![Endpoint {
+                name: "s3".to_owned(),
+                target: "s3.us-east-1.amazonaws.com:443".to_owned(),
+                seconds: 0.0025,
+            }],
             rows: vec![
                 Row {
                     workload: "small_commits".to_owned(),
                     phase: "inserts".to_owned(),
                     backend: "moraine".to_owned(),
                     seconds: vec![0.010, 0.020],
+                    commits: Vec::new(),
                 },
                 Row {
                     workload: "small_commits".to_owned(),
                     phase: "inserts".to_owned(),
                     backend: "duckdb".to_owned(),
                     seconds: vec![0.030, 0.030],
+                    commits: Vec::new(),
+                },
+                Row {
+                    workload: "concurrent_connections".to_owned(),
+                    phase: "writers_4".to_owned(),
+                    backend: "moraine".to_owned(),
+                    seconds: vec![0.5, 1.0],
+                    commits: vec![128, 128],
                 },
             ],
         }
@@ -238,10 +323,42 @@ mod tests {
     }
 
     #[test]
-    fn json_carries_metadata_and_per_repeat_seconds() {
+    fn a_counted_workload_cell_carries_its_commit_rate() {
+        let backends = vec!["moraine".to_owned()];
+        let table = render_table(&sample_report(), &backends).unwrap();
+        let line = table
+            .lines()
+            .find(|line| line.starts_with("concurrent_connections/writers_4"))
+            .unwrap();
+        // 128 commits over the median of 0.5 s and 1.0 s.
+        assert!(line.contains("192/s"), "{line}");
+
+        let latency = table
+            .lines()
+            .find(|line| line.starts_with("small_commits/inserts"))
+            .unwrap();
+        assert!(!latency.contains("/s"), "{latency}");
+    }
+
+    #[test]
+    fn endpoint_latency_is_rendered_above_the_table() {
+        let rendered = render_endpoints(&sample_report());
+        assert_eq!(
+            rendered,
+            "s3: 2.5ms to s3.us-east-1.amazonaws.com:443, one TCP connect\n"
+        );
+    }
+
+    #[test]
+    fn json_carries_metadata_endpoints_and_per_repeat_seconds() {
         let json = render_json(&sample_report());
         assert!(json.contains("\"scale\": \"small\""));
         assert!(json.contains("\"repeat\": 2"));
+        assert!(json.contains(
+            "{\"name\": \"s3\", \"target\": \"s3.us-east-1.amazonaws.com:443\", \
+             \"connect_seconds\": 0.0025}"
+        ));
+        assert!(json.contains("\"commits\": [128, 128]"));
         assert!(json.contains(
             "{\"workload\": \"small_commits\", \"phase\": \"inserts\", \
              \"backend\": \"moraine\", \"seconds\": [0.01, 0.02]}"

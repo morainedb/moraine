@@ -17,7 +17,7 @@ x86-64 Linux VM against the in-memory object store.
 
 | question | command | needs |
 |---|---|---|
-| moraine against other DuckLake catalogs | `cargo xtask bench` | Postgres on `PATH` or `MORAINE_BENCH_POSTGRES`, else that backend is skipped |
+| moraine against other DuckLake catalogs | `cargo xtask bench` | Postgres on `PATH` or `MORAINE_BENCH_POSTGRES`, else that backend is skipped; `MORAINE_S3_BUCKET` puts moraine's catalog on S3; `MORAINE_BENCH_QUACK` names a Quack server |
 | read path on a published scale | `cargo xtask clickbench run --clickbench <checkout> --machine <type>` | a ClickBench checkout, 40 GB of disk, passwordless `sudo` |
 | where a commit's time goes | `cargo xtask commit-bench` | an S3 endpoint in `MORAINE_S3_BUCKET` |
 | what a cold reader pays | `cargo xtask reader-bench` | an S3 endpoint for round-trip counts |
@@ -33,6 +33,12 @@ x86-64 Linux VM against the in-memory object store.
 
 The core harnesses use the in-memory object store, so their durable cost is
 flush wait plus compute; a real store adds its PUT round trip.
+
+A run against AWS needs a bucket, a directory bucket, a managed Postgres,
+and a Quack server, and a runner in their zone rather than a laptop.
+`benchmark/infra` is the OpenTofu for all of it, and leaves the
+environment these commands read on that runner; see
+[its README](../benchmark/infra/README.md).
 
 ## Commits
 
@@ -191,21 +197,45 @@ floor each batch waited a full flush and the 256 case took 20 s.
 ## Against other DuckLake catalogs
 
 `cargo xtask bench` runs identical workloads against moraine, a DuckDB
-file catalog, and Postgres through the same pinned DuckDB CLI. Data is
-local Parquet everywhere; only the catalog differs.
+file catalog, Postgres, and a DuckDB served over the Quack protocol,
+through the same pinned DuckDB CLI. Data is local Parquet everywhere; only
+the catalog differs.
 
 ```text
-cargo xtask bench [--backends moraine,duckdb,postgres] [--workloads <name>,...]
+cargo xtask bench [--backends moraine,duckdb,postgres,quack] [--workloads <name>,...]
                   [--scale small|medium|large] [--repeat N]
-                  [--concurrency 1,2,4,8] [--commits N] [--indexed]
+                  [--concurrency 1,2,4,8] [--commits N | --seconds N] [--indexed]
                   [--flush-interval-ms N]
 ```
 
 Defaults: all backends, all workloads, `small`, three repeats. Postgres
 is provisioned from binaries on `PATH` or under
 `/opt/homebrew/opt/postgresql@*`; `MORAINE_BENCH_POSTGRES` names an
-existing server. Output is a table of `median (min…max)` per phase with a
-ratio against moraine, also written to `target/bench/report.json`.
+existing server. The Quack server is a CLI the harness starts over a fresh
+database file, or `MORAINE_BENCH_QUACK` (`host:port`) with
+`MORAINE_BENCH_QUACK_TOKEN`, and `MORAINE_BENCH_QUACK_CA_CERT` for a
+server off the loopback, whose TLS certificate the client must trust;
+each run gets its own metadata schema.
+Moraine's catalog is a local directory unless `MORAINE_S3_BUCKET` (with
+`MORAINE_S3_PREFIX`, `MORAINE_S3_ENDPOINT`, and AWS credentials) names a
+bucket; Parquet stays local either way. Output is a table of
+`median (min…max)` per phase with a ratio against moraine, also written to
+`target/bench/report.json`.
+
+The concurrency workloads take either bound. `--commits N` splits a fixed
+count over the writers, which every number stamped here so far used, and
+needs a count each level divides. `--seconds N` instead opens a window
+every writer commits into until it closes, then asks the catalog what
+landed; its cells carry commits per second, and any writer count works.
+Prefer the window for a scaling curve: with a fixed count, the widest
+level gives each writer the fewest commits, so start-up and the first
+flush are most of what it measures. Sweep until the rate stops rising —
+that ceiling is the finding, and leaving it out overstates the curve.
+
+Every run first measures one TCP connect to each remote endpoint it will
+use and prints it above the table, with `connect_seconds` per endpoint in
+the report. A catalog comparison is only readable beside the latency of
+what served it, so a stamp here carries those round trips.
 
 | workload | measures |
 |---|---|
@@ -233,19 +263,22 @@ file saves); do not compare across pairs. The `indexed` twins add one
 ### Single writer
 
 `bulk_load` and `small_commits` at the `small` scale, loopback Postgres 16,
-three repeats<!-- site:omit -->, 2026-11-11 at commit
-`dd35dce`<!-- /site:omit -->:
+three repeats<!-- site:omit -->, 2026-11-16 at v0.9.1 (`d4e6b8e`), Amazon
+Linux cloud VM, Intel Xeon 2.50 GHz, 8 logical CPUs, 16 GiB
+RAM<!-- /site:omit -->:
 
 | phase | moraine | duckdb | postgres |
 |---|---:|---:|---:|
-| attach | 8 ms | 19 ms | 113 ms |
-| `CREATE TABLE` | 53 ms | 57 ms | 75 ms |
-| 100,000-row `INSERT` | 41 ms | 45 ms | 49 ms |
-| 20 single-row inserts | 254 ms | 218 ms | 135 ms |
+| attach | 19 ms | 49 ms | 220 ms |
+| `CREATE TABLE` | 113 ms | 99 ms | 151 ms |
+| 100,000-row `INSERT` | 94 ms | 73 ms | 118 ms |
+| 20 single-row inserts | 214 ms | 422 ms | 258 ms |
 
 Serial commits pay moraine's flush each, at the 1 ms interval the latency
-workloads pin; a loopback Postgres commits in about 7 ms and a DuckDB file
-in about 11 ms.
+workloads pin, about 11 ms per commit; a loopback Postgres commits in about
+13 ms and a DuckDB file in about 21 ms. At v0.9.0 moraine took 254 ms for
+the twenty inserts on a VM where the other two catalogs ran about 1.9×
+faster than here, so compare the columns, not the stamps.
 
 ### Small commits and first inline writes
 
@@ -259,17 +292,18 @@ with 1,000 rows each, and checks row counts and sums outside the timed phase.
 cargo xtask bench --backends moraine --workloads small_commits,wide_small_commits,first_inline_write --scale small --repeat 9
 ```
 
-2026-11-14 at `a4b2c8` plus scoped statistics reads, direct append metadata
-staging, and the preceding metadata/Appender changes; Amazon Linux cloud VM,
-Intel Xeon 2.90 GHz, 8 logical CPUs, 16 GiB RAM, local
-filesystem, DuckDB one thread, metadata flush interval 1 ms. Nine runs,
-excluding attach:
+2026-11-16 at v0.9.1 (`d4e6b8e`); Amazon Linux cloud VM, Intel Xeon 2.50 GHz,
+8 logical CPUs, 16 GiB RAM, local filesystem, metadata flush interval 1 ms.
+Nine runs, excluding attach:
 
 | Workload | Median | Min–max |
 |---|---:|---:|
-| Twenty single-row inserts, two columns | 101 ms | 97–109 ms |
-| Twenty single-row inserts, 32 BIGINT columns | 168 ms | 161–187 ms |
-| Ten table creations with 1,000 inline rows each | 488 ms | 471–537 ms |
+| Twenty single-row inserts, two columns | 189 ms | 167–236 ms |
+| Twenty single-row inserts, 32 BIGINT columns | 326 ms | 282–437 ms |
+| Ten table creations with 1,000 inline rows each | 830 ms | 725–883 ms |
+
+The wide table costs 1.7× the narrow one. Before the append path bypassed
+DuckLake's metadata SQL, its per-column statistics updates made it 11×.
 
 ### Concurrent writers
 
@@ -278,21 +312,45 @@ together on a barrier. `concurrent_connections` uses
 `xtask/cpp/concurrent_writers.c`, because the CLI holds one connection.
 128 commits, three repeats.
 
-Connections over one instance<!-- site:omit -->, 2026-11-11 at commit
-`dd35dce`<!-- /site:omit -->:
+Connections over one instance<!-- site:omit -->, 2026-11-16 at v0.9.1
+(`d4e6b8e`), the single-writer VM<!-- /site:omit -->:
 
 | writers | moraine | duckdb | postgres |
 |---|---|---|---|
-| 1 | 1.47 s | 1.08 s | 665 ms |
-| 4 | 597 ms | 1.78 s | 953 ms |
-| 8 | 417 ms | 1.76 s | 1.77 s |
-| 16 | 461 ms | 2.85 s | 2.94 s |
+| 1 | 1.51 s | 1.78 s | 1.36 s |
+| 4 | 606 ms | 2.26 s | 2.25 s |
+| 8 | 451 ms | 3.12 s | 3.13 s |
+| 16 | 528 ms | 4.13 s | 6.14 s |
 
 Within one process, moraine is the only catalog that gets faster with
 writers, and the fastest from four up. Across processes, both embedded
 catalogs are single-writer: moraine fences the previous writer with a typed
 error, and the DuckDB file catalog fails on the file lock. Postgres accepts
 more writers and gets slower.
+
+Where does that stop? The same workload bounded by a window instead of a
+count, moraine only, swept until the rate stopped rising:
+
+```bash
+cargo xtask bench --backends moraine --workloads concurrent_connections --seconds 5 --concurrency 1,2,4,8,16,32,64
+```
+
+2026-11-16 at `059a091` with this file's window bound; the single-writer
+VM, local store, the default 100 ms interval, five-second windows, three
+repeats:
+
+| writers | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| commits/s | 90 | 166 | 332 | 650 | 459 | 496 | 442 |
+
+The flush coalesces almost perfectly to eight writers — 7.2× the rate for
+8× the writers — then throughput falls back by a third and stays flat to
+64. Eight is this VM's logical CPU count, so the ceiling is where commits
+stop being flush-bound and become CPU-bound; a wider machine should move
+it. The fixed-count table above reads as still improving at 16 writers,
+which is the artifact a window removes: 128 commits over 16 writers is
+eight commits each, so start-up and the first flush are most of what it
+measures.
 
 <!-- site:omit -->
 Writer processes, 2026-08, before the pacing floor, not re-run:
@@ -309,8 +367,87 @@ At 512 commits (2026-08), DuckDB-file exhausts DuckLake's retry budget at
 1.92 s at 32, 2.10 s at 64.
 <!-- /site:omit -->
 
-These runs use local storage and report median, minimum, and maximum
-latency. They do not run in CI.
+### Injected round trips
+
+What does each catalog pay per network round trip? The same `bench`
+workloads, with moraine's catalog on loopback RustFS
+(`MORAINE_S3_BUCKET`), Postgres over loopback TCP
+(`MORAINE_BENCH_POSTGRES`), and a DuckDB file served over Quack
+(`MORAINE_BENCH_QUACK`), each behind a TCP delay line that adds one round
+trip of the stated length to every request. The plain DuckDB file catalog
+cannot leave the local disk, so it stays local as the control. Parquet is
+local everywhere; single-row inserts are inlined and write none.
+
+2026-11-16, the single-writer VM, three repeats, medians. Moraine is
+v0.9.1 with publications that carry a lifetime instead of being retired;
+the other catalogs are at v0.9.1 (`d4e6b8e`). RustFS answers a PUT in
+2.8 ms and a GET in 0.7 ms before the added delay.
+
+| round trip | 20 serial inserts: moraine | postgres | quack | duckdb, local | attach: moraine | postgres | quack |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 ms | 329 ms | 463 ms | 800 ms | 427 ms | 83 ms | 229 ms | 170 ms |
+| 5 ms | 993 ms | 2.31 s | 1.40 s | 483 ms | 329 ms | 835 ms | 228 ms |
+| 30 ms | 3.46 s | 9.20 s | 3.58 s | 548 ms | 1.24 s | 2.84 s | 399 ms |
+
+128 single-row commits over N connections:
+
+| round trip | writers | moraine | postgres | quack | duckdb, local |
+|---:|---:|---:|---:|---:|---:|
+| 0 ms | 1 | 1.98 s | 2.57 s | 4.45 s | 2.46 s |
+| 0 ms | 4 | 592 ms | 4.58 s | 12.2 s | 2.80 s |
+| 0 ms | 8 | 507 ms | 5.47 s | refused | 4.30 s |
+| 0 ms | 16 | 396 ms | 6.87 s | refused | 4.39 s |
+| 5 ms | 1 | 6.33 s | 14.2 s | 8.69 s | 2.20 s |
+| 5 ms | 4 | 1.83 s | refused | refused | 2.94 s |
+| 5 ms | 8 | 1.01 s | refused | refused | 4.12 s |
+| 5 ms | 16 | 663 ms | refused | refused | 4.21 s |
+| 30 ms | 1 | 22.2 s | 54.9 s | 21.0 s | 1.92 s |
+| 30 ms | 4 | 8.61 s | refused | refused | 2.18 s |
+| 30 ms | 8 | 4.39 s | refused | refused | 3.90 s |
+| 30 ms | 16 | 2.59 s | refused | refused | 3.01 s |
+
+- A moraine commit is two writes and three reads, all on the path the commit
+  waits for: the WAL PUT, then for the checkpoint's manifest write a probe of
+  the next manifest id, the GC boundary before and after, and the PUT itself.
+  Nothing runs behind the acknowledgement. A serial commit grows by 4.9 ms
+  per millisecond of round trip, about five round trips; the floor under
+  SlateDB's manifest protocol is two.
+- At v0.9.1 each publication was retired by a second manifest write inside
+  the acknowledgement, after listing the store's checkpoints: fourteen
+  requests, 14.2 ms per millisecond, 909 ms, 3.00 s, and 10.1 s for the
+  twenty inserts, and 17.0 s, 27.5 s, and 76.9 s for the lone writer's 128
+  commits. Moving the retirement behind the acknowledgement alone reached
+  9.7 ms per millisecond, with the retirement's write contending against
+  the next commit's. Postgres grows by 13.8 ms per millisecond, one
+  statement at a time.
+- The three reads are SlateDB's: the probe doubles as fencing and conflict
+  detection, and the boundary checks guard against collected manifests.
+  Serving them from cache needs SlateDB changes, and its boundary design
+  forbids a stale cache.
+- Serially, moraine on an object store leads a networked Postgres by 2.7× at
+  30 ms and matches the Quack-served DuckDB file, which leads only at the
+  shortest delays.
+- Quack grows by about 4 round trips per commit (4.4 ms per millisecond),
+  because DuckLake's statements for a commit travel in a few remote calls:
+  179 ms per commit at 30 ms against moraine's 173 ms. It is also the most
+  contended: four writers take 2.7× one writer's time at 0 ms and are
+  refused from 5 ms, and eight are refused everywhere, on duplicate
+  snapshot ids after ten retries.
+- Serially, moraine on an object store now leads a networked Postgres at
+  every delay, by 30% at 30 ms; the Quack-served DuckDB file leads both
+  once the round trip exceeds a few milliseconds.
+- From four writers up, moraine is the only networked catalog still
+  standing: Postgres exhausts DuckLake's ten retries on the snapshot
+  insert at 4 writers from 5 ms, and at 16 writers from 1 ms; Quack does
+  so at 8 writers from 0 ms. Moraine's 16-writer cost grows with the round
+  trip, 396 ms to 2.6 s, because each shared flush still pays the full
+  request chain.
+- The local DuckDB file beats networked moraine at every width here. The
+  comparison the sweep answers is between the two catalogs that can be
+  shared.
+
+Except for the injected round-trip sweep, these runs use local storage.
+All report median, minimum, and maximum latency and do not run in CI.
 
 ## Reads
 

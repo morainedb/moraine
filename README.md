@@ -67,19 +67,20 @@ SELECT payload FROM lake.events WHERE id = 2;
 
 Identical DuckLake workloads through the same DuckDB CLI, only the catalog
 swapped. Local disk, loopback Postgres 16, medians of three runs on an
-8-vCPU x86-64 VM:
+8-vCPU x86-64 VM at v0.9.1:
 
 | | Moraine | DuckDB file | Postgres |
 |---|---:|---:|---:|
-| attach | 8 ms | 19 ms | 113 ms |
-| create table and insert 100,000 rows | 94 ms | 102 ms | 124 ms |
-| 20 single-row commits, one connection | 254 ms | 218 ms | 135 ms |
-| 128 single-row commits over 8 connections | 417 ms | 1.76 s | 1.77 s |
-| 128 single-row commits over 16 connections | 461 ms | 2.85 s | 2.94 s |
+| attach | 19 ms | 49 ms | 220 ms |
+| create table and insert 100,000 rows | 207 ms | 172 ms | 269 ms |
+| 20 single-row commits, one connection | 214 ms | 422 ms | 258 ms |
+| 128 single-row commits over 8 connections | 451 ms | 3.12 s | 3.13 s |
+| 128 single-row commits over 16 connections | 528 ms | 4.13 s | 6.14 s |
 
-Serial commits pay a write-ahead-log flush each, where a local Postgres is
-faster. Overlapping commits can share one flush, giving Moraine more competitive
-performance. On S3, each flush is one PUT round trip, about 30 ms same-region.
+Serial commits pay a write-ahead-log flush each, and since v0.9.1 skip
+DuckLake's metadata SQL on the append path. Overlapping commits share one
+flush, so Moraine gets faster with writers where the other catalogs slow
+down. On S3, each flush is one PUT round trip, about 30 ms same-region.
 For more details, see [Benchmarks](https://morainedb.com/benchmarks/).
 
 ## Status
