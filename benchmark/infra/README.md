@@ -66,8 +66,9 @@ aws ssm start-session --region "$(tofu output -raw region)" \
   --target "$(tofu output -raw runner_instance_id)"
 sudo -iu ec2-user
 git clone --recurse-submodules https://github.com/morainedb/moraine && cd moraine
-set -a; . /etc/moraine-bench/s3.env; set +a
-cargo xtask bench --backends moraine,postgres,quack,duckdb
+set -a; . /etc/moraine-bench/bench.env; set +a
+cargo xtask bench --backends moraine,moraine_express,postgres,quack,duckdb \
+  --seconds 5 --concurrency 1,2,4,8,16
 ```
 
 Clone with the submodules: the extension build needs `duckdb` and
@@ -87,12 +88,12 @@ Amazon Linux has no `ccache`, so the first `bench` compiles DuckDB from
 scratch, which is the slow part. Snapshot an AMI once that has happened
 and later sweeps start in a minute.
 
-`/etc/moraine-bench/s3.env` and `s3express.env` differ only in the bucket;
-everything else — region, Postgres DSN, the Quack endpoint, its token, and
-the certificate to trust — is the same. The S3 prefix is stamped when the
-file is sourced, so re-source it between runs to keep their catalogs
-apart. One bucket is in play at a time: run the standard leg, then source
-the Express file and run it again.
+`/etc/moraine-bench/bench.env` names both buckets, so `moraine` and
+`moraine_express` are two columns of one run rather than two runs: they
+then share a machine, a clock and a network, which is what makes the
+comparison between the stores worth anything. The S3 prefix is stamped
+when the file is sourced, so re-source it between runs to keep their
+catalogs apart.
 
 Record the round trip to each endpoint beside the numbers. Every catalog
 here costs several sequential requests per commit, so endpoint latency is

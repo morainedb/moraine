@@ -202,10 +202,10 @@ through the same pinned DuckDB CLI. Data is local Parquet everywhere; only
 the catalog differs.
 
 ```text
-cargo xtask bench [--backends moraine,duckdb,postgres,quack] [--workloads <name>,...]
-                  [--scale small|medium|large] [--repeat N]
+cargo xtask bench [--backends moraine,moraine_express,duckdb,postgres,quack]
+                  [--workloads <name>,...] [--scale small|medium|large] [--repeat N]
                   [--concurrency 1,2,4,8] [--commits N | --seconds N] [--indexed]
-                  [--flush-interval-ms N]
+                  [--flush-interval-ms N] [--cache-dir <dir>]
 ```
 
 Defaults: all backends, all workloads, `small`, three repeats. Postgres
@@ -218,13 +218,24 @@ server off the loopback, whose TLS certificate the client must trust;
 each run gets its own metadata schema.
 Moraine's catalog is a local directory unless `MORAINE_S3_BUCKET` (with
 `MORAINE_S3_PREFIX`, `MORAINE_S3_ENDPOINT`, and AWS credentials) names a
-bucket; Parquet stays local either way. Without an endpoint the secret
-resolves AWS's credential chain, which `MORAINE_S3_CREDENTIAL_CHAIN`
-narrows — `instance` for a machine whose only credentials are an
-instance profile, where the default chain stops at the missing profile
-file. Output is a table of
-`median (min…max)` per phase with a ratio against moraine, also written to
-`target/bench/report.json`.
+bucket; Parquet stays local either way. `MORAINE_S3_EXPRESS_BUCKET` adds
+the `moraine_express` backend, the same catalog on a directory bucket, so
+one run measures both stores under the same conditions. Without an
+endpoint the secret resolves AWS's credential chain, which
+`MORAINE_S3_CREDENTIAL_CHAIN` narrows — `instance` for a machine whose
+only credentials are an instance profile, where the default chain stops
+at the missing profile file.
+
+`--cache-dir` gives moraine's attaches a cache directory shared by the
+whole run, so only the first pays for a cold store. Leave it off to
+measure what a fresh process pays, which is what every stamp here did;
+set it to measure a warm one, which is what a long-lived process sees.
+
+Output is a table of `median (min…max)` per phase with a ratio against
+moraine, also written to `target/bench/report.json`. A workload that
+counts commits also carries its rate, and is compared by that: under a
+window every backend runs for the same time, so its wall clock says
+nothing.
 
 The concurrency workloads take either bound. `--commits N` splits a fixed
 count over the writers, which every number stamped here so far used, and
@@ -331,6 +342,13 @@ writers, and the fastest from four up. Across processes, both embedded
 catalogs are single-writer: moraine fences the previous writer with a typed
 error, and the DuckDB file catalog fails on the file lock. Postgres accepts
 more writers and gets slower.
+
+Under a window, a server catalog taking two writer *processes* starves
+one of them: it commits nothing, silently, while its competitor commits
+continuously, and which one starves varies by run. The harness says so
+and reports the burst's aggregate, which for Postgres is flat — two
+processes land what one does. The connection sweep is the one to read for
+scaling, since there every writer is a thread of one process.
 
 Where does that stop? The same workload bounded by a window instead of a
 count, moraine only, swept until the rate stopped rising:

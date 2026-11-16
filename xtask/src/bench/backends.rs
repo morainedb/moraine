@@ -18,6 +18,9 @@ use anyhow::{Context, bail, ensure};
 pub enum BackendKind {
     /// moraine's SlateDB store over the local filesystem.
     Moraine,
+    /// The same, on the S3 Express directory bucket named by
+    /// `MORAINE_S3_EXPRESS_BUCKET`, so one run compares the two stores.
+    MoraineExpress,
     /// Stock DuckLake: a DuckDB database file.
     DuckdbFile,
     /// Stock DuckLake over a Postgres database.
@@ -30,6 +33,7 @@ impl BackendKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Moraine => "moraine",
+            Self::MoraineExpress => "moraine_express",
             Self::DuckdbFile => "duckdb",
             Self::Postgres => "postgres",
             Self::Quack => "quack",
@@ -39,15 +43,30 @@ impl BackendKind {
     pub fn parse(name: &str) -> anyhow::Result<Self> {
         match name {
             "moraine" => Ok(Self::Moraine),
+            "moraine_express" => Ok(Self::MoraineExpress),
             "duckdb" => Ok(Self::DuckdbFile),
             "postgres" => Ok(Self::Postgres),
             "quack" => Ok(Self::Quack),
-            other => bail!("unknown backend `{other}`; valid: moraine, duckdb, postgres, quack"),
+            other => bail!(
+                "unknown backend `{other}`; valid: moraine, moraine_express, duckdb, \
+                 postgres, quack"
+            ),
         }
     }
 
-    pub fn all() -> [Self; 4] {
-        [Self::Moraine, Self::DuckdbFile, Self::Postgres, Self::Quack]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Moraine,
+            Self::MoraineExpress,
+            Self::DuckdbFile,
+            Self::Postgres,
+            Self::Quack,
+        ]
+    }
+
+    /// Whether this backend is moraine, on whichever store.
+    pub fn is_moraine(self) -> bool {
+        matches!(self, Self::Moraine | Self::MoraineExpress)
     }
 }
 
@@ -67,6 +86,9 @@ pub enum RemoteCatalog {
 pub struct SessionPaths {
     pub catalog_dir: PathBuf,
     pub moraine_catalog: String,
+    /// Where moraine keeps what it read, when a run asked for one. Shared
+    /// across a sweep, so only the first attach pays for a cold store.
+    pub cache_dir: Option<PathBuf>,
     pub data_dir: PathBuf,
 }
 
@@ -87,9 +109,15 @@ pub fn attach_sql(
 ) -> anyhow::Result<String> {
     let data = paths.data_dir.display();
     Ok(match kind {
-        BackendKind::Moraine => format!(
-            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', META_FLUSH_INTERVAL_MS {flush_interval_ms});",
-            paths.moraine_catalog
+        BackendKind::Moraine | BackendKind::MoraineExpress => format!(
+            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', \
+             META_FLUSH_INTERVAL_MS {flush_interval_ms}{});",
+            paths.moraine_catalog,
+            paths
+                .cache_dir
+                .as_ref()
+                .map(|dir| format!(", CACHE_DIR '{}'", dir.display()))
+                .unwrap_or_default()
         ),
         BackendKind::DuckdbFile => format!(
             "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{data}');",
@@ -484,6 +512,7 @@ mod tests {
         SessionPaths {
             catalog_dir: PathBuf::from("/tmp/cat"),
             moraine_catalog: "/tmp/cat".to_owned(),
+            cache_dir: None,
             data_dir: PathBuf::from("/tmp/data"),
         }
     }
@@ -508,6 +537,24 @@ mod tests {
             "ATTACH 'ducklake:moraine:/tmp/cat' AS lake \
              (DATA_PATH '/tmp/data', META_FLUSH_INTERVAL_MS 1);"
         );
+    }
+
+    #[test]
+    fn a_cache_directory_reaches_moraines_attach_and_no_others() {
+        let paths = SessionPaths {
+            catalog_dir: PathBuf::from("/tmp/cat"),
+            moraine_catalog: "/tmp/cat".to_owned(),
+            cache_dir: Some(PathBuf::from("/tmp/cache")),
+            data_dir: PathBuf::from("/tmp/data"),
+        };
+        let moraine = attach_sql(BackendKind::Moraine, &paths, None, 1).unwrap();
+        assert!(moraine.contains("CACHE_DIR '/tmp/cache'"), "{moraine}");
+
+        let express = attach_sql(BackendKind::MoraineExpress, &paths, None, 1).unwrap();
+        assert_eq!(express, moraine);
+
+        let duckdb = attach_sql(BackendKind::DuckdbFile, &paths, None, 1).unwrap();
+        assert!(!duckdb.contains("CACHE_DIR"), "{duckdb}");
     }
 
     #[test]

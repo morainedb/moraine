@@ -174,6 +174,28 @@ pub struct WriterContext<'a> {
     pub scratch: &'a Path,
 }
 
+/// How long a writer has to exit on its own before it is killed. Long
+/// enough for the CLI to flush what it was writing, short beside a
+/// window.
+const TERM_GRACE: Duration = Duration::from_millis(500);
+
+/// Signals every running writer. `kill(1)` rather than a crate: the only
+/// signal `std` sends is `SIGKILL`, which takes the diagnostics with it.
+fn signal_writers(running: &[Mutex<Option<Child>>], signal: &str) {
+    for slot in running {
+        if let Ok(slot) = slot.lock()
+            && let Some(child) = slot.as_ref()
+        {
+            let _ = Command::new("kill")
+                .arg(format!("-{signal}"))
+                .arg(child.id().to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
 /// How long a writer is given to attach before the burst is called off.
 const READY_TIMEOUT: Duration = Duration::from_mins(2);
 
@@ -217,19 +239,17 @@ pub fn run(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<Outcome>
         barrier.wait();
         let started = Instant::now();
 
-        // Closing the window kills the writers, which is what unblocks a
-        // feeder stalled on a full pipe: the CLI acknowledges nothing, so
-        // the pipe is the only back-pressure and there is no gentler stop.
+        // Closing the window stops the writers, which is also what
+        // unblocks a feeder stalled on a full pipe: the CLI acknowledges
+        // nothing, so the pipe is the only back-pressure. They are asked
+        // first and killed after, because a writer killed outright loses
+        // the buffered diagnostics that say why it committed nothing.
         if let Bound::Window(window) = burst.bound {
             std::thread::sleep(window);
             elapsed = started.elapsed();
-            for slot in &running {
-                if let Ok(mut slot) = slot.lock()
-                    && let Some(child) = slot.as_mut()
-                {
-                    let _ = child.kill();
-                }
-            }
+            signal_writers(&running, "TERM");
+            std::thread::sleep(TERM_GRACE);
+            signal_writers(&running, "KILL");
         }
 
         let outcomes: Vec<anyhow::Result<()>> = handles
@@ -254,13 +274,28 @@ pub fn run(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<Outcome>
     }
 
     let landed = count_commits(context, burst)?;
-    // A killed writer leaves no exit status to check, so this is where a
-    // writer the catalog would not take shows up: it committed nothing
-    // while the others ran.
     if let Some(writer) = landed.iter().position(|&commits| commits == 0) {
-        bail!(
-            "writer {writer} committed nothing in the window: {}",
-            first_error(&context.scratch.join(format!("writer-{writer}.log")))
+        let spread = landed
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let log = context.scratch.join(format!("writer-{writer}.log"));
+
+        // A writer that complained is one the catalog would not take: a
+        // killed writer leaves no exit status, so its log is the only
+        // evidence. One that said nothing while its competitors committed
+        // was starved, which is a property of the catalog under load and
+        // not a reason to throw the burst's throughput away.
+        if let Some(error) = first_error(&log) {
+            bail!(
+                "writer {writer} committed nothing in the window \
+                 (per writer: {spread}): {error}"
+            );
+        }
+        println!(
+            "notice: writer {writer} was starved, committing nothing while the others ran \
+             (per writer: {spread}); the rate reported is the whole burst's"
         );
     }
     Ok(Outcome {
@@ -292,7 +327,7 @@ fn commit_burst(
             ensure!(
                 status.success(),
                 "a writer exited with {status}: {}",
-                first_error(&log)
+                first_error(&log).unwrap_or_else(no_diagnostics)
             );
         }
         Bound::Window(_) => {
@@ -393,8 +428,15 @@ fn parse_counts(stdout: &str) -> Vec<u64> {
 /// is the diagnosis and the rest is the same line again.
 const LOG_EXCERPT_LINES: usize = 2;
 
-/// The opening lines of a writer's log, flattened onto one line.
-fn first_error(log: &Path) -> String {
+/// What an error says about a writer that logged nothing at all.
+fn no_diagnostics() -> String {
+    "no diagnostics".to_owned()
+}
+
+/// The opening lines of a writer's log, flattened onto one line, or
+/// `None` when it wrote nothing: a writer that committed nothing and
+/// complained about nothing was starved, not refused.
+fn first_error(log: &Path) -> Option<String> {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let excerpt: Vec<&str> = text
         .lines()
@@ -402,10 +444,7 @@ fn first_error(log: &Path) -> String {
         .filter(|line| !line.is_empty())
         .take(LOG_EXCERPT_LINES)
         .collect();
-    if excerpt.is_empty() {
-        return "no diagnostics".to_owned();
-    }
-    excerpt.join(" / ")
+    (!excerpt.is_empty()).then(|| excerpt.join(" / "))
 }
 
 /// Starts a writer and blocks until it has attached and is waiting on
@@ -449,7 +488,7 @@ fn attach_writer(
         if let Some(status) = child.try_wait().context("polling a writer")? {
             bail!(
                 "a writer exited with {status} before it attached: {}",
-                first_error(&log)
+                first_error(&log).unwrap_or_else(no_diagnostics)
             );
         }
         ensure!(
@@ -609,10 +648,11 @@ mod tests {
     fn an_error_quotes_the_opening_of_a_writers_log_and_nothing_more() {
         let log = std::env::temp_dir().join(format!("burst-log-{}", std::process::id()));
         std::fs::write(&log, "first\n\nsecond\nthird\nfourth\n").unwrap();
-        assert_eq!(first_error(&log), "first / second");
+        assert_eq!(first_error(&log).as_deref(), Some("first / second"));
 
+        // An empty log is what tells a starved writer from a refused one.
         std::fs::write(&log, "").unwrap();
-        assert_eq!(first_error(&log), "no diagnostics");
+        assert_eq!(first_error(&log), None);
         std::fs::remove_file(&log).unwrap();
     }
 

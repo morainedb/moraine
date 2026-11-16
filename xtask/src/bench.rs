@@ -81,6 +81,8 @@ struct Options {
     commits: u64,
     /// A window every writer commits into, instead of a commit count.
     seconds: Option<u64>,
+    /// Where moraine keeps what it read, shared across the whole run.
+    cache_dir: Option<PathBuf>,
     flush_interval_ms: u64,
     /// Whether the concurrency workloads write to indexed tables.
     indexed: bool,
@@ -108,6 +110,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     let mut concurrency = vec![1usize, 2, 4, 8];
     let mut commits = 128u64;
     let mut seconds: Option<u64> = None;
+    let mut cache_dir: Option<PathBuf> = None;
     // The default spacing, not the pinned one the latency workloads use:
     // coalescing is what the concurrency workloads are there to measure,
     // and a 1 ms spacing leaves nothing to coalesce.
@@ -146,6 +149,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                     .parse()
                     .with_context(|| "parsing --commits".to_owned())?;
             }
+            "--cache-dir" => cache_dir = Some(PathBuf::from(value()?)),
             "--seconds" => {
                 seconds = Some(
                     value()?
@@ -176,6 +180,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         concurrency,
         commits,
         seconds,
+        cache_dir,
         flush_interval_ms,
         indexed,
     })
@@ -186,13 +191,17 @@ struct SessionContext {
     cli: PathBuf,
     extension: PathBuf,
     store: CatalogTarget,
+    /// The directory bucket, when one is named, so a run compares the
+    /// two S3 stores under identical conditions.
+    express_store: Option<CatalogTarget>,
     preamble: String,
+    cache_dir: Option<PathBuf>,
 }
 
 impl SessionContext {
     /// Builds and packages the extension, finds the CLI, and reads the
     /// store from the environment; `local_root` holds local catalogs.
-    fn prepare(local_root: PathBuf) -> anyhow::Result<Self> {
+    fn prepare(local_root: PathBuf, cache_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         let extension = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
         println!("ok: packaged {}", extension.display());
         let cli = duckdb::ensure_duckdb_cli()?;
@@ -202,23 +211,49 @@ impl SessionContext {
         if store.is_remote() {
             println!("ok: moraine catalogs on {}", store.description());
         }
+        let express_store = CatalogTarget::express_from_environment();
+        if let Some(cache_dir) = &cache_dir {
+            fs::create_dir_all(cache_dir)
+                .with_context(|| format!("creating {}", cache_dir.display()))?;
+            println!(
+                "ok: moraine keeps what it reads under {}",
+                cache_dir.display()
+            );
+        }
         let preamble = store_preamble(&store)?;
 
         Ok(Self {
             cli,
             extension,
             store,
+            express_store,
             preamble,
+            cache_dir,
         })
     }
 
     /// Moraine's catalog location for one run: a URI under the S3 prefix,
     /// or `catalog_dir` itself.
-    fn moraine_catalog(&self, catalog_dir: &std::path::Path, leaf: &str) -> anyhow::Result<String> {
-        if self.store.is_remote() {
-            self.store.catalog_uri(leaf)
+    fn moraine_catalog(
+        &self,
+        backend: BackendKind,
+        catalog_dir: &std::path::Path,
+        leaf: &str,
+    ) -> anyhow::Result<String> {
+        let store = self.store_for(backend);
+        if store.is_remote() {
+            store.catalog_uri(leaf)
         } else {
             Ok(catalog_dir.display().to_string())
+        }
+    }
+
+    /// The store a backend's catalog lives on: the directory bucket for
+    /// `moraine_express`, the standard store for everything else.
+    fn store_for(&self, backend: BackendKind) -> &CatalogTarget {
+        match (backend, &self.express_store) {
+            (BackendKind::MoraineExpress, Some(store)) => store,
+            _ => &self.store,
         }
     }
 
@@ -309,8 +344,9 @@ fn run_once(
     let run_dir = work_root.join(&leaf);
     let catalog_dir = run_dir.join("catalog");
     let paths = SessionPaths {
-        moraine_catalog: context.moraine_catalog(&catalog_dir, &leaf)?,
+        moraine_catalog: context.moraine_catalog(backend, &catalog_dir, &leaf)?,
         catalog_dir,
+        cache_dir: context.cache_dir.clone(),
         data_dir: run_dir.join("data"),
     };
     fs::create_dir_all(&paths.catalog_dir)
@@ -424,8 +460,9 @@ fn run_burst_once(
     let run_dir = work_root.join(&leaf);
     let catalog_dir = run_dir.join("catalog");
     let paths = SessionPaths {
-        moraine_catalog: context.moraine_catalog(&catalog_dir, &leaf)?,
+        moraine_catalog: context.moraine_catalog(backend, &catalog_dir, &leaf)?,
         catalog_dir,
+        cache_dir: context.cache_dir.clone(),
         data_dir: run_dir.join("data"),
     };
     let scratch = run_dir.join("scratch");
@@ -466,7 +503,7 @@ fn run_burst_once(
     // catalog put. The setup commits (one table per writer, the attach) are
     // in the count too, so read it against `commits + writers + 1`. A remote
     // store is not listed.
-    if backend == BackendKind::Moraine && !context.store.is_remote() {
+    if backend.is_moraine() && !context.store_for(backend).is_remote() {
         let wal_objects = fs::read_dir(paths.catalog_dir.join("wal"))
             .map_or(0, |entries| entries.filter_map(Result::ok).count());
         let commits = outcome
@@ -530,7 +567,7 @@ fn sweep_concurrency(
     rows: &mut Vec<Row>,
 ) -> anyhow::Result<()> {
     for &backend in backends {
-        if options.indexed && backend != BackendKind::Moraine {
+        if options.indexed && !backend.is_moraine() {
             println!(
                 "notice: {} skipped on {} — an equality index is moraine's own",
                 backend.name(),
@@ -650,13 +687,36 @@ fn probe_targets(context: &SessionContext, servers: &Servers) -> Vec<(String, St
     targets
 }
 
+/// The requested backends this machine can actually run, saying which it
+/// dropped and why.
+fn available_backends(
+    options: &Options,
+    context: &SessionContext,
+    servers: &Servers,
+) -> Vec<BackendKind> {
+    if options.backends.contains(&BackendKind::MoraineExpress) && context.express_store.is_none() {
+        println!(
+            "notice: moraine_express backend skipped — MORAINE_S3_EXPRESS_BUCKET names no \
+             directory bucket"
+        );
+    }
+
+    options
+        .backends
+        .iter()
+        .copied()
+        .filter(|kind| *kind != BackendKind::Postgres || servers.postgres.is_some())
+        .filter(|kind| *kind != BackendKind::MoraineExpress || context.express_store.is_some())
+        .collect()
+}
+
 /// Runs the whole suite and prints/writes the report.
 pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
 
     let work_root = std::env::temp_dir().join(format!("moraine-bench-{}", std::process::id()));
     fs::create_dir_all(&work_root).with_context(|| format!("creating {}", work_root.display()))?;
-    let mut context = SessionContext::prepare(work_root.clone())?;
+    let mut context = SessionContext::prepare(work_root.clone(), options.cache_dir.clone())?;
 
     let postgres = if options.backends.contains(&BackendKind::Postgres) {
         let handle = PostgresHandle::provision(&work_root)?;
@@ -679,12 +739,7 @@ pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
         None
     };
     let servers = Servers { postgres, quack };
-    let backends: Vec<BackendKind> = options
-        .backends
-        .iter()
-        .copied()
-        .filter(|kind| *kind != BackendKind::Postgres || servers.postgres.is_some())
-        .collect();
+    let backends = available_backends(&options, &context, &servers);
 
     let all_workloads = workloads::workloads(&options.scale);
     let selected = select_workloads(&all_workloads, options.workloads.as_ref())?;
@@ -692,7 +747,7 @@ pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
     let mut rows: Vec<Row> = Vec::new();
     for workload in &selected {
         for &backend in &backends {
-            if workload.moraine_only && backend != BackendKind::Moraine {
+            if workload.moraine_only && !backend.is_moraine() {
                 continue;
             }
             for repeat in 0..options.repeat {
@@ -767,7 +822,7 @@ mod tests {
     #[test]
     fn options_default_to_all_backends_small_scale_three_repeats() {
         let options = parse_options(&[]).unwrap();
-        assert_eq!(options.backends.len(), 4);
+        assert_eq!(options.backends.len(), 5);
         assert_eq!(options.scale.name, "small");
         assert_eq!(options.repeat, 3);
         assert!(options.workloads.is_none());

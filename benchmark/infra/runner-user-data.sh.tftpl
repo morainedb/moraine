@@ -16,29 +16,23 @@ chmod 0644 /etc/moraine-bench/quack-ca.pem
 
 # Written literally: the prefix is stamped when a run sources the file,
 # and `set -a; . <file>` is how it is meant to be read.
-cat > /etc/moraine-bench/common.env <<'ENV'
+# Both buckets in one file: `moraine` and `moraine_express` are separate
+# backends in one run, which is the only way their numbers share a
+# machine, a clock and a network.
+cat > /etc/moraine-bench/bench.env <<'ENV'
 export AWS_REGION=${region}
 export MORAINE_S3_CREDENTIAL_CHAIN=instance
 export MORAINE_S3_PREFIX="bench/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+export MORAINE_S3_BUCKET=${standard_bucket}
+export MORAINE_S3_EXPRESS_BUCKET=${express_bucket}
 export MORAINE_BENCH_POSTGRES="${postgres_dsn}"
 export MORAINE_BENCH_QUACK=${quack_endpoint}
 export MORAINE_BENCH_QUACK_TOKEN=${quack_token}
 export MORAINE_BENCH_QUACK_CA_CERT=/etc/moraine-bench/quack-ca.pem
 ENV
 
-{
-  echo "export MORAINE_S3_BUCKET=${standard_bucket}"
-  cat /etc/moraine-bench/common.env
-} > /etc/moraine-bench/s3.env
-
-{
-  echo "export MORAINE_S3_BUCKET=${express_bucket}"
-  cat /etc/moraine-bench/common.env
-} > /etc/moraine-bench/s3express.env
-
-rm /etc/moraine-bench/common.env
-chown root:ec2-user /etc/moraine-bench/s3.env /etc/moraine-bench/s3express.env
-chmod 0640 /etc/moraine-bench/s3.env /etc/moraine-bench/s3express.env
+chown root:ec2-user /etc/moraine-bench/bench.env
+chmod 0640 /etc/moraine-bench/bench.env
 
 # The toolchain the extension build needs, as CONTRIBUTING.md describes
 # it: DuckLake's Linux pipeline uses GCC 14, and DuckDB's cmake generates

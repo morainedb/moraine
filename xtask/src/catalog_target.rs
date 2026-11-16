@@ -29,17 +29,30 @@ impl CatalogTarget {
     /// and the AWS region from the environment; without a bucket, keeps the
     /// catalog under `local_root`.
     pub fn from_environment(local_root: PathBuf) -> Self {
-        match env::var("MORAINE_S3_BUCKET") {
-            Ok(bucket) => Self::S3(S3Target {
-                bucket,
-                prefix: env::var("MORAINE_S3_PREFIX").unwrap_or_default(),
-                endpoint: env::var("MORAINE_S3_ENDPOINT").ok(),
-                region: env::var("AWS_REGION")
-                    .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-                    .unwrap_or_else(|_| "us-east-1".to_owned()),
-            }),
-            Err(_) => Self::Local(local_root),
+        match Self::s3_from("MORAINE_S3_BUCKET") {
+            Some(target) => target,
+            None => Self::Local(local_root),
         }
+    }
+
+    /// The S3 Express store named by `MORAINE_S3_EXPRESS_BUCKET`, so one
+    /// run can measure both stores. `None` leaves that backend out.
+    pub fn express_from_environment() -> Option<Self> {
+        Self::s3_from("MORAINE_S3_EXPRESS_BUCKET")
+    }
+
+    /// An S3 target over the bucket named by `bucket_variable`, sharing
+    /// the prefix, endpoint and region of every other S3 target.
+    fn s3_from(bucket_variable: &str) -> Option<Self> {
+        let bucket = env::var(bucket_variable).ok()?;
+        Some(Self::S3(S3Target {
+            bucket,
+            prefix: env::var("MORAINE_S3_PREFIX").unwrap_or_default(),
+            endpoint: env::var("MORAINE_S3_ENDPOINT").ok(),
+            region: env::var("AWS_REGION")
+                .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_owned()),
+        }))
     }
 
     /// As [`from_environment`](Self::from_environment), refusing to run
