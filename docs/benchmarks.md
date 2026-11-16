@@ -469,19 +469,6 @@ A warm cache collapses the difference between the stores on reads — both
 scan in 34 ms — so Express earns its keep on writes and on cold reads.
 Commits move by nothing: they pay round trips, which no cache serves.
 
-### What distance costs
-
-Not measured. The catalog once carried a sweep that injected round trips
-through a loopback delay line, and it is gone: its tooling never entered
-the repository, so nothing here could re-run it, and its request counts
-described the commit path before publications gained a lifetime.
-
-What it was for remains open. Every real endpoint above is one zone away,
-which prices a same-zone deployment and says nothing about a catalog read
-across a region. Two points make that slope, so the measurement wants a
-second bucket in a distant region and the same harness pointed at it —
-real latency rather than injected.
-
 ### ClickBench
 
 `benchmark/clickbench` is a [ClickBench](https://benchmark.clickhouse.com)
