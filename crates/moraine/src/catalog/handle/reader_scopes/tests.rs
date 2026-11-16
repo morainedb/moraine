@@ -304,3 +304,155 @@ async fn a_committer_lists_the_newest_publication_inside_the_interval() {
     committer.close().await.unwrap();
     peer.close().await.unwrap();
 }
+
+/// Refuses every write, as a store reached with read-only credentials does.
+#[derive(Debug)]
+struct ReadOnlyStore {
+    inner: Arc<InMemory>,
+}
+
+impl std::fmt::Display for ReadOnlyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReadOnlyStore")
+    }
+}
+
+fn refused(path: &Path) -> object_store::Error {
+    object_store::Error::PermissionDenied {
+        path: path.to_string(),
+        source: "read-only credentials".into(),
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ReadOnlyStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        _payload: PutPayload,
+        _opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        Err(refused(location))
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        _opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        Err(refused(location))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(refused(from))
+    }
+}
+
+/// A writer that commits and then vanishes with its publication, as a crash
+/// followed by the collector leaves a store.
+async fn store_without_a_publication() -> Arc<InMemory> {
+    let objects = Arc::new(InMemory::new());
+    let writer = Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    set_probe(&writer, "survives").await;
+    drop(writer);
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    for checkpoint in admin
+        .list_checkpoints(Some(crate::store::checkpoint::PUBLISHED_NAME))
+        .await
+        .unwrap()
+    {
+        admin.delete_checkpoint(checkpoint.id).await.unwrap();
+    }
+    objects
+}
+
+/// With no publication left, a reader keeps a checkpoint of its own.
+#[tokio::test]
+async fn a_reader_outlives_a_collected_publication_with_its_own_checkpoint() {
+    let objects = store_without_a_publication().await;
+    let reader = Catalog::open_read_only(objects.clone(), reader_options(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    let scope = reader.index_read_scope().await.unwrap();
+    assert_eq!(
+        global_option(scope.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("survives")
+    );
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    let own = admin.list_checkpoints(None).await.unwrap();
+    assert!(
+        !own.is_empty(),
+        "the reader protects its view with a checkpoint"
+    );
+    assert!(
+        own.iter()
+            .all(|checkpoint| checkpoint.expire_time.is_some())
+    );
+    drop(scope);
+    reader.close().await.unwrap();
+}
+
+/// A reader whose credentials cannot write follows the latest manifest.
+#[tokio::test]
+async fn a_read_only_reader_follows_the_latest_manifest_without_a_publication() {
+    let objects = store_without_a_publication().await;
+    let read_only: Arc<dyn ObjectStore> = Arc::new(ReadOnlyStore {
+        inner: objects.clone(),
+    });
+    let reader = Catalog::open_read_only(read_only, reader_options(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    let scope = reader.index_read_scope().await.unwrap();
+    assert_eq!(
+        global_option(scope.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("survives")
+    );
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    assert!(admin.list_checkpoints(None).await.unwrap().is_empty());
+    drop(scope);
+    reader.close().await.unwrap();
+}

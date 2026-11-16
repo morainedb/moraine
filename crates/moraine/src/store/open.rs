@@ -128,6 +128,8 @@ pub(crate) struct StoreBuilder<'a> {
     cache_compaction_puts: bool,
     external_compaction: bool,
     checkpoint: Option<Uuid>,
+    /// A reader mode chosen by the caller, over the one the open derives.
+    reader_mode: Option<DbReaderMode>,
     /// The manifest's per-segment sizes, when the attach read them; they
     /// decide how a preload reaches each subspace's first entry.
     warm_segments: Vec<census::SegmentSize>,
@@ -157,6 +159,7 @@ impl<'a> StoreBuilder<'a> {
             cache_compaction_puts: true,
             external_compaction: false,
             checkpoint: None,
+            reader_mode: None,
             warm_segments: Vec::new(),
         }
     }
@@ -304,6 +307,14 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
+    /// Opens the reader in `mode` instead of the mode the open derives from
+    /// its checkpoint and session, with bounded store retries so a refused
+    /// write fails instead of stalling. Reader only.
+    pub(crate) fn reader_mode(mut self, mode: DbReaderMode) -> Self {
+        self.reader_mode = Some(mode);
+        self
+    }
+
     /// Opens (or creates) the store as a read-write [`Db`], with the
     /// per-store counters its reads tally into.
     pub(crate) async fn open_writer(&self) -> Result<(Db, Arc<cache::CacheCounters>)> {
@@ -366,9 +377,15 @@ impl<'a> StoreBuilder<'a> {
     }
 
     async fn open_reader_mode(&self, fixed: bool) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
+        let defaults = DbReaderOptions::default();
         let options = DbReaderOptions {
             manifest_poll_interval: self.poll_interval,
-            ..Default::default()
+            // A managed checkpoint must outlive two polls.
+            checkpoint_lifetime: defaults.checkpoint_lifetime.max(self.poll_interval * 3),
+            // SlateDB retries a refused write without bound; a mode the caller
+            // chose has a fallback, so it gives up after one retry instead.
+            object_store_max_retries: self.reader_mode.map(|_| 1),
+            ..defaults
         };
         let counters = cache::store_counters();
         let mut builder = DbReader::builder(self.path.to_owned(), Arc::clone(&self.object_store))
@@ -392,10 +409,11 @@ impl<'a> StoreBuilder<'a> {
         // its transactions pin the writer's publications, and this reader
         // serves head reads from the latest manifest between polls. A
         // reader over a log keeps SlateDB's managed checkpoint.
-        let mode = match self.checkpoint {
-            Some(checkpoint) => DbReaderMode::Checkpoint(checkpoint),
-            None if self.reader_session.is_none() => DbReaderMode::FollowLatest,
-            None => DbReaderMode::ManagedCheckpoint,
+        let mode = match (self.reader_mode, self.checkpoint) {
+            (Some(mode), _) => mode,
+            (None, Some(checkpoint)) => DbReaderMode::Checkpoint(checkpoint),
+            (None, None) if self.reader_session.is_none() => DbReaderMode::FollowLatest,
+            (None, None) => DbReaderMode::ManagedCheckpoint,
         };
         builder = builder.with_reader_mode(mode);
         let wal: Arc<dyn slatedb::wal::WalReader> = if let Some(session) = &self.reader_session {

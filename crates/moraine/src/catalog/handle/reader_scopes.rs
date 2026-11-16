@@ -13,7 +13,7 @@ use super::{CatalogOptions, commit_log_provider, reader_session};
 use crate::{
     Error, Result,
     store::{
-        checkpoint::{CheckpointReader, PUBLISHED_NAME, READ_GRACE, remaining_until},
+        checkpoint::{CheckpointReader, PUBLISHED_NAME, READ_GRACE},
         open::StoreBuilder,
     },
 };
@@ -85,17 +85,60 @@ impl ReaderScopes {
     }
 
     /// The shared reader, when it was listed inside the reuse window and has
-    /// at least half the grace left.
+    /// at least half the grace left; a reader with no deadline follows the
+    /// store itself.
     fn unexpired(&self, readers: &Readers) -> Option<Arc<CheckpointReader>> {
         let latest = readers.latest.as_ref()?;
         if readers.listed?.elapsed() >= self.reuse {
             return None;
         }
-        if latest.remaining()? < READ_GRACE / 2 {
+        if latest
+            .remaining()
+            .is_some_and(|remaining| remaining < READ_GRACE / 2)
+        {
             return None;
         }
         latest.reader().ok()?;
         Some(latest.clone())
+    }
+
+    /// A reader for a store with no publication: the writer is gone and its
+    /// publication has expired and been collected. The reader keeps a
+    /// checkpoint of its own on the latest manifest, as a plain SlateDB
+    /// reader does; a store that refuses the write is followed unprotected.
+    async fn unpublished(&self, readers: &mut Readers) -> Result<Arc<CheckpointReader>> {
+        if let Some(latest) = readers
+            .latest
+            .as_ref()
+            .filter(|latest| latest.remaining().is_none())
+        {
+            return Ok(latest.clone());
+        }
+        let opened = match self
+            .builder()
+            .reader_mode(slatedb::DbReaderMode::ManagedCheckpoint)
+            .open_reader()
+            .await
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "no publication and no checkpoint of our own; following the latest manifest"
+                );
+                self.builder()
+                    .reader_mode(slatedb::DbReaderMode::FollowLatest)
+                    .open_reader()
+                    .await?
+            }
+        };
+        let reader = CheckpointReader::fixed(opened.0);
+        readers
+            .generations
+            .retain(|reader| reader.strong_count() != 0);
+        readers.latest = Some(reader.clone());
+        readers.generations.push(Arc::downgrade(&reader));
+        Ok(reader)
     }
 
     pub(crate) async fn acquire(&self) -> Result<Arc<CheckpointReader>> {
@@ -114,13 +157,19 @@ impl ReaderScopes {
         let admin = Arc::new(self.builder().admin());
         for _ in 0..crate::transaction::commit::MAX_COMMIT_ATTEMPTS {
             let listed = Instant::now();
-            let published = admin.list_checkpoints(Some(PUBLISHED_NAME)).await?
-                .into_iter().max_by_key(|checkpoint| checkpoint.manifest_id)
-                .ok_or_else(|| Error::SnapshotExpired("no published read checkpoint; reopen the writer to publish recovered progress".into()))?;
+            let published = admin
+                .list_checkpoints(Some(PUBLISHED_NAME))
+                .await?
+                .into_iter()
+                .max_by_key(|checkpoint| checkpoint.manifest_id);
             readers.listed = Some(listed);
-            let expires = published
-                .expire_time
-                .map(|expires| remaining_until(expires.timestamp_millis()));
+            let Some(published) = published else {
+                return self.unpublished(&mut readers).await;
+            };
+            // The newest publication is current whatever its expiry says: the
+            // writer refreshes it while alive, and a closed writer's is
+            // permanent. The expiry governs only publications it superseded.
+            let expires = None;
             if let Some(latest) = &readers.latest
                 && latest.manifest == published.manifest_id
             {

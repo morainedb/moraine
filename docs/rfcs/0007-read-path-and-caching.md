@@ -41,26 +41,35 @@ Publication works as follows.
 1. After a commit group's writes are WAL-durable, and before any member is
    acknowledged, the writer calls
    `Db::create_checkpoint(CheckpointScope::Durable, ...)` under the name
-   `moraine-read-head-v1`.
+   `moraine-read-head-v1` with a lifetime of `PUBLICATION_LIFETIME`, thirty
+   minutes. The publication is the commit's only manifest write.
 2. The publisher refuses to publish a sequence the store has not yet made
    durable. One publication may cover several groups whose writes are already
    durable. Each acknowledgement waits for a checkpoint covering its own
    group.
-3. Publications with an older manifest are retired after the new one exists.
-   Retirement gives a publication an expiry of `READ_GRACE`, fifteen minutes,
-   and deletes one already past its expiry. The current publication never
-   carries an expiry, so readers acquire it while the writer is idle or
-   offline. `READ_GRACE` must exceed the longest explicit transaction, as the
-   retention window must. Files and log slots a retired publication
-   references stay until it expires.
+3. A publication is superseded, never retired: its lifetime is what expires
+   it, and SlateDB's collector removes it once expired. The writer refreshes
+   the current publication's lifetime in the background once half of it has
+   passed, so a publication has at least `READ_GRACE`, fifteen minutes, left
+   whenever it is superseded; a writer committing steadily replaces it long
+   before. `READ_GRACE` must exceed the longest explicit transaction, as the
+   retention window must. Files and log slots a superseded publication
+   references stay until it expires. A writer's first publication lists the
+   store's once and gives a lifetime to any publication an earlier writer
+   left permanent.
 4. A WAL-durable write whose publication fails is potentially committed. The
    outcome is reported as unknown under [the commit
    protocol](0003-commit-protocol.md). It is never treated as a conflict that
    permits replaying the mutation.
 5. A clean writer shutdown flushes memtables and republishes the resulting
-   manifest even when its sequence was already published, so an idle reader
-   does not keep replaying a WAL-heavy publication after the same rows have
-   reached SSTs.
+   manifest permanently, with no lifetime, even when its sequence was already
+   published: an idle reader does not keep replaying a WAL-heavy publication
+   after the same rows have reached SSTs, and a closed writer's catalog stays
+   readable with no process alive to refresh it. A writer that crashes leaves
+   a publication that expires thirty minutes after its last refresh; with the
+   collector in the writer process nothing removes it, and readers continue,
+   while an external collector removes it, after which readers keep
+   checkpoints of their own until a writer publishes again.
 
 A detached checkpoint created from the latest manifest is never used for
 writer publication. Such a checkpoint does not advance the manifest's WAL
@@ -94,13 +103,19 @@ Reader acquisition works as follows.
    whatever the interval, so a transaction reads what the one before it
    committed.
 2. Otherwise the reader lists published checkpoints and takes the one with
-   the highest manifest id. If none exists, acquisition fails with
-   `SnapshotExpired`, which tells the caller to reopen the writer so it
-   publishes recovered progress.
+   the highest manifest id. If none exists, the writer is gone and its
+   publication has expired and been collected: the reader opens on the
+   latest manifest with a checkpoint of its own that it refreshes, SlateDB's
+   managed mode, and a store that refuses that write is followed without a
+   checkpoint, unprotected from collection during a long transaction. Both
+   readers see every acknowledged commit, since the manifest records the
+   durable WAL boundary. Such a reader has no deadline and is shared like a
+   pinned one; a publication that reappears is taken at the next listing.
 3. If the latest reader is at that manifest, the listing confirms it: the
-   deadline moves to the listing time plus `READ_GRACE`, or to the
-   publication's own expiry when it carries one, less a one-minute allowance
-   for clock skew. The transaction shares the reader.
+   deadline moves to the listing time plus `READ_GRACE`, less a one-minute
+   allowance for clock skew. The newest publication is current whatever its
+   expiry says, since the writer refreshes it while alive. The transaction
+   shares the reader.
 4. Otherwise the reader opens a `DbReader` pinned to the published checkpoint
    id, with its deadline set the same way. The open writes nothing. If the
    publication expired during that step, acquisition retries discovery, up
@@ -631,8 +646,15 @@ container ceiling remains the final boundary.
   Rejected: it omits WAL-durable commits a following reader already sees.
 - **Reader-owned leases on a single-writer publication.** Rejected for that
   path: a manifest write per reader generation and one per renewal, forced only
-  by deleting the superseded publication at once. A grace on retirement lets
-  readers pin the publication itself.
+  by deleting the superseded publication at once. A lifetime on every
+  publication lets readers pin the publication itself.
+- **A current publication without an expiry, retired by a second manifest
+  write when superseded.** The original design. Rejected once measured
+  against a networked store: the retirement doubled every commit's manifest
+  traffic and contended with the next commit's write, for a guarantee, an
+  offline writer's catalog readable forever under an external collector,
+  that a permanent publication on clean close covers in every case but a
+  crash.
 - **A fixed metadata slot.** Rejected: a fixed fifth of the budget was both
   floor and ceiling, so holding a large store's filters meant inflating the
   whole budget. Eviction priority lets idle metadata space go to blocks.

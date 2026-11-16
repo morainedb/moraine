@@ -524,16 +524,16 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     // A superseded publication keeps the slots it replays from until its
-    // grace ends; stand in for that expiry so this flush may truncate.
+    // lifetime ends; stand in for that expiry so this flush may truncate.
     let admin = slatedb::admin::AdminBuilder::new("lake", object_store.clone()).build();
-    for checkpoint in admin
+    let mut published = admin
         .list_checkpoints(Some(crate::store::checkpoint::PUBLISHED_NAME))
         .await
-        .unwrap()
-    {
-        if checkpoint.expire_time.is_some() {
-            admin.delete_checkpoint(checkpoint.id).await.unwrap();
-        }
+        .unwrap();
+    published.sort_by_key(|checkpoint| checkpoint.manifest_id);
+    published.pop();
+    for checkpoint in published {
+        admin.delete_checkpoint(checkpoint.id).await.unwrap();
     }
     for name in ["c", "d"] {
         committer

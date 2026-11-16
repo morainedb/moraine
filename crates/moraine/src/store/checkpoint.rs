@@ -2,7 +2,7 @@
 
 use std::{
     sync::{Arc, Mutex as SyncMutex, PoisonError},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use slatedb::{
@@ -10,7 +10,8 @@ use slatedb::{
     admin::Admin,
     config::{CheckpointOptions, CheckpointScope},
 };
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
+use uuid::Uuid;
 
 /// The writer's discoverable checkpoint; readers pin it directly.
 pub(crate) const PUBLISHED_NAME: &str = "moraine-read-head-v1";
@@ -137,34 +138,46 @@ impl Drop for CheckpointReader {
 }
 
 /// Wall-clock time left until `expire_millis`, a Unix timestamp.
+#[cfg(test)]
 pub(crate) fn remaining_until(expire_millis: i64) -> Duration {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|since| i64::try_from(since.as_millis()).ok())
         .unwrap_or(i64::MAX);
     Duration::from_millis(u64::try_from(expire_millis.saturating_sub(now)).unwrap_or(0))
 }
 
+/// How long a publication lives unless refreshed: twice the grace, so one
+/// superseded while the writer keeps refreshing has at least the grace left.
+pub(crate) const PUBLICATION_LIFETIME: Duration = Duration::from_mins(30);
+/// How often an idle writer checks whether its publication needs refreshing.
+const REFRESH_TICK: Duration = Duration::from_mins(1);
+
 /// Serializes publication and coalesces writes covered by the same checkpoint.
+///
+/// Every publication is created with [`PUBLICATION_LIFETIME`]; a close
+/// publishes without one. The current publication is refreshed in the
+/// background once it ages past half its lifetime, so a superseded one always
+/// has the grace left for the readers pinned to it, and SlateDB's collector
+/// removes publications once they expire. Readers take the newest publication
+/// whatever its expiry says.
 pub(crate) struct Publisher {
     db: Db,
-    admin: Arc<Admin>,
     published: Mutex<Option<u64>>,
-    grace: Duration,
+    keeper: Arc<Keeper>,
 }
 
 impl Publisher {
     pub(crate) fn new(db: Db, admin: Admin) -> Self {
-        Self::with_grace(db, admin, READ_GRACE)
+        Self::with_lifetime(db, admin, PUBLICATION_LIFETIME, REFRESH_TICK)
     }
 
-    pub(crate) fn with_grace(db: Db, admin: Admin, grace: Duration) -> Self {
+    pub(crate) fn with_lifetime(db: Db, admin: Admin, lifetime: Duration, tick: Duration) -> Self {
         Self {
+            keeper: Arc::new(Keeper::new(db.clone(), admin, lifetime, tick)),
             db,
-            admin: Arc::new(admin),
             published: Mutex::new(None),
-            grace,
         }
     }
 
@@ -180,10 +193,11 @@ impl Publisher {
                 "checkpoint publication preceded WAL durability".to_owned(),
             ));
         }
-        self.publish(&mut published, covered).await
+        self.publish(&mut published, covered, false).await
     }
 
-    /// Publishes flushed SSTs even when their sequence was already announced.
+    /// Publishes flushed SSTs permanently, for a writer that is closing: the
+    /// publication stays discoverable with no writer alive to refresh it.
     pub(crate) async fn flushed(&self) -> Result<(), slatedb::Error> {
         let mut published = self.published.lock().await;
         self.db
@@ -191,7 +205,7 @@ impl Publisher {
                 flush_type: slatedb::config::FlushType::MemTable,
             })
             .await?;
-        self.publish(&mut published, self.db.status().durable_seq)
+        self.publish(&mut published, self.db.status().durable_seq, true)
             .await
     }
 
@@ -199,6 +213,7 @@ impl Publisher {
         &self,
         published: &mut Option<u64>,
         covered: u64,
+        permanent: bool,
     ) -> Result<(), slatedb::Error> {
         let checkpoint = self
             .db
@@ -206,38 +221,135 @@ impl Publisher {
                 CheckpointScope::Durable,
                 &CheckpointOptions {
                     name: Some(PUBLISHED_NAME.to_owned()),
+                    lifetime: (!permanent).then_some(self.keeper.lifetime),
                     ..CheckpointOptions::default()
                 },
             )
             .await?;
         *published = Some(covered);
+        Keeper::published(&self.keeper, checkpoint.id, permanent).await;
+        Ok(())
+    }
+}
 
-        // The current publication stays discoverable, without expiry, while
-        // the writer is idle or offline. Readers pinned to a superseded one
-        // keep it for the grace.
-        if let Err(error) = self.retire_before(checkpoint.manifest_id).await {
-            tracing::warn!(%error, "could not retire superseded read checkpoints");
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        if let Some(task) = self.keeper.state().task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Keeps the current publication alive and adopts what earlier writers left.
+struct Keeper {
+    db: Db,
+    admin: Arc<Admin>,
+    lifetime: Duration,
+    tick: Duration,
+    state: SyncMutex<KeeperState>,
+}
+
+#[derive(Default)]
+struct KeeperState {
+    current: Option<Current>,
+    adopted: bool,
+    task: Option<JoinHandle<()>>,
+}
+
+/// The publication readers now find, and when its lifetime last started.
+struct Current {
+    id: Uuid,
+    since: Instant,
+    permanent: bool,
+}
+
+impl Keeper {
+    fn new(db: Db, admin: Admin, lifetime: Duration, tick: Duration) -> Self {
+        Self {
+            db,
+            admin: Arc::new(admin),
+            lifetime,
+            tick,
+            state: SyncMutex::new(KeeperState::default()),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, KeeperState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records the new current publication, adopts leftovers on the first
+    /// call, and keeps the refresher running while the current one expires.
+    async fn published(this: &Arc<Self>, id: Uuid, permanent: bool) {
+        let adopted = {
+            let mut state = this.state();
+            state.current = Some(Current {
+                id,
+                since: Instant::now(),
+                permanent,
+            });
+            state.adopted
+        };
+        if !adopted {
+            match this.adopt().await {
+                Ok(()) => this.state().adopted = true,
+                Err(error) => tracing::warn!(%error, "could not adopt earlier publications"),
+            }
+        }
+
+        let mut state = this.state();
+        if !permanent && state.task.as_ref().is_none_or(JoinHandle::is_finished) {
+            let keeper = Arc::clone(this);
+            state.task = Some(tokio::spawn(async move { keeper.run().await }));
+        }
+    }
+
+    /// Gives every published checkpoint but the current one a lifetime if it
+    /// has none, so an earlier writer's permanent publication expires.
+    async fn adopt(&self) -> Result<(), slatedb::Error> {
+        let current = self.state().current.as_ref().map(|current| current.id);
+        for checkpoint in self.admin.list_checkpoints(Some(PUBLISHED_NAME)).await? {
+            if Some(checkpoint.id) != current && checkpoint.expire_time.is_none() {
+                self.admin
+                    .refresh_checkpoint(checkpoint.id, Some(self.lifetime))
+                    .await?;
+            }
         }
         Ok(())
     }
 
-    async fn retire_before(&self, manifest: u64) -> Result<(), slatedb::Error> {
-        for checkpoint in self.admin.list_checkpoints(Some(PUBLISHED_NAME)).await? {
-            if checkpoint.manifest_id >= manifest {
-                continue;
+    /// Refreshes the current publication once it has used half its lifetime,
+    /// less two ticks of slack, until it is permanent or the writer is gone.
+    async fn run(&self) {
+        let refresh_after = (self.lifetime / 2).saturating_sub(self.tick * 2);
+        loop {
+            tokio::time::sleep(self.tick).await;
+            if self.db.status().close_reason.is_some() {
+                return;
             }
-            match checkpoint.expire_time {
-                None => {
-                    self.admin
-                        .refresh_checkpoint(checkpoint.id, Some(self.grace))
-                        .await?;
+            let due = {
+                let state = self.state();
+                match &state.current {
+                    Some(current) if current.permanent => return,
+                    Some(current) if current.since.elapsed() >= refresh_after => Some(current.id),
+                    _ => None,
                 }
-                Some(expires) if remaining_until(expires.timestamp_millis()).is_zero() => {
-                    self.admin.delete_checkpoint(checkpoint.id).await?;
+            };
+            let Some(id) = due else {
+                continue;
+            };
+            match self.admin.refresh_checkpoint(id, Some(self.lifetime)).await {
+                Ok(()) => {
+                    let mut state = self.state();
+                    if let Some(current) = state.current.as_mut().filter(|current| current.id == id)
+                    {
+                        current.since = Instant::now();
+                    }
                 }
-                Some(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not refresh the current publication");
+                }
             }
         }
-        Ok(())
     }
 }
