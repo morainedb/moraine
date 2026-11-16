@@ -64,7 +64,7 @@ is the way in.
 ```sh
 aws ssm start-session --region "$(tofu output -raw region)" \
   --target "$(tofu output -raw runner_instance_id)"
-sudo -iu ec2-user
+sudo -iu ec2-user          # a session starts as ssm-user, which owns none of this
 git clone --recurse-submodules https://github.com/morainedb/moraine && cd moraine
 set -a; . /etc/moraine-bench/bench.env; set +a
 cargo xtask bench --backends moraine,moraine_express,postgres,quack,duckdb \

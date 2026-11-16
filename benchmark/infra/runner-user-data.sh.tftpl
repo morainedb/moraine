@@ -52,5 +52,15 @@ dnf install -y ccache || echo "ccache unavailable; DuckDB builds will not be cac
 
 su - ec2-user -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
 
+# Session Manager lands in a session as `ssm-user`, where none of this
+# exists: the clone, the toolchain and the environment belong to
+# `ec2-user`.
+cat > /etc/profile.d/moraine-bench.sh <<'HINT'
+if [ "$(id -un)" != "ec2-user" ]; then
+  echo "moraine bench: run 'sudo -iu ec2-user' first; the toolchain and /etc/moraine-bench are theirs"
+fi
+HINT
+chmod 0644 /etc/profile.d/moraine-bench.sh
+
 # The last line, so its absence is the signal that setup did not finish.
 touch /etc/moraine-bench/ready
