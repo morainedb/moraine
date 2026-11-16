@@ -7,8 +7,10 @@
 
 use std::{
     fs,
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -31,14 +33,25 @@ const STORE_VARIABLES: [&str; 7] = [
     "MORAINE_BENCH_QUACK_CA_CERT",
 ];
 
-/// One harness run: what to call it, what to run, and whether it may see
-/// the store environment.
+/// How long a harness may run before it is stopped and reported failed.
+/// Generous: the point is to bound a wedged server, not to hurry a sweep.
+const STEP_TIMEOUT: Duration = Duration::from_mins(90);
+
+/// ClickBench loads tens of gigabytes before it measures anything.
+const CLICKBENCH_TIMEOUT: Duration = Duration::from_hours(10);
+
+/// How often a waiting run checks on the harness it started.
+const POLL: Duration = Duration::from_secs(1);
+
+/// One harness run: what to call it, what to run, whether it may see the
+/// store environment, and how long it may take.
 struct Step {
     name: &'static str,
     /// `None` runs this xtask; `Some(program)` runs that instead.
     program: Option<&'static str>,
     arguments: Vec<String>,
     local_only: bool,
+    timeout: Duration,
 }
 
 impl Step {
@@ -51,6 +64,7 @@ impl Step {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
             local_only: false,
+            timeout: STEP_TIMEOUT,
         }
     }
 
@@ -63,6 +77,11 @@ impl Step {
 
     fn local(mut self) -> Self {
         self.local_only = true;
+        self
+    }
+
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 }
@@ -345,7 +364,8 @@ fn clickbench_steps(checkout: Option<&Path>) -> Vec<Step> {
                 "--machine",
                 "c6i.2xlarge",
             ],
-        ),
+        )
+        .with_timeout(CLICKBENCH_TIMEOUT),
         Step::xtask(
             "clickbench-report",
             &["clickbench", "report", "--clickbench", &checkout],
@@ -472,12 +492,16 @@ fn run_step(step: &Step, xtask: &Path, output: &Path) -> anyhow::Result<bool> {
         }
     }
 
-    let status = command
+    // Its own process group, so a harness that has to be stopped takes
+    // the servers and sessions it started with it.
+    let mut child = command
         .current_dir(workspace_root())
         .stdout(file)
         .stderr(errors)
-        .status()
+        .process_group(0)
+        .spawn()
         .with_context(|| format!("running {}", step.name))?;
+    let status = wait_for(&mut child, step)?;
 
     // Every bench invocation overwrites one report, so it is kept under
     // this step's name before the next one lands on it.
@@ -486,7 +510,43 @@ fn run_step(step: &Step, xtask: &Path, output: &Path) -> anyhow::Result<bool> {
         let kept = output.join(format!("{}.json", step.name));
         fs::rename(&report, &kept).or_else(|_| fs::copy(&report, &kept).map(|_| ()))?;
     }
-    Ok(status.success())
+    Ok(status)
+}
+
+/// Waits for a harness, stopping it once its timeout passes. A wedged
+/// server is the reason this exists: one harness waiting on a statement
+/// that never answers would otherwise hold a run of hours.
+fn wait_for(child: &mut std::process::Child, step: &Step) -> anyhow::Result<bool> {
+    let deadline = Instant::now() + step.timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("polling a harness")? {
+            return Ok(status.success());
+        }
+        if Instant::now() >= deadline {
+            println!(
+                "notice: {} passed {} minutes and was stopped",
+                step.name,
+                step.timeout.as_secs() / 60
+            );
+            signal_group(child.id(), "TERM");
+            std::thread::sleep(Duration::from_secs(5));
+            signal_group(child.id(), "KILL");
+            let _ = child.wait();
+            return Ok(false);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Signals a harness's whole process group, which is where the DuckDB
+/// sessions and servers it started live.
+fn signal_group(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(format!("-{pid}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(test)]
@@ -522,6 +582,17 @@ mod tests {
         assert_eq!(steps.len(), without + 2);
         assert_eq!(steps[steps.len() - 2].name, "clickbench-run");
         assert_eq!(steps[steps.len() - 1].name, "clickbench-report");
+    }
+
+    #[test]
+    fn clickbench_alone_gets_longer_than_the_others() {
+        let steps = steps(Path::new("/tmp/out"), Some(Path::new("/tmp/ClickBench")));
+        let long: Vec<&str> = steps
+            .iter()
+            .filter(|step| step.timeout > STEP_TIMEOUT)
+            .map(|step| step.name)
+            .collect();
+        assert_eq!(long, ["clickbench-run"]);
     }
 
     #[test]
