@@ -190,6 +190,16 @@ GitHub keeps the artifact for 30 days. CloudFormation retains the bucket
 when the stack is deleted so benchmark data is not destroyed implicitly;
 empty it explicitly when retiring the stack.
 
+## Benchmarking against AWS by hand
+
+The cross-catalog comparison in [`docs/benchmarks.md`](docs/benchmarks.md)
+runs moraine's catalog on S3 and DuckLake's on a managed Postgres.
+[`benchmark/infra`](benchmark/infra/README.md) is the OpenTofu for a whole
+networked run: an EC2 runner, a standard bucket, an S3 Express directory
+bucket, an RDS instance, and a host serving a DuckDB file over Quack, all
+in one availability zone, with the bench environment waiting on the runner.
+It is independent of the stack above, which only serves the workflow.
+
 ## Conventions
 
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, …) — release-plz derives
