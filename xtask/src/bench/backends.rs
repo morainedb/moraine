@@ -116,7 +116,15 @@ pub fn attach_sql(
             paths
                 .cache_dir
                 .as_ref()
-                .map(|dir| format!(", CACHE_DIR '{}'", dir.display()))
+                .map(|dir| {
+                    // `META_`-prefixed: the attach is DuckLake's, which
+                    // passes the option through to the moraine catalog
+                    // under it and refuses it unprefixed.
+                    format!(
+                        ", META_CACHE_DIR {}",
+                        crate::catalog_target::sql_literal(&dir.display().to_string())
+                    )
+                })
                 .unwrap_or_default()
         ),
         BackendKind::DuckdbFile => format!(
@@ -548,7 +556,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/data"),
         };
         let moraine = attach_sql(BackendKind::Moraine, &paths, None, 1).unwrap();
-        assert!(moraine.contains("CACHE_DIR '/tmp/cache'"), "{moraine}");
+        assert!(moraine.contains("META_CACHE_DIR '/tmp/cache'"), "{moraine}");
 
         let express = attach_sql(BackendKind::MoraineExpress, &paths, None, 1).unwrap();
         assert_eq!(express, moraine);
