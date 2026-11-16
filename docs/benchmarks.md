@@ -15,6 +15,12 @@ x86-64 Linux VM against the in-memory object store.
 
 ## Running the harnesses
 
+`cargo xtask benchmarks` runs every harness below, one at a time, each to
+its own log and report under `target/benchmarks` — the whole set behind a
+restamp. It takes hours, keeps going when a harness fails, and adds
+ClickBench only when `--clickbench <checkout>` names one. The individual
+commands below stay the way to answer one question.
+
 | question | command | needs |
 |---|---|---|
 | moraine against other DuckLake catalogs | `cargo xtask bench` | Postgres on `PATH` or `MORAINE_BENCH_POSTGRES`, else that backend is skipped; `MORAINE_S3_BUCKET` puts moraine's catalog on S3; `MORAINE_BENCH_QUACK` names a Quack server |
