@@ -226,10 +226,12 @@ endpoint the secret resolves AWS's credential chain, which
 only credentials are an instance profile, where the default chain stops
 at the missing profile file.
 
-`--cache-dir` gives moraine's attaches a cache directory shared by the
-whole run, so only the first pays for a cold store. Leave it off to
-measure what a fresh process pays, which is what every stamp here did;
-set it to measure a warm one, which is what a long-lived process sees.
+`--cache-dir` gives moraine's attaches a cache directory the whole
+invocation shares, which speeds up the phases that read. It does not warm
+the attach: every run attaches a catalog of its own, stamped with the
+process and the clock, so the cache holds nothing for it. A warm attach
+is [the cold reader's](#cold-reader) measurement, which re-attaches one
+catalog across restarts.
 
 Output is a table of `median (min…max)` per phase with a ratio against
 moraine, also written to `target/bench/report.json`. A workload that
