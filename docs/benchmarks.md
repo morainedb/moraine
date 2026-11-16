@@ -438,7 +438,7 @@ Serial phases, medians:
   as DuckLake spends its retry budget on snapshot conflicts against the
   shared server.
 - The attach column is a cold read: no `--cache-dir`, so every run pays
-  for a store no cache kept. A long-lived process does not.
+  for a store no cache kept.
 - Postgres and Quack take writer *processes* but do not share the work
   among them: at eight writers one commits a few hundred times and the
   rest commit nothing, so their aggregate is flat across widths. Both
@@ -447,6 +447,21 @@ Serial phases, medians:
   5 s window at sixteen writers — because a writer inside a retry loop
   only stops between statements. The rates are over the window each
   actually got.
+
+The same run with `--cache-dir`, moraine's two stores (medians; the
+cache's own run measured 680 µs to S3 against 961 µs for the one above):
+
+| phase | moraine | +cache | express | +cache |
+|---|---:|---:|---:|---:|
+| full scan | 136 ms | 34 ms | 55 ms | 34 ms |
+| bulk delete | 236 ms | 162 ms | 90 ms | 72 ms |
+| merge | 283 ms | 179 ms | 130 ms | 108 ms |
+| 20 serial inserts | 1.96 s | 1.91 s | 644 ms | 617 ms |
+| attach | 1.13 s | 800 ms | 304 ms | 340 ms |
+
+A warm cache collapses the difference between the stores on reads — both
+scan in 34 ms — so Express earns its keep on writes and on cold reads.
+Commits move by nothing: they pay round trips, which no cache serves.
 
 ### Injected round trips
 
