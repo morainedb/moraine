@@ -469,91 +469,19 @@ A warm cache collapses the difference between the stores on reads — both
 scan in 34 ms — so Express earns its keep on writes and on cold reads.
 Commits move by nothing: they pay round trips, which no cache serves.
 
-### Injected round trips
+### What distance costs
 
-What does each catalog pay per network round trip? The same `bench`
-workloads, with moraine's catalog on loopback RustFS
-(`MORAINE_S3_BUCKET`), Postgres over loopback TCP
-(`MORAINE_BENCH_POSTGRES`), and a DuckDB file served over Quack
-(`MORAINE_BENCH_QUACK`), each behind a TCP delay line that adds one round
-trip of the stated length to every request. The plain DuckDB file catalog
-cannot leave the local disk, so it stays local as the control. Parquet is
-local everywhere; single-row inserts are inlined and write none.
+Not measured. The catalog once carried a sweep that injected round trips
+through a loopback delay line, and it is gone: its tooling never entered
+the repository, so nothing here could re-run it, and its request counts
+described the commit path before publications gained a lifetime.
 
-2026-11-16, the single-writer VM, three repeats, medians. Moraine is
-v0.9.1 with publications that carry a lifetime instead of being retired;
-the other catalogs are at v0.9.1 (`d4e6b8e`). RustFS answers a PUT in
-2.8 ms and a GET in 0.7 ms before the added delay.
+What it was for remains open. Every real endpoint above is one zone away,
+which prices a same-zone deployment and says nothing about a catalog read
+across a region. Two points make that slope, so the measurement wants a
+second bucket in a distant region and the same harness pointed at it —
+real latency rather than injected.
 
-| round trip | 20 serial inserts: moraine | postgres | quack | duckdb, local | attach: moraine | postgres | quack |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0 ms | 329 ms | 463 ms | 800 ms | 427 ms | 83 ms | 229 ms | 170 ms |
-| 5 ms | 993 ms | 2.31 s | 1.40 s | 483 ms | 329 ms | 835 ms | 228 ms |
-| 30 ms | 3.46 s | 9.20 s | 3.58 s | 548 ms | 1.24 s | 2.84 s | 399 ms |
-
-128 single-row commits over N connections:
-
-| round trip | writers | moraine | postgres | quack | duckdb, local |
-|---:|---:|---:|---:|---:|---:|
-| 0 ms | 1 | 1.98 s | 2.57 s | 4.45 s | 2.46 s |
-| 0 ms | 4 | 592 ms | 4.58 s | 12.2 s | 2.80 s |
-| 0 ms | 8 | 507 ms | 5.47 s | refused | 4.30 s |
-| 0 ms | 16 | 396 ms | 6.87 s | refused | 4.39 s |
-| 5 ms | 1 | 6.33 s | 14.2 s | 8.69 s | 2.20 s |
-| 5 ms | 4 | 1.83 s | refused | refused | 2.94 s |
-| 5 ms | 8 | 1.01 s | refused | refused | 4.12 s |
-| 5 ms | 16 | 663 ms | refused | refused | 4.21 s |
-| 30 ms | 1 | 22.2 s | 54.9 s | 21.0 s | 1.92 s |
-| 30 ms | 4 | 8.61 s | refused | refused | 2.18 s |
-| 30 ms | 8 | 4.39 s | refused | refused | 3.90 s |
-| 30 ms | 16 | 2.59 s | refused | refused | 3.01 s |
-
-- A moraine commit is two writes and three reads, all on the path the commit
-  waits for: the WAL PUT, then for the checkpoint's manifest write a probe of
-  the next manifest id, the GC boundary before and after, and the PUT itself.
-  Nothing runs behind the acknowledgement. A serial commit grows by 4.9 ms
-  per millisecond of round trip, about five round trips; the floor under
-  SlateDB's manifest protocol is two.
-- At v0.9.1 each publication was retired by a second manifest write inside
-  the acknowledgement, after listing the store's checkpoints: fourteen
-  requests, 14.2 ms per millisecond, 909 ms, 3.00 s, and 10.1 s for the
-  twenty inserts, and 17.0 s, 27.5 s, and 76.9 s for the lone writer's 128
-  commits. Moving the retirement behind the acknowledgement alone reached
-  9.7 ms per millisecond, with the retirement's write contending against
-  the next commit's. Postgres grows by 13.8 ms per millisecond, one
-  statement at a time.
-- The three reads are SlateDB's: the probe doubles as fencing and conflict
-  detection, and the boundary checks guard against collected manifests.
-  Serving them from cache needs SlateDB changes, and its boundary design
-  forbids a stale cache.
-- Serially, moraine on an object store leads a networked Postgres by 2.7× at
-  30 ms and matches the Quack-served DuckDB file, which leads only at the
-  shortest delays.
-- Quack grows by about 4 round trips per commit (4.4 ms per millisecond),
-  because DuckLake's statements for a commit travel in a few remote calls:
-  179 ms per commit at 30 ms against moraine's 173 ms. It is also the most
-  contended: four writers take 2.7× one writer's time at 0 ms and are
-  refused from 5 ms, and eight are refused everywhere, on duplicate
-  snapshot ids after ten retries.
-- Serially, moraine on an object store now leads a networked Postgres at
-  every delay, by 30% at 30 ms; the Quack-served DuckDB file leads both
-  once the round trip exceeds a few milliseconds.
-- From four writers up, moraine is the only networked catalog still
-  standing: Postgres exhausts DuckLake's ten retries on the snapshot
-  insert at 4 writers from 5 ms, and at 16 writers from 1 ms; Quack does
-  so at 8 writers from 0 ms. Moraine's 16-writer cost grows with the round
-  trip, 396 ms to 2.6 s, because each shared flush still pays the full
-  request chain.
-- The local DuckDB file beats networked moraine at every width here. The
-  comparison the sweep answers is between the two catalogs that can be
-  shared.
-
-Except for the injected round-trip sweep, these runs use local storage.
-All report median, minimum, and maximum latency and do not run in CI.
-
-## Reads
-
-<!-- site:omit -->
 ### ClickBench
 
 `benchmark/clickbench` is a [ClickBench](https://benchmark.clickhouse.com)

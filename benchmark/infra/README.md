@@ -41,8 +41,8 @@ So the runner, both servers, and the directory bucket are placed in one
 zone, and the runner's type is `c6i.2xlarge`: eight vCPUs and 16 GiB,
 matching the shape behind the existing numbers. The resulting figures are
 a best case — everything is one zone away — which the stamp should say.
-Distance is still simulated with the delay line the catalog documents, not
-bought.
+Distance is not simulated either: a second bucket in a distant region,
+with the same harness pointed at it, is what would price it.
 
 ## What it creates
 

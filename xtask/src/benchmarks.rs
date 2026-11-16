@@ -234,6 +234,25 @@ fn single_purpose_steps(output: &Path) -> Vec<Step> {
             &["filter-bench", &extension, &filter_results],
         ),
         Step::xtask("core-endpoint", &["s3"]),
+        // The same suite the `Real S3 benchmark` workflow runs, against
+        // whatever bucket the environment names rather than a loopback
+        // server. Skipped by its own harness when none is named.
+        Step::cargo(
+            "core-endpoint-aws",
+            &[
+                "test",
+                "-p",
+                "moraine",
+                "--test",
+                "object_storage",
+                "--release",
+                "--locked",
+                "--",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+        ),
     ]
 }
 
