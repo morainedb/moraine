@@ -8,6 +8,11 @@ locals {
   ])
 }
 
+output "region" {
+  description = "Region every resource is in. Name it on every CLI call: a call to another region reports the instance as not connected rather than as absent."
+  value       = var.region
+}
+
 output "runner_instance_id" {
   description = "The runner, reached with `aws ssm start-session --target`."
   value       = aws_instance.runner.id
