@@ -269,6 +269,7 @@ impl QuackHandle {
     }
 
     pub fn create_schema(&self, schema: &str) -> anyhow::Result<()> {
+        self.remote_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))?;
         self.remote_sql(&format!("CREATE SCHEMA {schema}"))
     }
 
@@ -460,6 +461,7 @@ impl PostgresHandle {
     }
 
     pub fn create_database(&self, database: &str) -> anyhow::Result<()> {
+        self.psql(&format!("DROP DATABASE IF EXISTS {database};"))?;
         self.psql(&format!("CREATE DATABASE {database};"))
     }
 

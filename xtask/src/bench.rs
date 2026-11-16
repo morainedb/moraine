@@ -359,7 +359,7 @@ fn run_once(
     fs::create_dir_all(&paths.data_dir)
         .with_context(|| format!("creating {}", paths.data_dir.display()))?;
 
-    let scratch_name = format!("bench_{}_{repeat}", workload.name);
+    let scratch_name = scratch_name(&format!("{}_{repeat}", workload.name));
     let remote = servers.create(backend, &scratch_name)?;
     let attach = attach_sql(backend, &paths, remote.as_ref(), LATENCY_FLUSH_INTERVAL_MS)?;
 
@@ -425,6 +425,13 @@ impl Servers {
     }
 }
 
+/// A server-side name for one run, carrying this process's id. A run
+/// killed mid-flight leaves its schemas and databases behind, and a
+/// deterministic name would collide with them on the next attempt.
+fn scratch_name(leaf: &str) -> String {
+    format!("bench_{}_{leaf}", std::process::id())
+}
+
 /// The statements a moraine attach needs before it runs: `httpfs` and the
 /// store's secret for S3, nothing for a local directory.
 fn store_preamble(store: &CatalogTarget) -> anyhow::Result<String> {
@@ -476,7 +483,7 @@ fn run_burst_once(
             .with_context(|| format!("creating {}", directory.display()))?;
     }
 
-    let scratch_name = format!("bench_burst_{}_{repeat}", burst.writers);
+    let scratch_name = scratch_name(&format!("burst_{}_{repeat}", burst.writers));
     let remote = servers.create(backend, &scratch_name)?;
     let attach = attach_sql(backend, &paths, remote.as_ref(), flush_interval_ms)?;
     let writer_context = concurrent::WriterContext {
