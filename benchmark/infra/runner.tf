@@ -93,6 +93,7 @@ resource "aws_instance" "runner" {
 
   user_data = templatefile("${path.module}/runner-user-data.sh.tftpl", {
     region           = var.region
+    repository       = var.repository
     standard_bucket  = aws_s3_bucket.standard.bucket
     express_bucket   = aws_s3_directory_bucket.express.bucket
     postgres_dsn     = local.postgres_dsn

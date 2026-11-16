@@ -50,7 +50,15 @@ dnf install -y postgresql16 postgresql16-server ||
 # quick.
 dnf install -y ccache || echo "ccache unavailable; DuckDB builds will not be cached"
 
+# No default toolchain: the repository's `rust-toolchain.toml` picks it,
+# which is why `cargo` is only meaningful inside the clone below.
 su - ec2-user -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
+
+# Cloned here so a fresh runner is one `cargo xtask bench` from measuring,
+# and so the submodules — a few hundred megabytes the extension build
+# cannot do without — are fetched before anyone is waiting on them.
+su - ec2-user -c 'git clone --recurse-submodules ${repository} moraine' ||
+  echo "clone failed; clone it by hand before benching"
 
 # Session Manager lands in a session as `ssm-user`, where none of this
 # exists: the clone, the toolchain and the environment belong to

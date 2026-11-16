@@ -65,17 +65,24 @@ is the way in.
 aws ssm start-session --region "$(tofu output -raw region)" \
   --target "$(tofu output -raw runner_instance_id)"
 sudo -iu ec2-user          # a session starts as ssm-user, which owns none of this
-git clone --recurse-submodules https://github.com/morainedb/moraine && cd moraine
+cd moraine                 # cloned at boot, submodules and all
 set -a; . /etc/moraine-bench/bench.env; set +a
 cargo xtask bench --backends moraine,moraine_express,postgres,quack,duckdb \
   --seconds 5 --concurrency 1,2,4,8,16
 ```
 
-Clone with the submodules: the extension build needs `duckdb` and
-`extension-ci-tools`, and without them it stops at a missing makefile
-rather than at anything naming a submodule. `git submodule update --init`
-repairs a clone that went without them — not `--depth`, since DuckDB is
-pinned to a commit that is not a branch head.
+First boot clones the repository into `~ec2-user/moraine` with its
+submodules, which the extension build needs: without `duckdb` and
+`extension-ci-tools` it stops at a missing makefile rather than at
+anything naming a submodule. A clone made by hand needs
+`--recurse-submodules`, or `git submodule update --init` after the
+fact — not `--depth`, since DuckDB is pinned to a commit that is not a
+branch head.
+
+`cargo` only works inside that clone: rustup is installed with no default
+toolchain, so the version comes from the repository's
+`rust-toolchain.toml` rather than from whatever the runner happened to
+install.
 
 First boot writes that environment, then installs the build toolchain
 from [CONTRIBUTING.md](../../CONTRIBUTING.md) and `rustup`, and finishes

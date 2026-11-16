@@ -34,6 +34,12 @@ variable "runner_instance_type" {
   default     = "c6i.2xlarge"
 }
 
+variable "repository" {
+  description = "Repository the runner clones at boot, submodules and all."
+  type        = string
+  default     = "https://github.com/morainedb/moraine"
+}
+
 variable "runner_volume_gb" {
   description = "Runner root volume. It holds a DuckDB build tree, the Rust target directory, and the benchmark's Parquet."
   type        = number
