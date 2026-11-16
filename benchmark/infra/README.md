@@ -62,7 +62,8 @@ is the way in.
 ## Running a sweep
 
 ```sh
-aws ssm start-session --target "$(tofu output -raw runner_instance_id)"
+aws ssm start-session --region "$(tofu output -raw region)" \
+  --target "$(tofu output -raw runner_instance_id)"
 sudo -iu ec2-user
 git clone https://github.com/morainedb/moraine && cd moraine
 set -a; . /etc/moraine-bench/s3.env; set +a
@@ -112,7 +113,8 @@ it. First boot downloads the CLI and installs the `quack` extension, so
 give it a minute. To look at it:
 
 ```sh
-aws ssm start-session --target "$(tofu output -raw quack_instance_id)"
+aws ssm start-session --region "$(tofu output -raw region)" \
+  --target "$(tofu output -raw quack_instance_id)"
 sudo journalctl -u quack -n 50
 ```
 
@@ -142,6 +144,10 @@ objects in the standard bucket also expire after seven days.
 
 ## Assumptions
 
+- Every command names the region explicitly, from the `region` output.
+  These resources are in one region whatever your CLI defaults to, and an
+  SSM call to the wrong one reports the instance as not connected rather
+  than as absent.
 - The region has a default VPC with public subnets, and a subnet in the
   zone of `express_availability_zone_id`.
 - That zone offers S3 Express. The default, `use1-az4`, does; change it
