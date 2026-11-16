@@ -84,14 +84,27 @@ fn cell(report: &Report, workload: &str, phase: &str, backend: &str) -> anyhow::
     ))
 }
 
-/// Median for a cell, if that backend ran it.
-fn cell_median(report: &Report, workload: &str, phase: &str, backend: &str) -> Option<f64> {
-    let row = report
-        .rows
-        .iter()
-        .find(|row| row.workload == workload && row.phase == phase && row.backend == backend)?;
-    let mut samples = row.seconds.clone();
-    median(&mut samples).ok()
+/// How much slower `backend` was than moraine on this cell. A workload
+/// that counts commits is compared by rate: under a window every backend
+/// runs for the same time by construction, so its wall clock says
+/// nothing.
+fn cell_ratio(report: &Report, workload: &str, phase: &str, backend: &str) -> Option<f64> {
+    let find = |backend: &str| {
+        report
+            .rows
+            .iter()
+            .find(|row| row.workload == workload && row.phase == phase && row.backend == backend)
+    };
+    let moraine = find("moraine")?;
+    let other = find(backend)?;
+
+    if let (Some(moraine_rate), Some(other_rate)) = (cell_rate(moraine), cell_rate(other)) {
+        return (other_rate > 0.0).then_some(moraine_rate / other_rate);
+    }
+
+    let moraine = median(&mut moraine.seconds.clone()).ok()?;
+    let other = median(&mut other.seconds.clone()).ok()?;
+    (moraine > 0.0).then_some(other / moraine)
 }
 
 /// Renders one line per probed endpoint. A table of catalog timings is
@@ -145,17 +158,13 @@ pub fn render_table(report: &Report, backends: &[String]) -> anyhow::Result<Stri
             line.push(cell(report, workload, phase, backend)?);
         }
         if has_moraine {
-            let moraine = cell_median(report, workload, phase, "moraine");
             for backend in backends {
                 if backend == "moraine" {
                     continue;
                 }
-                let other = cell_median(report, workload, phase, backend);
-                line.push(match (moraine, other) {
-                    (Some(base), Some(other)) if base > 0.0 => {
-                        format!("{:.2}×", other / base)
-                    }
-                    _ => "—".to_owned(),
+                line.push(match cell_ratio(report, workload, phase, backend) {
+                    Some(ratio) => format!("{ratio:.2}×"),
+                    None => "—".to_owned(),
                 });
             }
         }
@@ -320,6 +329,41 @@ mod tests {
         assert!(lines[1].contains("30.0ms (30.0ms…30.0ms)"));
         assert!(lines[1].contains("2.00×"));
         assert!(lines[1].contains("skipped"));
+    }
+
+    #[test]
+    fn a_counted_workload_is_compared_by_rate_not_by_its_window() {
+        let report = Report {
+            scale: "small".to_owned(),
+            repeat: 1,
+            endpoints: Vec::new(),
+            rows: vec![
+                Row {
+                    workload: "concurrent_connections".to_owned(),
+                    phase: "writers_1".to_owned(),
+                    backend: "moraine".to_owned(),
+                    seconds: vec![5.0],
+                    commits: vec![55],
+                },
+                Row {
+                    workload: "concurrent_connections".to_owned(),
+                    phase: "writers_1".to_owned(),
+                    backend: "duckdb".to_owned(),
+                    seconds: vec![5.0],
+                    commits: vec![680],
+                },
+            ],
+        };
+
+        // Both ran for the same five seconds, so a wall-clock ratio would
+        // read as parity where one committed twelve times as much.
+        let table = render_table(&report, &["moraine".to_owned(), "duckdb".to_owned()]).unwrap();
+        let line = table
+            .lines()
+            .find(|line| line.starts_with("concurrent_connections/writers_1"))
+            .unwrap();
+        assert!(line.contains("0.08×"), "{line}");
+        assert!(!line.contains("1.00×"), "{line}");
     }
 
     #[test]
