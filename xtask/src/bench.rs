@@ -324,7 +324,12 @@ fn with_session_prefix(
         Statement::setup(attach)
     };
     let mut statements = vec![Statement::setup("SELECT 1;"), attach_statement];
-    statements.extend(rest);
+    // A workload that re-attaches writes `{attach}` rather than knowing
+    // the backend's own attach, which only the runner can build.
+    statements.extend(rest.into_iter().map(|statement| Statement {
+        sql: statement.sql.replace("{attach}", attach),
+        ..statement
+    }));
     statements
 }
 

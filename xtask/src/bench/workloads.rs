@@ -190,6 +190,8 @@ pub fn workloads(scale: &Scale) -> Vec<Workload> {
         moraine_only: false,
     };
 
+    let warm = warm_attach(&create_items, &insert_items);
+
     let many_tables = Workload {
         name: "many_tables",
         seed: Vec::new(),
@@ -256,6 +258,7 @@ pub fn workloads(scale: &Scale) -> Vec<Workload> {
     let mut all = vec![
         bulk_load,
         small_commits,
+        warm,
         wide_small_commits(scale),
         first_inline_write(scale),
         many_tables,
@@ -264,6 +267,23 @@ pub fn workloads(scale: &Scale) -> Vec<Workload> {
     ];
     all.extend(delete_workloads(scale));
     all
+}
+
+/// The second attach is the one worth having: a catalog is attached once
+/// per process and read for as long as that process lives, so what a
+/// re-attach costs is what a long-lived reader pays.
+fn warm_attach(create_items: &str, insert_items: &str) -> Workload {
+    Workload {
+        name: "warm_attach",
+        seed: vec![create_items.to_owned(), insert_items.to_owned()],
+        measured: vec![
+            Statement::setup("SELECT count(*) FROM lake.main.items;"),
+            Statement::setup("DETACH lake;"),
+            Statement::measured("reattach", "{attach}"),
+            Statement::measured("reattached_count", "SELECT count(*) FROM lake.main.items;"),
+        ],
+        moraine_only: false,
+    }
 }
 
 /// The table every delete workload targets. One name across all of them:
@@ -403,6 +423,7 @@ mod tests {
             [
                 "bulk_load",
                 "small_commits",
+                "warm_attach",
                 "wide_small_commits",
                 "first_inline_write",
                 "many_tables",
@@ -431,6 +452,11 @@ mod tests {
         };
         assert_eq!(phases("bulk_load"), ["create_table", "insert"]);
         assert_eq!(phases("small_commits"), ["inserts"]);
+        assert_eq!(
+            phases("warm_attach"),
+            ["reattach", "reattached_count"],
+            "the re-attach is the phase this workload exists for"
+        );
         assert_eq!(phases("wide_small_commits"), ["inserts"]);
         assert_eq!(phases("first_inline_write"), ["creates_with_rows"]);
         assert_eq!(phases("many_tables"), ["creates"]);
