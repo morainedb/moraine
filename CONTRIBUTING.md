@@ -3,6 +3,7 @@
 ## Setup
 
 ```bash
+git submodule update --init  # duckdb and extension-ci-tools; the build needs both
 rustup toolchain install  # respects rust-toolchain.toml
 rustup toolchain install nightly-2026-08-29 --profile minimal --component rustfmt
 cargo install cargo-deny

@@ -65,10 +65,16 @@ is the way in.
 aws ssm start-session --region "$(tofu output -raw region)" \
   --target "$(tofu output -raw runner_instance_id)"
 sudo -iu ec2-user
-git clone https://github.com/morainedb/moraine && cd moraine
+git clone --recurse-submodules https://github.com/morainedb/moraine && cd moraine
 set -a; . /etc/moraine-bench/s3.env; set +a
 cargo xtask bench --backends moraine,postgres,quack,duckdb
 ```
+
+Clone with the submodules: the extension build needs `duckdb` and
+`extension-ci-tools`, and without them it stops at a missing makefile
+rather than at anything naming a submodule. `git submodule update --init`
+repairs a clone that went without them — not `--depth`, since DuckDB is
+pinned to a commit that is not a branch head.
 
 First boot writes that environment, then installs the build toolchain
 from [CONTRIBUTING.md](../../CONTRIBUTING.md) and `rustup`, and finishes
