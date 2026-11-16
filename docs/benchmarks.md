@@ -389,6 +389,63 @@ At 512 commits (2026-08), DuckDB-file exhausts DuckLake's retry budget at
 1.92 s at 32, 2.10 s at 64.
 <!-- /site:omit -->
 
+### Five catalogs on AWS
+
+What does each catalog cost on real endpoints, and what does S3 Express
+buy? One run of every backend, both of moraine's stores among them, so
+the columns share a machine, a clock and a network.
+
+```bash
+cargo xtask bench --backends moraine,moraine_express,duckdb,postgres,quack \
+  --seconds 5 --concurrency 1,2,4,8,16
+```
+
+2026-11-16 at `79d9646`; a `c6i.2xlarge` runner in us-east-1 `use1-az4`,
+with the standard bucket, the directory bucket, RDS Postgres 16
+(`db.t4g.small`) and a `t4g.small` Quack server in that same zone.
+Measured TCP connects: 961 µs to S3, 399 µs to RDS, 226 µs to Quack.
+Parquet is local, the DuckDB file catalog is local and is the control.
+Three repeats.
+
+Commits per second, writers sharing one process:
+
+| writers | moraine | express | duckdb | postgres | quack |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 10 | 32 | 128 | 86 | 43 |
+| 2 | 18 | 58 | 97 | 67 | 31 |
+| 4 | 41 | 115 | 85 | 55 | 14 |
+| 8 | 58 | 225 | 98 | 35 | 4 |
+| 16 | 113 | 376 | 70 | 23 | 2 |
+
+Serial phases, medians:
+
+| phase | moraine | express | duckdb | postgres | quack |
+|---|---:|---:|---:|---:|---:|
+| attach | 776 ms | 295 ms | 16 ms | 181 ms | 165 ms |
+| bulk insert | 121 ms | 65 ms | 38 ms | 72 ms | 76 ms |
+| 100 repeated deletes | 2.57 s | 964 ms | 407 ms | 526 ms | 1.02 s |
+
+- **S3 Express is worth about 3× at every width**, and a little over 2×
+  on serial latency. It is the same catalog and the same code: only the
+  bucket differs, and moraine reads Express addressing off its name.
+- **Only moraine gets faster with writers.** On the standard bucket it
+  passes RDS at eight and the local file at sixteen; on Express it passes
+  the local file at four and ends 5× ahead of it. Every other catalog
+  declines from its first writer.
+- **Quack collapses under concurrency**, from 43 commits per second to 2,
+  as DuckLake spends its retry budget on snapshot conflicts against the
+  shared server.
+- The attach column is a cold read: no `--cache-dir`, so every run pays
+  for a store no cache kept. A long-lived process does not.
+- Postgres and Quack take writer *processes* but do not share the work
+  among them: at eight writers one commits a few hundred times and the
+  rest commit nothing, so their aggregate is flat across widths. Both
+  embedded catalogs refuse a second process outright.
+- The windows ran long for the contended backends — up to 10 s for a
+  5 s window at sixteen writers — because a writer inside a retry loop
+  only stops between statements. The rates are over the window each
+  actually got.
+
 ### Injected round trips
 
 What does each catalog pay per network round trip? The same `bench`
