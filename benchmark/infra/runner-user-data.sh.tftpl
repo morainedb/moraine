@@ -1,30 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-# The toolchain the extension build needs, as CONTRIBUTING.md describes it:
-# DuckLake's Linux pipeline uses GCC 14, DuckDB's cmake generates Ninja and
-# finds ccache on PATH by itself.
-dnf install -y git tar gzip jq cmake ninja-build ccache gcc gcc-c++ gcc14 gcc14-c++ python3 python3-pip
+# The bench environment is written first, before anything that can fail:
+# a missing package must not take the values only this script knows.
+install -d -m 0755 /etc/moraine-bench
 
-# `pg_ctl` is what the harness probes for, and it ships with the server
-# package even though an external server needs only the client.
-dnf install -y postgresql16 postgresql16-server ||
-  dnf install -y postgresql15 postgresql15-server
-
-su - ec2-user -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
-
-# The certificate names the host, not its address, so the name has to
-# resolve. This is the only client the server has.
+# The Quack certificate names the host, not its address, so the name has
+# to resolve. This is the only client that server has.
 echo "${quack_private_ip} ${quack_hostname}" >> /etc/hosts
 
-install -d -m 0755 /etc/moraine-bench
 cat > /etc/moraine-bench/quack-ca.pem <<'CERT'
 ${trimspace(quack_ca_cert)}
 CERT
 chmod 0644 /etc/moraine-bench/quack-ca.pem
 
-# Written literally: the prefix is stamped when a run sources the file, and
-# `set -a; . <file>` is how it is meant to be read.
+# Written literally: the prefix is stamped when a run sources the file,
+# and `set -a; . <file>` is how it is meant to be read.
 cat > /etc/moraine-bench/common.env <<'ENV'
 export AWS_REGION=${region}
 export MORAINE_S3_PREFIX="bench/$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -47,3 +38,24 @@ ENV
 rm /etc/moraine-bench/common.env
 chown root:ec2-user /etc/moraine-bench/s3.env /etc/moraine-bench/s3express.env
 chmod 0640 /etc/moraine-bench/s3.env /etc/moraine-bench/s3express.env
+
+# The toolchain the extension build needs, as CONTRIBUTING.md describes
+# it: DuckLake's Linux pipeline uses GCC 14, and DuckDB's cmake generates
+# Ninja.
+dnf install -y git tar gzip jq cmake ninja-build gcc gcc-c++ gcc14 gcc14-c++ python3 python3-pip
+
+# `pg_ctl` is what the harness probes for, and it ships with the server
+# package even though an external server needs only the client.
+dnf install -y postgresql16 postgresql16-server ||
+  dnf install -y postgresql15 postgresql15-server
+
+# Not in Amazon Linux's repositories, and only an accelerator: DuckDB's
+# cmake uses it when it is on PATH and builds from scratch when it is
+# not. An AMI snapshot after the first build is what makes later sweeps
+# quick.
+dnf install -y ccache || echo "ccache unavailable; DuckDB builds will not be cached"
+
+su - ec2-user -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
+
+# The last line, so its absence is the signal that setup did not finish.
+touch /etc/moraine-bench/ready

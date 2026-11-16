@@ -70,10 +70,16 @@ set -a; . /etc/moraine-bench/s3.env; set +a
 cargo xtask bench --backends moraine,postgres,quack,duckdb
 ```
 
-First boot installs the build toolchain from
-[CONTRIBUTING.md](../../CONTRIBUTING.md) and `rustup`; the first `bench`
-then compiles DuckDB, which is the slow part. Snapshot an AMI once that
-has happened and later sweeps start in a minute.
+First boot writes that environment, then installs the build toolchain
+from [CONTRIBUTING.md](../../CONTRIBUTING.md) and `rustup`, and finishes
+by creating `/etc/moraine-bench/ready`. If that file is missing, setup
+did not finish and `/var/log/cloud-init-output.log` says why; replace the
+instance with `tofu apply -replace=aws_instance.runner` rather than
+repairing it, since cloud-init runs a script once per instance.
+
+Amazon Linux has no `ccache`, so the first `bench` compiles DuckDB from
+scratch, which is the slow part. Snapshot an AMI once that has happened
+and later sweeps start in a minute.
 
 `/etc/moraine-bench/s3.env` and `s3express.env` differ only in the bucket;
 everything else — region, Postgres DSN, the Quack endpoint, its token, and
