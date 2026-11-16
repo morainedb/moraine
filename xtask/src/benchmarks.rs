@@ -353,11 +353,54 @@ fn clickbench_steps(checkout: Option<&Path>) -> Vec<Step> {
     ]
 }
 
+/// Where a run records the process holding the output directory.
+fn lock_path(output: &Path) -> PathBuf {
+    output.join("running.pid")
+}
+
+/// Refuses to start beside a run already using this output directory.
+/// Two runs on one machine share its cores and measure each other, and
+/// their logs land on each other's.
+fn claim(output: &Path) -> anyhow::Result<()> {
+    let lock = lock_path(output);
+    if let Ok(holder) = fs::read_to_string(&lock) {
+        let holder = holder.trim();
+        if holder.parse::<u32>().is_ok_and(is_running) {
+            anyhow::bail!(
+                "a run is already going as process {holder}; wait for it, or stop it and \
+                 delete {}",
+                lock.display()
+            );
+        }
+    }
+
+    fs::write(&lock, std::process::id().to_string())
+        .with_context(|| format!("claiming {}", lock.display()))
+}
+
+/// Whether a process by that id is alive. Asked of `/proc` where there
+/// is one, and of `ps` elsewhere: `kill -0` reads an out-of-range id as
+/// every process and answers yes.
+fn is_running(pid: u32) -> bool {
+    let processes = Path::new("/proc");
+    if processes.is_dir() {
+        return processes.join(pid.to_string()).exists();
+    }
+
+    Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// `benchmarks [--out <dir>] [--clickbench <checkout>]`.
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let (output, clickbench) = parse_options(arguments)?;
 
     fs::create_dir_all(&output).with_context(|| format!("creating {}", output.display()))?;
+    claim(&output)?;
     let xtask = std::env::current_exe().context("finding this xtask binary")?;
     let steps = steps(&output, clickbench.as_deref());
     println!(
@@ -376,6 +419,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         }
     }
 
+    let _ = fs::remove_file(lock_path(&output));
     if failed.is_empty() {
         println!("ok: every harness ran; logs under {}", output.display());
     } else {
@@ -478,6 +522,25 @@ mod tests {
         assert_eq!(steps.len(), without + 2);
         assert_eq!(steps[steps.len() - 2].name, "clickbench-run");
         assert_eq!(steps[steps.len() - 1].name, "clickbench-report");
+    }
+
+    #[test]
+    fn a_live_run_keeps_a_second_one_out_and_a_dead_one_does_not() {
+        let output = std::env::temp_dir().join(format!("benchmarks-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&output);
+        fs::create_dir_all(&output).unwrap();
+
+        claim(&output).unwrap();
+        let error = claim(&output).unwrap_err().to_string();
+        assert!(error.contains("already going"), "{error}");
+
+        // A run killed mid-flight leaves its id behind; the next one
+        // takes the directory rather than refusing forever.
+        fs::write(lock_path(&output), u32::MAX.to_string()).unwrap();
+        assert!(!is_running(u32::MAX));
+        claim(&output).unwrap();
+
+        fs::remove_dir_all(&output).unwrap();
     }
 
     #[test]
