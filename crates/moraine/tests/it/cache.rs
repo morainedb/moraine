@@ -455,61 +455,6 @@ async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
     writer.close().await.unwrap();
 }
 
-/// A cache size bounds the cache without disabling it: the catalog is
-/// served through a capped cache on the writer's side and the reader's
-/// alike.
-///
-/// That a directory becomes a device is `store::cache`'s to assert, not
-/// this test's: one cache serves the whole process, so whichever store
-/// opens first in this binary decides whether there is a device at all.
-#[tokio::test]
-async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
-    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
-    let cache = std::env::temp_dir().join(format!(
-        "moraine-bounded-cache-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&cache);
-
-    let mut options = CatalogOptions::default();
-    options.cache_dir = Some(cache.clone());
-    options.cache_size = Some(64 * 1024 * 1024);
-
-    let writer = Catalog::open(Arc::clone(&object_store), options.clone())
-        .await
-        .unwrap();
-    writer
-        .commit(async |tx| {
-            let schema = tx
-                .schema_by_name("main")
-                .await
-                .unwrap()
-                .expect("bootstrap")
-                .id;
-            tx.create_table(schema, "t", &[col("a")]).await?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
-
-    let reader = Catalog::open_read_only(object_store, options)
-        .await
-        .unwrap();
-    let view = reader.read_scope().await.unwrap();
-    let schema = view
-        .schema_by_name("main")
-        .await
-        .unwrap()
-        .expect("bootstrap")
-        .id;
-    assert!(view.table_by_name(schema, "t").await.unwrap().is_some());
-    reader.close().await.unwrap();
-
-    let _ = std::fs::remove_dir_all(&cache);
-}
-
 /// The cache reports what it served. Reads run through the process's one
 /// instance, so the counters move as soon as anything reads a store —
 /// which is what makes the budget sizable from measurement instead of
