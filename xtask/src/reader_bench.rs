@@ -194,9 +194,7 @@ fn preamble(artifacts: &Artifacts<'_>, target: &CatalogTarget) -> anyhow::Result
         "SET extension_directory={};",
         sql_literal(&duckdb::extension_install_directory().display().to_string())
     );
-    if target.is_remote() {
-        script.push_str("INSTALL httpfs;\nLOAD httpfs;\n");
-    }
+    script.push_str(&target.extensions_sql());
     let _ = writeln!(
         script,
         "LOAD {};",

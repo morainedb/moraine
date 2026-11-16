@@ -387,10 +387,7 @@ impl Servers {
 /// The statements a moraine attach needs before it runs: `httpfs` and the
 /// store's secret for S3, nothing for a local directory.
 fn store_preamble(store: &CatalogTarget) -> anyhow::Result<String> {
-    let mut preamble = String::new();
-    if store.is_remote() {
-        preamble.push_str("INSTALL httpfs;\nLOAD httpfs;\n");
-    }
+    let mut preamble = store.extensions_sql();
     if let Some(secret) = store.secret_sql()? {
         preamble.push_str(&secret);
         preamble.push('\n');

@@ -218,7 +218,11 @@ server off the loopback, whose TLS certificate the client must trust;
 each run gets its own metadata schema.
 Moraine's catalog is a local directory unless `MORAINE_S3_BUCKET` (with
 `MORAINE_S3_PREFIX`, `MORAINE_S3_ENDPOINT`, and AWS credentials) names a
-bucket; Parquet stays local either way. Output is a table of
+bucket; Parquet stays local either way. Without an endpoint the secret
+resolves AWS's credential chain, which `MORAINE_S3_CREDENTIAL_CHAIN`
+narrows — `instance` for a machine whose only credentials are an
+instance profile, where the default chain stops at the missing profile
+file. Output is a table of
 `median (min…max)` per phase with a ratio against moraine, also written to
 `target/bench/report.json`.
 
