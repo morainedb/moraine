@@ -537,8 +537,11 @@ the methodology. No result is recorded yet.
 ### Cold reader
 
 `cargo xtask reader-bench` measures what a fresh read-only process pays
-over thousands of files: attach (split into store open and first
-materialization), file listing, a pruned query plan, and a warm repeat.
+over thousands of files: attach and the store open within it, file
+listing, a pruned query plan, and a warm repeat. The attach once split
+into a store open and a first materialization; scopes load on demand
+now, so nothing materializes at attach and there is nothing there to
+time.
 Each repeat is a new process; only `--cache-dir` survives.
 
 ```text

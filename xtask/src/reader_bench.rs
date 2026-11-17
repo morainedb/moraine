@@ -124,7 +124,6 @@ fn seed_plan(files: usize) -> SeedPlan {
 struct Sample {
     attach_ms: f64,
     open_ms: f64,
-    view_ms: f64,
     files_ms: f64,
     plan_ms: f64,
     warm_ms: f64,
@@ -160,14 +159,13 @@ fn parse_sample(stdout: &str) -> anyhow::Result<Sample> {
         .with_context(|| format!("benchmark result row is missing from CLI output:\n{stdout}"))?;
     let fields: Vec<&str> = row.split(',').collect();
     ensure!(
-        fields.len() == 8,
+        fields.len() == 7,
         "benchmark result has {} fields",
         fields.len()
     );
     Ok(Sample {
         attach_ms: times[0] * 1_000.0,
         open_ms: parse_field(&fields, 6, "open_ms")?,
-        view_ms: parse_field(&fields, 7, "view_ms")?,
         files_ms: times[1] * 1_000.0,
         plan_ms: times[2] * 1_000.0,
         warm_ms: times[3] * 1_000.0,
@@ -338,14 +336,15 @@ fn seed(
     Ok(())
 }
 
-/// The two halves of an attach, read back from the events moraine logs as
-/// it opens: the store open, and the first materialization of the catalog.
-/// Both are milliseconds, and both are NULL if the event never fired.
-const ATTACH_SPLIT_SQL: &str = "\
+/// The store open within an attach, read back from the event moraine logs
+/// as it opens. Milliseconds, and NULL if the event never fired.
+///
+/// There was a second half once, the first materialization of the
+/// catalog. Scopes load on demand now, so no attach materializes
+/// anything and there is nothing there to time.
+const STORE_OPEN_SQL: &str = "\
     (SELECT CAST(regexp_extract(message, 'elapsed_ms=([0-9]+)', 1) AS BIGINT) FROM duckdb_logs \
-     WHERE type = 'moraine' AND message LIKE '%opened catalog read-only%' LIMIT 1), \
-    (SELECT CAST(regexp_extract(message, 'elapsed_ms=([0-9]+)', 1) AS BIGINT) FROM duckdb_logs \
-     WHERE type = 'moraine' AND message LIKE '%materializations=1,%' LIMIT 1)";
+     WHERE type = 'moraine' AND message LIKE '%opened catalog read-only%' LIMIT 1)";
 
 /// One cold process: attach read-only, list every data file, plan a query
 /// pruned to one file, then plan another with everything warm.
@@ -399,7 +398,7 @@ fn measure(
         "SELECT '{MARKER}', cold.main_gets + cold.wal_gets, cold.main_get_ms + cold.wal_get_ms, \
          after.main_gets + after.wal_gets - cold.main_gets - cold.wal_gets, \
          after.main_get_ms + after.wal_get_ms - cold.main_get_ms - cold.wal_get_ms, after.errors, \
-         {ATTACH_SPLIT_SQL} \
+         {STORE_OPEN_SQL} \
          FROM moraine_object_store_tally('lake') AS after, io_cold AS cold;"
     );
 
@@ -449,11 +448,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
             .map_or_else(|| "none".to_owned(), |dir| dir.display().to_string())
     );
     println!(
-        "{:>7}  {:>9}  {:>7}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>11}  {:>9}  {:>11}",
+        "{:>7}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>11}  {:>9}  {:>11}",
         "files",
         "attach_ms",
         "open_ms",
-        "view_ms",
         "files_ms",
         "plan_ms",
         "warm_ms",
@@ -492,11 +490,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         }
         let errors: u64 = samples.iter().map(|sample| sample.errors).sum();
         println!(
-            "{files:>7}  {:>9.1}  {:>7.1}  {:>7.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>11.1}  \
+            "{files:>7}  {:>9.1}  {:>7.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>11.1}  \
              {:>9.1}  {:>11.1}",
             median_of(&samples, |sample| sample.attach_ms)?,
             median_of(&samples, |sample| sample.open_ms)?,
-            median_of(&samples, |sample| sample.view_ms)?,
             median_of(&samples, |sample| sample.files_ms)?,
             median_of(&samples, |sample| sample.plan_ms)?,
             median_of(&samples, |sample| sample.warm_ms)?,
@@ -584,17 +581,18 @@ mod tests {
 
     #[test]
     fn parses_four_timings_and_the_tagged_row() {
+        // Seven fields: the row lost its materialization column with the
+        // materialization itself.
         let output = "Run Time (s): real 0.250 user 0 sys 0\n\
                       Run Time (s): real 0.150 user 0 sys 0\n\
                       Run Time (s): real 0.040 user 0 sys 0\n\
                       Run Time (s): real 0.002 user 0 sys 0\n\
-                      __MORAINE_READER_BENCH__,4,86.5,0,0.0,0,90,160\n";
+                      __MORAINE_READER_BENCH__,4,86.5,0,0.0,0,90\n";
         assert_eq!(
             parse_sample(output).unwrap(),
             Sample {
                 attach_ms: 250.0,
                 open_ms: 90.0,
-                view_ms: 160.0,
                 files_ms: 150.0,
                 plan_ms: 40.0,
                 warm_ms: 2.0,
