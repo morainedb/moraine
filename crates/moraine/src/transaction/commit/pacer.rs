@@ -20,7 +20,7 @@ use tokio::time::Instant;
 /// and waiting longer coalesces nothing.
 pub(crate) struct FlushPacer {
     db: Db,
-    publication: Option<crate::store::checkpoint::Publisher>,
+    publication: Option<Arc<crate::store::checkpoint::Publisher>>,
     spacing: Duration,
     state: Mutex<PacerState>,
     /// Serializes the flushes themselves, so a deferred one never overlaps
@@ -170,7 +170,10 @@ impl FlushPacer {
 
     pub(crate) fn publishing(db: Db, spacing: Duration, admin: slatedb::admin::Admin) -> Arc<Self> {
         Arc::new(Self {
-            publication: Some(crate::store::checkpoint::Publisher::new(db.clone(), admin)),
+            publication: Some(Arc::new(crate::store::checkpoint::Publisher::new(
+                db.clone(),
+                admin,
+            ))),
             db,
             spacing,
             state: Mutex::new(PacerState::default()),
@@ -185,6 +188,22 @@ impl FlushPacer {
             publication.through(sequence).await?;
         }
         Ok(())
+    }
+
+    /// Asks for `sequence` to become visible to other processes without
+    /// waiting for it, which is what every commit but the bootstrap does.
+    pub(crate) fn request_publication(&self, sequence: u64) {
+        if let Some(publication) = &self.publication {
+            publication.request(sequence);
+        }
+    }
+
+    /// Stops paced publication, which a close does after its final
+    /// publication lands.
+    pub(crate) fn stop_publishing(&self) {
+        if let Some(publication) = &self.publication {
+            publication.stop();
+        }
     }
 
     pub(crate) async fn publish_flushed(&self) -> Result<(), slatedb::Error> {

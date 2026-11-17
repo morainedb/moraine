@@ -129,6 +129,7 @@ async fn a_read_only_attach_writes_nothing() {
         .await
         .unwrap();
     set_probe(&catalog, "one").await;
+    catalog.publish_now().await.unwrap();
 
     let counting = CountingStore::new(objects);
     let reader = Catalog::open_read_only(counting.clone(), reader_options(Duration::ZERO))
@@ -143,6 +144,7 @@ async fn a_read_only_attach_writes_nothing() {
         Some("one")
     );
     set_probe(&catalog, "two").await;
+    catalog.publish_now().await.unwrap();
     let second = reader.index_read_scope().await.unwrap();
     assert_ne!(first.identity(), second.identity());
     assert_eq!(
@@ -166,12 +168,14 @@ async fn a_shared_reader_keeps_its_publication_inside_the_interval() {
         .await
         .unwrap();
     set_probe(&catalog, "one").await;
+    catalog.publish_now().await.unwrap();
 
     let reader = Catalog::open_read_only(objects, reader_options(Duration::from_hours(1)))
         .await
         .unwrap();
     let first = reader.index_read_scope().await.unwrap();
     set_probe(&catalog, "two").await;
+    catalog.publish_now().await.unwrap();
     let second = reader.index_read_scope().await.unwrap();
     assert_eq!(first.identity(), second.identity());
     assert_eq!(

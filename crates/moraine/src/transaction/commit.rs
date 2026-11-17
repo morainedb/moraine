@@ -170,21 +170,21 @@ pub(crate) async fn await_durable(
         CommitDurability::Paced(pacer) => {
             let sequence = handle.seqnum();
             reporting_stalls(operation, staged, pacer.await_durable(handle, commits)).await?;
-            reporting_stalls(
-                "checkpoint publication",
-                staged,
-                pacer.publish_through(sequence),
-            )
-            .await
-            .map_err(|error| {
-                if operation == "bootstrap" {
-                    return error;
-                }
-                slatedb::Error::unavailable(
-                    "write is durable but checkpoint publication was not acknowledged".to_owned(),
+
+            // A bootstrap waits: its catalog has to be readable from another
+            // process the moment the statement returns. Every other commit
+            // is committed once durable, and its publication follows within
+            // the pacing interval.
+            if operation == "bootstrap" {
+                return reporting_stalls(
+                    "checkpoint publication",
+                    staged,
+                    pacer.publish_through(sequence),
                 )
-                .with_source(Box::new(error))
-            })
+                .await;
+            }
+            pacer.request_publication(sequence);
+            Ok(())
         }
     }
 }

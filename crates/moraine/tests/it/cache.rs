@@ -422,6 +422,7 @@ async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
         .unwrap();
 
     // A reader opened after `commit` returns resolves that commit.
+    writer.publish_now().await.unwrap();
     let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
         .await
         .unwrap();

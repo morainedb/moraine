@@ -146,8 +146,12 @@ mod tests {
         catalog.close().await.unwrap();
     }
 
+    /// An acknowledged commit is durable, and published once asked for:
+    /// publication is paced behind the acknowledgement, so what a reader
+    /// elsewhere resolves is the newest publication rather than the newest
+    /// commit.
     #[tokio::test]
-    async fn acknowledged_commits_have_a_published_checkpoint() {
+    async fn published_commits_are_what_another_process_resolves() {
         let objects = Arc::new(InMemory::new());
         let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
             .await
@@ -158,6 +162,7 @@ mod tests {
             })
             .await
             .unwrap();
+        catalog.publish_now().await.unwrap();
         let checkpoints = slatedb::admin::AdminBuilder::new("", objects.clone())
             .build()
             .list_checkpoints(Some("moraine-read-head-v1"))
@@ -204,6 +209,7 @@ mod tests {
         )
         .await
         .unwrap();
+        catalog.publish_now().await.unwrap();
         let first = reader.index_read_scope().await.unwrap();
         let shared = reader.index_read_scope().await.unwrap();
         assert_eq!(first.identity(), shared.identity());
@@ -213,6 +219,7 @@ mod tests {
             })
             .await
             .unwrap();
+        catalog.publish_now().await.unwrap();
         let next = reader.index_read_scope().await.unwrap();
         assert_ne!(first.identity(), next.identity());
         assert_eq!(

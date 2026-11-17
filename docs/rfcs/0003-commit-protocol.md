@@ -8,7 +8,7 @@ write-write conflict detection on that key is the head compare-and-set. Lost
 races are classified against DuckLake's own conflict matrix: benign races
 retry inside the catalog, true conflicts return a typed error. Two entry paths
 feed one commit core, concurrent commits coalesce into one batch, and a commit
-is acknowledged only after WAL durability and checkpoint publication.
+is acknowledged on WAL durability, with checkpoint publication behind it.
 
 ## Topology
 
@@ -305,26 +305,27 @@ returns at once.
 
 ## Durability and acknowledgement
 
-A commit returns success only after two waits:
+A commit returns success after one wait: WAL durability. The transaction's
+`WriteHandle` is awaited through the flush pacer below. An empty transaction
+returns no handle and waits for nothing.
 
-1. WAL durability. The transaction's `WriteHandle` is awaited through the
-   flush pacer below. An empty transaction returns no handle and waits for
-   nothing.
-2. Checkpoint publication. The writer's `Publisher` creates a
-   `CheckpointScope::Durable` checkpoint named `moraine-read-head-v1` covering
-   the handle's sequence. Publication must finish before success is reported.
-
-Publication is coalesced: one checkpoint acknowledges every commit whose
-sequence it covers. If publication fails after the write became durable, the
-commit is reported as `CommitOutcomeUnknown` and the mutation is never
-resubmitted by moraine. A publication-only failure never re-runs a catalog
-mutation. On open the writer publishes a checkpoint covering its durable
-progress before serving commits.
+It then asks its `Publisher` for a `CheckpointScope::Durable` checkpoint named
+`moraine-read-head-v1` covering the handle's sequence, and returns without
+waiting. Publication is coalesced in time as well as across commits: one
+checkpoint covers every sequence durable when it is written, and a steady
+writer pays one manifest write per `PUBLICATION_INTERVAL` rather than one per
+commit — four of the five object-store requests a commit used to make. A
+publication that fails leaves the commit committed, since durability is the
+WAL write; the next attempt covers the same sequence. On open the writer
+publishes a checkpoint covering its durable progress before serving commits,
+and that one waits.
 
 Readers pin the published checkpoint directly, as specified in [the read
 path](0007-read-path-and-caching.md); a superseded publication is kept for a
-grace rather than deleted. A reader opened after `commit` returns resolves
-`N+1`. A reader opened before may lag by its poll interval, which is ordinary
+grace rather than deleted. The writer reads its own writes from its `Db`
+without a publication. A read-only handle opened after `commit` returns
+resolves `N+1` once the publication covering it lands, within one interval.
+A reader opened before may lag by its poll interval, which is ordinary
 snapshot isolation.
 
 ## Flush pacing
@@ -454,9 +455,10 @@ When `CatalogOptions::commit_log` names a provider, or one is registered for
 the process, `submit_batch` offers the sealed batch through
 `CommitStore::write_at` at the sequence derived from its premise before any
 SlateDB commit. A won slot is the commit point, and the session's own
-transaction is rolled back. A lost offer is a lost race. Acknowledgement still
-waits for a published checkpoint covering the slot. Everything else about the
-log is in [the commit-log seam](0011-commit-log-seam.md).
+transaction is rolled back. A lost offer is a lost race. Acknowledgement
+waits for the slot's durability, not for the checkpoint that publishes it.
+Everything else about the log is in
+[the commit-log seam](0011-commit-log-seam.md).
 <!-- /site:omit -->
 
 ## Submission outcomes and cancel safety

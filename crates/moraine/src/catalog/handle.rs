@@ -1322,6 +1322,28 @@ impl ReadOnlyCatalog {
     /// store down for every clone, so subsequent operations on any of
     /// them — this one included — fail.
     ///
+    /// Publishes every commit acknowledged so far, so a reader in another
+    /// process sees them without waiting for the next paced publication.
+    ///
+    /// Commits are durable when they are acknowledged; this is only about
+    /// when they become visible elsewhere. A read-only handle opened after
+    /// this returns resolves them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication cannot be written. The commits
+    /// remain durable and committed either way.
+    pub async fn publish_now(&self) -> Result<()> {
+        match self.store.as_ref() {
+            Store::Writer { db, pacer, .. } => pacer
+                .publish_through(db.status().durable_seq)
+                .await
+                .map_err(Error::from),
+            // Neither reads through a publication it writes itself.
+            Store::Reader(_) | Store::Committer { .. } => Ok(()),
+        }
+    }
+
     /// # Errors
     ///
     /// Returns an error if the underlying store fails to close cleanly.
@@ -1335,6 +1357,7 @@ impl ReadOnlyCatalog {
                 } else {
                     Ok(())
                 };
+                pacer.stop_publishing();
                 let closed = db.close().await.map_err(Error::from);
                 publication.and(closed)
             }

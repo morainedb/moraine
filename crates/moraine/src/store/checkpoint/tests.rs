@@ -197,6 +197,62 @@ async fn publication_waits_for_the_manifest_after_wal_durability() {
     db.close().await.unwrap();
 }
 
+/// A request publishes behind the caller, and coalesces: several durable
+/// writes inside one interval cost one publication, not one each.
+#[tokio::test]
+async fn a_requested_publication_lands_within_the_interval() {
+    let objects = Arc::new(InMemory::new());
+    let db = uncollected_db(objects.clone()).await;
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    let publisher = Arc::new(Publisher::with_pacing(
+        db.clone(),
+        slatedb::admin::AdminBuilder::new("", objects.clone()).build(),
+        PUBLICATION_LIFETIME,
+        REFRESH_TICK,
+        Duration::from_millis(50),
+    ));
+
+    let mut sequence = 0;
+    for key in [b"a", b"b", b"c"] {
+        sequence = durable_write(&db, key, b"value").await;
+        publisher.request(sequence);
+    }
+    assert!(
+        published(&admin).await.is_empty(),
+        "a request must not publish before the caller returns"
+    );
+
+    for _ in 0..100 {
+        if !published(&admin).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let checkpoints = published(&admin).await;
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "three writes inside one interval are one publication"
+    );
+
+    let reader = DbReader::open(
+        "",
+        objects,
+        slatedb::DbReaderMode::Checkpoint(checkpoints[0].id),
+        slatedb::config::DbReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reader.get(b"c").await.unwrap().as_deref(),
+        Some(b"value".as_slice()),
+        "the publication covers the last sequence requested"
+    );
+    reader.close().await.unwrap();
+    assert!(sequence > 0);
+    db.close().await.unwrap();
+}
+
 async fn durable_write(db: &Db, key: &[u8], value: &[u8]) -> u64 {
     let write = db.put(key, value).await.unwrap();
     db.flush().await.unwrap();

@@ -153,6 +153,11 @@ pub(crate) fn remaining_until(expire_millis: i64) -> Duration {
 pub(crate) const PUBLICATION_LIFETIME: Duration = Duration::from_mins(30);
 /// How often an idle writer checks whether its publication needs refreshing.
 const REFRESH_TICK: Duration = Duration::from_mins(1);
+/// How long a commit's visibility to other processes may lag its
+/// acknowledgement. A publication is a manifest write, and awaiting one per
+/// commit is four of the five object-store requests a commit otherwise makes;
+/// pacing them puts that cost behind the acknowledgement instead.
+pub(crate) const PUBLICATION_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Serializes publication and coalesces writes covered by the same checkpoint.
 ///
@@ -166,6 +171,21 @@ pub(crate) struct Publisher {
     db: Db,
     published: Mutex<Option<u64>>,
     keeper: Arc<Keeper>,
+    /// The highest durable sequence a commit has asked to be published, and
+    /// the task that publishes it. Commits do not wait for either.
+    pending: Arc<Pending>,
+}
+
+/// What a paced publisher owes its readers: the sequence to cover, and a
+/// task covering it no more often than the interval.
+struct Pending {
+    sequence: SyncMutex<u64>,
+    wake: tokio::sync::Notify,
+    interval: Duration,
+    task: SyncMutex<Option<JoinHandle<()>>>,
+    /// Set by a close, after which nothing more is published: the store it
+    /// would publish to is gone.
+    stopped: SyncMutex<bool>,
 }
 
 impl Publisher {
@@ -174,10 +194,123 @@ impl Publisher {
     }
 
     pub(crate) fn with_lifetime(db: Db, admin: Admin, lifetime: Duration, tick: Duration) -> Self {
+        Self::with_pacing(db, admin, lifetime, tick, PUBLICATION_INTERVAL)
+    }
+
+    pub(crate) fn with_pacing(
+        db: Db,
+        admin: Admin,
+        lifetime: Duration,
+        tick: Duration,
+        interval: Duration,
+    ) -> Self {
         Self {
             keeper: Arc::new(Keeper::new(db.clone(), admin, lifetime, tick)),
             db,
             published: Mutex::new(None),
+            pending: Arc::new(Pending {
+                sequence: SyncMutex::new(0),
+                wake: tokio::sync::Notify::new(),
+                interval,
+                task: SyncMutex::new(None),
+                stopped: SyncMutex::new(false),
+            }),
+        }
+    }
+
+    /// Asks for `sequence` to be published and returns. The commit is
+    /// durable; this is what makes it visible to a reader in another
+    /// process, within one interval.
+    pub(crate) fn request(self: &Arc<Self>, sequence: u64) {
+        if *self
+            .pending
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return;
+        }
+        {
+            let mut wanted = self
+                .pending
+                .sequence
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *wanted = (*wanted).max(sequence);
+        }
+
+        let mut task = self
+            .pending
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if task.as_ref().is_none_or(JoinHandle::is_finished) {
+            // Weak, so the task cannot keep the writer it publishes for
+            // alive: a dropped writer stops publishing.
+            let publisher = Arc::downgrade(self);
+            *task = Some(tokio::spawn(async move { Self::pace(publisher).await }));
+        }
+        self.pending.wake.notify_one();
+    }
+
+    /// Stops publishing, for a catalog closing: a paced task outliving its
+    /// store would keep asking a closed database to publish.
+    pub(crate) fn stop(&self) {
+        *self
+            .pending
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        if let Some(task) = self
+            .pending
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
+
+    /// Publishes whatever commits have asked for, no more often than the
+    /// interval, until nothing is pending.
+    async fn pace(publisher: std::sync::Weak<Self>) {
+        loop {
+            let interval = match publisher.upgrade() {
+                Some(publisher) => publisher.pending.interval,
+                None => return,
+            };
+            tokio::time::sleep(interval).await;
+
+            let Some(publisher) = publisher.upgrade() else {
+                return;
+            };
+            let wanted = *publisher
+                .pending
+                .sequence
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+
+            match publisher.through(wanted).await {
+                Ok(()) => {}
+                // A publication that fails leaves the commit durable and
+                // committed; readers in other processes go on seeing the
+                // previous one until a later attempt lands.
+                Err(error) => tracing::warn!(%error, "a paced publication failed"),
+            }
+
+            let caught_up = publisher
+                .published
+                .lock()
+                .await
+                .is_some_and(|covered| covered >= wanted);
+            let wake = Arc::clone(&publisher.pending);
+            drop(publisher);
+            if caught_up {
+                // Nothing owed. Wait to be asked again rather than tick,
+                // holding nothing but the pending state while idle.
+                wake.wake.notified().await;
+            }
         }
     }
 
@@ -235,6 +368,15 @@ impl Publisher {
 impl Drop for Publisher {
     fn drop(&mut self) {
         if let Some(task) = self.keeper.state().task.take() {
+            task.abort();
+        }
+        if let Some(task) = self
+            .pending
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             task.abort();
         }
     }

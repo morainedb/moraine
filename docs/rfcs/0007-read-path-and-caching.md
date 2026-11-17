@@ -38,15 +38,23 @@ between polls.
 
 Publication works as follows.
 
-1. After a commit group's writes are WAL-durable, and before any member is
-   acknowledged, the writer calls
+1. A commit is acknowledged once its writes are WAL-durable. It then asks
+   for publication and does not wait: the writer calls
    `Db::create_checkpoint(CheckpointScope::Durable, ...)` under the name
-   `moraine-read-head-v1` with a lifetime of `PUBLICATION_LIFETIME`, thirty
-   minutes. The publication is the commit's only manifest write.
+   `moraine-read-head-v1`, with a lifetime of `PUBLICATION_LIFETIME`, thirty
+   minutes, from a background task that publishes no more often than
+   `PUBLICATION_INTERVAL`. The writer's own reads do not go through a
+   publication — they take a snapshot of its `Db` — so a writer always
+   reads its own writes. A read-only handle, in this process or another,
+   pins the newest publication and therefore sees a commit within one
+   interval of its acknowledgement. The bootstrap commit is the exception:
+   it waits, so a catalog is readable from elsewhere the moment it exists.
 2. The publisher refuses to publish a sequence the store has not yet made
-   durable. One publication may cover several groups whose writes are already
-   durable. Each acknowledgement waits for a checkpoint covering its own
-   group.
+   durable. One publication covers every group durable when it is written,
+   so a steady writer pays one manifest write per interval rather than one
+   per commit. A publication is a manifest write, and a manifest write
+   carries three further object-store reads in SlateDB's sequenced-object
+   protocol; awaiting one per commit made four of a commit's five requests.
 3. A publication is superseded, never retired: its lifetime is what expires
    it, and SlateDB's collector removes it once expired. The writer refreshes
    the current publication's lifetime in the background once half of it has
@@ -57,10 +65,11 @@ Publication works as follows.
    references stay until it expires. A writer's first publication lists the
    store's once and gives a lifetime to any publication an earlier writer
    left permanent.
-4. A WAL-durable write whose publication fails is potentially committed. The
-   outcome is reported as unknown under [the commit
-   protocol](0003-commit-protocol.md). It is never treated as a conflict that
-   permits replaying the mutation.
+4. A publication that fails leaves the commit committed: durability is the
+   WAL write, which has already landed. The failure is logged and the next
+   attempt covers the same sequence, so readers in other processes go on
+   seeing the previous publication until one lands. Only the bootstrap, which
+   waits, reports a publication failure to its caller.
 5. A clean writer shutdown flushes memtables and republishes the resulting
    manifest permanently, with no lifetime, even when its sequence was already
    published: an idle reader does not keep replaying a WAL-heavy publication
