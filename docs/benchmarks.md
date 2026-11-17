@@ -1,14 +1,15 @@
 # Benchmarks
 
-Moraine replaces DuckLake's metadata catalog. These harnesses measure what
-the catalog costs: a commit, a cold attach, and what a statement reads
-outside of Parquet.
+Moraine replaces DuckLake's metadata catalog with one on object storage:
+no database to run, and anything with bucket credentials attaches. These
+harnesses measure what that costs — a commit, an attach, and what a
+statement reads outside of Parquet.
 
 The numbers are from a `c6i.2xlarge` runner in us-east-1 against AWS S3, an
 S3 Express directory bucket, RDS Postgres and a Quack server in the same
-zone. A commit is durable once its write-ahead-log object lands, so against
-a real endpoint the PUT round trip is the floor, and concurrent commits
-share one flush.
+zone. A commit is durable once its write-ahead-log object lands, so the
+round trip to the store under the log is the floor; moraine's log sits on
+the Express bucket and everything else on the standard one.
 
 <!-- site:omit -->
 The in-memory measurements are from a release build on an 8-vCPU x86-64
@@ -78,7 +79,30 @@ AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
   SQL, and the single PUT accounts for all of it.
 - The durable wait does not grow with the file count, so the cost is per
   commit rather than per file.
+- The store under the log sets the floor. This table is the standard
+  bucket; with the log on Express the same commit is 15 ms, measured
+  against the other catalogs below.
 
+### Small writes
+
+A small insert is a catalog commit and no file: DuckLake inlines rows below
+its inlining limit into the catalog, and moraine writes them as one object.
+From the five-catalog run below, serial, medians of three:
+
+| phase | moraine | log on Express | duckdb | postgres | quack |
+|---|---:|---:|---:|---:|---:|
+| 20 single-row inserts, 2 columns | 823 ms | 305 ms | 209 ms | 269 ms | 564 ms |
+| 20 single-row inserts, 32 columns | 658 ms | 343 ms | 688 ms | 351 ms | 1.32 s |
+| 10 tables created with 1,000 inline rows each | 793 ms | 581 ms | 508 ms | 961 ms | 2.32 s |
+
+- **Row width costs moraine almost nothing**: 32 columns against 2 is 343 ms
+  against 305, one object either way. The file catalog triples and Quack
+  more than doubles, paying per-column metadata on every commit.
+- A thousand inlined rows per table write no Parquet on any catalog; moraine
+  with its log on Express lands them in 581 ms against 961 for RDS and 2.3 s
+  for Quack, behind only the local file.
+
+<!-- site:omit -->
 ### Concurrent writers
 
 `concurrent_connections` spreads single-row inserts over N writers released
@@ -106,7 +130,6 @@ on the file lock. A server catalog takes more processes but starves all
 but one, which commits nothing while its competitor commits continuously;
 the connection sweep is therefore the one to read for scaling.
 
-<!-- site:omit -->
 ### Flush interval
 
 `measure_commit_latency_by_flush_interval`, 60 sequential commits:
@@ -339,16 +362,6 @@ Measured TCP connects: 0.97 ms to S3, 0.31 ms to RDS, 0.28 ms to Quack.
 Parquet is local, the DuckDB file catalog is local and is the control.
 Three repeats.
 
-Commits per second, writers sharing one process:
-
-| writers | moraine | log on Express | duckdb | postgres | quack |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 30 | 73 | 125 | 87 | 33 |
-| 2 | 56 | 135 | 103 | 67 | 13 |
-| 4 | 103 | 238 | 97 | 52 | 7 |
-| 8 | 186 | 396 | 83 | 37 | 4 |
-| 16 | 353 | 563 | 74 | 26 | 2 |
-
 Serial phases, medians:
 
 | phase | moraine | log on Express | duckdb | postgres | quack |
@@ -359,20 +372,35 @@ Serial phases, medians:
 | 20 repeated deletes | 1.16 s | 657 ms | 409 ms | 524 ms | 1.05 s |
 | merge adjacent files | 210 ms | 191 ms | 54 ms | 90 ms | 112 ms |
 
-- **Only moraine gets faster with writers**, twelvefold from one to
-  sixteen: concurrent commits share one paced flush, which is also why a
-  lone writer on the standard bucket is the slowest of the five. It passes
-  both the local file and RDS at four writers; with its log on Express, at
-  two. Every other catalog declines from its first.
-- **Moving only the write-ahead log to Express takes a serial commit from
-  41 ms to 15 ms** and more than doubles the single-writer rate, while
-  attach and scan do not move: a commit is one write, to the log's store,
-  and a read never touches that store.
-- **Quack collapses under concurrency**, 33 commits per second down to 2,
-  on snapshot conflicts against the shared server; RDS declines more
-  gently, 87 down to 26.
+- **A commit is 15 ms with the log on Express**, against 13 for RDS
+  Postgres and 10 for the local file, and twice as fast as Quack: a
+  database's commit latency with no database to run. On the standard
+  bucket alone it is 41 ms; the store under the log is the difference,
+  and attach and scan do not move with it, since a read never touches the
+  log.
+- **Attach is the cost**: about 600 ms against 16 ms for the file and under
+  200 for the servers, paid once per process. A long-lived writer pays it
+  once; a process that attaches per invocation pays it every time.
 - Serially the ranking is requests per commit, not the network: the round
-  trips above are sub-millisecond.
+  trips above are sub-millisecond, and the request-bound phases — deletes,
+  merges — trail the file and RDS accordingly.
+- If writers do pile up, throughput rises rather than falls: 73 to 563
+  commits a second from one writer to sixteen with the log on Express,
+  where every other catalog declines from its first and Quack collapses
+  to 2. Concurrent commits share one flush.
+
+<!-- site:omit -->
+Commits per second, writers sharing one process:
+
+| writers | moraine | log on Express | duckdb | postgres | quack |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 30 | 73 | 125 | 87 | 33 |
+| 2 | 56 | 135 | 103 | 67 | 13 |
+| 4 | 103 | 238 | 97 | 52 | 7 |
+| 8 | 186 | 396 | 83 | 37 | 4 |
+| 16 | 353 | 563 | 74 | 26 | 2 |
+
+<!-- /site:omit -->
 
 <!-- site:omit -->
 `moraine_wal_express` is the catalog on the standard bucket with only its
