@@ -1121,6 +1121,10 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
 /// A fixed read sees committed state without requesting a live-reader poll.
 #[tokio::test]
 async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
+    // Building a managed-checkpoint reader's state and its first poll each
+    // probe the log tail; neither repeats per commit.
+    const ESTABLISH_POLLS: u64 = 2;
+
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -1147,15 +1151,18 @@ async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
     .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let idle = reader_provider.polls();
-    committer
-        .commit_materialized(|tx| tx.create_schema("landed").map(|_| ()))
-        .await
-        .unwrap();
+    for index in 0..4 {
+        committer
+            .commit_materialized(|tx| tx.create_schema(&format!("landed{index}")).map(|_| ()))
+            .await
+            .unwrap();
+    }
     let view = reader.materialized().await.unwrap();
-    assert!(view.schema_by_name("landed").is_some());
+    assert!(view.schema_by_name("landed3").is_some());
+    let polls = reader_provider.polls();
     assert!(
-        reader_provider.polls() <= idle + 1,
-        "a log scope polls only to establish its own reader, not to track the committer"
+        polls <= idle + ESTABLISH_POLLS,
+        "a log scope polls to establish its own reader, not once per commit: {polls} polls against {idle} idle"
     );
 
     reader.close().await.unwrap();
