@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/morainedb/moraine/compare/v0.9.1...v0.9.2) - 2026-11-17
+
+### Other
+
+- *(store)* give publications a lifetime instead of retiring them ([#443](https://github.com/morainedb/moraine/pull/443))
+
 ## [0.9.1](https://github.com/morainedb/moraine/compare/v0.9.0...v0.9.1) - 2026-11-15
 
 ### Fixed
