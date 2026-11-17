@@ -90,8 +90,13 @@ resource "aws_iam_instance_profile" "quack" {
 }
 
 resource "aws_instance" "quack" {
-  ami           = data.aws_ssm_parameter.al2023_arm64.value
-  instance_type = "t4g.small"
+  ami = data.aws_ssm_parameter.al2023_arm64.value
+
+  # A catalog server under a benchmark is memory-bound: it holds the
+  # metadata every sweep writes, and two gigabytes left the box wedged
+  # under five backends — a listening socket answering nothing, with the
+  # agent killed along with everything else.
+  instance_type = "t4g.large"
   subnet_id     = local.instance_subnet_id
 
   vpc_security_group_ids = [aws_security_group.quack.id]

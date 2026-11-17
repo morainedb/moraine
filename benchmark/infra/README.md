@@ -51,7 +51,7 @@ belongs beside the compute that commits to it.
 | S3 bucket, encrypted, lifecycle expiry | `MORAINE_S3_BUCKET` for the standard-S3 leg |
 | S3 Express directory bucket | the same leg on Express; moraine selects Express addressing from the bucket name |
 | RDS Postgres, private, engine defaults | `MORAINE_BENCH_POSTGRES` |
-| EC2 Quack server with a self-signed certificate | `MORAINE_BENCH_QUACK`, a DuckDB file served to a remote client |
+| EC2 Quack server, `t4g.large`, with a self-signed certificate | `MORAINE_BENCH_QUACK`, a DuckDB file served to a remote client |
 | three security groups | Postgres and Quack admit the runner's group and nothing else |
 
 Neither server has an inbound rule reaching the internet, and the RDS
