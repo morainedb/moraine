@@ -12,7 +12,10 @@ use tokio::{sync::Mutex, time::Instant};
 use super::{CatalogOptions, commit_log_provider, reader_session};
 use crate::{
     Error, Result,
-    store::{checkpoint::CheckpointReader, open::StoreBuilder},
+    store::{
+        checkpoint::CheckpointReader,
+        open::{READ_WINDOW, StoreBuilder},
+    },
 };
 
 const MAX_READER_GENERATIONS: usize = 8;
@@ -62,8 +65,12 @@ impl ReaderScopes {
         commit_log_provider(&self.options).is_some()
     }
 
+    /// The builder every scope reader opens through. Its poll interval is the
+    /// read window: a reader that re-pointed mid-scope would advance state a
+    /// transaction had already started reading.
     fn builder(&self) -> StoreBuilder<'_> {
         let builder = StoreBuilder::new(&self.options.path, self.objects.clone())
+            .poll_interval(READ_WINDOW)
             .wal_object_store(
                 self.options
                     .wal_store

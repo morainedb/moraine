@@ -213,7 +213,10 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("before")
+            Some("before"),
+            "a held scope reads its own revision {:?}, not {:?}",
+            first.identity(),
+            next.identity()
         );
         assert_eq!(
             crate::ffi_support::catalog_read::global_option(next.reads(), "probe")
