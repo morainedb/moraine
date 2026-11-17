@@ -375,23 +375,6 @@ Serial phases, medians:
   trips above are sub-millisecond.
 
 <!-- site:omit -->
-With `--shared`, every writer commits to one table instead of its own,
-which adds the row-level conflict a catalog's protocol has to resolve.
-Commits per second, same runner, 2026-11-17:
-
-| writers | moraine | express | wal on express | duckdb | postgres | quack |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 11 | 34 | 13 | 122 | 90 | 30 |
-| 2 | 21 | 65 | 27 | 104 | 70 | 20 |
-| 4 | 41 | 124 | 52 | 89 | 60 | 10 |
-| 8 | 78 | 243 | 99 | 92 | 46 | 4 |
-| 16 | 123 | 407 | 122 | 75 | 35 | 2 |
-
-One table costs moraine nothing — 123 commits a second over sixteen
-writers against 113 with a table each — because concurrent appends do not
-conflict in its staged check. The other catalogs fall as they did with
-separate tables, so the curve is not an artifact of the workload's shape.
-
 `moraine_wal_express` is the catalog on the standard bucket with only its
 write-ahead log on the directory bucket. Twenty single-row commits:
 
