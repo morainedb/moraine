@@ -613,9 +613,8 @@ pub fn csv_rows(output: &str) -> Vec<Vec<String>> {
     output
         .lines()
         .map(strip_ansi)
-        .filter(|line| !is_log_line(line))
+        .filter(|line| !is_log_line(line) && !line.trim().is_empty())
         .skip(1)
-        .filter(|line| !line.is_empty())
         .map(|line| line.split(',').map(String::from).collect())
         .collect()
 }
@@ -783,6 +782,15 @@ fn csv_rows_drops_a_log_record_sharing_the_result_stream() {
 }
 
 /// A result row that merely contains a colon is not mistaken for one.
+#[test]
+fn csv_rows_skips_the_header_past_a_blank_line_ahead_of_it() {
+    assert_eq!(
+        csv_rows("\nrowid,a\n100,100\n"),
+        vec![vec!["100".to_string(), "100".to_string()]],
+        "the blank line and the header go, the row stays"
+    );
+}
+
 #[test]
 fn csv_rows_keeps_a_row_that_looks_faintly_like_a_record() {
     assert_eq!(
