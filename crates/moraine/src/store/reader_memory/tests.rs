@@ -63,3 +63,48 @@ async fn overlapping_wal_readers_share_admission_and_release_it_with_rows() {
     drop(reopened);
     db.close().await.unwrap();
 }
+
+/// A reader a scope holds replays to the log boundary it saw when it opened
+/// and never past it, however far the log has moved by its next poll.
+#[tokio::test]
+async fn a_fixed_reader_keeps_the_boundary_it_opened_on() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use slatedb::wal::{WalError, WalFileRange, WalIterator, WalReader, WalRows};
+
+    struct Advancing(AtomicU64);
+    struct Nothing;
+
+    #[async_trait::async_trait]
+    impl WalIterator for Nothing {
+        async fn next(&mut self) -> Result<Option<WalRows>, WalError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WalReader for Advancing {
+        async fn iterator(&self, _: WalFileRange) -> Result<Box<dyn WalIterator>, WalError> {
+            Ok(Box::new(Nothing))
+        }
+
+        async fn last_wal_file_id(&self, _: u64) -> Result<u64, WalError> {
+            Ok(10 + self.0.fetch_add(1, Ordering::AcqRel))
+        }
+    }
+
+    let following = AdmittedReader::new(
+        Arc::new(Advancing(AtomicU64::new(0))),
+        MemoryReservation::reserve(0).unwrap(),
+    );
+    assert_eq!(following.last_wal_file_id(0).await.unwrap(), 10);
+    assert_eq!(following.last_wal_file_id(0).await.unwrap(), 11);
+
+    let fixed = AdmittedReader::fixed(
+        Arc::new(Advancing(AtomicU64::new(0))),
+        MemoryReservation::reserve(0).unwrap(),
+    );
+    assert_eq!(fixed.last_wal_file_id(0).await.unwrap(), 10);
+    assert_eq!(fixed.last_wal_file_id(0).await.unwrap(), 10);
+    assert_eq!(fixed.last_wal_file_id(5).await.unwrap(), 10);
+}

@@ -1,6 +1,6 @@
 //! Admission for WAL rows retained by read-only SlateDB memtables.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,13 +14,29 @@ use crate::MemoryReservation;
 pub(crate) struct AdmittedReader {
     inner: Arc<dyn WalReader>,
     memory: Arc<MemoryReservation>,
+    /// The log boundary a fixed reader replays to, taken on its first probe.
+    /// `None` follows the log.
+    boundary: Option<OnceLock<u64>>,
 }
 
 impl AdmittedReader {
+    /// A reader that follows the log: every probe asks for its newest file.
     pub(crate) fn new(inner: Arc<dyn WalReader>, memory: MemoryReservation) -> Self {
         Self {
             inner,
             memory: Arc::new(memory),
+            boundary: None,
+        }
+    }
+
+    /// A reader that replays to the log boundary it finds when it opens and
+    /// never past it, so a scope holding it reads one revision however long
+    /// it lives and whenever its store polls.
+    pub(crate) fn fixed(inner: Arc<dyn WalReader>, memory: MemoryReservation) -> Self {
+        Self {
+            inner,
+            memory: Arc::new(memory),
+            boundary: Some(OnceLock::new()),
         }
     }
 }
@@ -35,7 +51,16 @@ impl WalReader for AdmittedReader {
     }
 
     async fn last_wal_file_id(&self, after: u64) -> Result<u64, WalError> {
-        self.inner.last_wal_file_id(after).await
+        let Some(boundary) = &self.boundary else {
+            return self.inner.last_wal_file_id(after).await;
+        };
+        let id = if let Some(id) = boundary.get() {
+            *id
+        } else {
+            let id = self.inner.last_wal_file_id(after).await?;
+            *boundary.get_or_init(|| id)
+        };
+        Ok(id.max(after))
     }
 }
 
