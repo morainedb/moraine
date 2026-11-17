@@ -60,16 +60,29 @@ MORAINE_S3_BUCKET=... MORAINE_S3_PREFIX=... AWS_REGION=... \
   cargo xtask commit-bench [--files 16,128] [--commits 7] [--flush-ms 25]
 ```
 
-Loopback RustFS, same VM<!-- site:omit -->, 2026-10-20<!-- /site:omit -->,
-medians of seven commits:
+AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
+2026-11-17 at `fd1b99e`<!-- /site:omit -->, medians of seven commits:
 
 | files | commit | DuckLake metadata | moraine core | durable wait | requests |
 |---:|---:|---:|---:|---:|---|
-| 16 | 23.0 ms | 13.4 ms | 3.3 ms | 3.0 ms | 1 PUT, 2.7 ms |
-| 128 | 25.0 ms | 14.1 ms | 3.4 ms | 3.0 ms | 1 PUT, 2.9 ms |
+| 16 | 105.0 ms | 12.1 ms | 86.9 ms | 86.1 ms | 2 PUT 57.0 ms, 3 GET 28.8 ms |
+| 128 | 111.0 ms | 15.0 ms | 94.7 ms | 93.9 ms | 2 PUT 57.2 ms, 3 GET 36.2 ms |
 
-- DuckLake's eight metadata statements are about 60% of the commit. The cost
-  does not grow with the file count.
+- Five requests per commit, and **all three GETs answer 404**: the
+  garbage-collection boundary before and after the manifest write, and
+  the probe for the manifest about to be written. Two writes are the WAL
+  object and the manifest; those are the work, the three reads are the
+  protocol being careful.
+- The requests are the commit: 86 ms of durable wait against 12 ms of
+  DuckLake metadata SQL. On a local store the ratio is the other way
+  round, which is why the same statements looked like the problem there.
+- Neither half grows with the file count, so the cost is per commit
+  rather than per file.
+
+On loopback RustFS the balance inverts, which is where the notes below
+come from: DuckLake's eight metadata statements are about 60% of a 23 ms
+commit, and the cost does not grow with the file count.
+
 - Two statements are 69% of that: the per-column file-list query and the
   snapshot insert.
 - A local-filesystem store is within 0.2 ms of RustFS, and the task records zero
@@ -384,12 +397,26 @@ repeats:
 
 The flush coalesces almost perfectly to eight writers — 7.2× the rate for
 8× the writers — then throughput falls back by a third and stays flat to
-64. Eight is this VM's logical CPU count, so the ceiling is where commits
-stop being flush-bound and become CPU-bound; a wider machine should move
-it. The fixed-count table above reads as still improving at 16 writers,
-which is the artifact a window removes: 128 commits over 16 writers is
-eight commits each, so start-up and the first flush are most of what it
+64. Eight is this VM's logical CPU count, so on a local store the ceiling
+is where commits stop being flush-bound and become CPU-bound. The
+fixed-count table above reads as still improving at 16 writers, which is
+the artifact a window removes: 128 commits over 16 writers is eight
+commits each, so start-up and the first flush are most of what it
 measures.
+
+On an object store there is no such ceiling, because a commit waits on
+requests rather than on cores. The same sweep on the benchmark runner,
+2026-11-17 at `fd1b99e`:
+
+| writers | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| standard bucket | 10 | 21 | 34 | 56 | 110 | 209 | 331 |
+| S3 Express | 36 | 62 | 120 | 227 | 391 | 570 | 665 |
+
+Still climbing at sixty-four writers on both stores, at 33× and 18× the
+single-writer rate. Express leads throughout and its lead narrows as the
+width grows — from 3.6× at one writer to 2× at sixty-four — since both
+converge on what a shared flush can carry.
 
 <!-- site:omit -->
 Writer processes, 2026-08, before the pacing floor, not re-run:
