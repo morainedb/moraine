@@ -31,7 +31,7 @@ commands below stay the way to answer one question.
 | indexed scan strategies | `cargo xtask filter-bench <extension> <results-directory>` | a built extension |
 | the core against a real endpoint | `cargo xtask s3` | nothing; it starts a pinned RustFS |
 | the core in isolation | `cargo test -p moraine --test it --release -- --ignored --nocapture measure_` | nothing |
-| the two needing crate-internal seams | `cargo test -p moraine --lib --release -- --ignored --nocapture measure_` | `MORAINE_MEMORY_FIXTURE` naming a directory, for the writer-generation one |
+| the two needing crate-internal access | `cargo test -p moraine --lib --release -- --ignored --nocapture measure_` | `MORAINE_MEMORY_FIXTURE` naming a directory, for the writer-generation one |
 | <!-- site:omit -->allocations on the commit path | `cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 --nocapture transaction::commit::tests::allocation::<name>` | nothing<!-- /site:omit --> |
 | peak heap of a staged index build | `cargo test -p moraine --test staged_build_memory --release -- --ignored --nocapture` | nothing |
 | a commit's conflict check against retained snapshots | `cargo test -p moraine-duckdb --test ducklake_load -- --include-ignored --nocapture measure_staged_conflict_check_by_retained_snapshots` | `MORAINE_DUCKDB_EXT` and `MORAINE_DUCKDB_CLI` naming a built extension and CLI |
@@ -472,13 +472,44 @@ Serial phases, medians:
   stops between statements. The rates are over the window each actually
   got.
 - Every writer commits to a table of its own, which separates catalog
-  contention from row contention and is the shape most favourable to
-  moraine: its writers never contend for a snapshot, where DuckLake's SQL
-  catalogs retry on one. Writers sharing a table is unmeasured.
+  contention from row contention. Sharing one table changes nothing for
+  moraine, measured below.
 - Moraine's curve is group commit: concurrent commits share one paced
   flush, which is also why a lone writer is the slowest here. The other
   catalogs decline for a different reason — a statement chain and an
   optimistic conflict check per commit, which concurrency makes longer.
+
+With `--shared`, every writer commits to one table instead of its own,
+which adds the row-level conflict a catalog's protocol has to resolve.
+Commits per second, same runner, 2026-11-17:
+
+| writers | moraine | express | wal on express | duckdb | postgres | quack |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 11 | 34 | 13 | 122 | 90 | 30 |
+| 2 | 21 | 65 | 27 | 104 | 70 | 20 |
+| 4 | 41 | 124 | 52 | 89 | 60 | 10 |
+| 8 | 78 | 243 | 99 | 92 | 46 | 4 |
+| 16 | 123 | 407 | 122 | 75 | 35 | 2 |
+
+One table costs moraine nothing — 123 commits a second over sixteen
+writers against 113 with a table each — because concurrent appends do not
+conflict in its staged check. The other catalogs fall as they did with
+separate tables, so the curve is not an artifact of the workload's shape.
+
+`moraine_wal_express` is the catalog on the standard bucket with only its
+write-ahead log on the directory bucket. Twenty single-row commits:
+
+| store | 20 commits | 32-column commits | attach |
+|---|---:|---:|---:|
+| standard | 1.88 s | 2.03 s | 801 ms |
+| log on Express | 1.49 s | 1.45 s | 846 ms |
+| all Express | 622 ms | 709 ms | 289 ms |
+
+The fast store under the log alone is worth a fifth to a third of a
+commit, not the two thirds all of Express buys, so the durable write is
+not what a commit mostly pays for: the manifest write and the reads
+around it are, and they stay on the standard bucket. Attach does not move
+at all, which follows — it reads the catalog, never the log.
 
 What a second attach costs, from `warm_attach`: the catalog is attached,
 detached, and attached again in one process, each attach timed.
