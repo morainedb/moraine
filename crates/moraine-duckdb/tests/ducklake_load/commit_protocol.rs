@@ -50,15 +50,31 @@ impl Twin {
     /// Runs `sql` against both catalogs and returns the rows, asserting
     /// they agree.
     fn probe(&self, sql: &str) -> Vec<Vec<String>> {
-        let moraine_rows = csv_rows(&run_ducklake_sql(self.store.path(), self.data.path(), sql));
-        let reference_rows = csv_rows(&run_reference_ducklake_sql(
-            self.reference_meta.path(),
-            self.reference_data.path(),
+        let moraine = run_session(
+            &Attach::Moraine {
+                store_dir: self.store.path(),
+                data_path: self.data.path(),
+                options: "",
+                read_only: false,
+            },
             sql,
-        ));
+        );
+        let reference = run_session(
+            &Attach::Reference {
+                meta_dir: self.reference_meta.path(),
+                data_path: self.reference_data.path(),
+            },
+            sql,
+        );
+        let moraine_rows = csv_rows(&String::from_utf8_lossy(&moraine.stdout));
+        let reference_rows = csv_rows(&String::from_utf8_lossy(&reference.stdout));
         assert_eq!(
-            moraine_rows, reference_rows,
-            "moraine diverges from stock DuckLake for `{sql}`"
+            moraine_rows,
+            reference_rows,
+            "moraine diverges from stock DuckLake for `{sql}`\n--- moraine stdout ---\n{:?}\n--- moraine stderr ---\n{:?}\n--- reference stdout ---\n{:?}",
+            String::from_utf8_lossy(&moraine.stdout),
+            String::from_utf8_lossy(&moraine.stderr),
+            String::from_utf8_lossy(&reference.stdout),
         );
         moraine_rows
     }
