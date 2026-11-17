@@ -404,14 +404,13 @@ buy? One run of every backend, both of moraine's stores among them, so
 the columns share a machine, a clock and a network.
 
 ```bash
-cargo xtask bench --backends moraine,moraine_express,duckdb,postgres,quack \
-  --seconds 5 --concurrency 1,2,4,8,16
+cargo xtask benchmarks
 ```
 
-2026-11-16 at `79d9646`; a `c6i.2xlarge` runner in us-east-1 `use1-az4`,
+2026-11-17 at `fd1b99e`; a `c6i.2xlarge` runner in us-east-1 `use1-az4`,
 with the standard bucket, the directory bucket, RDS Postgres 16
-(`db.t4g.small`) and a `t4g.small` Quack server in that same zone.
-Measured TCP connects: 961 µs to S3, 399 µs to RDS, 226 µs to Quack.
+(`db.t4g.small`) and a `t4g.large` Quack server in that same zone.
+Measured TCP connects: 0.67 ms to S3, 0.34 ms to RDS, 0.27 ms to Quack.
 Parquet is local, the DuckDB file catalog is local and is the control.
 Three repeats.
 
@@ -419,65 +418,69 @@ Commits per second, writers sharing one process:
 
 | writers | moraine | express | duckdb | postgres | quack |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 10 | 32 | 128 | 86 | 43 |
-| 2 | 18 | 58 | 97 | 67 | 31 |
-| 4 | 41 | 115 | 85 | 55 | 14 |
-| 8 | 58 | 225 | 98 | 35 | 4 |
-| 16 | 113 | 376 | 70 | 23 | 2 |
+| 1 | 11 | 36 | 136 | 90 | 43 |
+| 2 | 16 | 59 | 108 | 69 | 27 |
+| 4 | 28 | 118 | 107 | 56 | 12 |
+| 8 | 55 | 234 | 94 | 45 | 4 |
+| 16 | 113 | 385 | 86 | 28 | 2 |
 
 Serial phases, medians:
 
 | phase | moraine | express | duckdb | postgres | quack |
 |---|---:|---:|---:|---:|---:|
-| attach | 776 ms | 295 ms | 16 ms | 181 ms | 165 ms |
-| bulk insert | 121 ms | 65 ms | 38 ms | 72 ms | 76 ms |
-| 100 repeated deletes | 2.57 s | 964 ms | 407 ms | 526 ms | 1.02 s |
+| attach | 830 ms | 311 ms | 16 ms | 193 ms | 171 ms |
+| 20 single-row commits | 1.92 s | 687 ms | 212 ms | 305 ms | 535 ms |
+| full scan | 138 ms | 54 ms | 36 ms | 75 ms | 75 ms |
+| 20 repeated deletes | 2.26 s | 940 ms | 405 ms | 540 ms | 1.03 s |
+| merge adjacent files | 292 ms | 112 ms | 55 ms | 89 ms | 104 ms |
 
-- **S3 Express is worth about 3× at every width**, and a little over 2×
+- **S3 Express is worth about 3× at every width**, and two to three times
   on serial latency. It is the same catalog and the same code: only the
   bucket differs, and moraine reads Express addressing off its name.
-- **Only moraine gets faster with writers.** On the standard bucket it
-  passes RDS at eight and the local file at sixteen; on Express it passes
-  the local file at four and ends 5× ahead of it. Every other catalog
+- **Only moraine gets faster with writers**, by a factor of ten from one
+  to sixteen. On the standard bucket it passes RDS at eight writers and
+  the local file at sixteen; on Express it passes the local file at four
+  and ends four and a half times ahead of it. Every other catalog
   declines from its first writer.
-- **Quack collapses under concurrency**, from 43 commits per second to 2,
+- **Quack collapses under concurrency**, 43 commits per second down to 2,
   as DuckLake spends its retry budget on snapshot conflicts against the
-  shared server.
-- The attach column is not a cold-start artifact: attaching the same
-  catalog a second time in the same process costs the same, as below.
+  shared server. It is also the slowest to create tables with rows.
+- Serially moraine is the slowest of the five, and the ranking is set by
+  requests per commit rather than by the network: the round trips above
+  are sub-millisecond.
 - Postgres and Quack take writer *processes* but do not share the work
-  among them: at eight writers one commits a few hundred times and the
-  rest commit nothing, so their aggregate is flat across widths. Both
-  embedded catalogs refuse a second process outright.
-- The windows ran long for the contended backends — up to 10 s for a
-  5 s window at sixteen writers — because a writer inside a retry loop
-  only stops between statements. The rates are over the window each
-  actually got.
+  among them: one commits a few hundred times while the rest commit
+  nothing, so their aggregate is flat across widths — 87 to 62 commits
+  per second for Postgres from one writer to sixteen. Both embedded
+  catalogs refuse a second process outright.
+- The windows ran long for the contended backends — up to 9 s for a 5 s
+  window at sixteen writers — because a writer inside a retry loop only
+  stops between statements. The rates are over the window each actually
+  got.
 
 What a second attach costs, from `warm_attach`: the catalog is attached,
-detached, and attached again in one process, each attach timed. Same
-runner, 2026-11-17, measured round trips of 665 µs to S3, 337 µs to RDS
-and 270 µs to Quack:
+detached, and attached again in one process, each attach timed.
 
 | phase | moraine | express | duckdb | postgres | quack |
 |---|---:|---:|---:|---:|---:|
-| attach | 883 ms | 291 ms | 4 ms | 55 ms | 79 ms |
-| re-attach | 843 ms | 260 ms | 3 ms | 56 ms | 74 ms |
-| count after it | 25 ms | 25 ms | 28 ms | 66 ms | 62 ms |
+| attach | 883 ms | 309 ms | 5 ms | 56 ms | 82 ms |
+| re-attach | 906 ms | 259 ms | 4 ms | 52 ms | 78 ms |
+| count after it | 26 ms | 29 ms | 29 ms | 68 ms | 64 ms |
 
-An attach does not get cheaper for having been done before: moraine
-saves 5% the second time, Express 11%, Postgres nothing. The cost is
-what every attach does — open the store, read the manifest, materialize
-the first view — rather than reads a warm cache could serve, so a
-long-lived process pays it per attach and not once. What does reduce it
-is a cache directory carried across restarts, which the cold reader
-measures separately.
+An attach does not get cheaper for having been done before: moraine's
+second attach is no faster than its first, Express saves a sixth, and
+Postgres nothing. The cost is what every attach does — open the store,
+read the manifest, materialize the first view — rather than reads a warm
+cache could serve, so a long-lived process pays it per attach and not
+once. What does reduce it is a cache directory carried across restarts,
+which the cold reader measures separately.
 
 Reading is the other way around: once attached, both moraine stores
-answer a count in 25 ms against 66 ms for Postgres and 62 ms for Quack.
+answer a count in under 30 ms against 68 ms for Postgres and 64 ms for
+Quack.
 
-The same run with `--cache-dir`, moraine's two stores (medians; the
-cache's own run measured 680 µs to S3 against 961 µs for the one above):
+The same workloads with `--cache-dir`, on the same runner the day before
+(2026-11-16), moraine's two stores:
 
 | phase | moraine | +cache | express | +cache |
 |---|---:|---:|---:|---:|
@@ -485,7 +488,6 @@ cache's own run measured 680 µs to S3 against 961 µs for the one above):
 | bulk delete | 236 ms | 162 ms | 90 ms | 72 ms |
 | merge | 283 ms | 179 ms | 130 ms | 108 ms |
 | 20 serial inserts | 1.96 s | 1.91 s | 644 ms | 617 ms |
-| attach | 1.13 s | 800 ms | 304 ms | 340 ms |
 
 A warm cache collapses the difference between the stores on reads — both
 scan in 34 ms — so Express earns its keep on writes and on cold reads.
