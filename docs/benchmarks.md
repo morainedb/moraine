@@ -89,15 +89,16 @@ asked what landed. Swept until the rate stopped rising, moraine only,
 
 | writers | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| standard bucket | 34 | 35 | 121 | 214 | 390 | 546 | 657 |
-| S3 Express | 89 | 155 | 291 | 509 | 724 | 855 | 819 |
+| standard bucket | 31 | 55 | 115 | 202 | 358 | 523 | 562 |
+| log on Express | 74 | 124 | 250 | 395 | 539 | 578 | 497 |
 
 A commit waits on requests rather than on cores, so the rate climbs with
 the width. The standard bucket is still climbing at sixty-four writers,
-nineteen times its single-writer rate; Express peaks at thirty-two and
-falls back at sixty-four, which is its ceiling. Its lead narrows from 2.6×
-at one writer to 1.2× at sixty-four, since both converge on what a shared
-flush can carry.
+eighteen times its single-writer rate. The log on Express peaks at
+thirty-two, 578 commits a second, and falls back at sixty-four, which is
+its ceiling: its lead of 2.4× at one writer narrows until the standard
+bucket passes it there, since both converge on what a shared flush can
+carry.
 
 Across processes, both embedded catalogs are single-writer: moraine fences
 the previous writer with a typed error, and the DuckDB file catalog fails
@@ -320,8 +321,10 @@ file saves); do not compare across pairs. The `indexed` twins add one
 ### Five catalogs on AWS
 
 What does each catalog cost on real endpoints, and what does S3 Express
-buy? One run of every backend, both of moraine's stores among them, so
-the columns share a machine, a clock and a network.
+buy? One run of every backend, so the columns share a machine, a clock
+and a network. Moraine appears twice: on the standard bucket, and with
+its write-ahead log on an Express directory bucket and everything else on
+the standard one.
 
 <!-- site:omit -->
 ```bash
@@ -332,43 +335,44 @@ cargo xtask benchmarks
 2026-11-17 at `a491fe5`; a `c6i.2xlarge` runner in us-east-1 `use1-az4`,
 with the standard bucket, the directory bucket, RDS Postgres 16
 (`db.t4g.small`) and a `t4g.large` Quack server in that same zone.
-Measured TCP connects: 0.27 ms to S3, 0.34 ms to RDS, 0.25 ms to Quack.
+Measured TCP connects: 0.97 ms to S3, 0.31 ms to RDS, 0.28 ms to Quack.
 Parquet is local, the DuckDB file catalog is local and is the control.
 Three repeats.
 
 Commits per second, writers sharing one process:
 
-| writers | moraine | express | duckdb | postgres | quack |
+| writers | moraine | log on Express | duckdb | postgres | quack |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 32 | 88 | 136 | 93 | 37 |
-| 2 | 59 | 157 | 111 | 76 | 27 |
-| 4 | 113 | 285 | 103 | 53 | 12 |
-| 8 | 211 | 508 | 103 | 45 | 4 |
-| 16 | 367 | 730 | 76 | 27 | 2 |
+| 1 | 30 | 73 | 125 | 87 | 33 |
+| 2 | 56 | 135 | 103 | 67 | 13 |
+| 4 | 103 | 238 | 97 | 52 | 7 |
+| 8 | 186 | 396 | 83 | 37 | 4 |
+| 16 | 353 | 563 | 74 | 26 | 2 |
 
 Serial phases, medians:
 
-| phase | moraine | express | duckdb | postgres | quack |
+| phase | moraine | log on Express | duckdb | postgres | quack |
 |---|---:|---:|---:|---:|---:|
-| attach | 619 ms | 226 ms | 16 ms | 192 ms | 167 ms |
-| 20 single-row commits | 605 ms | 263 ms | 200 ms | 276 ms | 507 ms |
-| full scan | 125 ms | 52 ms | 36 ms | 77 ms | 71 ms |
-| 20 repeated deletes | 1.07 s | 539 ms | 380 ms | 514 ms | 947 ms |
-| merge adjacent files | 206 ms | 115 ms | 52 ms | 89 ms | 95 ms |
+| attach | 604 ms | 615 ms | 16 ms | 189 ms | 173 ms |
+| 20 single-row commits | 823 ms | 305 ms | 209 ms | 269 ms | 564 ms |
+| full scan | 135 ms | 131 ms | 37 ms | 75 ms | 78 ms |
+| 20 repeated deletes | 1.16 s | 657 ms | 409 ms | 524 ms | 1.05 s |
+| merge adjacent files | 210 ms | 191 ms | 54 ms | 90 ms | 112 ms |
 
-- **Only moraine gets faster with writers**, elevenfold from one to
+- **Only moraine gets faster with writers**, twelvefold from one to
   sixteen: concurrent commits share one paced flush, which is also why a
-  lone writer is the slowest of the five. It passes both the local file
-  and RDS at four writers. Every other catalog declines from its first.
-- **S3 Express is worth two to three times at every width** and about
-  twice serially, on the same catalog and the same code: only the bucket
-  differs.
-- **Quack collapses under concurrency**, 37 commits per second down to 2,
+  lone writer on the standard bucket is the slowest of the five. It passes
+  both the local file and RDS at four writers; with its log on Express, at
+  two. Every other catalog declines from its first.
+- **Moving only the write-ahead log to Express takes a serial commit from
+  41 ms to 15 ms** and more than doubles the single-writer rate, while
+  attach and scan do not move: a commit is one write, to the log's store,
+  and a read never touches that store.
+- **Quack collapses under concurrency**, 33 commits per second down to 2,
   on snapshot conflicts against the shared server; RDS declines more
-  gently, 93 down to 27.
+  gently, 87 down to 26.
 - Serially the ranking is requests per commit, not the network: the round
-  trips above are sub-millisecond, at about 30 ms per commit on the
-  standard bucket and 13 ms on Express.
+  trips above are sub-millisecond.
 
 <!-- site:omit -->
 With `--shared`, every writer commits to one table instead of its own,
@@ -393,50 +397,50 @@ write-ahead log on the directory bucket. Twenty single-row commits:
 
 | store | 20 commits | 32-column commits | attach |
 |---|---:|---:|---:|
-| standard | 1.88 s | 2.03 s | 801 ms |
-| log on Express | 1.49 s | 1.45 s | 846 ms |
-| all Express | 622 ms | 709 ms | 289 ms |
+| standard | 823 ms | 658 ms | 604 ms |
+| log on Express | 305 ms | 343 ms | 615 ms |
+| all Express | 267 ms | 332 ms | 264 ms |
 
-The fast store under the log alone is worth a fifth to a third of a
-commit, not the two thirds all of Express buys, so the durable write is
-not what a commit mostly pays for: the manifest write and the reads
-around it are, and they stay on the standard bucket. Attach does not move
-at all, which follows — it reads the catalog, never the log.
+The store under the log is worth nearly all of what all of Express buys
+on a commit, 305 ms against 267, because a commit is one write and it
+goes to the log. Attach does not move, which follows: it reads the
+catalog, never the log.
 <!-- /site:omit -->
 
 What a second attach costs: the catalog is attached, detached, and
 attached again in one process, each attach timed.
 
-| phase | moraine | express | duckdb | postgres | quack |
+| phase | moraine | log on Express | duckdb | postgres | quack |
 |---|---:|---:|---:|---:|---:|
-| attach | 653 ms | 244 ms | 4 ms | 53 ms | 81 ms |
-| re-attach | 604 ms | 202 ms | 3 ms | 51 ms | 74 ms |
-| count after it | 25 ms | 25 ms | 27 ms | 65 ms | 61 ms |
+| attach | 699 ms | 700 ms | 4 ms | 56 ms | 86 ms |
+| re-attach | 634 ms | 690 ms | 4 ms | 54 ms | 80 ms |
+| count after it | 28 ms | 28 ms | 31 ms | 72 ms | 67 ms |
 
 An attach does not get cheaper for having been done before: moraine's
-second attach saves under a tenth, Express a sixth, and Postgres
-nothing. The cost is what every attach does — open the store,
-read the manifest, materialize the first view — rather than reads a warm
+second attach saves under a tenth on either store, and Postgres nothing.
+The cost is what every attach does — open the store, read the manifest,
+materialize the first view — rather than reads a warm
 cache could serve, so a long-lived process pays it per attach and not
 once. What does reduce it is a cache directory carried across restarts,
 which the cold reader measures separately.
 
 Reading is the other way around: once attached, both moraine stores
-answer a count in 25 ms against 65 ms for Postgres and 61 ms for Quack.
+answer a count in 28 ms against 72 ms for Postgres and 67 ms for Quack.
 
 The same workloads with a cache directory every attach shares, moraine's
 two stores:
 
-| phase | moraine | +cache | express | +cache |
+| phase | moraine | +cache | log on Express | +cache |
 |---|---:|---:|---:|---:|
-| full scan | 125 ms | 34 ms | 52 ms | 34 ms |
-| bulk delete | 171 ms | 92 ms | 70 ms | 51 ms |
-| merge | 206 ms | 170 ms | 115 ms | 110 ms |
-| 20 serial inserts | 605 ms | 641 ms | 263 ms | 251 ms |
+| full scan | 135 ms | 36 ms | 131 ms | 37 ms |
+| bulk delete | 187 ms | 93 ms | 157 ms | 60 ms |
+| merge | 210 ms | 148 ms | 191 ms | 120 ms |
+| 20 serial inserts | 823 ms | 702 ms | 305 ms | 303 ms |
 
-A warm cache collapses the difference between the stores on reads — both
-scan in 34 ms — so Express earns its keep on writes and on cold reads.
-Commits move by nothing: they pay round trips, which no cache serves.
+A warm cache serves the reads, and both stores read the same catalog: a
+scan is 36 ms on either. Commits do not move — 305 ms against 303 with
+the log on Express — because they pay round trips, which no cache
+serves. The fast store under the log earns its keep on commits alone.
 
 ## Reads
 
