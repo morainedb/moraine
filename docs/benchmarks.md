@@ -71,35 +71,14 @@ AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
 | 128 | 47.0 ms | 14.3 ms | 28.1 ms | 27.7 ms | 1.0 PUT 27.5 ms |
 
 - **One request per commit**, and it is the commit: the object write that
-  makes it durable. Nothing else is on the path. Publication — the manifest
-  write that lets another process find the commit, with the probe and the
-  garbage-collection boundary reads around it — is off it entirely, so the
-  fractional PUT and the two 404 reads that pacing left behind are gone.
+  makes it durable. Nothing else is on the path.
 - The durable wait is the commit: 28 ms against 10 ms of DuckLake metadata
-  SQL, and the single PUT accounts for all of it. On a local store the SQL
-  dominates outright, which is why the same statements looked like the
-  problem there.
-- Neither half grows with the file count, so the cost is per commit
-  rather than per file.
-- Publishing per commit cost 105 ms and five requests, three of them 404
-  probes. Pacing it took the commit to 47 ms and 2.2 requests; taking it
-  off the commit path takes it to 42 ms and one, without changing what a
-  reader sees beyond a bounded staleness.
+  SQL, and the single PUT accounts for all of it.
+- The durable wait does not grow with the file count, so the cost is per
+  commit rather than per file.
 
-On loopback RustFS the balance inverts, which is where the notes below
-come from: DuckLake's eight metadata statements are about 60% of a 23 ms
-commit, and the cost does not grow with the file count.
-
-- Two statements are 69% of that: the per-column file-list query and the
-  snapshot insert.
-- A local-filesystem store is within 0.2 ms of RustFS, and the task records zero
-  GETs per commit. DuckDB spends the time parsing, binding, and optimising about
-  a kilobyte of generated SQL. Preparing the statement saves the parse, because
-  DuckDB re-binds prepared statements that read a catalog.
-- A CPU profile puts Moraine's own code and its SlateDB reads under 4% of the
-  commit.
-
-<!-- site:omit -->### Flush interval
+<!-- site:omit -->
+### Flush interval
 
 `measure_commit_latency_by_flush_interval`, 60 sequential commits:
 
@@ -134,7 +113,8 @@ vendoring it cost one.
 
 `measure_commit_latency_against_the_endpoint` (`tests/object_storage.rs`)
 runs the same sweep against a real endpoint. `cargo xtask s3` runs it
-against loopback RustFS, where a PUT costs about 1 ms. The `Real S3
+against a RustFS on the same machine, where a PUT costs about 1 ms. The
+`Real S3
 benchmark` workflow runs it from an ARM CodeBuild worker against
 same-region AWS S3. Twenty commits per interval, 2026-08-09, before the
 pacing floor:
@@ -240,7 +220,7 @@ is provisioned from binaries on `PATH` or under
 existing server. The Quack server is a CLI the harness starts over a fresh
 database file, or `MORAINE_BENCH_QUACK` (`host:port`) with
 `MORAINE_BENCH_QUACK_TOKEN`, and `MORAINE_BENCH_QUACK_CA_CERT` for a
-server off the loopback, whose TLS certificate the client must trust;
+server on another machine, whose TLS certificate the client must trust;
 each run gets its own metadata schema.
 Moraine's catalog is a local directory unless `MORAINE_S3_BUCKET` (with
 `MORAINE_S3_PREFIX`, `MORAINE_S3_ENDPOINT`, and AWS credentials) names a
@@ -309,10 +289,8 @@ file saves); do not compare across pairs. The `indexed` twins add one
 
 ### Single writer
 
-`bulk_load` and `small_commits` at the `small` scale, loopback Postgres 16,
-three repeats, 2026-11-16 at v0.9.1 (`d4e6b8e`), Amazon
-Linux cloud VM, Intel Xeon 2.50 GHz, 8 logical CPUs, 16 GiB
-RAM:
+`bulk_load` and `small_commits` at the `small` scale, Postgres 16 on the
+same machine, three repeats, 2026-11-16 at v0.9.1 (`d4e6b8e`):
 
 | phase | moraine | duckdb | postgres |
 |---|---:|---:|---:|
@@ -322,7 +300,8 @@ RAM:
 | 20 single-row inserts | 214 ms | 422 ms | 258 ms |
 
 Serial commits pay moraine's flush each, at the 1 ms interval the latency
-workloads pin, about 11 ms per commit; a loopback Postgres commits in about
+workloads pin, about 11 ms per commit; a Postgres on the same machine
+commits in about
 13 ms and a DuckDB file in about 21 ms. At v0.9.0 moraine took 254 ms for
 the twenty inserts on a VM where the other two catalogs ran about 1.9×
 faster than here, so compare the columns, not the stamps.
@@ -339,9 +318,8 @@ with 1,000 rows each, and checks row counts and sums outside the timed phase.
 cargo xtask bench --backends moraine --workloads small_commits,wide_small_commits,first_inline_write --scale small --repeat 9
 ```
 
-2026-11-16 at v0.9.1 (`d4e6b8e`); Amazon Linux cloud VM, Intel Xeon 2.50 GHz,
-8 logical CPUs, 16 GiB RAM, local filesystem, metadata flush interval 1 ms.
-Nine runs, excluding attach:
+2026-11-16 at v0.9.1 (`d4e6b8e`); an 8-vCPU cloud VM, local filesystem,
+metadata flush interval 1 ms. Nine runs, excluding attach:
 
 | Workload | Median | Min–max |
 |---|---:|---:|
@@ -426,7 +404,7 @@ requests rather than on cores. The same sweep on the benchmark runner,
 
 The standard bucket is still climbing at sixty-four writers, nineteen
 times its single-writer rate. Express peaks at thirty-two and falls back
-at sixty-four, which is the ceiling worth reporting. Its lead narrows as
+at sixty-four, which is its ceiling. Its lead narrows as
 the width grows — from 2.6× at one writer to 1.2× at sixty-four — since
 both converge on what a shared flush can carry.
 
@@ -771,8 +749,8 @@ record cost compared with deep cloning or sharing an existing value?
 cargo test -p moraine --lib --release --locked measure_decoding_and_shared_reuse -- --ignored --nocapture --test-threads=1
 ```
 
-2026-11-13, commit `30c961a`, 8-vCPU x86-64 Linux sandbox, Intel Xeon
-2.90 GHz, Rust 1.96.1 release build with the test allocation counter. Each
+2026-11-13, commit `30c961a`, an 8-vCPU x86-64 Linux sandbox, release
+build with the test allocation counter. Each
 mode runs 100,000 iterations over a 69-byte framed `DataFileValue` containing
 one path string. CPU is measured on the calling thread; no store or I/O is
 involved.
@@ -811,8 +789,8 @@ afterwards, so both its reads and its time grew with the retained count. A
 cursor that opens at the pushed `snapshot_id` floor reads only the snapshots
 since the transaction began, so its cost is **flat in the retained count**
 instead: no reads at all over twenty checks at 512 snapshots retained and
-nineteen at 2,048, against 607 and 1,553 before. The check stays near a
-millisecond whatever is retained.
+nineteen at 2,048, against 607 and 1,553 for the paged scan. The check
+stays near a millisecond whatever is retained.
 
 <!-- site:omit -->
 ### Worker pool
