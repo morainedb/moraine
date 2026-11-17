@@ -66,21 +66,25 @@ SELECT payload FROM lake.events WHERE id = 2;
 ## By the numbers
 
 Identical DuckLake workloads through the same DuckDB CLI, only the catalog
-swapped. Local disk, loopback Postgres 16, medians of three runs on an
-8-vCPU x86-64 VM at v0.9.1:
+swapped. Local disk, loopback Postgres 16, medians of three runs on a
+`c6i.2xlarge` (8 vCPU x86-64) at `fd1b99e`:
 
 | | Moraine | DuckDB file | Postgres |
 |---|---:|---:|---:|
-| attach | 19 ms | 49 ms | 220 ms |
-| create table and insert 100,000 rows | 207 ms | 172 ms | 269 ms |
-| 20 single-row commits, one connection | 214 ms | 422 ms | 258 ms |
-| 128 single-row commits over 8 connections | 451 ms | 3.12 s | 3.13 s |
-| 128 single-row commits over 16 connections | 528 ms | 4.13 s | 6.14 s |
+| attach | 9 ms | 15 ms | 78 ms |
+| create table and insert 100,000 rows | 74 ms | 85 ms | 99 ms |
+| 20 single-row commits, one connection | 78 ms | 199 ms | 132 ms |
+| 128 single-row commits over 8 connections | 305 ms | 1.95 s | 1.48 s |
+| 128 single-row commits over 16 connections | 631 ms | 2.72 s | 2.64 s |
 
 Serial commits pay a write-ahead-log flush each, and since v0.9.1 skip
 DuckLake's metadata SQL on the append path. Overlapping commits share one
 flush, so Moraine gets faster with writers where the other catalogs slow
-down. On S3, each flush is one PUT round trip, about 30 ms same-region.
+down — here to eight writers, this machine's core count, beyond which it
+is bound by cores rather than by flushes. On S3 a commit costs about
+96 ms against a standard bucket and 34 ms against S3 Express, where the
+same curve gives 385 commits a second over sixteen writers.
+
 For more details, see [Benchmarks](https://morainedb.com/benchmarks/).
 
 ## Status
