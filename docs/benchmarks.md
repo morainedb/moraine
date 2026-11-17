@@ -13,7 +13,7 @@ the in-memory object store.
   11 ms. Concurrent commits share one flush.
 - Against a real endpoint the PUT round trip is the floor.
 
-## Running the harnesses
+<!-- site:omit -->## Running the harnesses
 
 `cargo xtask benchmarks` runs every harness below, one at a time, each to
 its own log and report under `target/benchmarks` — the whole set behind a
@@ -23,7 +23,7 @@ restamp.
 |---|---|---|
 | commit timing | `cargo xtask commit-bench` | an S3 endpoint in `MORAINE_S3_BUCKET` |
 | core against a real endpoint | `cargo xtask s3` | nothing; it starts a pinned RustFS |
-| <!-- site:omit -->allocations on the commit path | `cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 --nocapture transaction::commit::tests::allocation::<name>` | nothing<!-- /site:omit --> |
+| allocations on the commit path | `cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 --nocapture transaction::commit::tests::allocation::<name>` | nothing |
 | moraine against other DuckLake catalogs | `cargo xtask bench` | Postgres on `PATH` or `MORAINE_BENCH_POSTGRES`, else that backend is skipped; `MORAINE_S3_BUCKET` puts moraine's catalog on S3; `MORAINE_BENCH_QUACK` names a Quack server |
 | read path on a published scale | `cargo xtask clickbench run --clickbench <checkout> --machine <type>` | a ClickBench checkout, 40 GB of disk, passwordless `sudo` |
 | cold reader timing | `cargo xtask reader-bench` | an S3 endpoint for round-trip counts |
@@ -44,6 +44,8 @@ and a Quack server, and a runner in their zone rather than a laptop.
 environment these commands read on that runner; see
 [its README](../benchmark/infra/README.md).
 
+<!-- /site:omit -->
+
 ## Commits
 
 ### Commit timing
@@ -53,10 +55,12 @@ DuckLake's metadata SQL, moraine's commit work, the durable wait, and the
 object-store requests. Parquet stays local, so every request counted is
 metadata.
 
+<!-- site:omit -->
 ```text
 MORAINE_S3_BUCKET=... MORAINE_S3_PREFIX=... AWS_REGION=... \
   cargo xtask commit-bench [--files 16,128] [--commits 7] [--flush-ms 25]
 ```
+<!-- /site:omit -->
 
 AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
 2026-11-17 at `a491fe5`<!-- /site:omit -->, medians of seven commits:
@@ -95,7 +99,7 @@ commit, and the cost does not grow with the file count.
 - A CPU profile puts Moraine's own code and its SlateDB reads under 4% of the
   commit.
 
-### Flush interval
+<!-- site:omit -->### Flush interval
 
 `measure_commit_latency_by_flush_interval`, 60 sequential commits:
 
@@ -122,7 +126,6 @@ delay against the flush interval. 30 commits per cell, median:
 | 25 ms | 80.0 ms | 79.9 ms | 80.0 ms |
 | 100 ms | 305 ms | 305 ms | 305 ms |
 
-<!-- site:omit -->
 Once the round trip exceeds the pacing floor, the interval no longer
 matters and a commit costs about three round trips. Before the SlateDB 0.18
 vendoring it cost one.
@@ -146,7 +149,7 @@ The S3 floor was one round trip, about 30 ms. Going below a 25 ms
 interval gained nothing.
 <!-- /site:omit -->
 
-### Concurrency
+<!-- site:omit -->### Concurrency
 
 `measure_commit_throughput_by_concurrency`: K callers share 128 commits,
 each appending to its own table, at the default interval. Batch size is
@@ -163,7 +166,6 @@ the WAL objects written.
 Batch size equals concurrency up to the 64-member ceiling, and throughput
 scales linearly with K in this run.
 
-<!-- site:omit -->
 ### Allocations
 
 The tests in `transaction::commit::tests::allocation` count allocator
@@ -203,7 +205,7 @@ For a heap profile, build the test executable with `--no-run`, run
 stacks by `profile_index_append`.
 <!-- /site:omit -->
 
-### Reclaim
+<!-- site:omit -->### Reclaim
 
 `measure_reclaim_by_batch_size`, 50,000 dead index entries:
 
@@ -216,8 +218,10 @@ stacks by `profile_index_append`.
 The sweep is compute-bound; batch size does not matter. Before the pacing
 floor each batch waited a full flush and the 256 case took 20 s.
 
-## Against other DuckLake catalogs
+<!-- /site:omit -->
 
+## Against other DuckLake catalogs
+<!-- site:omit -->
 `cargo xtask bench` runs identical workloads against moraine, a DuckDB
 file catalog, Postgres, and a DuckDB served over the Quack protocol,
 through the same pinned DuckDB CLI. Data is local Parquet everywhere; only
@@ -306,9 +310,9 @@ file saves); do not compare across pairs. The `indexed` twins add one
 ### Single writer
 
 `bulk_load` and `small_commits` at the `small` scale, loopback Postgres 16,
-three repeats<!-- site:omit -->, 2026-11-16 at v0.9.1 (`d4e6b8e`), Amazon
+three repeats, 2026-11-16 at v0.9.1 (`d4e6b8e`), Amazon
 Linux cloud VM, Intel Xeon 2.50 GHz, 8 logical CPUs, 16 GiB
-RAM<!-- /site:omit -->:
+RAM:
 
 | phase | moraine | duckdb | postgres |
 |---|---:|---:|---:|
@@ -348,6 +352,8 @@ Nine runs, excluding attach:
 The wide table costs 1.7× the narrow one. Before the append path bypassed
 DuckLake's metadata SQL, its per-column statistics updates made it 11×.
 
+<!-- /site:omit -->
+
 ### Concurrent writers
 
 `--commits` single-row inserts are spread over N writers, released
@@ -386,9 +392,11 @@ scaling, since there every writer is a thread of one process.
 Where does that stop? The same workload bounded by a window instead of a
 count, moraine only, swept until the rate stopped rising:
 
+<!-- site:omit -->
 ```bash
 cargo xtask bench --backends moraine --workloads concurrent_connections --seconds 5 --concurrency 1,2,4,8,16,32,64
 ```
+<!-- /site:omit -->
 
 2026-11-16 at `059a091` with this file's window bound; the single-writer
 VM, local store, the default 100 ms interval, five-second windows, three
@@ -443,9 +451,11 @@ What does each catalog cost on real endpoints, and what does S3 Express
 buy? One run of every backend, both of moraine's stores among them, so
 the columns share a machine, a clock and a network.
 
+<!-- site:omit -->
 ```bash
 cargo xtask benchmarks
 ```
+<!-- /site:omit -->
 
 2026-11-17 at `a491fe5`; a `c6i.2xlarge` runner in us-east-1 `use1-az4`,
 with the standard bucket, the directory bucket, RDS Postgres 16
@@ -560,11 +570,13 @@ Commits move by nothing: they pay round trips, which no cache serves.
 `benchmark/clickbench` is a [ClickBench](https://benchmark.clickhouse.com)
 system entry for a moraine-backed DuckLake.
 
+<!-- site:omit -->
 ```sh
 git clone https://github.com/ClickHouse/ClickBench.git
 cargo xtask clickbench run --clickbench ./ClickBench --machine c6a.4xlarge
 cargo xtask clickbench report --clickbench ./ClickBench
 ```
+<!-- /site:omit -->
 
 `run` drives upstream's own `lib/benchmark-common.sh` and writes
 `benchmark/clickbench/results/<date>/<machine>.json`. `report` scores it
@@ -584,11 +596,13 @@ now, so nothing materializes at attach and there is nothing there to
 time.
 Each repeat is a new process; only `--cache-dir` survives.
 
+<!-- site:omit -->
 ```text
 MORAINE_S3_BUCKET=... [MORAINE_S3_ENDPOINT=...] \
   cargo xtask reader-bench [--files 2000,20000] [--tables 1] [--deletes 0]
                            [--repeat 5] [--cache-dir <dir>]
 ```
+<!-- /site:omit -->
 
 `--tables` spreads the files over that many tables and queries one.
 `--deletes` gives that share of files a delete file.
@@ -633,7 +647,7 @@ This catalog attached in about 0.4 s. Compaction halved the SST count
 without reducing attach latency.
 <!-- /site:omit -->
 
-### What an attach reads
+<!-- site:omit -->### What an attach reads
 
 Three in-memory sweeps, median read-only attaches.
 
@@ -661,9 +675,9 @@ the GET count is the slope:
 
 At 10 ms per GET the attach costs 31× its in-memory time. The merge cut
 SSTs by 63% and did not reduce GETs, matching the S3 run above. Measured
-<!-- site:omit -->at `c224745`, <!-- /site:omit -->after a reader stopped
-writing a checkpoint of its own on open; before that<!-- site:omit --> (at
-`8146cbf`)<!-- /site:omit --> the slopes were 22.6 and 23.7, and before the
+at `c224745`, after a reader stopped
+writing a checkpoint of its own on open; before that (at
+`8146cbf`) the slopes were 22.6 and 23.7, and before the
 demand-loaded catalog the merge cut GETs from 14.5 to 12.3.
 
 `measure_attach_cost_by_index_size` grows only the `index` subspace:
@@ -679,6 +693,8 @@ count (about 85 µs each), never with bytes. A production attach took 833 s
 to read 12.8 MB because SlateDB's default scan fetched one 4 KB block per
 round trip. Reading 4 MiB ahead with eight fetches in
 flight fixed it.
+
+<!-- /site:omit -->
 
 ### Materialization and refresh
 
@@ -746,7 +762,7 @@ transaction paid, and a cold handle 28.3 and 18.3. Metadata reads within the
 interval require no endpoint round trip; checking for a new publication requires
 a manifest read.
 
-### Decoded value ownership
+<!-- site:omit -->### Decoded value ownership
 
 Question: how much synchronous CPU and allocation does decoding one file
 record cost compared with deep cloning or sharing an existing value?
@@ -769,6 +785,8 @@ involved.
 
 This small-record fixture isolates ownership costs. It does not measure a
 catalog lookup, larger nested records, or the benefit of a decoded-value cache.
+
+<!-- /site:omit -->
 
 ### Staged conflict check
 
@@ -808,7 +826,7 @@ records. They need to run lookups to measure I/O and decoding again.
 
 ## Index lookups
 
-### Probe fetch
+<!-- site:omit -->### Probe fetch
 
 `measure_probe_cost_by_index_size`, 32 probes across the whole `index`
 run:
@@ -825,7 +843,6 @@ A cold probe into 37.8 MB fetches 62 KB (a part-grained cache would fetch
 one unique index. Clustered commits cost 75 to 85 ms throughout;
 scattered ones 1.1 to 1.8× that.
 
-<!-- site:omit -->
 ### Lookup latency on AWS S3
 
 `measure_index_lookup_latency_against_the_endpoint`: unique and
