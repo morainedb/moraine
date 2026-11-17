@@ -41,6 +41,8 @@ ignore = [
     { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7.x legacy-frame decompression; transitive via slatedb->foyer, unpatched on 7.x" },
     # Transitive via object_store, which every store path depends on.
     { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained; transitive via object_store" },
+    # Transitive via arrow's date and timestamp kernels.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; transitive via arrow" },
 ]
 
 [sources]
