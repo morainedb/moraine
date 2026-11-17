@@ -447,7 +447,12 @@ Serial phases, medians:
   shared server. It is also the slowest to create tables with rows.
 - Serially moraine is the slowest of the five, and the ranking is set by
   requests per commit rather than by the network: the round trips above
-  are sub-millisecond.
+  are sub-millisecond. Each of those twenty commits costs about 96 ms on
+  the standard bucket and 34 ms on Express.
+- Attach is a startup cost, not a per-operation one. A process that
+  attaches once and commits for its lifetime pays it once; one that
+  attaches per invocation pays it every time, and a second attach is no
+  cheaper than the first.
 - Postgres and Quack take writer *processes* but do not share the work
   among them: one commits a few hundred times while the rest commit
   nothing, so their aggregate is flat across widths — 87 to 62 commits
