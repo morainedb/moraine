@@ -462,6 +462,14 @@ Serial phases, medians:
   window at sixteen writers — because a writer inside a retry loop only
   stops between statements. The rates are over the window each actually
   got.
+- Every writer commits to a table of its own, which separates catalog
+  contention from row contention and is the shape most favourable to
+  moraine: its writers never contend for a snapshot, where DuckLake's SQL
+  catalogs retry on one. Writers sharing a table is unmeasured.
+- Moraine's curve is group commit: concurrent commits share one paced
+  flush, which is also why a lone writer is the slowest here. The other
+  catalogs decline for a different reason — a statement chain and an
+  optimistic conflict check per commit, which concurrency makes longer.
 
 What a second attach costs, from `warm_attach`: the catalog is attached,
 detached, and attached again in one process, each attach timed.
