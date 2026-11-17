@@ -443,8 +443,8 @@ Serial phases, medians:
 - **Quack collapses under concurrency**, from 43 commits per second to 2,
   as DuckLake spends its retry budget on snapshot conflicts against the
   shared server.
-- The attach column is a cold read: no `--cache-dir`, so every run pays
-  for a store no cache kept.
+- The attach column is not a cold-start artifact: attaching the same
+  catalog a second time in the same process costs the same, as below.
 - Postgres and Quack take writer *processes* but do not share the work
   among them: at eight writers one commits a few hundred times and the
   rest commit nothing, so their aggregate is flat across widths. Both
@@ -453,6 +453,28 @@ Serial phases, medians:
   5 s window at sixteen writers — because a writer inside a retry loop
   only stops between statements. The rates are over the window each
   actually got.
+
+What a second attach costs, from `warm_attach`: the catalog is attached,
+detached, and attached again in one process, each attach timed. Same
+runner, 2026-11-17, measured round trips of 665 µs to S3, 337 µs to RDS
+and 270 µs to Quack:
+
+| phase | moraine | express | duckdb | postgres | quack |
+|---|---:|---:|---:|---:|---:|
+| attach | 883 ms | 291 ms | 4 ms | 55 ms | 79 ms |
+| re-attach | 843 ms | 260 ms | 3 ms | 56 ms | 74 ms |
+| count after it | 25 ms | 25 ms | 28 ms | 66 ms | 62 ms |
+
+An attach does not get cheaper for having been done before: moraine
+saves 5% the second time, Express 11%, Postgres nothing. The cost is
+what every attach does — open the store, read the manifest, materialize
+the first view — rather than reads a warm cache could serve, so a
+long-lived process pays it per attach and not once. What does reduce it
+is a cache directory carried across restarts, which the cold reader
+measures separately.
+
+Reading is the other way around: once attached, both moraine stores
+answer a count in 25 ms against 66 ms for Postgres and 62 ms for Quack.
 
 The same run with `--cache-dir`, moraine's two stores (medians; the
 cache's own run measured 680 µs to S3 against 961 µs for the one above):
