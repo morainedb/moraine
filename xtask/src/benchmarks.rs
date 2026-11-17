@@ -415,9 +415,11 @@ fn other_run() -> Option<u32> {
 /// Whether a `/proc` command line is a `benchmarks` run of this xtask.
 /// The arguments are NUL-separated, so the check is on the parts.
 fn is_benchmarks_run(cmdline: &[u8]) -> bool {
-    let parts: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
-    parts.iter().any(|part| part.ends_with(b"xtask"))
-        && parts.iter().any(|part| *part == b"benchmarks")
+    let mut parts = cmdline.split(|byte| *byte == 0);
+    let (Some(program), Some(command)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    program.ends_with(b"xtask") && command == b"benchmarks"
 }
 
 /// `benchmarks [--out <dir>] [--clickbench <checkout>]`.
@@ -607,7 +609,8 @@ mod tests {
             b"/home/me/moraine/target/debug/xtask\0benchmarks\0--out\0/t\0"
         ));
 
-        // The harnesses a run starts are not themselves runs.
+        // Neither a harness a run starts nor a test naming both words.
+        assert!(!is_benchmarks_run(b"cargo\0test\0-p\0xtask\0benchmarks\0"));
         assert!(!is_benchmarks_run(
             b"target/debug/xtask\0bench\0--backends\0moraine\0"
         ));
