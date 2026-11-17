@@ -59,10 +59,11 @@ Reader acquisition works as follows.
    is also the collector's minimum age for log and compacted objects, and must
    exceed the longest explicit transaction.
 5. Because a reader advances only on its own manifest poll, freshness comes
-   from opening one rather than from waiting on one. A scope shares the
-   reader its predecessor opened for `reader_poll_interval`, and opens a newer
-   one past that; a committer, which must read its own commits through a
-   reader, opens one per transaction.
+   from opening one rather than from waiting on one: a scope's reader polls on
+   `READ_WINDOW`, so it cannot re-point while a transaction holds it. A scope
+   shares the reader its predecessor opened for `reader_poll_interval`, and
+   opens a newer one past that; a committer, which must read its own commits
+   through a reader, opens one per transaction.
 6. A writer that closes or crashes leaves nothing to refresh and nothing to
    expire. Readers go on opening their own readers over whatever the log and
    manifest say, which is the last acknowledged commit either way.
@@ -607,17 +608,13 @@ container ceiling remains the final boundary.
 ## Tests
 
 - A reader scope opened after acknowledgement sees the commit, and an open
-  scope keeps its revision across later commits.
-- Publication fails when the covered sequence is not yet WAL-durable.
-- A reader past its deadline rejects point reads and scan yields, and a
-  listing that still shows its publication extends the deadline.
-- A read-only attach writes nothing to the object store across open, several
-  transactions, and a writer commit between them.
-- A shared reader keeps its publication inside `reader_poll_interval` and
-  moves to a newer one after it.
-- A committer's scope takes a newer publication inside `reader_poll_interval`.
-- A superseded publication carries an expiry and the newest carries none; an
-  expired one is deleted at the next publication.
+  scope keeps its revision across later commits and past the interval a
+  reader would otherwise re-point on.
+- A reader past its deadline rejects point reads and scan yields.
+- A checkpoint-pinned attach writes nothing to the object store; a reader with
+  none to pin records a checkpoint of its own.
+- A shared reader is reused inside `reader_poll_interval`, and a scope past it
+  opens a newer one; a committer opens one per transaction.
 - A head change under a lookup rerun reaches `RetryBudgetExhausted` after
   eight passes without an unguarded fallback.
 - A corrupt sidecar header, wrong identity, or unknown version falls through
@@ -627,19 +624,9 @@ container ceiling remains the final boundary.
 
 ## Alternatives
 
-- **Writer publication by detached checkpoint of the latest manifest.**
-  Rejected: it omits WAL-durable commits a following reader already sees.
-- **Reader-owned leases on a single-writer publication.** Rejected for that
-  path: a manifest write per reader generation and one per renewal, forced only
-  by deleting the superseded publication at once. A lifetime on every
-  publication lets readers pin the publication itself.
-- **A current publication without an expiry, retired by a second manifest
-  write when superseded.** The original design. Rejected once measured
-  against a networked store: the retirement doubled every commit's manifest
-  traffic and contended with the next commit's write, for a guarantee, an
-  offline writer's catalog readable forever under an external collector,
-  that a permanent publication on clean close covers in every case but a
-  crash.
+- **Pinning a scope to a detached checkpoint of the latest manifest.**
+  Rejected: such a checkpoint does not advance the manifest's WAL boundary, so
+  a reader pinned to it omits commits acknowledged only in the log.
 - **A fixed metadata slot.** Rejected: a fixed fifth of the budget was both
   floor and ceiling, so holding a large store's filters meant inflating the
   whole budget. Eviction priority lets idle metadata space go to blocks.
