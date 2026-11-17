@@ -119,10 +119,24 @@ function downloadTable(byDuckdb) {
 // was introduced read from format 1; before the catalog version was
 // recorded they served 1.0.
 export function parseVersionConstants(text) {
+  // A constant may name one declared after it, so resolve until a pass
+  // settles nothing more.
+  const declared = [...text.matchAll(/const ([A-Z_]+): u64 = ([^;]+);/g)].map(([, name, value]) => [
+    name,
+    value.trim(),
+  ]);
   const numbers = new Map();
-  for (const [, name, value] of text.matchAll(/const ([A-Z_]+): u64 = ([^;]+);/g)) {
-    const resolved = /^\d+$/.test(value.trim()) ? Number(value) : numbers.get(value.trim());
-    if (resolved !== undefined) numbers.set(name, resolved);
+  let settled = true;
+  while (settled) {
+    settled = false;
+    for (const [name, value] of declared) {
+      if (numbers.has(name)) continue;
+      const resolved = /^\d+$/.test(value) ? Number(value) : numbers.get(value);
+      if (resolved !== undefined) {
+        numbers.set(name, resolved);
+        settled = true;
+      }
+    }
   }
   if (!numbers.has('MAX_FORMAT_VERSION')) return null;
 

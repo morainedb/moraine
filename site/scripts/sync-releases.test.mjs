@@ -218,6 +218,25 @@ test('version constants resolve names to numbers, with old-tag defaults', () => 
   assert.equal(parseVersionConstants(''), null);
 });
 
+test('version constants resolve a name declared after its use', () => {
+  // 0.9.0 declares MAX_FORMAT_VERSION above the constant it names.
+  const forward = [
+    'pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;',
+    'pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_DELETE_TARGETS;',
+    'pub(crate) const FORMAT_WITH_NAMES: u64 = 11;',
+    'pub(crate) const FORMAT_WITH_DELETE_TARGETS: u64 = 12;',
+    'pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;',
+    'pub const CATALOG_VERSION: &str = "1.0";',
+    'pub const MAX_CATALOG_VERSION: &str = "1.1";',
+  ].join('\n');
+  assert.deepEqual(parseVersionConstants(forward), {
+    formatMin: 9,
+    formatMax: 12,
+    catalogMin: '1.0',
+    catalogMax: '1.1',
+  });
+});
+
 test('compatibility rows merge consecutive releases that agree', () => {
   const entries = ['0.8.1', '0.8.0', '0.7.0', '0.6.5'].map((version) => ({ version }));
   const downloads = new Map([
