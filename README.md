@@ -66,24 +66,28 @@ SELECT payload FROM lake.events WHERE id = 2;
 ## By the numbers
 
 Identical DuckLake workloads through the same DuckDB CLI, only the catalog
-swapped. Local disk, loopback Postgres 16, medians of three runs on a
-`c6i.2xlarge` (8 vCPU x86-64) at `fd1b99e`:
+swapped, each on the store it would really use: Moraine on S3 and on S3
+Express, Postgres on RDS, a DuckDB catalog file on local disk, since that
+is its only option. One `c6i.2xlarge` runner and every endpoint in its
+availability zone, medians of three runs at `fd1b99e`:
 
-| | Moraine | DuckDB file | Postgres |
-|---|---:|---:|---:|
-| attach | 9 ms | 15 ms | 78 ms |
-| create table and insert 100,000 rows | 74 ms | 85 ms | 99 ms |
-| 20 single-row commits, one connection | 78 ms | 199 ms | 132 ms |
-| 128 single-row commits over 8 connections | 305 ms | 1.95 s | 1.48 s |
-| 128 single-row commits over 16 connections | 631 ms | 2.72 s | 2.64 s |
+| | Moraine | Moraine on Express | DuckDB file | Postgres |
+|---|---:|---:|---:|---:|
+| 20 single-row commits, one connection | 1.92 s | 687 ms | 212 ms | 305 ms |
+| commits per second, 1 connection | 11 | 36 | 136 | 90 |
+| commits per second, 8 connections | 55 | 234 | 94 | 45 |
+| commits per second, 16 connections | 113 | 385 | 86 | 28 |
+| attach | 830 ms | 311 ms | 16 ms | 193 ms |
+| full scan | 138 ms | 54 ms | 36 ms | 75 ms |
 
-Serial commits pay a write-ahead-log flush each, and since v0.9.1 skip
-DuckLake's metadata SQL on the append path. Overlapping commits share one
-flush, so Moraine gets faster with writers where the other catalogs slow
-down — here to eight writers, this machine's core count, beyond which it
-is bound by cores rather than by flushes. On S3 a commit costs about
-96 ms against a standard bucket and 34 ms against S3 Express, where the
-same curve gives 385 commits a second over sixteen writers.
+A commit on an object store is bound by requests, not by bandwidth: five
+sequential round trips, which is why one writer is slower here than a
+catalog on a local file or a nearby Postgres. Overlapping commits share
+one write-ahead-log flush, so Moraine is the only catalog that gets
+faster with writers — tenfold from one to sixteen — passing RDS at eight
+and the local file at sixteen, and on S3 Express passing the local file
+at four. Attach is a start-up cost, paid once by a process that stays
+attached.
 
 For more details, see [Benchmarks](https://morainedb.com/benchmarks/).
 
