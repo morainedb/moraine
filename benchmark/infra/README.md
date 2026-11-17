@@ -126,6 +126,10 @@ does not, deliberately: a proxy adds a hop to the very latency being
 measured. The security group is the control instead, and the token is 32
 random characters.
 
+It holds the metadata every sweep writes, which is what makes it
+memory-bound: hence `t4g.large` and a swap file, after two gigabytes and
+no swap left it listening and unresponsive with its instance agent dead.
+
 The server runs the DuckDB release pinned in `.github/duckdb-versions`,
 read from that file so it cannot drift from the extension that talks to
 it. First boot downloads the CLI and installs the `quack` extension, so

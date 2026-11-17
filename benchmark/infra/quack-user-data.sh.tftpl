@@ -3,6 +3,17 @@ set -euo pipefail
 
 dnf install -y tar gzip
 
+# Swap, so memory pressure slows this server rather than wedging it. Under
+# a five-backend sweep the OOM killer took the instance agent with it,
+# leaving a socket that accepted connections and answered none.
+if [ ! -f /swapfile ]; then
+  fallocate -l 4G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo "/swapfile none swap sw 0 0" >> /etc/fstab
+fi
+
 useradd --system --home-dir /var/lib/quack --shell /sbin/nologin quack || true
 install -d -o quack -g quack -m 0750 /var/lib/quack
 install -d -m 0755 /etc/quack
