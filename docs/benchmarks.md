@@ -31,10 +31,10 @@ commands below stay the way to answer one question.
 | indexed scan strategies | `cargo xtask filter-bench <extension> <results-directory>` | a built extension |
 | the core against a real endpoint | `cargo xtask s3` | nothing; it starts a pinned RustFS |
 | the core in isolation | `cargo test -p moraine --test it --release -- --ignored --nocapture measure_` | nothing |
-| the two needing crate-internal seams | `cargo test -p moraine --lib --release -- --ignored --nocapture measure_` | nothing |
+| the two needing crate-internal seams | `cargo test -p moraine --lib --release -- --ignored --nocapture measure_` | `MORAINE_MEMORY_FIXTURE` naming a directory, for the writer-generation one |
 | <!-- site:omit -->allocations on the commit path | `cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 --nocapture transaction::commit::tests::allocation::<name>` | nothing<!-- /site:omit --> |
 | peak heap of a staged index build | `cargo test -p moraine --test staged_build_memory --release -- --ignored --nocapture` | nothing |
-| a commit's conflict check against retained snapshots | `cargo test -p moraine-duckdb --test ducklake_load -- --include-ignored --nocapture measure_staged_conflict_check_by_retained_snapshots` | a built extension, as `cargo xtask e2e` sets up |
+| a commit's conflict check against retained snapshots | `cargo test -p moraine-duckdb --test ducklake_load -- --include-ignored --nocapture measure_staged_conflict_check_by_retained_snapshots` | `MORAINE_DUCKDB_EXT` naming a built extension |
 | the core against AWS S3 | the `Real S3 benchmark` workflow | the AWS stack in [CONTRIBUTING.md](../CONTRIBUTING.md#the-real-s3-benchmark) |
 
 The core harnesses use the in-memory object store, so their durable cost is

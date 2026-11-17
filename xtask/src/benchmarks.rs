@@ -53,6 +53,8 @@ struct Step {
     arguments: Vec<String>,
     local_only: bool,
     timeout: Duration,
+    /// What this harness needs in its environment and nothing else does.
+    environment: Vec<(&'static str, String)>,
 }
 
 impl Step {
@@ -66,6 +68,7 @@ impl Step {
                 .collect(),
             local_only: false,
             timeout: STEP_TIMEOUT,
+            environment: Vec::new(),
         }
     }
 
@@ -85,6 +88,11 @@ impl Step {
         self.timeout = timeout;
         self
     }
+
+    fn with_env(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.environment.push((name, value.into()));
+        self
+    }
 }
 
 /// Every harness, in the order it runs.
@@ -92,7 +100,7 @@ fn steps(output: &Path, clickbench: Option<&Path>, backends: &str) -> Vec<Step> 
     let mut steps = networked_steps(output, backends);
     steps.extend(local_steps());
     steps.extend(single_purpose_steps(output));
-    steps.extend(core_steps());
+    steps.extend(core_steps(output));
     steps.extend(clickbench_steps(clickbench));
     steps
 }
@@ -277,7 +285,13 @@ fn single_purpose_steps(output: &Path) -> Vec<Step> {
 }
 
 /// What the core measures of itself, through its own ignored tests.
-fn core_steps() -> Vec<Step> {
+fn core_steps(output: &Path) -> Vec<Step> {
+    let fixture = output.join("memory-fixture").display().to_string();
+    let extension = workspace_root()
+        .join("build/release/extension/moraine/moraine.duckdb_extension")
+        .display()
+        .to_string();
+
     vec![
         Step::cargo(
             "core-integration",
@@ -311,7 +325,9 @@ fn core_steps() -> Vec<Step> {
                 "--test-threads=1",
                 "measure_",
             ],
-        ),
+        )
+        // One of these measures a fixture it will not build itself.
+        .with_env("MORAINE_MEMORY_FIXTURE", &fixture),
         Step::cargo(
             "staged-build-memory",
             &[
@@ -342,7 +358,9 @@ fn core_steps() -> Vec<Step> {
                 "--nocapture",
                 "measure_staged_conflict_check_by_retained_snapshots",
             ],
-        ),
+        )
+        // It drives a real CLI, which needs the packaged extension named.
+        .with_env("MORAINE_DUCKDB_EXT", &extension),
     ]
 }
 
@@ -513,6 +531,9 @@ fn run_step(step: &Step, xtask: &Path, output: &Path) -> anyhow::Result<bool> {
         None => Command::new(xtask),
     };
     command.args(&step.arguments);
+    for (name, value) in &step.environment {
+        command.env(name, value);
+    }
     if step.local_only {
         for variable in STORE_VARIABLES {
             command.env_remove(variable);
@@ -613,6 +634,26 @@ mod tests {
         assert_eq!(steps.len(), without + 2);
         assert_eq!(steps[steps.len() - 2].name, "clickbench-run");
         assert_eq!(steps[steps.len() - 1].name, "clickbench-report");
+    }
+
+    #[test]
+    fn the_harnesses_that_need_an_environment_are_given_one() {
+        let steps = steps(Path::new("/tmp/out"), None, ALL_BACKENDS);
+        let named = |name: &str| {
+            steps
+                .iter()
+                .find(|step| step.name == name)
+                .map(|step| {
+                    step.environment
+                        .iter()
+                        .map(|(variable, _)| *variable)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap()
+        };
+        assert_eq!(named("core-internal"), ["MORAINE_MEMORY_FIXTURE"]);
+        assert_eq!(named("conflict-check"), ["MORAINE_DUCKDB_EXT"]);
+        assert!(named("catalogs-windowed").is_empty());
     }
 
     #[test]
