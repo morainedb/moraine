@@ -16,6 +16,8 @@
 //!   `commit_bench.rs`).
 //! - `s3` runs the catalog's object storage suite against a pinned RustFS
 //!   server (see `s3.rs`).
+//! - `rebench` re-runs every harness behind a published number, logging each
+//!   separately (see `rebench.rs`).
 //! - `check-pins` verifies every place naming a DuckDB version agrees with
 //!   `.github/duckdb-versions` (see `pins.rs`).
 //! - `check-patch-pins` applies the DuckLake patch series to every source
@@ -35,6 +37,7 @@
 use anyhow::bail;
 
 mod bench;
+mod benchmarks;
 mod bump;
 mod catalog_target;
 mod clickbench;
@@ -66,6 +69,7 @@ fn main() -> anyhow::Result<()> {
         Some("filter-bench") => filter_bench::run(&arguments),
         Some("reader-bench") => reader_bench::run(&arguments),
         Some("s3") => s3::s3(),
+        Some("benchmarks") => benchmarks::run(&arguments),
         Some("check-pins") => pins::check_pins(),
         Some("check-patch-pins") => ducklake_patch::check_pins(),
         Some("check-release-assets") => release::check_release_assets(&arguments),

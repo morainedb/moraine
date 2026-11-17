@@ -27,6 +27,11 @@ summary; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
   necessity — the contract is a set of executables. Its queries are *not*
   vendored (CC BY-NC-SA); `cargo xtask clickbench` stages them from a
   ClickBench checkout.
+- `benchmark/infra` — OpenTofu for a networked cross-catalog run: a
+  zone-pinned EC2 runner plus the endpoints it measures (S3, an S3 Express
+  directory bucket, RDS Postgres, a Quack server), each private to the
+  runner. Nothing in CI uses it; the `Real S3 benchmark` workflow keeps its
+  own CloudFormation stack.
 
 ## Rules
 

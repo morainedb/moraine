@@ -329,7 +329,6 @@ async fn scan(
         .scan_prefix(prefix, .., ScanShape::bounded().retain())
         .await?;
     while let Some(entry) = cursor.next().await? {
-        handle.validate()?;
         let record = read::decode_current_record(Key::decode(&entry.key)?, &entry.value)?;
         if include(&record) {
             retain(view, record)?;

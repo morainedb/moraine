@@ -105,7 +105,7 @@ pub(super) fn report() {
         bypassed_parquet_range_bytes = ACTIVITY.bypassed_range_bytes.load(Ordering::Relaxed),
         publication_decoded_records = ACTIVITY.decoded_records.load(Ordering::Relaxed),
         publication_decoded_estimated_bytes = ACTIVITY.decoded_bytes.load(Ordering::Relaxed),
-        publication_reused_records = ACTIVITY.reused_records.load(Ordering::Relaxed),
+        reader_reused_records = ACTIVITY.reused_records.load(Ordering::Relaxed),
         "read cache activity: cumulative process totals"
     );
 }
