@@ -28,7 +28,6 @@ impl TableContext {
 
     pub(crate) async fn resolve(&self, table: TableId) -> Result<WorkingValue<String>> {
         let handle = self.reads().owned_read_handle();
-        handle.borrow().validate()?;
         let mut current = self.current.lock().await;
         if let Some((held, prefix)) = &*current
             && *held == table

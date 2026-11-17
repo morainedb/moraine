@@ -122,8 +122,10 @@ async fn set_probe(catalog: &Catalog, value: &str) {
         .unwrap();
 }
 
+/// A read-only attach writes only the checkpoint that keeps collection off
+/// what it reads: one per reader it opens, and nothing else.
 #[tokio::test]
-async fn a_read_only_attach_writes_nothing() {
+async fn a_read_only_attach_writes_only_its_own_checkpoints() {
     let objects = Arc::new(InMemory::new());
     let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
         .await
@@ -156,11 +158,15 @@ async fn a_read_only_attach_writes_nothing() {
     reader.close().await.unwrap();
     catalog.close().await.unwrap();
 
-    assert_eq!(counting.writes(), 0, "a read-only attach must not write");
+    assert_eq!(
+        counting.writes(),
+        4,
+        "two readers, each establishing and refreshing a checkpoint of its own"
+    );
 }
 
 #[tokio::test]
-async fn a_shared_reader_keeps_its_publication_inside_the_interval() {
+async fn a_shared_reader_is_reused_inside_the_interval() {
     let objects = Arc::new(InMemory::new());
     let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
         .await
@@ -187,7 +193,7 @@ async fn a_shared_reader_keeps_its_publication_inside_the_interval() {
 }
 
 #[tokio::test]
-async fn readers_acquire_the_newest_publication_with_the_writer_closed() {
+async fn readers_see_the_last_commit_of_a_closed_writer() {
     let objects = Arc::new(InMemory::new());
     let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
         .await
@@ -211,32 +217,7 @@ async fn readers_acquire_the_newest_publication_with_the_writer_closed() {
 }
 
 #[tokio::test]
-async fn a_listing_that_confirms_the_publication_extends_the_deadline() {
-    let objects = Arc::new(InMemory::new());
-    let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
-    set_probe(&catalog, "one").await;
-
-    let reader = Catalog::open_read_only(objects, reader_options(Duration::from_hours(1)))
-        .await
-        .unwrap();
-    let scopes = reader.reader_scopes.as_ref().unwrap();
-    let first = scopes.acquire().await.unwrap();
-    first.set_deadline(tokio::time::Instant::now() + Duration::from_secs(1));
-
-    // Little life left forces a listing inside the interval; the publication
-    // is still current, so the same reader is confirmed and extended.
-    let again = scopes.acquire().await.unwrap();
-    assert!(Arc::ptr_eq(&first, &again));
-    assert!(again.remaining().unwrap() > Duration::from_mins(5));
-    drop((first, again));
-    reader.close().await.unwrap();
-    catalog.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_committer_lists_the_newest_publication_inside_the_interval() {
+async fn a_committer_opens_a_reader_past_its_own_commit() {
     use super::super::index_read_scope::PinnedRead;
     use crate::store::{checkpoint::CheckpointReader, handle::OwnedReadHandle};
 
@@ -249,7 +230,7 @@ async fn a_committer_lists_the_newest_publication_inside_the_interval() {
         .unwrap();
     // The peer's commits wait out a poll of its reader; the committer under
     // test never commits, so its interval only governs how long its scopes
-    // may reuse a publication.
+    // may share one reader.
     let provider = Arc::new(crate::commit_log::test_log::TestProvider::default());
     let peer = Catalog::open(
         objects.clone(),
@@ -271,8 +252,8 @@ async fn a_committer_lists_the_newest_publication_inside_the_interval() {
     .await
     .unwrap();
 
-    // A committer's scope is never a listing interval behind a publication:
-    // the one after a commit reads past the one before it.
+    // A committer's scope is never an interval behind the store: the one
+    // after a commit reads past the one before it.
     let scopes = committer.reader_scopes.as_ref().unwrap();
     let first = scopes.acquire().await.unwrap();
     set_probe(&peer, "two").await;
@@ -282,7 +263,7 @@ async fn a_committer_lists_the_newest_publication_inside_the_interval() {
         let mut reads = (*committer).clone();
         reads.pinned = Some(Arc::new(PinnedRead {
             handle: OwnedReadHandle::Checkpoint(reader.clone()),
-            revision: reader.manifest,
+            revision: reader.revision,
         }));
         reads
     };
@@ -303,4 +284,148 @@ async fn a_committer_lists_the_newest_publication_inside_the_interval() {
     drop((first, second));
     committer.close().await.unwrap();
     peer.close().await.unwrap();
+}
+
+/// Refuses every write, as a store reached with read-only credentials does.
+#[derive(Debug)]
+struct ReadOnlyStore {
+    inner: Arc<InMemory>,
+}
+
+impl std::fmt::Display for ReadOnlyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReadOnlyStore")
+    }
+}
+
+fn refused(path: &Path) -> object_store::Error {
+    object_store::Error::PermissionDenied {
+        path: path.to_string(),
+        source: "read-only credentials".into(),
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ReadOnlyStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        _payload: PutPayload,
+        _opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        Err(refused(location))
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        _opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        Err(refused(location))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(refused(from))
+    }
+}
+
+/// A writer that commits and then vanishes, as a crash leaves a store.
+async fn store_left_by_a_vanished_writer() -> Arc<InMemory> {
+    let objects = Arc::new(InMemory::new());
+    let writer = Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    set_probe(&writer, "survives").await;
+    drop(writer);
+    objects
+}
+
+/// A reader protects what it reads with a checkpoint of its own.
+#[tokio::test]
+async fn a_reader_keeps_a_checkpoint_of_its_own() {
+    let objects = store_left_by_a_vanished_writer().await;
+    let reader = Catalog::open_read_only(objects.clone(), reader_options(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    let scope = reader.index_read_scope().await.unwrap();
+    assert_eq!(
+        global_option(scope.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("survives")
+    );
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    let own = admin.list_checkpoints(None).await.unwrap();
+    assert!(
+        !own.is_empty(),
+        "the reader protects its view with a checkpoint"
+    );
+    assert!(
+        own.iter()
+            .all(|checkpoint| checkpoint.expire_time.is_some())
+    );
+    drop(scope);
+    reader.close().await.unwrap();
+}
+
+/// A reader whose credentials cannot write follows the latest manifest
+/// instead, protected only by retention.
+#[tokio::test]
+async fn a_reader_that_cannot_write_follows_the_latest_manifest() {
+    let objects = store_left_by_a_vanished_writer().await;
+    let read_only: Arc<dyn ObjectStore> = Arc::new(ReadOnlyStore {
+        inner: objects.clone(),
+    });
+    let reader = Catalog::open_read_only(read_only, reader_options(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    let scope = reader.index_read_scope().await.unwrap();
+    assert_eq!(
+        global_option(scope.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("survives")
+    );
+    let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
+    assert!(admin.list_checkpoints(None).await.unwrap().is_empty());
+    drop(scope);
+    reader.close().await.unwrap();
 }

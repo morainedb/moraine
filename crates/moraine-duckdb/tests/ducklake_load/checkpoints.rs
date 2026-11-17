@@ -214,10 +214,10 @@ fn a_pinned_attach_leaves_the_store_untouched() {
     );
 
     run_standalone_read_only_sql(store, "SELECT count(*) FROM m.ducklake_table;");
-    assert_eq!(
+    assert_ne!(
         store_objects(store),
         before,
-        "a follow-latest reader pins the writer's publication and writes nothing either"
+        "a reader with no checkpoint to pin records one of its own"
     );
 }
 

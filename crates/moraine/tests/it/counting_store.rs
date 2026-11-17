@@ -25,6 +25,7 @@ pub struct CountingStore {
     ranged_gets: AtomicU64,
     bytes: AtomicU64,
     wal_puts: AtomicU64,
+    manifest_puts: AtomicU64,
 }
 
 impl CountingStore {
@@ -35,6 +36,7 @@ impl CountingStore {
             ranged_gets: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             wal_puts: AtomicU64::new(0),
+            manifest_puts: AtomicU64::new(0),
         }
     }
 
@@ -45,9 +47,19 @@ impl CountingStore {
         self.wal_puts.swap(0, Ordering::SeqCst)
     }
 
+    /// Manifest objects written since the last call, and resets the tally.
+    /// A commit writes none: the manifest is the store's own bookkeeping.
+    #[allow(dead_code)]
+    pub fn take_manifest_puts(&self) -> u64 {
+        self.manifest_puts.swap(0, Ordering::SeqCst)
+    }
+
     fn record_put(&self, location: &Path) {
         if location.as_ref().contains("wal/") {
             self.wal_puts.fetch_add(1, Ordering::SeqCst);
+        }
+        if location.as_ref().contains("manifest") {
+            self.manifest_puts.fetch_add(1, Ordering::SeqCst);
         }
     }
 

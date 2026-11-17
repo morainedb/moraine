@@ -7,8 +7,12 @@
 // the same binary measures all of them.
 //
 // Usage:
-//   concurrent_writers <extension-dir> <extension> <attach-sql> <writers> <commits-each>
-// Prints `elapsed_seconds=<seconds>` and exits non-zero on any failure.
+//   concurrent_writers <extension-dir> <extension> <attach-sql> <writers> <bound>
+//                      [indexed] [shared]
+// where <bound> is a commit count per writer, or seconds with a trailing
+// `s` for a window every writer commits into until it closes.
+// Prints `elapsed_seconds=<seconds>` and `commits=<count>`, and exits
+// non-zero on any failure.
 
 #include <pthread.h>
 #include <stdio.h>
@@ -26,7 +30,12 @@ typedef struct {
 	duckdb_database database;
 	pthread_barrier_t *barrier;
 	int writer;
+	// Whether every writer commits to one table instead of its own.
+	int shared;
 	long long commits;
+	// Seconds to commit for, or zero when `commits` bounds the writer.
+	double window;
+	long long committed;
 	char error[STATEMENT_MAX];
 } writer_task;
 
@@ -101,8 +110,9 @@ static void *ddl_loop(void *argument) {
 	return NULL;
 }
 
-// One writer: connect, wait for the others, then commit `commits` times.
-// Each insert autocommits, so each is one DuckLake transaction.
+// One writer: connect, wait for the others, then commit until its count
+// runs out or its window closes. Each insert autocommits, so each is one
+// DuckLake transaction.
 static void *commit_loop(void *argument) {
 	writer_task *task = (writer_task *)argument;
 	duckdb_connection connection = NULL;
@@ -115,10 +125,29 @@ static void *commit_loop(void *argument) {
 	// ones that did.
 	pthread_barrier_wait(task->barrier);
 
-	for (long long row = 0; !failed && row < task->commits; ++row) {
+	struct timespec started;
+	clock_gettime(CLOCK_MONOTONIC, &started);
+	for (long long row = 0; !failed; ++row) {
+		if (task->window > 0.0) {
+			struct timespec now;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			if (seconds_between(started, now) >= task->window) {
+				break;
+			}
+		} else if (row >= task->commits) {
+			break;
+		}
+
 		char sql[STATEMENT_MAX];
-		snprintf(sql, sizeof(sql), "INSERT INTO lake.main.writer_%d VALUES (%lld);", task->writer, row);
+		if (task->shared) {
+			snprintf(sql, sizeof(sql), "INSERT INTO lake.main.shared VALUES (%d, %lld);", task->writer, row);
+		} else {
+			snprintf(sql, sizeof(sql), "INSERT INTO lake.main.writer_%d VALUES (%lld);", task->writer, row);
+		}
 		failed = run(connection, sql, task->error);
+		if (!failed) {
+			++task->committed;
+		}
 	}
 
 	if (connection) {
@@ -134,19 +163,28 @@ static double seconds_between(struct timespec start, struct timespec end) {
 int main(int argc, char **argv) {
 	if (argc != 6 && argc != 7) {
 		fprintf(stderr,
-		        "usage: %s <extension-dir> <extension> <attach-sql> <writers> <commits-each> "
+		        "usage: %s <extension-dir> <extension> <attach-sql> <writers> <bound> "
 		        "[indexed]\n",
 		        argv[0]);
 		return 2;
 	}
-	int indexed = argc == 7 && strcmp(argv[6], "indexed") == 0;
+	int indexed = 0;
+	int shared = 0;
+	for (int argument = 6; argument < argc; ++argument) {
+		indexed |= strcmp(argv[argument], "indexed") == 0;
+		shared |= strcmp(argv[argument], "shared") == 0;
+	}
 	const char *extension_dir = argv[1];
 	const char *extension = argv[2];
 	const char *attach = argv[3];
 	int writers = atoi(argv[4]);
-	long long commits = atoll(argv[5]);
-	if (writers < 1 || commits < 1) {
-		fprintf(stderr, "writers and commits-each must both be at least one\n");
+	const char *bound = argv[5];
+	size_t bound_length = strlen(bound);
+	int windowed = bound_length > 1 && bound[bound_length - 1] == 's';
+	double window = windowed ? atof(bound) : 0.0;
+	long long commits = windowed ? 0 : atoll(bound);
+	if (writers < 1 || (windowed ? window <= 0.0 : commits < 1)) {
+		fprintf(stderr, "writers must be at least one, and the bound a commit count or `Ns`\n");
 		return 2;
 	}
 
@@ -196,7 +234,15 @@ int main(int argc, char **argv) {
 		         level ? level : "warn");
 		run(setup, statement, ignored);
 	}
-	for (int writer = 0; !failed && writer < writers; ++writer) {
+	if (shared) {
+		// The writer column is what lets one table still say who committed
+		// what.
+		failed = run(setup, "CREATE TABLE lake.main.shared (writer BIGINT, id BIGINT);", error);
+		if (!failed && indexed) {
+			failed = run(setup, "CREATE INDEX shared_by_id ON lake.main.shared(id);", error);
+		}
+	}
+	for (int writer = 0; !failed && !shared && writer < writers; ++writer) {
 		snprintf(statement, sizeof(statement), "CREATE TABLE lake.main.writer_%d (id BIGINT);", writer);
 		failed = run(setup, statement, error);
 		if (!failed && indexed) {
@@ -230,6 +276,8 @@ int main(int argc, char **argv) {
 		tasks[writer].barrier = &barrier;
 		tasks[writer].writer = writer;
 		tasks[writer].commits = commits;
+		tasks[writer].shared = shared;
+		tasks[writer].window = window;
 		pthread_create(&threads[writer], NULL, commit_loop, &tasks[writer]);
 	}
 
@@ -269,7 +317,12 @@ int main(int argc, char **argv) {
 		report_catalog_warnings(setup);
 		return 1;
 	}
+	long long committed = 0;
+	for (int writer = 0; writer < writers; ++writer) {
+		committed += tasks[writer].committed;
+	}
 	printf("elapsed_seconds=%.6f\n", seconds_between(started, ended));
+	printf("commits=%lld\n", committed);
 
 	free(tasks);
 	free(threads);

@@ -115,6 +115,20 @@ fn every_case_declares_its_guarantee_and_coverage() {
     }
 }
 
+/// The inventory once nothing has changed it for a moment, so work a
+/// writer left running behind an acknowledgement has landed.
+async fn settled_inventory(store: &Arc<InMemory>) -> Vec<(String, u64)> {
+    let mut last = inventory(store).await;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let next = inventory(store).await;
+        if next == last {
+            return next;
+        }
+        last = next;
+    }
+}
+
 /// Every object in the store as sorted `(path, size)` pairs — what a
 /// "the store is unchanged" assertion compares.
 #[allow(clippy::unwrap_used)]
@@ -452,7 +466,9 @@ async fn fenced_writer_that_resumes_writes_nothing() {
         .unwrap();
     let head_after_takeover = successor.read_scope().await.unwrap().current_snapshot().id;
 
-    let before = inventory(&backing).await;
+    // The displaced writer's commit retires its previous publication behind
+    // the acknowledgement; that work belongs to the timeline under test.
+    let before = settled_inventory(&backing).await;
 
     // The displaced writer resumes and tries to commit against a premise
     // the takeover already invalidated.

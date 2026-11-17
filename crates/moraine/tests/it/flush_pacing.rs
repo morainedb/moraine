@@ -137,3 +137,21 @@ async fn flush_on_commit_flushes_every_commit() {
     );
     catalog.close().await.unwrap();
 }
+
+/// A commit costs one object-store write: the write-ahead-log object that
+/// makes it durable. The manifest is the store's own bookkeeping, so no
+/// commit waits for one or pays for one.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_commit_writes_one_wal_object_and_no_manifest() {
+    let store = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    let catalog = open(&store, Duration::ZERO, true).await;
+    store.take_manifest_puts();
+
+    commit_schema(&catalog, "one").await;
+    // Long enough that a paced manifest write would have landed.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert_eq!(store.take_wal_puts(), 1);
+    assert_eq!(store.take_manifest_puts(), 0);
+}

@@ -13,22 +13,39 @@ use std::{
     io::Write as _,
     path::Path,
     process::{Child, Command, Stdio},
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail, ensure};
 
-/// One commit burst: `writers` processes committing `commits_each` times
-/// apiece, each into a table of its own so the measurement is of
-/// concurrent commits rather than of row-level conflict.
+/// What bounds a burst's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// Each writer commits this many times and the burst ends with the
+    /// last of them.
+    Commits(u64),
+    /// Every writer commits until the window closes, and the burst
+    /// reports what landed inside it. The measurement a scaling curve
+    /// wants: start-up and the first flush are a fixed share of a window,
+    /// where in a short count they are most of it.
+    Window(Duration),
+}
+
+/// One commit burst: `writers` processes committing under `bound`, each
+/// into a table of its own so the measurement is of concurrent commits
+/// rather than of row-level conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Burst {
     pub writers: usize,
-    pub commits_each: u64,
+    pub bound: Bound,
     /// Whether each writer's table carries an equality index, so every
     /// commit also maintains index entries.
     pub indexed: bool,
+    /// Whether every writer commits to one table instead of its own.
+    /// Separate tables measure catalog contention alone; one table adds
+    /// the conflict a catalog's own protocol has to resolve.
+    pub shared: bool,
 }
 
 impl Burst {
@@ -45,8 +62,22 @@ impl Burst {
         );
         Ok(Self {
             writers,
-            commits_each: commits / count,
+            bound: Bound::Commits(commits / count),
             indexed: false,
+            shared: false,
+        })
+    }
+
+    /// Every writer commits for `window`. Any writer count works, since
+    /// nothing has to divide evenly.
+    pub fn windowed(window: Duration, writers: usize) -> anyhow::Result<Self> {
+        ensure!(writers > 0, "a burst needs at least one writer");
+        ensure!(!window.is_zero(), "a burst window must be longer than zero");
+        Ok(Self {
+            writers,
+            bound: Bound::Window(window),
+            indexed: false,
+            shared: false,
         })
     }
 
@@ -55,13 +86,42 @@ impl Burst {
         Self { indexed, ..self }
     }
 
-    /// Commits the whole burst performs.
-    pub fn commits(self) -> u64 {
-        self.commits_each * self.writers as u64
+    /// The same burst with every writer on one table.
+    pub fn with_shared(self, shared: bool) -> Self {
+        Self { shared, ..self }
+    }
+
+    /// The table a writer commits to.
+    fn table(self, writer: usize) -> String {
+        if self.shared {
+            "lake.main.shared".to_owned()
+        } else {
+            format!("lake.main.writer_{writer}")
+        }
+    }
+
+    /// Commits the burst is planned to perform, or `None` when the window
+    /// decides and only the run can say.
+    pub fn planned_commits(self) -> Option<u64> {
+        match self.bound {
+            Bound::Commits(each) => Some(each * self.writers as u64),
+            Bound::Window(_) => None,
+        }
     }
 
     /// The table each writer appends to, created before any of them start.
     pub fn setup_sql(self) -> Vec<String> {
+        if self.shared {
+            // The writer column is what lets a shared table still say who
+            // committed what, which is how a starved writer shows up.
+            let mut statements =
+                vec!["CREATE TABLE lake.main.shared (writer BIGINT, id BIGINT);".to_owned()];
+            if self.indexed {
+                statements.push("CREATE INDEX shared_by_id ON lake.main.shared(id);".to_owned());
+            }
+            return statements;
+        }
+
         (0..self.writers)
             .flat_map(|writer| {
                 let table = format!("CREATE TABLE lake.main.writer_{writer} (id BIGINT);");
@@ -73,28 +133,58 @@ impl Burst {
             .collect()
     }
 
-    /// One writer's statements. Each is its own autocommitted insert, so
-    /// each is one catalog commit.
+    /// One writer's statements under a commit count. Each is its own
+    /// autocommitted insert, so each is one catalog commit.
     pub fn writer_sql(self, writer: usize) -> Vec<String> {
-        (0..self.commits_each)
-            .map(|row| format!("INSERT INTO lake.main.writer_{writer} VALUES ({row});"))
-            .collect()
+        let Bound::Commits(each) = self.bound else {
+            return Vec::new();
+        };
+        (0..each).map(|row| self.insert_sql(writer, row)).collect()
     }
 
-    /// Commits per second over `elapsed`.
-    #[allow(clippy::cast_precision_loss)]
-    pub fn commits_per_second(self, elapsed: Duration) -> f64 {
-        self.commits() as f64 / elapsed.as_secs_f64()
+    /// The statement a writer repeats, with `row` as its value.
+    pub fn insert_sql(self, writer: usize, row: u64) -> String {
+        if self.shared {
+            format!("INSERT INTO lake.main.shared VALUES ({writer}, {row});")
+        } else {
+            format!("INSERT INTO {} VALUES ({row});", self.table(writer))
+        }
+    }
+
+    /// One row per writer's table, in writer order, for the session that
+    /// counts what landed. Per writer rather than summed: a writer that
+    /// committed nothing is a refusal to report, not a zero to absorb.
+    pub fn count_sql(self) -> String {
+        let counts: Vec<String> = (0..self.writers)
+            .map(|writer| {
+                if self.shared {
+                    format!("SELECT count(*) FROM lake.main.shared WHERE writer = {writer}")
+                } else {
+                    format!("SELECT count(*) FROM {}", self.table(writer))
+                }
+            })
+            .collect();
+        format!("{};", counts.join(" UNION ALL "))
     }
 
     /// The report phase this burst fills.
     pub fn phase(self) -> String {
-        if self.indexed {
-            format!("writers_{}_indexed", self.writers)
-        } else {
-            format!("writers_{}", self.writers)
+        let mut phase = format!("writers_{}", self.writers);
+        if self.shared {
+            phase.push_str("_shared");
         }
+        if self.indexed {
+            phase.push_str("_indexed");
+        }
+        phase
     }
+}
+
+/// Commits per second, from what a run committed and how long its window
+/// was open.
+#[allow(clippy::cast_precision_loss)]
+pub fn commits_per_second(commits: u64, elapsed: Duration) -> f64 {
+    commits as f64 / elapsed.as_secs_f64()
 }
 
 /// Parses `--concurrency 1,2,4,8` into sorted, distinct writer counts.
@@ -120,8 +210,32 @@ pub fn parse_sweep(value: &str) -> anyhow::Result<Vec<usize>> {
 pub struct WriterContext<'a> {
     pub cli: &'a Path,
     pub extension: &'a Path,
+    /// Untimed statements the store needs before `attach` (none locally).
+    pub preamble: &'a str,
     pub attach: &'a str,
     pub scratch: &'a Path,
+}
+
+/// How long a writer has to exit on its own before it is killed. Long
+/// enough for the CLI to flush what it was writing, short beside a
+/// window.
+const TERM_GRACE: Duration = Duration::from_millis(500);
+
+/// Signals every running writer. `kill(1)` rather than a crate: the only
+/// signal `std` sends is `SIGKILL`, which takes the diagnostics with it.
+fn signal_writers(running: &[Mutex<Option<Child>>], signal: &str) {
+    for slot in running {
+        if let Ok(slot) = slot.lock()
+            && let Some(child) = slot.as_ref()
+        {
+            let _ = Command::new("kill")
+                .arg(format!("-{signal}"))
+                .arg(child.id().to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 /// How long a writer is given to attach before the burst is called off.
@@ -130,22 +244,33 @@ const READY_TIMEOUT: Duration = Duration::from_mins(2);
 /// How often a writer checks whether it has finished attaching.
 const READY_POLL: Duration = Duration::from_millis(1);
 
-/// Runs one burst and returns the wall clock of the released window —
-/// from the instant every writer is attached and waiting to the instant
-/// the last one finishes committing.
+/// What a burst did: the wall clock of the released window and the
+/// commits that landed inside it.
+#[derive(Debug, Clone, Copy)]
+pub struct Outcome {
+    pub elapsed: Duration,
+    pub commits: u64,
+}
+
+/// Runs one burst and reports the released window — from the instant
+/// every writer is attached and waiting to the instant the last one
+/// stops committing.
 ///
 /// Attaching, extension loading and table creation all happen before the
 /// clock starts, so the measurement is of commits under contention and
-/// nothing else.
-pub fn run(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<Duration> {
+/// nothing else. Under a window, the writers are stopped where they
+/// stand and the catalog is asked what landed.
+pub fn run(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<Outcome> {
     let barrier = Arc::new(Barrier::new(burst.writers + 1));
+    let running: Vec<Mutex<Option<Child>>> = (0..burst.writers).map(|_| Mutex::new(None)).collect();
     let mut elapsed = Duration::ZERO;
 
     let outcomes = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..burst.writers)
             .map(|writer| {
                 let barrier = Arc::clone(&barrier);
-                scope.spawn(move || commit_burst(context, burst, writer, &barrier))
+                let running = &running;
+                scope.spawn(move || commit_burst(context, burst, writer, &barrier, running))
             })
             .collect();
 
@@ -156,6 +281,19 @@ pub fn run(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<Duration
         barrier.wait();
         let started = Instant::now();
 
+        // Closing the window stops the writers, which is also what
+        // unblocks a feeder stalled on a full pipe: the CLI acknowledges
+        // nothing, so the pipe is the only back-pressure. They are asked
+        // first and killed after, because a writer killed outright loses
+        // the buffered diagnostics that say why it committed nothing.
+        if let Bound::Window(window) = burst.bound {
+            std::thread::sleep(window);
+            elapsed = started.elapsed();
+            signal_writers(&running, "TERM");
+            std::thread::sleep(TERM_GRACE);
+            signal_writers(&running, "KILL");
+        }
+
         let outcomes: Vec<anyhow::Result<()>> = handles
             .into_iter()
             .map(|handle| match handle.join() {
@@ -163,22 +301,59 @@ pub fn run(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<Duration
                 Err(_) => Err(anyhow::anyhow!("a writer thread panicked")),
             })
             .collect();
-        elapsed = started.elapsed();
+        if matches!(burst.bound, Bound::Commits(_)) {
+            elapsed = started.elapsed();
+        }
         outcomes
     });
 
     for outcome in outcomes {
         outcome?;
     }
-    Ok(elapsed)
+
+    if let Some(commits) = burst.planned_commits() {
+        return Ok(Outcome { elapsed, commits });
+    }
+
+    let landed = count_commits(context, burst)?;
+    if let Some(writer) = landed.iter().position(|&commits| commits == 0) {
+        let spread = landed
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let log = context.scratch.join(format!("writer-{writer}.log"));
+
+        // A writer that complained is one the catalog would not take: a
+        // killed writer leaves no exit status, so its log is the only
+        // evidence. One that said nothing while its competitors committed
+        // was starved, which is a property of the catalog under load and
+        // not a reason to throw the burst's throughput away.
+        if let Some(error) = first_error(&log) {
+            bail!(
+                "writer {writer} committed nothing in the window \
+                 (per writer: {spread}): {error}"
+            );
+        }
+        println!(
+            "notice: writer {writer} was starved, committing nothing while the others ran \
+             (per writer: {spread}); the rate reported is the whole burst's"
+        );
+    }
+    Ok(Outcome {
+        elapsed,
+        commits: landed.iter().sum(),
+    })
 }
 
-/// One writer: attach, wait for the others, then commit.
+/// One writer: attach, wait for the others, then commit until its
+/// statements run out or the window closes under it.
 fn commit_burst(
     context: &WriterContext<'_>,
     burst: Burst,
     writer: usize,
     barrier: &Barrier,
+    running: &[Mutex<Option<Child>>],
 ) -> anyhow::Result<()> {
     let prepared = attach_writer(context, writer);
     // Unconditional, so a writer that failed to attach does not strand
@@ -186,15 +361,108 @@ fn commit_burst(
     barrier.wait();
 
     let (mut child, log) = prepared?;
-    let outcome = commit(&mut child, &burst.writer_sql(writer));
-    let status = child.wait().context("waiting for a writer")?;
-    outcome?;
-    ensure!(
-        status.success(),
-        "a writer exited with {status}: {}",
-        first_error(&log)
-    );
+    match burst.bound {
+        Bound::Commits(_) => {
+            let outcome = commit(&mut child, &burst.writer_sql(writer));
+            let status = child.wait().context("waiting for a writer")?;
+            outcome?;
+            ensure!(
+                status.success(),
+                "a writer exited with {status}: {}",
+                first_error(&log).unwrap_or_else(no_diagnostics)
+            );
+        }
+        Bound::Window(_) => {
+            let mut stdin = child.stdin.take().context("taking a writer's stdin")?;
+            let slot = running
+                .get(writer)
+                .context("a writer with no slot to run in")?;
+            slot.lock()
+                .map_err(|_| anyhow::anyhow!("a writer slot was poisoned"))?
+                .replace(child);
+
+            // Writes stop with the kill that closes the window, so the
+            // first failure is the end of the run, not an error in it.
+            for row in 0.. {
+                if stdin
+                    .write_all(burst.insert_sql(writer, row).as_bytes())
+                    .and_then(|()| stdin.write_all(b"\n"))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            let mut slot = slot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("a writer slot was poisoned"))?;
+            if let Some(child) = slot.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
     Ok(())
+}
+
+/// Asks the catalog how many rows each of the burst's writers committed.
+/// Each insert is one commit, so a row count is a commit count.
+fn count_commits(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<Vec<u64>> {
+    let script = format!(
+        "SET extension_directory='{}';\nINSTALL postgres;\nLOAD postgres;\nLOAD '{}';\n{}{}\n{}\n",
+        crate::duckdb::extension_install_directory().display(),
+        context.extension.display(),
+        context.preamble,
+        context.attach,
+        burst.count_sql()
+    );
+
+    let mut child = Command::new(context.cli)
+        .args(["-unsigned", "-batch", "-noheader", "-list"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning the session that counts a burst's commits")?;
+    child
+        .stdin
+        .take()
+        .context("opening the counting session's stdin")?
+        .write_all(script.as_bytes())
+        .context("writing the counting script")?;
+    let output = child
+        .wait_with_output()
+        .context("waiting for the counting session")?;
+    ensure!(
+        output.status.success(),
+        "counting a burst's commits failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let counts = parse_counts(&stdout);
+    ensure!(
+        counts.len() == burst.writers,
+        "the counting session reported {} of {} writers: {stdout}",
+        counts.len(),
+        burst.writers
+    );
+    Ok(counts)
+}
+
+/// The counts in a counting session's output, in writer order. The
+/// catalog may print a coloured warning first, and its reset sequence
+/// lands on the line the first count is on, so the escapes come off
+/// before the parse.
+fn parse_counts(stdout: &str) -> Vec<u64> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            super::timing::strip_terminal_escapes(line)
+                .trim()
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 /// How much of a writer's log an error quotes. A writer that loses its
@@ -202,8 +470,15 @@ fn commit_burst(
 /// is the diagnosis and the rest is the same line again.
 const LOG_EXCERPT_LINES: usize = 2;
 
-/// The opening lines of a writer's log, flattened onto one line.
-fn first_error(log: &Path) -> String {
+/// What an error says about a writer that logged nothing at all.
+fn no_diagnostics() -> String {
+    "no diagnostics".to_owned()
+}
+
+/// The opening lines of a writer's log, flattened onto one line, or
+/// `None` when it wrote nothing: a writer that committed nothing and
+/// complained about nothing was starved, not refused.
+fn first_error(log: &Path) -> Option<String> {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let excerpt: Vec<&str> = text
         .lines()
@@ -211,10 +486,7 @@ fn first_error(log: &Path) -> String {
         .filter(|line| !line.is_empty())
         .take(LOG_EXCERPT_LINES)
         .collect();
-    if excerpt.is_empty() {
-        return "no diagnostics".to_owned();
-    }
-    excerpt.join(" / ")
+    (!excerpt.is_empty()).then(|| excerpt.join(" / "))
 }
 
 /// Starts a writer and blocks until it has attached and is waiting on
@@ -240,9 +512,10 @@ fn attach_writer(
         .context("spawning a writer")?;
 
     let preamble = format!(
-        "SET extension_directory='{}';\nINSTALL postgres;\nLOAD postgres;\nLOAD '{}';\n{}\n         COPY (SELECT 1) TO '{}' (FORMAT csv);\n",
+        "SET extension_directory='{}';\nINSTALL postgres;\nLOAD postgres;\nLOAD '{}';\n{}{}\n         COPY (SELECT 1) TO '{}' (FORMAT csv);\n",
         crate::duckdb::extension_install_directory().display(),
         context.extension.display(),
+        context.preamble,
         context.attach,
         ready.display()
     );
@@ -257,7 +530,7 @@ fn attach_writer(
         if let Some(status) = child.try_wait().context("polling a writer")? {
             bail!(
                 "a writer exited with {status} before it attached: {}",
-                first_error(&log)
+                first_error(&log).unwrap_or_else(no_diagnostics)
             );
         }
         ensure!(
@@ -286,9 +559,10 @@ fn commit(child: &mut Child, statements: &[String]) -> anyhow::Result<()> {
 /// any writer starts.
 pub fn create_tables(context: &WriterContext<'_>, burst: Burst) -> anyhow::Result<()> {
     let mut script = format!(
-        "SET extension_directory='{}';\nINSTALL postgres;\nLOAD postgres;\nLOAD '{}';\n{}\n",
+        "SET extension_directory='{}';\nINSTALL postgres;\nLOAD postgres;\nLOAD '{}';\n{}{}\n",
         crate::duckdb::extension_install_directory().display(),
         context.extension.display(),
+        context.preamble,
         context.attach
     );
     for statement in burst.setup_sql() {
@@ -328,8 +602,72 @@ mod tests {
     fn a_burst_splits_its_commits_evenly_across_writers() {
         let burst = Burst::plan(128, 8).unwrap();
         assert_eq!(burst.writers, 8);
-        assert_eq!(burst.commits_each, 16);
-        assert_eq!(burst.commits(), 128);
+        assert_eq!(burst.bound, Bound::Commits(16));
+        assert_eq!(burst.planned_commits(), Some(128));
+    }
+
+    #[test]
+    fn a_windowed_burst_takes_any_writer_count_and_plans_no_commits() {
+        let burst = Burst::windowed(Duration::from_secs(5), 7).unwrap();
+        assert_eq!(burst.bound, Bound::Window(Duration::from_secs(5)));
+        // Nothing has to divide evenly, which is what lets a sweep run
+        // until a backend stops improving.
+        assert_eq!(burst.planned_commits(), None);
+        assert!(burst.writer_sql(0).is_empty());
+
+        assert!(Burst::windowed(Duration::ZERO, 1).is_err());
+        assert!(Burst::windowed(Duration::from_secs(5), 0).is_err());
+    }
+
+    #[test]
+    fn a_colour_reset_on_the_first_count_line_does_not_hide_it() {
+        // Exactly what a deprecation warning ahead of the counts looks
+        // like: the reset sequence is on the first count's own line.
+        let stdout = concat!(
+            "\u{1b}[90mWARNING:\n\u{1b}[00m\u{1b}[90mdeprecated.\n\n",
+            "\u{1b}[00m266\n71\n"
+        );
+        assert_eq!(parse_counts(stdout), vec![266, 71]);
+        assert_eq!(parse_counts("266\n"), vec![266]);
+        assert!(parse_counts("writer 0: boom\n").is_empty());
+    }
+
+    #[test]
+    fn a_shared_burst_puts_every_writer_on_one_table() {
+        let burst = Burst::plan(4, 2).unwrap().with_shared(true);
+        assert_eq!(
+            burst.setup_sql(),
+            ["CREATE TABLE lake.main.shared (writer BIGINT, id BIGINT);"]
+        );
+        assert_eq!(
+            burst.insert_sql(1, 7),
+            "INSERT INTO lake.main.shared VALUES (1, 7);"
+        );
+
+        // The writer column keeps a starved writer visible.
+        assert_eq!(
+            burst.count_sql(),
+            "SELECT count(*) FROM lake.main.shared WHERE writer = 0 UNION ALL \
+             SELECT count(*) FROM lake.main.shared WHERE writer = 1;"
+        );
+        assert_eq!(burst.phase(), "writers_2_shared");
+        assert_eq!(
+            burst.with_index(true).phase(),
+            "writers_2_shared_indexed",
+            "a report must tell the four variants apart"
+        );
+    }
+
+    #[test]
+    fn a_windowed_burst_counts_each_writer_separately() {
+        let sql = Burst::windowed(Duration::from_secs(1), 2)
+            .unwrap()
+            .count_sql();
+        assert_eq!(
+            sql,
+            "SELECT count(*) FROM lake.main.writer_0 UNION ALL \
+             SELECT count(*) FROM lake.main.writer_1;"
+        );
     }
 
     #[test]
@@ -362,11 +700,10 @@ mod tests {
     }
 
     #[test]
-    fn throughput_is_the_whole_burst_over_the_wall_clock() {
-        let burst = Burst::plan(128, 8).unwrap();
-        let rate = burst.commits_per_second(Duration::from_secs(2));
+    fn throughput_is_what_landed_over_the_wall_clock() {
+        let rate = commits_per_second(128, Duration::from_secs(2));
         assert!((rate - 64.0).abs() < f64::EPSILON, "{rate}");
-        assert!(burst.commits_per_second(Duration::ZERO).is_infinite());
+        assert!(commits_per_second(128, Duration::ZERO).is_infinite());
     }
 
     #[test]
@@ -379,10 +716,11 @@ mod tests {
     fn an_error_quotes_the_opening_of_a_writers_log_and_nothing_more() {
         let log = std::env::temp_dir().join(format!("burst-log-{}", std::process::id()));
         std::fs::write(&log, "first\n\nsecond\nthird\nfourth\n").unwrap();
-        assert_eq!(first_error(&log), "first / second");
+        assert_eq!(first_error(&log).as_deref(), Some("first / second"));
 
+        // An empty log is what tells a starved writer from a refused one.
         std::fs::write(&log, "").unwrap();
-        assert_eq!(first_error(&log), "no diagnostics");
+        assert_eq!(first_error(&log), None);
         std::fs::remove_file(&log).unwrap();
     }
 
