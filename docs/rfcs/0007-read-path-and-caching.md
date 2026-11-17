@@ -3,13 +3,14 @@
 ## Summary
 
 Every read runs at one fixed store revision and decodes only the records it asks
-for. Writers read through a SlateDB snapshot. Independent readers pin
-checkpoints the writer publishes at durable boundaries, and require only read
-access. Each store has a foyer block cache, with a shared process-wide budget.
-SST metadata has higher eviction priority than data blocks. Row summaries are
-published as immutable sidecars beside embedded-row-id data files. Live
-allocations are admitted against a separate working-memory allowance. Operations
-fail when they exceed it.
+for. Writers read through a SlateDB snapshot. Independent readers open their own
+`DbReader` over the latest state, replaying the write-ahead log to resolve every
+acknowledged commit, and keep a checkpoint of their own so collection cannot
+remove what they read. Each store has a foyer block cache, with a shared
+process-wide budget. SST metadata has higher eviction priority than data blocks.
+Row summaries are published as immutable sidecars beside embedded-row-id data
+files. Live allocations are admitted against a separate working-memory
+allowance. Operations fail when they exceed it.
 
 ## Read revisions
 
@@ -27,97 +28,97 @@ member's premises. Nothing a committer reads is cached past the operation that
 read it.
 
 **Single-writer reader scopes.** An independent reader cannot take a
-`DbSnapshot`, so it reads through a `DbReader` fixed at a checkpoint. The writer
-publishes that checkpoint and readers pin it.
-`crates/moraine/src/store/checkpoint.rs` publishes and pins.
-`crates/moraine/src/catalog/handle/reader_scopes.rs` shares the fixed readers
+`DbSnapshot`, so it reads through a `DbReader` of its own.
+`crates/moraine/src/store/checkpoint.rs` holds one open.
+`crates/moraine/src/catalog/handle/reader_scopes.rs` shares those readers
 across transactions. The handle's own `DbReader` follows the latest manifest
 without a checkpoint of its own, polling at `reader_poll_interval`; it serves
 head reads only, and the collector's age threshold protects what it references
 between polls.
 
-Publication works as follows.
+Reader acquisition works as follows.
 
-1. After a commit group's writes are WAL-durable, and before any member is
-   acknowledged, the writer calls
-   `Db::create_checkpoint(CheckpointScope::Durable, ...)` under the name
-   `moraine-read-head-v1`.
-2. The publisher refuses to publish a sequence the store has not yet made
-   durable. One publication may cover several groups whose writes are already
-   durable. Each acknowledgement waits for a checkpoint covering its own
-   group.
-3. Publications with an older manifest are retired after the new one exists.
-   Retirement gives a publication an expiry of `READ_GRACE`, fifteen minutes,
-   and deletes one already past its expiry. The current publication never
-   carries an expiry, so readers acquire it while the writer is idle or
-   offline. `READ_GRACE` must exceed the longest explicit transaction, as the
-   retention window must. Files and log slots a retired publication
-   references stay until it expires.
-4. A WAL-durable write whose publication fails is potentially committed. The
-   outcome is reported as unknown under [the commit
-   protocol](0003-commit-protocol.md). It is never treated as a conflict that
-   permits replaying the mutation.
-5. A clean writer shutdown flushes memtables and republishes the resulting
-   manifest even when its sequence was already published, so an idle reader
-   does not keep replaying a WAL-heavy publication after the same rows have
-   reached SSTs.
+1. A commit is acknowledged once its writes are WAL-durable, and the writer
+   does nothing further: it announces no checkpoint and writes no manifest, so
+   a commit costs one object-store request. The writer's own reads take a
+   snapshot of its `Db`, so a writer always reads its own writes.
+2. A reader opens a `DbReader` in SlateDB's managed-checkpoint mode, which
+   replays the write-ahead log past the manifest it opened on. It therefore
+   resolves every commit acknowledged before it opened, with no announcement
+   from the writer and no agreement about naming between them. Visibility
+   follows from the log being the commit.
+3. That reader keeps a checkpoint of its own and refreshes it while it lives.
+   This is the only thing that stops the collector removing the SSTs and log
+   slots it reads: nothing else references them, since no writer publishes on
+   a reader's behalf. The cost is two manifest writes per reader opened, paid
+   by the reader rather than by every commit.
+4. A store that refuses that write — read-only credentials — is followed on
+   the latest manifest instead, with no checkpoint. Retention is then the only
+   protection, so such a reader refuses reads past `READ_WINDOW`, fifteen
+   minutes, rather than discovering a collected object mid-scan. `READ_WINDOW`
+   is also the collector's minimum age for log and compacted objects, and must
+   exceed the longest explicit transaction.
+5. Because a reader advances only on its own manifest poll, freshness comes
+   from opening one rather than from waiting on one: a scope's reader polls on
+   `READ_WINDOW`, so it cannot re-point while a transaction holds it. A scope
+   shares the reader its predecessor opened for `reader_poll_interval`, and
+   opens a newer one past that; a committer, which must read its own commits
+   through a reader, opens one per transaction.
+6. A writer that closes or crashes leaves nothing to refresh and nothing to
+   expire. Readers go on opening their own readers over whatever the log and
+   manifest say, which is the last acknowledged commit either way.
 
-A detached checkpoint created from the latest manifest is never used for
-writer publication. Such a checkpoint does not advance the manifest's WAL
-boundary, so a following reader can already see durable commits it omits.
+A checkpoint detached from the latest manifest does not advance that
+manifest's WAL boundary, so a reader replaying the log can already see durable
+commits such a checkpoint omits.
 
 <!-- site:omit -->
 Under the [commit-log seam](0011-commit-log-seam.md), each read scope and commit
 preparation acquires a fixed protected reader from its provider. The provider
 captures the durable WAL boundary without taking a writer, and the reader renews
 that checkpoint without advancing the view. A commit is acknowledged at its
-slot; no publication is required. Scopes release their reader when the last
-reference is dropped. The publication-sharing rules below apply to single-writer
-catalogs.
+slot. Scopes release their reader when the last reference is dropped. The
+reader-sharing rules below apply to single-writer catalogs.
 <!-- /site:omit -->
 
 | Owner | Holds |
 |---|---|
 | The block cache | SST metadata and blocks, shared across handles and reader generations |
-| A read scope | its `DbSnapshot` or pinned checkpoint reader |
+| A read scope | its `DbSnapshot` or its own checkpoint reader |
 | One operation | its decoded records and output page |
 | DuckDB | native catalog entries and query execution state |
 | Lookup facilities | bounded row directories and probe memos under the lookup allowance |
 
-Reader acquisition works as follows.
+Acquiring a reader works as follows.
 
-1. A new transaction shares the handle's latest reader without a store
-   request when the publications were listed less than `reader_poll_interval`
-   ago, the reader has at least half of `READ_GRACE` left, and its deadline
-   has not passed. The interval is therefore how stale a reader may be; zero
-   lists on every transaction. A committer lists on every transaction
-   whatever the interval, so a transaction reads what the one before it
-   committed.
-2. Otherwise the reader lists published checkpoints and takes the one with
-   the highest manifest id. If none exists, acquisition fails with
-   `SnapshotExpired`, which tells the caller to reopen the writer so it
-   publishes recovered progress.
-3. If the latest reader is at that manifest, the listing confirms it: the
-   deadline moves to the listing time plus `READ_GRACE`, or to the
-   publication's own expiry when it carries one, less a one-minute allowance
-   for clock skew. The transaction shares the reader.
-4. Otherwise the reader opens a `DbReader` pinned to the published checkpoint
-   id, with its deadline set the same way. The open writes nothing. If the
-   publication expired during that step, acquisition retries discovery, up
-   to `MAX_COMMIT_ATTEMPTS` times, ten, then fails with
-   `RetryBudgetExhausted`.
-5. Every point read and every scan yield checks the deadline through
+1. A new transaction shares the handle's latest reader, without a store
+   request, while that reader was opened less than `reader_poll_interval`
+   ago. The interval is therefore how stale a reader may be; zero opens one
+   per transaction. A committer opens one per transaction whatever the
+   interval, since it has no `Db` of its own and can only read its own
+   commits through a reader.
+2. Otherwise it opens a `DbReader` in managed-checkpoint mode over the latest
+   state. The open establishes a checkpoint, which is two manifest writes,
+   and replays the write-ahead log, so the reader resolves every commit
+   acknowledged before it opened.
+3. A store that refuses the checkpoint write is followed on the latest
+   manifest instead. Such a reader is shared the same way but carries a
+   deadline of `READ_WINDOW` less a one-minute allowance for clock skew,
+   since retention is all that protects it.
+4. Every point read and every scan yield checks that deadline through
    `CheckpointReader::reader`, which refuses a reader past it with an error
-   telling the caller to restart the transaction. A transaction therefore
-   cannot outlive `READ_GRACE`.
+   telling the caller to restart the transaction. A transaction reading
+   without a checkpoint therefore cannot outlive `READ_WINDOW`.
+5. The reader an operation holds never changes under it: a newer one is a
+   new reader, and the old one lives until its last reference drops.
 
-For native published readers, at most `MAX_READER_GENERATIONS` generations,
+For native readers, at most `MAX_READER_GENERATIONS` generations,
 eight, may be live in one handle. Acquiring another is refused with `Constraint`
 until an older transaction or cursor finishes. An unshared older generation is
 retired before its replacement reserves replay memory. A new generation never
 changes what an existing transaction sees. An explicit checkpoint attach, named
 through the `checkpoint` attach option, uses an external reader that no deadline
-governs.
+governs and that writes nothing.
 
 Logged fixed scopes do not use this generation-count cap. Each acquisition
 opens independently, and WAL replay bytes share the process working-memory
@@ -607,17 +608,13 @@ container ceiling remains the final boundary.
 ## Tests
 
 - A reader scope opened after acknowledgement sees the commit, and an open
-  scope keeps its revision across later commits.
-- Publication fails when the covered sequence is not yet WAL-durable.
-- A reader past its deadline rejects point reads and scan yields, and a
-  listing that still shows its publication extends the deadline.
-- A read-only attach writes nothing to the object store across open, several
-  transactions, and a writer commit between them.
-- A shared reader keeps its publication inside `reader_poll_interval` and
-  moves to a newer one after it.
-- A committer's scope takes a newer publication inside `reader_poll_interval`.
-- A superseded publication carries an expiry and the newest carries none; an
-  expired one is deleted at the next publication.
+  scope keeps its revision across later commits and past the interval a
+  reader would otherwise re-point on.
+- A reader past its deadline rejects point reads and scan yields.
+- A checkpoint-pinned attach writes nothing to the object store; a reader with
+  none to pin records a checkpoint of its own.
+- A shared reader is reused inside `reader_poll_interval`, and a scope past it
+  opens a newer one; a committer opens one per transaction.
 - A head change under a lookup rerun reaches `RetryBudgetExhausted` after
   eight passes without an unguarded fallback.
 - A corrupt sidecar header, wrong identity, or unknown version falls through
@@ -627,12 +624,9 @@ container ceiling remains the final boundary.
 
 ## Alternatives
 
-- **Writer publication by detached checkpoint of the latest manifest.**
-  Rejected: it omits WAL-durable commits a following reader already sees.
-- **Reader-owned leases on a single-writer publication.** Rejected for that
-  path: a manifest write per reader generation and one per renewal, forced only
-  by deleting the superseded publication at once. A grace on retirement lets
-  readers pin the publication itself.
+- **Pinning a scope to a detached checkpoint of the latest manifest.**
+  Rejected: such a checkpoint does not advance the manifest's WAL boundary, so
+  a reader pinned to it omits commits acknowledged only in the log.
 - **A fixed metadata slot.** Rejected: a fixed fifth of the budget was both
   floor and ceiling, so holding a large store's filters meant inflating the
   whole budget. Eviction priority lets idle metadata space go to blocks.

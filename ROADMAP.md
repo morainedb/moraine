@@ -19,7 +19,7 @@ Moraine 0.8 supports DuckDB 2.0.0.
   commit, DuckLake's metadata SQL is 14.5 ms against 3.3 ms of Moraine's own
   work, and nearly all of it is parsing, binding, and optimizing the
   generated SQL, which DuckDB re-plans on every execution
-  ([measurement](docs/benchmarks.md#where-the-time-goes)). Moraine
+  ([measurement](docs/benchmarks.md#commit-timing)). Moraine
   reports a catalog version so that plan reuse is possible once DuckDB
   stops re-planning; the rest of the gain is upstream.
 

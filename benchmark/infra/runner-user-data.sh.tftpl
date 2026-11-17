@@ -1,0 +1,74 @@
+#!/bin/bash
+set -euo pipefail
+
+# The bench environment is written first, before anything that can fail:
+# a missing package must not take the values only this script knows.
+install -d -m 0755 /etc/moraine-bench
+
+# The Quack certificate names the host, not its address, so the name has
+# to resolve. This is the only client that server has.
+echo "${quack_private_ip} ${quack_hostname}" >> /etc/hosts
+
+cat > /etc/moraine-bench/quack-ca.pem <<'CERT'
+${trimspace(quack_ca_cert)}
+CERT
+chmod 0644 /etc/moraine-bench/quack-ca.pem
+
+# Written literally: the prefix is stamped when a run sources the file,
+# and `set -a; . <file>` is how it is meant to be read.
+# Both buckets in one file: `moraine` and `moraine_express` are separate
+# backends in one run, which is the only way their numbers share a
+# machine, a clock and a network.
+cat > /etc/moraine-bench/bench.env <<'ENV'
+export AWS_REGION=${region}
+export MORAINE_S3_CREDENTIAL_CHAIN=instance
+export MORAINE_S3_PREFIX="bench/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+export MORAINE_S3_BUCKET=${standard_bucket}
+export MORAINE_S3_EXPRESS_BUCKET=${express_bucket}
+export MORAINE_BENCH_POSTGRES="${postgres_dsn}"
+export MORAINE_BENCH_QUACK=${quack_endpoint}
+export MORAINE_BENCH_QUACK_TOKEN=${quack_token}
+export MORAINE_BENCH_QUACK_CA_CERT=/etc/moraine-bench/quack-ca.pem
+ENV
+
+chown root:ec2-user /etc/moraine-bench/bench.env
+chmod 0640 /etc/moraine-bench/bench.env
+
+# The toolchain the extension build needs, as CONTRIBUTING.md describes
+# it: DuckLake's Linux pipeline uses GCC 14, and DuckDB's cmake generates
+# Ninja.
+dnf install -y git tar gzip jq cmake ninja-build gcc gcc-c++ gcc14 gcc14-c++ python3 python3-pip
+
+# `pg_ctl` is what the harness probes for, and it ships with the server
+# package even though an external server needs only the client.
+dnf install -y postgresql16 postgresql16-server ||
+  dnf install -y postgresql15 postgresql15-server
+
+# Not in Amazon Linux's repositories, and only an accelerator: DuckDB's
+# cmake uses it when it is on PATH and builds from scratch when it is
+# not. An AMI snapshot after the first build is what makes later sweeps
+# quick.
+dnf install -y ccache || echo "ccache unavailable; DuckDB builds will not be cached"
+
+# No default toolchain: the repository's `rust-toolchain.toml` picks it,
+# which is why `cargo` is only meaningful inside the clone below.
+su - ec2-user -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
+
+# Cloned here so a fresh runner is one `cargo xtask bench` from measuring,
+# and so the submodules — a few hundred megabytes the extension build
+# cannot do without — are fetched before anyone is waiting on them.
+su - ec2-user -c 'git clone --recurse-submodules ${repository} moraine' ||
+  echo "clone failed; clone it by hand before benching"
+
+# Session Manager lands in a session as `ssm-user`, where none of this
+# exists: the clone, the toolchain and the environment belong to
+# `ec2-user`.
+cat > /etc/profile.d/moraine-bench.sh <<'HINT'
+if [ "$(id -un)" != "ec2-user" ]; then
+  echo "moraine bench: run 'sudo -iu ec2-user' first; the toolchain and /etc/moraine-bench are theirs"
+fi
+HINT
+chmod 0644 /etc/profile.d/moraine-bench.sh
+
+# The last line, so its absence is the signal that setup did not finish.
+touch /etc/moraine-bench/ready

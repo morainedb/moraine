@@ -411,17 +411,11 @@ impl ReaderSession for TestSession {
         &self,
         builder: slatedb::DbReaderBuilder<String>,
         options: slatedb::config::DbReaderOptions,
-        admin: slatedb::admin::Admin,
+        _admin: slatedb::admin::Admin,
     ) -> Result<DbReader> {
-        let checkpoint = admin
-            .list_checkpoints(Some(crate::store::checkpoint::PUBLISHED_NAME))
-            .await?
-            .into_iter()
-            .max_by_key(|checkpoint| checkpoint.manifest_id)
-            .ok_or_else(|| Error::Corruption("test log has no checkpoint".into()))?;
         Ok(builder
             .with_options(options)
-            .with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint.id))
+            .with_reader_mode(slatedb::DbReaderMode::ManagedCheckpoint)
             .build()
             .await?)
     }
@@ -563,7 +557,7 @@ impl TestStore {
         })
         .await
         .map_err(Error::from)?;
-        self.publish(db).await?;
+        self.flush_folded(db).await?;
         self.folded_since_flush.store(0, Ordering::Release);
         let directory = slatedb::config::GarbageCollectorDirectoryOptions {
             interval: None,
@@ -609,38 +603,31 @@ impl TestStore {
         }
     }
 
-    async fn publish(&self, db: &Db) -> Result<()> {
-        db.flush().await?;
-        let admin = slatedb::admin::AdminBuilder::new(
-            self.hooks.path.clone(),
-            self.hooks.object_store.clone(),
-        )
-        .build();
-        crate::store::checkpoint::Publisher::new(db.clone(), admin)
-            .through(db.status().durable_seq)
-            .await
-            .map_err(Into::into)
+    /// Flushes the folded state, which is what a reader following the
+    /// latest manifest picks up.
+    async fn flush_folded(&self, db: &Db) -> Result<()> {
+        db.flush().await.map_err(Into::into)
     }
 
-    async fn publish_through(&self, sequence: u64) -> Result<()> {
+    async fn flush_through(&self, sequence: u64) -> Result<()> {
         let (db, session) = self
             .hooks
             .take
             .take()
             .await?
-            .ok_or_else(|| Error::Constraint("test publisher could not take store".into()))?;
+            .ok_or_else(|| Error::Constraint("test log folder could not take store".into()))?;
         let session = own_session(session.as_any());
-        let publication = if session.cursor.folded.load(Ordering::Acquire) >= sequence {
-            self.publish(&db).await
+        let folded = if session.cursor.folded.load(Ordering::Acquire) >= sequence {
+            self.flush_folded(&db).await
         } else {
             Err(Error::CommitOutcomeUnknown(format!(
-                "checkpoint publisher has not replayed committed slot {sequence}",
+                "the log folder has not replayed committed slot {sequence}",
             )))
         };
         let closed = db
             .close_with_options(slatedb::config::CloseOptions { flush_type: None })
             .await;
-        publication?;
+        folded?;
         closed.map_err(Into::into)
     }
 
@@ -753,7 +740,7 @@ impl CommitStore for TestStore {
             }
             (Some(winner), Side::Follower(_)) => {
                 self.cursor.serve(sequence);
-                self.publish_through(sequence).await?;
+                self.flush_through(sequence).await?;
                 Ok(SlotOffer::Lost {
                     sequence,
                     winner,
@@ -761,12 +748,12 @@ impl CommitStore for TestStore {
                 })
             }
             (None, Side::Holder(db)) => {
-                let publication = async {
+                let folded = async {
                     self.fold_from_cursor(db, &self.cursor).await?;
-                    self.publish(db).await
+                    self.flush_folded(db).await
                 }
                 .await;
-                publication.map_err(|error| Error::CommitOutcomeUnknown(format!(
+                folded.map_err(|error| Error::CommitOutcomeUnknown(format!(
                     "slot {sequence} is durable but its checkpoint was not acknowledged: {error}",
                 )))?;
                 Ok(SlotOffer::Won { sequence })
@@ -777,7 +764,7 @@ impl CommitStore for TestStore {
                 if every != 0 && sequence.is_multiple_of(every) {
                     self.fold_on_cadence(sequence).await;
                 }
-                self.publish_through(sequence).await.map_err(|error| {
+                self.flush_through(sequence).await.map_err(|error| {
                     Error::CommitOutcomeUnknown(format!(
                         "slot {sequence} is durable but its checkpoint was not acknowledged: {error}",
                     ))
@@ -794,7 +781,7 @@ impl CommitStore for TestStore {
             Side::Holder(db) => self.fold_from_cursor(db, &self.cursor).await,
             Side::Follower(_) => {
                 let before = *self.cursor.served.borrow();
-                self.publish_through(self.log.last_sequence()).await?;
+                self.flush_through(self.log.last_sequence()).await?;
                 self.cursor.serve(self.log.last_sequence());
                 Ok(self.cursor.served.borrow().saturating_sub(before))
             }

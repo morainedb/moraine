@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub(crate) struct SchemaVersionCursor {
+    #[expect(dead_code, reason = "held so the reader outlives the cursor")]
     handle: OwnedReadHandle,
     iterator: ScanIterator,
 }
@@ -41,11 +42,9 @@ impl SchemaVersionCursor {
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<(u64, u64, u64, MemoryReservation)>> {
-        self.handle.borrow().validate()?;
         let Some(entry) = self.iterator.next().await? else {
             return Ok(None);
         };
-        self.handle.borrow().validate()?;
         let memory = MemoryReservation::reserve(
             (entry.key.len() as u64)
                 .saturating_add(entry.value.len() as u64)

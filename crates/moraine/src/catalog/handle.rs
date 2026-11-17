@@ -615,11 +615,11 @@ fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::Commit
         .or_else(crate::commit_log::registered_commit_log)
 }
 
-/// How long a scope may keep the publication its predecessor listed. A
-/// committer lists on every transaction, so each reads what the one before
-/// it committed; a read-only catalog keeps it for the poll interval.
-fn publication_reuse(options: &CatalogOptions, fresh_publication: bool) -> Duration {
-    if fresh_publication {
+/// How long a scope may share the reader its predecessor opened. A
+/// committer opens one per transaction, so each reads what the one before
+/// it committed; a read-only catalog shares one for the poll interval.
+fn reader_reuse(options: &CatalogOptions, per_transaction: bool) -> Duration {
+    if per_transaction {
         Duration::ZERO
     } else {
         options.reader_poll_interval
@@ -1318,9 +1318,9 @@ impl ReadOnlyCatalog {
     /// Closes the catalog, flushing background work.
     ///
     /// A [`Catalog`] is cheaply cloneable, and all clones share one
-    /// underlying store handle: closing through any clone shuts that
-    /// store down for every clone, so subsequent operations on any of
-    /// them — this one included — fail.
+    /// underlying store handle: closing through any clone shuts that store
+    /// down for every clone, so subsequent operations on any of them — this
+    /// one included — fail.
     ///
     /// # Errors
     ///
@@ -1329,15 +1329,7 @@ impl ReadOnlyCatalog {
         // A commit store closes the handle it was built over: a held store
         // is written out and let go of first.
         match self.store.as_ref() {
-            Store::Writer { db, pacer, .. } => {
-                let publication = if db.status().close_reason.is_none() {
-                    pacer.publish_flushed().await.map_err(Error::from)
-                } else {
-                    Ok(())
-                };
-                let closed = db.close().await.map_err(Error::from);
-                publication.and(closed)
-            }
+            Store::Writer { db, .. } => db.close().await.map_err(Error::from),
             Store::Reader(reader) => {
                 if let Some(scopes) = &self.reader_scopes {
                     scopes.close().await;
@@ -1967,12 +1959,12 @@ impl Catalog {
     }
 
     /// Opens the base reader and transaction-scope factory. Native readers
-    /// may reuse a publication; logged transactions always capture a fresh
+    /// may share one reader; logged transactions always capture a fresh
     /// view.
     async fn open_reader_catalog(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
-        fresh_publication: bool,
+        fresh_reader: bool,
         session: Option<Arc<dyn crate::ReaderSession>>,
     ) -> Result<ReadOnlyCatalog> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
@@ -2033,7 +2025,7 @@ impl Catalog {
             located.clone(),
             options.clone(),
             reader.clone(),
-            publication_reuse(&options, fresh_publication),
+            reader_reuse(&options, fresh_reader),
         )));
         Ok(ReadOnlyCatalog {
             pinned: None,
@@ -2130,21 +2122,7 @@ impl Catalog {
         let closed = if let Some(log) = log {
             log.store.close().await
         } else {
-            let publication = if report.is_ok() {
-                crate::store::checkpoint::Publisher::new(
-                    db.clone(),
-                    StoreBuilder::new(&options.path, object_store.clone())
-                        .wal_object_store(wal_object_store(&options))
-                        .admin(),
-                )
-                .flushed()
-                .await
-                .map_err(Error::from)
-            } else {
-                Ok(())
-            };
-            let closed = db.close().await.map_err(Error::from);
-            publication.and(closed)
+            db.close().await.map_err(Error::from)
         };
 
         // A failed migration keeps its checkpoint as the recovery point.

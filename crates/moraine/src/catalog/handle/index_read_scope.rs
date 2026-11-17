@@ -94,7 +94,7 @@ impl ReadOnlyCatalog {
                 self.begin_read().await?.finish();
             }
             let reader = Box::pin(scopes.acquire()).await?;
-            let revision = reader.manifest;
+            let revision = reader.revision;
             (OwnedReadHandle::Checkpoint(reader), revision)
         } else if let Store::Writer { db, .. } = self.store.as_ref() {
             let snapshot = db.snapshot()?;
@@ -146,39 +146,79 @@ mod tests {
         catalog.close().await.unwrap();
     }
 
+    /// An acknowledged commit is durable and is what a reader in another
+    /// process resolves: the reader replays the write-ahead log past the
+    /// manifest, so no publication stands between the two.
     #[tokio::test]
-    async fn acknowledged_commits_have_a_published_checkpoint() {
+    async fn acknowledged_commits_are_what_another_process_resolves() {
         let objects = Arc::new(InMemory::new());
         let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
             .await
             .unwrap();
         catalog
             .commit_materialized(|transaction| {
-                transaction.set_option(crate::OptionScope::Global, "probe", "published")
+                transaction.set_option(crate::OptionScope::Global, "probe", "acknowledged")
             })
             .await
             .unwrap();
-        let checkpoints = slatedb::admin::AdminBuilder::new("", objects.clone())
-            .build()
-            .list_checkpoints(Some("moraine-read-head-v1"))
+
+        let reader = Catalog::open_read_only(objects, CatalogOptions::default())
             .await
             .unwrap();
-        let checkpoint = checkpoints
-            .iter()
-            .max_by_key(|checkpoint| checkpoint.manifest_id)
-            .expect("an acknowledged commit must have a published checkpoint");
-        let options = CatalogOptions {
-            checkpoint: Some(checkpoint.id.to_string()),
-            ..CatalogOptions::default()
-        };
-        let reader = Catalog::open_read_only(objects, options).await.unwrap();
         assert_eq!(
             crate::ffi_support::catalog_read::global_option(&reader, "probe")
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("published")
+            Some("acknowledged")
         );
+        reader.close().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    /// A scope holds its revision past the interval a reader would otherwise
+    /// re-point on, which is the only thing that advances one.
+    #[tokio::test]
+    async fn a_held_scope_keeps_its_revision_past_a_reader_poll() {
+        let objects = Arc::new(InMemory::new());
+        let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
+            .await
+            .unwrap();
+        catalog
+            .commit_materialized(|transaction| {
+                transaction.set_option(crate::OptionScope::Global, "probe", "before")
+            })
+            .await
+            .unwrap();
+        let reader = Catalog::open_read_only(
+            objects,
+            CatalogOptions {
+                reader_poll_interval: std::time::Duration::ZERO,
+                ..CatalogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let held = reader.index_read_scope().await.unwrap();
+        catalog
+            .commit_materialized(|transaction| {
+                transaction.set_option(crate::OptionScope::Global, "probe", "after")
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+        assert_eq!(
+            crate::ffi_support::catalog_read::global_option(held.reads(), "probe")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before"),
+            "a held scope must not pick up a commit made after it opened"
+        );
+
+        drop(held);
         reader.close().await.unwrap();
         catalog.close().await.unwrap();
     }
@@ -220,7 +260,10 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("before")
+            Some("before"),
+            "a held scope reads its own revision {:?}, not {:?}",
+            first.identity(),
+            next.identity()
         );
         assert_eq!(
             crate::ffi_support::catalog_read::global_option(next.reads(), "probe")

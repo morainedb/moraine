@@ -98,11 +98,12 @@ async fn a_pinned_reader_opens_against_a_store_that_refuses_writes() {
     );
 }
 
-/// A reader following the latest state pins the writer's publications, so
-/// it writes no more than a pinned one: nothing.
+/// A reader following the latest state keeps a checkpoint of its own, so
+/// collection cannot take what it reads. A reader given a checkpoint still
+/// writes nothing: its protection is already someone else's.
 #[tokio::test]
 #[allow(clippy::unwrap_used)]
-async fn a_latest_following_reader_writes_nothing_either() {
+async fn a_following_reader_keeps_its_own_checkpoint_and_a_pinned_one_writes_nothing() {
     let (store, checkpoint) = seeded_with_checkpoint().await;
 
     let before = store.writes_attempted();
@@ -131,7 +132,10 @@ async fn a_latest_following_reader_writes_nothing_either() {
         .unwrap();
     let pinned_writes = store.writes_attempted() - before;
 
-    assert_eq!(latest_writes, 0, "a following reader must write nothing");
+    assert_eq!(
+        latest_writes, 2,
+        "a following reader establishes and refreshes a checkpoint of its own"
+    );
     assert_eq!(pinned_writes, 0, "a pinned reader must write nothing");
 }
 
