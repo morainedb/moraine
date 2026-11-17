@@ -17,7 +17,8 @@ use anyhow::Context;
 
 use crate::duckdb::workspace_root;
 
-/// Every backend a networked run compares.
+/// Every backend a networked run compares unless `--backends` narrows
+/// it, which is how a run proceeds while one server is down.
 const ALL_BACKENDS: &str = "moraine,moraine_express,duckdb,postgres,quack";
 
 /// The store variables a local-disk run must not see. The published
@@ -87,8 +88,8 @@ impl Step {
 }
 
 /// Every harness, in the order it runs.
-fn steps(output: &Path, clickbench: Option<&Path>) -> Vec<Step> {
-    let mut steps = networked_steps(output);
+fn steps(output: &Path, clickbench: Option<&Path>, backends: &str) -> Vec<Step> {
+    let mut steps = networked_steps(output, backends);
     steps.extend(local_steps());
     steps.extend(single_purpose_steps(output));
     steps.extend(core_steps());
@@ -98,7 +99,7 @@ fn steps(output: &Path, clickbench: Option<&Path>) -> Vec<Step> {
 
 /// The five-column tables and the moraine-only sections, on whatever
 /// store the environment names.
-fn networked_steps(output: &Path) -> Vec<Step> {
+fn networked_steps(output: &Path, backends: &str) -> Vec<Step> {
     let cache = output.join("bench-cache").display().to_string();
 
     vec![
@@ -107,7 +108,7 @@ fn networked_steps(output: &Path) -> Vec<Step> {
             &[
                 "bench",
                 "--backends",
-                ALL_BACKENDS,
+                backends,
                 "--seconds",
                 "5",
                 "--concurrency",
@@ -119,7 +120,7 @@ fn networked_steps(output: &Path) -> Vec<Step> {
             &[
                 "bench",
                 "--backends",
-                ALL_BACKENDS,
+                backends,
                 "--workloads",
                 "concurrent_connections",
                 "--commits",
@@ -135,7 +136,7 @@ fn networked_steps(output: &Path) -> Vec<Step> {
             &[
                 "bench",
                 "--backends",
-                ALL_BACKENDS,
+                backends,
                 "--workloads",
                 "warm_attach",
                 "--repeat",
@@ -147,7 +148,7 @@ fn networked_steps(output: &Path) -> Vec<Step> {
             &[
                 "bench",
                 "--backends",
-                ALL_BACKENDS,
+                backends,
                 "--seconds",
                 "5",
                 "--concurrency",
@@ -424,12 +425,16 @@ fn is_benchmarks_run(cmdline: &[u8]) -> bool {
 
 /// `benchmarks [--out <dir>] [--clickbench <checkout>]`.
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {
-    let (output, clickbench) = parse_options(arguments)?;
+    let Options {
+        output,
+        clickbench,
+        backends,
+    } = parse_options(arguments)?;
 
     fs::create_dir_all(&output).with_context(|| format!("creating {}", output.display()))?;
     claim(&output)?;
     let xtask = std::env::current_exe().context("finding this xtask binary")?;
-    let steps = steps(&output, clickbench.as_deref());
+    let steps = steps(&output, clickbench.as_deref(), &backends);
     println!(
         "ok: {} harnesses, one at a time, logs under {}",
         steps.len(),
@@ -460,9 +465,17 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_options(arguments: &[String]) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+/// What a run was asked for.
+struct Options {
+    output: PathBuf,
+    clickbench: Option<PathBuf>,
+    backends: String,
+}
+
+fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     let mut output = workspace_root().join("target/benchmarks");
     let mut clickbench = None;
+    let mut backends = ALL_BACKENDS.to_owned();
 
     let mut iterator = arguments.iter();
     while let Some(argument) = iterator.next() {
@@ -475,10 +488,17 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<(PathBuf, Option<PathBu
         match argument.as_str() {
             "--out" => output = PathBuf::from(value()?),
             "--clickbench" => clickbench = Some(PathBuf::from(value()?)),
-            other => anyhow::bail!("unknown argument `{other}`; valid: --out, --clickbench"),
+            "--backends" => backends = value()?,
+            other => {
+                anyhow::bail!("unknown argument `{other}`; valid: --out, --clickbench, --backends")
+            }
         }
     }
-    Ok((output, clickbench))
+    Ok(Options {
+        output,
+        clickbench,
+        backends,
+    })
 }
 
 /// Runs one harness to its own log, keeping whatever report it wrote.
@@ -562,7 +582,7 @@ mod tests {
 
     #[test]
     fn every_step_is_named_once_and_carries_a_command() {
-        let steps = steps(Path::new("/tmp/out"), None);
+        let steps = steps(Path::new("/tmp/out"), None, ALL_BACKENDS);
         let mut names: Vec<&str> = steps.iter().map(|step| step.name).collect();
         let count = names.len();
         names.sort_unstable();
@@ -573,7 +593,7 @@ mod tests {
 
     #[test]
     fn only_the_published_local_table_hides_the_store_environment() {
-        let steps = steps(Path::new("/tmp/out"), None);
+        let steps = steps(Path::new("/tmp/out"), None, ALL_BACKENDS);
         let local: Vec<&str> = steps
             .iter()
             .filter(|step| step.local_only)
@@ -584,8 +604,12 @@ mod tests {
 
     #[test]
     fn a_clickbench_checkout_adds_its_two_steps_last() {
-        let without = steps(Path::new("/tmp/out"), None).len();
-        let steps = steps(Path::new("/tmp/out"), Some(Path::new("/tmp/ClickBench")));
+        let without = steps(Path::new("/tmp/out"), None, ALL_BACKENDS).len();
+        let steps = steps(
+            Path::new("/tmp/out"),
+            Some(Path::new("/tmp/ClickBench")),
+            ALL_BACKENDS,
+        );
         assert_eq!(steps.len(), without + 2);
         assert_eq!(steps[steps.len() - 2].name, "clickbench-run");
         assert_eq!(steps[steps.len() - 1].name, "clickbench-report");
@@ -593,7 +617,11 @@ mod tests {
 
     #[test]
     fn clickbench_alone_gets_longer_than_the_others() {
-        let steps = steps(Path::new("/tmp/out"), Some(Path::new("/tmp/ClickBench")));
+        let steps = steps(
+            Path::new("/tmp/out"),
+            Some(Path::new("/tmp/ClickBench")),
+            ALL_BACKENDS,
+        );
         let long: Vec<&str> = steps
             .iter()
             .filter(|step| step.timeout > STEP_TIMEOUT)
@@ -632,20 +660,33 @@ mod tests {
     }
 
     #[test]
-    fn options_default_to_the_workspace_and_no_clickbench() {
-        let (output, clickbench) = parse_options(&[]).unwrap();
-        assert!(
-            output.ends_with("target/benchmarks"),
-            "{}",
-            output.display()
-        );
-        assert!(clickbench.is_none());
+    fn options_default_to_every_backend_and_no_clickbench() {
+        let options = parse_options(&[]).unwrap();
+        assert!(options.output.ends_with("target/benchmarks"));
+        assert!(options.clickbench.is_none());
+        assert_eq!(options.backends, ALL_BACKENDS);
+    }
 
-        let arguments = ["--out", "/tmp/here", "--clickbench", "/tmp/ClickBench"]
-            .map(str::to_owned)
-            .to_vec();
-        let (output, clickbench) = parse_options(&arguments).unwrap();
-        assert_eq!(output, Path::new("/tmp/here"));
-        assert_eq!(clickbench.as_deref(), Some(Path::new("/tmp/ClickBench")));
+    #[test]
+    fn narrowing_the_backends_reaches_every_networked_harness() {
+        let options =
+            parse_options(&["--backends".to_owned(), "moraine,duckdb".to_owned()]).unwrap();
+        assert_eq!(options.backends, "moraine,duckdb");
+
+        let steps = steps(Path::new("/tmp/out"), None, &options.backends);
+        let networked: Vec<&Step> = steps
+            .iter()
+            .filter(|step| step.name.starts_with("catalogs-"))
+            .collect();
+        assert!(!networked.is_empty());
+        for step in networked {
+            assert!(
+                step.arguments
+                    .iter()
+                    .any(|argument| argument == "moraine,duckdb"),
+                "{} kept every backend",
+                step.name
+            );
+        }
     }
 }
