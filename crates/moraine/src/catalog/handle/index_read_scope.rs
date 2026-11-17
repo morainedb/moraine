@@ -176,6 +176,53 @@ mod tests {
         catalog.close().await.unwrap();
     }
 
+    /// A scope holds its revision past the interval a reader would otherwise
+    /// re-point on, which is the only thing that advances one.
+    #[tokio::test]
+    async fn a_held_scope_keeps_its_revision_past_a_reader_poll() {
+        let objects = Arc::new(InMemory::new());
+        let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
+            .await
+            .unwrap();
+        catalog
+            .commit_materialized(|transaction| {
+                transaction.set_option(crate::OptionScope::Global, "probe", "before")
+            })
+            .await
+            .unwrap();
+        let reader = Catalog::open_read_only(
+            objects,
+            CatalogOptions {
+                reader_poll_interval: std::time::Duration::ZERO,
+                ..CatalogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let held = reader.index_read_scope().await.unwrap();
+        catalog
+            .commit_materialized(|transaction| {
+                transaction.set_option(crate::OptionScope::Global, "probe", "after")
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+        assert_eq!(
+            crate::ffi_support::catalog_read::global_option(held.reads(), "probe")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before"),
+            "a held scope must not pick up a commit made after it opened"
+        );
+
+        drop(held);
+        reader.close().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn read_only_scopes_keep_unversioned_values_and_rotate() {
         let objects = Arc::new(InMemory::new());
