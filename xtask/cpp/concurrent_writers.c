@@ -8,6 +8,7 @@
 //
 // Usage:
 //   concurrent_writers <extension-dir> <extension> <attach-sql> <writers> <bound>
+//                      [indexed] [shared]
 // where <bound> is a commit count per writer, or seconds with a trailing
 // `s` for a window every writer commits into until it closes.
 // Prints `elapsed_seconds=<seconds>` and `commits=<count>`, and exits
@@ -29,6 +30,8 @@ typedef struct {
 	duckdb_database database;
 	pthread_barrier_t *barrier;
 	int writer;
+	// Whether every writer commits to one table instead of its own.
+	int shared;
 	long long commits;
 	// Seconds to commit for, or zero when `commits` bounds the writer.
 	double window;
@@ -136,7 +139,11 @@ static void *commit_loop(void *argument) {
 		}
 
 		char sql[STATEMENT_MAX];
-		snprintf(sql, sizeof(sql), "INSERT INTO lake.main.writer_%d VALUES (%lld);", task->writer, row);
+		if (task->shared) {
+			snprintf(sql, sizeof(sql), "INSERT INTO lake.main.shared VALUES (%d, %lld);", task->writer, row);
+		} else {
+			snprintf(sql, sizeof(sql), "INSERT INTO lake.main.writer_%d VALUES (%lld);", task->writer, row);
+		}
 		failed = run(connection, sql, task->error);
 		if (!failed) {
 			++task->committed;
@@ -161,7 +168,12 @@ int main(int argc, char **argv) {
 		        argv[0]);
 		return 2;
 	}
-	int indexed = argc == 7 && strcmp(argv[6], "indexed") == 0;
+	int indexed = 0;
+	int shared = 0;
+	for (int argument = 6; argument < argc; ++argument) {
+		indexed |= strcmp(argv[argument], "indexed") == 0;
+		shared |= strcmp(argv[argument], "shared") == 0;
+	}
 	const char *extension_dir = argv[1];
 	const char *extension = argv[2];
 	const char *attach = argv[3];
@@ -222,7 +234,15 @@ int main(int argc, char **argv) {
 		         level ? level : "warn");
 		run(setup, statement, ignored);
 	}
-	for (int writer = 0; !failed && writer < writers; ++writer) {
+	if (shared) {
+		// The writer column is what lets one table still say who committed
+		// what.
+		failed = run(setup, "CREATE TABLE lake.main.shared (writer BIGINT, id BIGINT);", error);
+		if (!failed && indexed) {
+			failed = run(setup, "CREATE INDEX shared_by_id ON lake.main.shared(id);", error);
+		}
+	}
+	for (int writer = 0; !failed && !shared && writer < writers; ++writer) {
 		snprintf(statement, sizeof(statement), "CREATE TABLE lake.main.writer_%d (id BIGINT);", writer);
 		failed = run(setup, statement, error);
 		if (!failed && indexed) {
@@ -256,6 +276,7 @@ int main(int argc, char **argv) {
 		tasks[writer].barrier = &barrier;
 		tasks[writer].writer = writer;
 		tasks[writer].commits = commits;
+		tasks[writer].shared = shared;
 		tasks[writer].window = window;
 		pthread_create(&threads[writer], NULL, commit_loop, &tasks[writer]);
 	}

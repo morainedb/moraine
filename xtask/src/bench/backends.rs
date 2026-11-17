@@ -21,6 +21,10 @@ pub enum BackendKind {
     /// The same, on the S3 Express directory bucket named by
     /// `MORAINE_S3_EXPRESS_BUCKET`, so one run compares the two stores.
     MoraineExpress,
+    /// The catalog on the standard bucket with only its write-ahead log
+    /// on the directory bucket: the durable step of a commit on the fast
+    /// store, everything else on the cheap one.
+    MoraineWalExpress,
     /// Stock DuckLake: a DuckDB database file.
     DuckdbFile,
     /// Stock DuckLake over a Postgres database.
@@ -34,6 +38,7 @@ impl BackendKind {
         match self {
             Self::Moraine => "moraine",
             Self::MoraineExpress => "moraine_express",
+            Self::MoraineWalExpress => "moraine_wal_express",
             Self::DuckdbFile => "duckdb",
             Self::Postgres => "postgres",
             Self::Quack => "quack",
@@ -44,20 +49,22 @@ impl BackendKind {
         match name {
             "moraine" => Ok(Self::Moraine),
             "moraine_express" => Ok(Self::MoraineExpress),
+            "moraine_wal_express" => Ok(Self::MoraineWalExpress),
             "duckdb" => Ok(Self::DuckdbFile),
             "postgres" => Ok(Self::Postgres),
             "quack" => Ok(Self::Quack),
             other => bail!(
-                "unknown backend `{other}`; valid: moraine, moraine_express, duckdb, \
-                 postgres, quack"
+                "unknown backend `{other}`; valid: moraine, moraine_express, \
+                 moraine_wal_express, duckdb, postgres, quack"
             ),
         }
     }
 
-    pub fn all() -> [Self; 5] {
+    pub fn all() -> [Self; 6] {
         [
             Self::Moraine,
             Self::MoraineExpress,
+            Self::MoraineWalExpress,
             Self::DuckdbFile,
             Self::Postgres,
             Self::Quack,
@@ -66,7 +73,10 @@ impl BackendKind {
 
     /// Whether this backend is moraine, on whichever store.
     pub fn is_moraine(self) -> bool {
-        matches!(self, Self::Moraine | Self::MoraineExpress)
+        matches!(
+            self,
+            Self::Moraine | Self::MoraineExpress | Self::MoraineWalExpress
+        )
     }
 }
 
@@ -86,6 +96,9 @@ pub enum RemoteCatalog {
 pub struct SessionPaths {
     pub catalog_dir: PathBuf,
     pub moraine_catalog: String,
+    /// The store moraine's write-ahead log goes to, when a backend puts
+    /// it somewhere other than the catalog's own store.
+    pub wal_path: Option<String>,
     /// Where moraine keeps what it read, when a run asked for one. Shared
     /// across a sweep, so only the first attach pays for a cold store.
     pub cache_dir: Option<PathBuf>,
@@ -109,24 +122,36 @@ pub fn attach_sql(
 ) -> anyhow::Result<String> {
     let data = paths.data_dir.display();
     Ok(match kind {
-        BackendKind::Moraine | BackendKind::MoraineExpress => format!(
-            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', \
-             META_FLUSH_INTERVAL_MS {flush_interval_ms}{});",
-            paths.moraine_catalog,
-            paths
-                .cache_dir
-                .as_ref()
-                .map(|dir| {
-                    // `META_`-prefixed: the attach is DuckLake's, which
-                    // passes the option through to the moraine catalog
-                    // under it and refuses it unprefixed.
-                    format!(
-                        ", META_CACHE_DIR {}",
-                        crate::catalog_target::sql_literal(&dir.display().to_string())
-                    )
-                })
-                .unwrap_or_default()
-        ),
+        BackendKind::Moraine | BackendKind::MoraineExpress | BackendKind::MoraineWalExpress => {
+            format!(
+                "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', \
+                 META_FLUSH_INTERVAL_MS {flush_interval_ms}{}{});",
+                paths.moraine_catalog,
+                paths
+                    .wal_path
+                    .as_ref()
+                    .map(|wal| {
+                        format!(
+                            ", META_WAL_PATH {}",
+                            crate::catalog_target::sql_literal(wal)
+                        )
+                    })
+                    .unwrap_or_default(),
+                paths
+                    .cache_dir
+                    .as_ref()
+                    .map(|dir| {
+                        // `META_`-prefixed: the attach is DuckLake's, which
+                        // passes the option through to the moraine catalog
+                        // under it and refuses it unprefixed.
+                        format!(
+                            ", META_CACHE_DIR {}",
+                            crate::catalog_target::sql_literal(&dir.display().to_string())
+                        )
+                    })
+                    .unwrap_or_default()
+            )
+        }
         BackendKind::DuckdbFile => format!(
             "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{data}');",
             paths.catalog_dir.join("meta.ducklake").display()
@@ -522,6 +547,7 @@ mod tests {
         SessionPaths {
             catalog_dir: PathBuf::from("/tmp/cat"),
             moraine_catalog: "/tmp/cat".to_owned(),
+            wal_path: None,
             cache_dir: None,
             data_dir: PathBuf::from("/tmp/data"),
         }
@@ -550,10 +576,39 @@ mod tests {
     }
 
     #[test]
+    fn only_the_wal_express_backend_names_a_wal_store() {
+        let paths = SessionPaths {
+            catalog_dir: PathBuf::from("/tmp/cat"),
+            moraine_catalog: "s3://standard/run".to_owned(),
+            wal_path: Some("s3://express--use1-az4--x-s3/run-wal".to_owned()),
+            cache_dir: None,
+            data_dir: PathBuf::from("/tmp/data"),
+        };
+        let wal_express = attach_sql(BackendKind::MoraineWalExpress, &paths, None, 1).unwrap();
+        assert!(
+            wal_express.contains("META_WAL_PATH 's3://express--use1-az4--x-s3/run-wal'"),
+            "{wal_express}"
+        );
+        assert!(
+            wal_express.contains("ducklake:moraine:s3://standard/run"),
+            "{wal_express}"
+        );
+
+        // The other backends get no wal path to name.
+        let paths = SessionPaths {
+            wal_path: None,
+            ..paths
+        };
+        let plain = attach_sql(BackendKind::Moraine, &paths, None, 1).unwrap();
+        assert!(!plain.contains("WAL_PATH"), "{plain}");
+    }
+
+    #[test]
     fn a_cache_directory_reaches_moraines_attach_and_no_others() {
         let paths = SessionPaths {
             catalog_dir: PathBuf::from("/tmp/cat"),
             moraine_catalog: "/tmp/cat".to_owned(),
+            wal_path: None,
             cache_dir: Some(PathBuf::from("/tmp/cache")),
             data_dir: PathBuf::from("/tmp/data"),
         };

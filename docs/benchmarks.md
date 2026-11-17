@@ -208,10 +208,10 @@ through the same pinned DuckDB CLI. Data is local Parquet everywhere; only
 the catalog differs.
 
 ```text
-cargo xtask bench [--backends moraine,moraine_express,duckdb,postgres,quack]
+cargo xtask bench [--backends moraine,moraine_express,moraine_wal_express,duckdb,postgres,quack]
                   [--workloads <name>,...] [--scale small|medium|large] [--repeat N]
-                  [--concurrency 1,2,4,8] [--commits N | --seconds N] [--indexed]
-                  [--flush-interval-ms N] [--cache-dir <dir>]
+                  [--concurrency 1,2,4,8] [--commits N | --seconds N]
+                  [--indexed] [--shared] [--flush-interval-ms N] [--cache-dir <dir>]
 ```
 
 Defaults: all backends, all workloads, `small`, three repeats. Postgres
@@ -225,8 +225,11 @@ each run gets its own metadata schema.
 Moraine's catalog is a local directory unless `MORAINE_S3_BUCKET` (with
 `MORAINE_S3_PREFIX`, `MORAINE_S3_ENDPOINT`, and AWS credentials) names a
 bucket; Parquet stays local either way. `MORAINE_S3_EXPRESS_BUCKET` adds
-the `moraine_express` backend, the same catalog on a directory bucket, so
-one run measures both stores under the same conditions. Without an
+two backends: `moraine_express`, the same catalog on a directory bucket,
+and `moraine_wal_express`, the catalog on the standard bucket with only
+its write-ahead log on the directory one — the durable step of a commit
+on the fast store and everything else on the cheap one. One run measures
+all three under the same conditions. Without an
 endpoint the secret resolves AWS's credential chain, which
 `MORAINE_S3_CREDENTIAL_CHAIN` narrows — `instance` for a machine whose
 only credentials are an instance profile, where the default chain stops
@@ -269,6 +272,7 @@ what served it, so a stamp here carries those round trips.
 | `scan` | full and filtered scans, time travel, snapshot listing |
 | `maintenance` | `merge_adjacent_files`, `expire_snapshots`, `cleanup_old_files` |
 | `deletes_repeated` | D single-key deletes, one commit each |
+| `warm_attach` | attach, detach, attach again: what a second attach costs |
 | `deletes_bulk` | the same rows in one statement |
 | `deletes_covering` | a partition-aligned delete that drops the file |
 | `deletes_partial` | the same, one row short of covering |
@@ -350,6 +354,11 @@ writers, and the fastest from four up. Across processes, both embedded
 catalogs are single-writer: moraine fences the previous writer with a typed
 error, and the DuckDB file catalog fails on the file lock. Postgres accepts
 more writers and gets slower.
+
+`--shared` puts every writer of a concurrency workload on one table
+instead of its own, which adds the row-level conflict a catalog's own
+protocol has to resolve; the phase is then `writers_N_shared`. Separate
+tables are the default and measure catalog contention alone.
 
 Under a window, a server catalog taking two writer *processes* starves
 one of them: it commits nothing, silently, while its competitor commits

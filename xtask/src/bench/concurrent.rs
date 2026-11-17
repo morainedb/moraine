@@ -42,6 +42,10 @@ pub struct Burst {
     /// Whether each writer's table carries an equality index, so every
     /// commit also maintains index entries.
     pub indexed: bool,
+    /// Whether every writer commits to one table instead of its own.
+    /// Separate tables measure catalog contention alone; one table adds
+    /// the conflict a catalog's own protocol has to resolve.
+    pub shared: bool,
 }
 
 impl Burst {
@@ -60,6 +64,7 @@ impl Burst {
             writers,
             bound: Bound::Commits(commits / count),
             indexed: false,
+            shared: false,
         })
     }
 
@@ -72,12 +77,27 @@ impl Burst {
             writers,
             bound: Bound::Window(window),
             indexed: false,
+            shared: false,
         })
     }
 
     /// The same burst over indexed tables.
     pub fn with_index(self, indexed: bool) -> Self {
         Self { indexed, ..self }
+    }
+
+    /// The same burst with every writer on one table.
+    pub fn with_shared(self, shared: bool) -> Self {
+        Self { shared, ..self }
+    }
+
+    /// The table a writer commits to.
+    fn table(self, writer: usize) -> String {
+        if self.shared {
+            "lake.main.shared".to_owned()
+        } else {
+            format!("lake.main.writer_{writer}")
+        }
     }
 
     /// Commits the burst is planned to perform, or `None` when the window
@@ -91,6 +111,17 @@ impl Burst {
 
     /// The table each writer appends to, created before any of them start.
     pub fn setup_sql(self) -> Vec<String> {
+        if self.shared {
+            // The writer column is what lets a shared table still say who
+            // committed what, which is how a starved writer shows up.
+            let mut statements =
+                vec!["CREATE TABLE lake.main.shared (writer BIGINT, id BIGINT);".to_owned()];
+            if self.indexed {
+                statements.push("CREATE INDEX shared_by_id ON lake.main.shared(id);".to_owned());
+            }
+            return statements;
+        }
+
         (0..self.writers)
             .flat_map(|writer| {
                 let table = format!("CREATE TABLE lake.main.writer_{writer} (id BIGINT);");
@@ -108,14 +139,16 @@ impl Burst {
         let Bound::Commits(each) = self.bound else {
             return Vec::new();
         };
-        (0..each)
-            .map(|row| format!("INSERT INTO lake.main.writer_{writer} VALUES ({row});"))
-            .collect()
+        (0..each).map(|row| self.insert_sql(writer, row)).collect()
     }
 
-    /// The statement a windowed writer repeats, with `row` as its value.
-    pub fn insert_sql(writer: usize, row: u64) -> String {
-        format!("INSERT INTO lake.main.writer_{writer} VALUES ({row});")
+    /// The statement a writer repeats, with `row` as its value.
+    pub fn insert_sql(self, writer: usize, row: u64) -> String {
+        if self.shared {
+            format!("INSERT INTO lake.main.shared VALUES ({writer}, {row});")
+        } else {
+            format!("INSERT INTO {} VALUES ({row});", self.table(writer))
+        }
     }
 
     /// One row per writer's table, in writer order, for the session that
@@ -123,18 +156,27 @@ impl Burst {
     /// committed nothing is a refusal to report, not a zero to absorb.
     pub fn count_sql(self) -> String {
         let counts: Vec<String> = (0..self.writers)
-            .map(|writer| format!("SELECT count(*) FROM lake.main.writer_{writer}"))
+            .map(|writer| {
+                if self.shared {
+                    format!("SELECT count(*) FROM lake.main.shared WHERE writer = {writer}")
+                } else {
+                    format!("SELECT count(*) FROM {}", self.table(writer))
+                }
+            })
             .collect();
         format!("{};", counts.join(" UNION ALL "))
     }
 
     /// The report phase this burst fills.
     pub fn phase(self) -> String {
-        if self.indexed {
-            format!("writers_{}_indexed", self.writers)
-        } else {
-            format!("writers_{}", self.writers)
+        let mut phase = format!("writers_{}", self.writers);
+        if self.shared {
+            phase.push_str("_shared");
         }
+        if self.indexed {
+            phase.push_str("_indexed");
+        }
+        phase
     }
 }
 
@@ -343,7 +385,7 @@ fn commit_burst(
             // first failure is the end of the run, not an error in it.
             for row in 0.. {
                 if stdin
-                    .write_all(Burst::insert_sql(writer, row).as_bytes())
+                    .write_all(burst.insert_sql(writer, row).as_bytes())
                     .and_then(|()| stdin.write_all(b"\n"))
                     .is_err()
                 {
@@ -588,6 +630,32 @@ mod tests {
         assert_eq!(parse_counts(stdout), vec![266, 71]);
         assert_eq!(parse_counts("266\n"), vec![266]);
         assert!(parse_counts("writer 0: boom\n").is_empty());
+    }
+
+    #[test]
+    fn a_shared_burst_puts_every_writer_on_one_table() {
+        let burst = Burst::plan(4, 2).unwrap().with_shared(true);
+        assert_eq!(
+            burst.setup_sql(),
+            ["CREATE TABLE lake.main.shared (writer BIGINT, id BIGINT);"]
+        );
+        assert_eq!(
+            burst.insert_sql(1, 7),
+            "INSERT INTO lake.main.shared VALUES (1, 7);"
+        );
+
+        // The writer column keeps a starved writer visible.
+        assert_eq!(
+            burst.count_sql(),
+            "SELECT count(*) FROM lake.main.shared WHERE writer = 0 UNION ALL \
+             SELECT count(*) FROM lake.main.shared WHERE writer = 1;"
+        );
+        assert_eq!(burst.phase(), "writers_2_shared");
+        assert_eq!(
+            burst.with_index(true).phase(),
+            "writers_2_shared_indexed",
+            "a report must tell the four variants apart"
+        );
     }
 
     #[test]

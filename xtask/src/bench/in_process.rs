@@ -84,6 +84,7 @@ pub fn run(
     writers: usize,
     bound: Bound,
     indexed: bool,
+    shared: bool,
 ) -> anyhow::Result<Outcome> {
     let output = Command::new(driver)
         .arg(duckdb::extension_install_directory())
@@ -92,6 +93,7 @@ pub fn run(
         .arg(writers.to_string())
         .arg(driver_bound(bound))
         .args(indexed.then_some("indexed"))
+        .args(shared.then_some("shared"))
         .output()
         .context("running the concurrent-writer driver")?;
     ensure!(

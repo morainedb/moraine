@@ -86,6 +86,8 @@ struct Options {
     flush_interval_ms: u64,
     /// Whether the concurrency workloads write to indexed tables.
     indexed: bool,
+    /// Whether the concurrency workloads share one table.
+    shared: bool,
 }
 
 impl Options {
@@ -98,7 +100,7 @@ impl Options {
             }
             None => concurrent::Burst::plan(self.commits, writers)?,
         };
-        Ok(burst.with_index(self.indexed))
+        Ok(burst.with_index(self.indexed).with_shared(self.shared))
     }
 }
 
@@ -116,6 +118,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     // and a 1 ms spacing leaves nothing to coalesce.
     let mut flush_interval_ms = 100u64;
     let mut indexed = false;
+    let mut shared = false;
 
     let mut iterator = arguments.iter();
     while let Some(flag) = iterator.next() {
@@ -144,6 +147,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                     .with_context(|| "parsing --flush-interval-ms".to_owned())?;
             }
             "--indexed" => indexed = true,
+            "--shared" => shared = true,
             "--commits" => {
                 commits = value()?
                     .parse()
@@ -183,6 +187,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         cache_dir,
         flush_interval_ms,
         indexed,
+        shared,
     })
 }
 
@@ -255,6 +260,18 @@ impl SessionContext {
             (BackendKind::MoraineExpress, Some(store)) => store,
             _ => &self.store,
         }
+    }
+
+    /// Where a backend's write-ahead log goes, for the one backend that
+    /// puts it somewhere other than its catalog's store.
+    fn wal_path(&self, backend: BackendKind, leaf: &str) -> anyhow::Result<Option<String>> {
+        if backend != BackendKind::MoraineWalExpress {
+            return Ok(None);
+        }
+        let Some(express) = &self.express_store else {
+            return Ok(None);
+        };
+        express.catalog_uri(&format!("{leaf}-wal")).map(Some)
     }
 
     /// Runs one CLI session: an untimed preamble (extension setup, and
@@ -351,6 +368,7 @@ fn run_once(
     let paths = SessionPaths {
         moraine_catalog: context.moraine_catalog(backend, &catalog_dir, &leaf)?,
         catalog_dir,
+        wal_path: context.wal_path(backend, &leaf)?,
         cache_dir: context.cache_dir.clone(),
         data_dir: run_dir.join("data"),
     };
@@ -474,6 +492,7 @@ fn run_burst_once(
     let paths = SessionPaths {
         moraine_catalog: context.moraine_catalog(backend, &catalog_dir, &leaf)?,
         catalog_dir,
+        wal_path: context.wal_path(backend, &leaf)?,
         cache_dir: context.cache_dir.clone(),
         data_dir: run_dir.join("data"),
     };
@@ -507,6 +526,7 @@ fn run_burst_once(
                 burst.writers,
                 burst.bound,
                 burst.indexed,
+                burst.shared,
             )
         }),
     };
@@ -706,9 +726,15 @@ fn available_backends(
     context: &SessionContext,
     servers: &Servers,
 ) -> Vec<BackendKind> {
-    if options.backends.contains(&BackendKind::MoraineExpress) && context.express_store.is_none() {
+    let needs_express = [BackendKind::MoraineExpress, BackendKind::MoraineWalExpress];
+    if options
+        .backends
+        .iter()
+        .any(|kind| needs_express.contains(kind))
+        && context.express_store.is_none()
+    {
         println!(
-            "notice: moraine_express backend skipped — MORAINE_S3_EXPRESS_BUCKET names no \
+            "notice: the express backends are skipped — MORAINE_S3_EXPRESS_BUCKET names no \
              directory bucket"
         );
     }
@@ -718,7 +744,7 @@ fn available_backends(
         .iter()
         .copied()
         .filter(|kind| *kind != BackendKind::Postgres || servers.postgres.is_some())
-        .filter(|kind| *kind != BackendKind::MoraineExpress || context.express_store.is_some())
+        .filter(|kind| !needs_express.contains(kind) || context.express_store.is_some())
         .collect()
 }
 
@@ -834,7 +860,7 @@ mod tests {
     #[test]
     fn options_default_to_all_backends_small_scale_three_repeats() {
         let options = parse_options(&[]).unwrap();
-        assert_eq!(options.backends.len(), 5);
+        assert_eq!(options.backends.len(), 6);
         assert_eq!(options.scale.name, "small");
         assert_eq!(options.repeat, 3);
         assert!(options.workloads.is_none());
