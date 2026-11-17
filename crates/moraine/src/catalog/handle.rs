@@ -1315,19 +1315,11 @@ impl ReadOnlyCatalog {
         Ok(session)
     }
 
-    /// Closes the catalog, flushing background work.
-    ///
-    /// A [`Catalog`] is cheaply cloneable, and all clones share one
-    /// underlying store handle: closing through any clone shuts that
-    /// store down for every clone, so subsequent operations on any of
-    /// them — this one included — fail.
-    ///
     /// Publishes every commit acknowledged so far, so a reader in another
-    /// process sees them without waiting for the next paced publication.
+    /// process resolves them without waiting for the next paced publication.
     ///
-    /// Commits are durable when they are acknowledged; this is only about
-    /// when they become visible elsewhere. A read-only handle opened after
-    /// this returns resolves them.
+    /// Commits are durable once acknowledged; this governs only when they
+    /// become visible elsewhere.
     ///
     /// # Errors
     ///
@@ -1344,6 +1336,14 @@ impl ReadOnlyCatalog {
         }
     }
 
+    /// Closes the catalog, flushing background work and publishing what it
+    /// has acknowledged.
+    ///
+    /// A [`Catalog`] is cheaply cloneable, and all clones share one
+    /// underlying store handle: closing through any clone shuts that store
+    /// down for every clone, so subsequent operations on any of them — this
+    /// one included — fail.
+    ///
     /// # Errors
     ///
     /// Returns an error if the underlying store fails to close cleanly.
