@@ -133,7 +133,6 @@ async fn a_read_only_catalog_reads_the_wal_store() {
         .commit(async |tx| tx.create_schema("sales").await.map(|_| ()))
         .await
         .unwrap();
-    writer.publish_now().await.unwrap();
     drop(writer);
 
     let reader = Catalog::open_read_only(catalog_store, with_wal(&wal_store))

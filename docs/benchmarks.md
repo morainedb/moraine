@@ -61,23 +61,28 @@ MORAINE_S3_BUCKET=... MORAINE_S3_PREFIX=... AWS_REGION=... \
 ```
 
 AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
-2026-11-17 at `fd1b99e`<!-- /site:omit -->, medians of seven commits:
+2026-11-17 at `5f5a20c`<!-- /site:omit -->, medians of seven commits:
 
 | files | commit | DuckLake metadata | moraine core | durable wait | requests |
 |---:|---:|---:|---:|---:|---|
-| 16 | 105.0 ms | 12.1 ms | 86.9 ms | 86.1 ms | 2 PUT 57.0 ms, 3 GET 28.8 ms |
-| 128 | 111.0 ms | 15.0 ms | 94.7 ms | 93.9 ms | 2 PUT 57.2 ms, 3 GET 36.2 ms |
+| 16 | 47.0 ms | 10.7 ms | 31.6 ms | 31.0 ms | 1.3 PUT 39.1 ms, 0.9 GET 14.2 ms |
+| 128 | 50.0 ms | 14.4 ms | 31.6 ms | 30.9 ms | 1.3 PUT 39.0 ms, 1.1 GET 13.1 ms |
 
-- Five requests per commit, and **all three GETs answer 404**: the
-  garbage-collection boundary before and after the manifest write, and
-  the probe for the manifest about to be written. Two writes are the WAL
-  object and the manifest; those are the work, the three reads are the
-  protocol being careful.
-- The requests are the commit: 86 ms of durable wait against 12 ms of
-  DuckLake metadata SQL. On a local store the ratio is the other way
-  round, which is why the same statements looked like the problem there.
+- **Two requests per commit**, and only one of them is the commit: the WAL
+  object that makes it durable. The rest is a fraction of a publication —
+  the manifest write that lets another process find the commit, with the
+  probe and the garbage-collection boundary reads around it. Publication is
+  paced, so one of those covers every commit in the interval rather than
+  one each, and the reads still answer 404.
+- The durable wait is the commit: 31 ms against 11 ms of DuckLake metadata
+  SQL. The SQL was a tenth of a commit when every commit published and is
+  now a quarter. On a local store it dominates outright, which is why the
+  same statements looked like the problem there.
 - Neither half grows with the file count, so the cost is per commit
   rather than per file.
+- Publishing per commit cost 105 ms and five requests, three of them 404
+  probes. Pacing it took the commit to 47 ms without changing what a
+  reader sees beyond a bounded staleness.
 
 On loopback RustFS the balance inverts, which is where the notes below
 come from: DuckLake's eight metadata statements are about 60% of a 23 ms
@@ -610,6 +615,23 @@ MORAINE_S3_BUCKET=... [MORAINE_S3_ENDPOINT=...] \
 
 `--tables` spreads the files over that many tables and queries one.
 `--deletes` gives that share of files a delete file.
+
+AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
+2026-11-17 at `fd1b99e`<!-- /site:omit -->, one table, no delete files,
+five cold processes per size sharing a cache directory:
+
+| files | attach | store open | listing | plan | warm repeat | cold GETs |
+|---:|---:|---:|---:|---:|---:|---|
+| 2,000 | 559 ms | 359 ms | 10 ms | 90 ms | 66 ms | 7 / 71 ms |
+| 20,000 | 612 ms | 426 ms | 67 ms | 593 ms | 571 ms | 7 / 75 ms |
+
+- Attach barely moves with the file count, and most of it is the store
+  open. Ten times the files cost 53 ms more.
+- The plan is what grows, 90 ms to 593 ms, and the warm repeat tracks it
+  at 571 ms while issuing no object-store request at all. That cost is
+  DuckDB planning over the file list, not the catalog reading it.
+- A cold attach reads seven objects at either size.
+
 <!-- site:omit -->
 Findings, 2026-08, before the demand-loaded catalog:
 
@@ -779,16 +801,24 @@ the changes arm of DuckLake's commit-time conflict check twenty times. GETs are
 what the twenty runs issued; the per-check time is amortized against a session
 that runs none, through the DuckDB CLI over a local store:
 
-| retained | GETs, every snapshot read | GETs, from the floor | ms per check, before | after |
+The floor columns are the current code on the benchmark
+runner<!-- site:omit -->, 2026-11-17 at `fd1b99e`<!-- /site:omit -->; the
+paged-scan columns are the code it replaced and cannot be re-measured:
+
+| retained | GETs, paged scan | GETs, from the floor | ms per check, paged | floor |
 |---:|---:|---:|---:|---:|
-| 128 | 302 | 0 | 12.8 | 1.6 |
-| 512 | 607 | 0 | 7.5 | 1.1 |
-| 2,048 | 1,553 | 0 | noise | 0.5 |
+| 128 | 302 | 232 | 12.8 | 1.22 |
+| 512 | 607 | 143 | 7.5 | 0.27 |
+| 2,048 | 1,553 | 141 | noise | 0.03 |
 
 The paged scan read and decoded every retained snapshot and DuckDB filtered
-afterwards. A cursor that opens at the pushed `snapshot_id` floor reads the
-snapshots since the transaction began, which the block cache already holds,
-so the check issues no object-store read at any retained count.
+afterwards, so both its reads and its time grew with the retained count. A
+cursor that opens at the pushed `snapshot_id` floor reads only the snapshots
+since the transaction began, so its cost is **flat in the retained count**
+instead: about 140 reads over twenty checks whether 512 snapshots are
+retained or 2,048, against 607 and 1,553 before. At 2,048 retained that is
+eleven times fewer reads, and the check falls below a tenth of a
+millisecond.
 
 <!-- site:omit -->
 ### Worker pool
@@ -851,7 +881,9 @@ reads with and without the located join.
 <!-- site:omit -->
 Apple M2,64 files × 8,000 rows: 121,664 summary bytes (a quarter
 byte per row), 0.2 ms warm lookup, and after six update batches the row-id
-path reads 7 files where the located join reads 1.
+path reads 7 files where the located join reads 1. The benchmark runner at
+`fd1b99e` (2026-11-17), 16 files × 2,000 rows over AWS S3: 166,008 summary
+bytes, 79 ms cold, 1.4 ms warm, and the same 7-against-1 after six batches.
 
 `measure_located_lookup_latency_against_the_endpoint` builds summaries
 from 64 real Parquet objects on AWS S3 (2026-08-16): 463 ms cold with 96
@@ -890,16 +922,18 @@ reuses an earlier run's data. Output is CSV.
 ### Staged index build
 
 `measure_staged_build_peak_heap` profiles one `create_index_staged` call
-with dhat's allocator, 1,024-byte string values, 8 MiB cache:
+with dhat's allocator, 1,024-byte string values, 8 MiB cache. A local
+filesystem store on the `c6i.2xlarge` benchmark runner<!-- site:omit -->,
+2026-11-17 at `fd1b99e`<!-- /site:omit -->:
 
 | chunks × rows | step entries | peak heap | retained at return | time |
 |---|---:|---:|---:|---:|
-| 16 × 128 | 128 | 3.40 MB | 2.65 MB | 0.36 s |
-| 128 × 128 | 128 | 22.80 MB | 21.08 MB | 4.9 s |
-| 128 × 128 | 16 | 25.16 MB | 22.63 MB | 74 s |
-| 16 × 1,024 | 128 | 23.56 MB | 21.06 MB | 3.5 s |
+| 16 × 128 | 128 | 3.16 MB | 2.66 MB | 0.16 s |
+| 128 × 128 | 128 | 22.66 MB | 21.19 MB | 1.7 s |
+| 128 × 128 | 16 | 25.19 MB | 23.33 MB | 22 s |
+| 16 × 1,024 | 128 | 23.38 MB | 21.13 MB | 1.3 s |
 
 `BuildStep.entries` bounds the commit buffer, not the heap; most of the
-peak is the resulting index and store buffers. A smaller step costs 15×
+peak is the resulting index and store buffers. A smaller step costs 13×
 the time for no memory gain. Before streaming, the 128 × 128 case peaked
 at 40 MB.

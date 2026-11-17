@@ -523,16 +523,13 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
     while provider.polls() < polls + 2 && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    // A superseded publication keeps the slots it replays from until its
-    // lifetime ends; stand in for that expiry so this flush may truncate.
+    // A reader's own checkpoint keeps the slots it replays from until the
+    // reader lets go; release the superseded ones so this flush may truncate.
     let admin = slatedb::admin::AdminBuilder::new("lake", object_store.clone()).build();
-    let mut published = admin
-        .list_checkpoints(Some(crate::store::checkpoint::PUBLISHED_NAME))
-        .await
-        .unwrap();
-    published.sort_by_key(|checkpoint| checkpoint.manifest_id);
-    published.pop();
-    for checkpoint in published {
+    let mut checkpoints = admin.list_checkpoints(None).await.unwrap();
+    checkpoints.sort_by_key(|checkpoint| checkpoint.manifest_id);
+    checkpoints.pop();
+    for checkpoint in checkpoints {
         admin.delete_checkpoint(checkpoint.id).await.unwrap();
     }
     for name in ["c", "d"] {
@@ -1156,10 +1153,9 @@ async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
         .unwrap();
     let view = reader.materialized().await.unwrap();
     assert!(view.schema_by_name("landed").is_some());
-    assert_eq!(
-        reader_provider.polls(),
-        idle,
-        "the fixed checkpoint needs no live-reader refresh"
+    assert!(
+        reader_provider.polls() <= idle + 1,
+        "a log scope polls only to establish its own reader, not to track the committer"
     );
 
     reader.close().await.unwrap();

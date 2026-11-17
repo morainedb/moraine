@@ -1,4 +1,4 @@
-//! Acquires fixed log views or shares native published readers.
+//! Acquires fixed log views or shares native store readers.
 
 use std::{
     sync::{Arc, Weak},
@@ -12,10 +12,7 @@ use tokio::{sync::Mutex, time::Instant};
 use super::{CatalogOptions, commit_log_provider, reader_session};
 use crate::{
     Error, Result,
-    store::{
-        checkpoint::{CheckpointReader, PUBLISHED_NAME, READ_GRACE},
-        open::StoreBuilder,
-    },
+    store::{checkpoint::CheckpointReader, open::StoreBuilder},
 };
 
 const MAX_READER_GENERATIONS: usize = 8;
@@ -27,8 +24,8 @@ mod tests;
 struct Readers {
     latest: Option<Arc<CheckpointReader>>,
     generations: Vec<Weak<CheckpointReader>>,
-    /// When the publications were last listed.
-    listed: Option<Instant>,
+    /// When the shared reader was opened.
+    opened: Option<Instant>,
 }
 
 pub(crate) struct ReaderScopes {
@@ -36,8 +33,8 @@ pub(crate) struct ReaderScopes {
     options: CatalogOptions,
     readers: Mutex<Readers>,
     explicit: Option<Arc<CheckpointReader>>,
-    /// How long a scope may keep the publication its predecessor listed
-    /// before listing again. Zero lists on every scope.
+    /// How long a scope may share the reader its predecessor opened before
+    /// opening a newer one. Zero opens one per scope.
     reuse: Duration,
 }
 
@@ -84,58 +81,62 @@ impl ReaderScopes {
         builder.reader_session(session)
     }
 
-    /// The shared reader, when it was listed inside the reuse window and has
-    /// at least half the grace left; a reader with no deadline follows the
-    /// store itself.
-    fn unexpired(&self, readers: &Readers) -> Option<Arc<CheckpointReader>> {
+    /// The shared reader, while it is inside the reuse window. Past it a
+    /// scope opens its own, which is what makes a commit by another process
+    /// visible: a reader advances only on its own manifest poll.
+    fn reusable(&self, readers: &Readers) -> Option<Arc<CheckpointReader>> {
         let latest = readers.latest.as_ref()?;
-        if readers.listed?.elapsed() >= self.reuse {
+        if readers.opened?.elapsed() >= self.reuse {
             return None;
         }
-        if latest
-            .remaining()
-            .is_some_and(|remaining| remaining < READ_GRACE / 2)
-        {
-            return None;
-        }
-        latest.reader().ok()?;
         Some(latest.clone())
     }
 
-    /// A reader for a store with no publication: the writer is gone and its
-    /// publication has expired and been collected. The reader keeps a
-    /// checkpoint of its own on the latest manifest, as a plain SlateDB
-    /// reader does; a store that refuses the write is followed unprotected.
-    async fn unpublished(&self, readers: &mut Readers) -> Result<Arc<CheckpointReader>> {
-        if let Some(latest) = readers
+    /// Opens a reader over the latest state, keeping a checkpoint of its own
+    /// so collection cannot take what it reads. A store that refuses that
+    /// write is followed on retention alone, under a read window.
+    async fn open(&self, readers: &mut Readers) -> Result<Arc<CheckpointReader>> {
+        readers
+            .generations
+            .retain(|reader| reader.strong_count() != 0);
+        if readers.generations.len() >= MAX_READER_GENERATIONS {
+            return Err(Error::Constraint(format!(
+                "catalog read generation limit ({MAX_READER_GENERATIONS}) reached; finish an older transaction before opening another"
+            )));
+        }
+
+        let unused_latest = readers
             .latest
             .as_ref()
-            .filter(|latest| latest.remaining().is_none())
-        {
-            return Ok(latest.clone());
+            .is_some_and(|reader| Arc::strong_count(reader) == 1);
+        if unused_latest && let Some(latest) = readers.latest.take() {
+            match Arc::try_unwrap(latest) {
+                Ok(latest) => latest.retire().await,
+                Err(latest) => readers.latest = Some(latest),
+            }
         }
-        let opened = match self
+
+        let reader = match self
             .builder()
             .reader_mode(slatedb::DbReaderMode::ManagedCheckpoint)
             .open_reader()
             .await
         {
-            Ok(opened) => opened,
+            Ok((opened, _)) => CheckpointReader::fixed(opened),
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    "no publication and no checkpoint of our own; following the latest manifest"
+                    "could not keep a checkpoint of our own; following the latest manifest"
                 );
-                self.builder()
+                let (opened, _) = self
+                    .builder()
                     .reader_mode(slatedb::DbReaderMode::FollowLatest)
                     .open_reader()
-                    .await?
+                    .await?;
+                CheckpointReader::following(opened)
             }
         };
-        let reader = CheckpointReader::fixed(opened.0);
-        readers
-            .generations
-            .retain(|reader| reader.strong_count() != 0);
+        readers.opened = Some(Instant::now());
         readers.latest = Some(reader.clone());
         readers.generations.push(Arc::downgrade(&reader));
         Ok(reader)
@@ -151,80 +152,10 @@ impl ReaderScopes {
             return Ok(CheckpointReader::fixed(reader));
         }
         let mut readers = self.readers.lock().await;
-        if let Some(reader) = self.unexpired(&readers) {
+        if let Some(reader) = self.reusable(&readers) {
             return Ok(reader);
         }
-        let admin = Arc::new(self.builder().admin());
-        for _ in 0..crate::transaction::commit::MAX_COMMIT_ATTEMPTS {
-            let listed = Instant::now();
-            let published = admin
-                .list_checkpoints(Some(PUBLISHED_NAME))
-                .await?
-                .into_iter()
-                .max_by_key(|checkpoint| checkpoint.manifest_id);
-            readers.listed = Some(listed);
-            let Some(published) = published else {
-                return self.unpublished(&mut readers).await;
-            };
-            // The newest publication is current whatever its expiry says: the
-            // writer refreshes it while alive, and a closed writer's is
-            // permanent. The expiry governs only publications it superseded.
-            let expires = None;
-            if let Some(latest) = &readers.latest
-                && latest.manifest == published.manifest_id
-            {
-                latest.confirm(listed, expires);
-                if latest.reader().is_ok() {
-                    return Ok(latest.clone());
-                }
-            }
-            let unused_latest = readers
-                .latest
-                .as_ref()
-                .is_some_and(|reader| Arc::strong_count(reader) == 1);
-            if unused_latest && let Some(latest) = readers.latest.take() {
-                match Arc::try_unwrap(latest) {
-                    Ok(latest) => latest.retire().await,
-                    Err(latest) => readers.latest = Some(latest),
-                }
-            }
-            readers
-                .generations
-                .retain(|reader| reader.strong_count() != 0);
-            if readers.generations.len() >= MAX_READER_GENERATIONS {
-                return Err(Error::Constraint(format!(
-                    "catalog read generation limit ({MAX_READER_GENERATIONS}) reached; finish an older transaction before opening another"
-                )));
-            }
-            let opened = self
-                .builder()
-                .checkpoint(Some(published.id))
-                .open_reader()
-                .await;
-            let (reader, _) = match opened {
-                Ok(reader) => reader,
-                Err(error) => {
-                    // Retry only a publication that lapsed during acquisition.
-                    if admin
-                        .list_checkpoints(Some(PUBLISHED_NAME))
-                        .await?
-                        .iter()
-                        .any(|checkpoint| checkpoint.id == published.id)
-                    {
-                        return Err(error);
-                    }
-                    continue;
-                }
-            };
-            let reader = CheckpointReader::pinned(reader, published.manifest_id, listed, expires);
-            reader.reader()?;
-            readers.latest = Some(reader.clone());
-            readers.generations.push(Arc::downgrade(&reader));
-            return Ok(reader);
-        }
-        Err(Error::RetryBudgetExhausted(
-            "published read checkpoints changed during acquisition".into(),
-        ))
+        self.open(&mut readers).await
     }
 
     pub(super) async fn close(&self) {

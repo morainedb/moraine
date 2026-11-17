@@ -548,7 +548,6 @@ async fn read_only_reads_the_committed_catalog_but_rejects_writes() {
         .unwrap();
 
     // A read-only attach sees the committed state.
-    writer.publish_now().await.unwrap();
     let reader = Catalog::open_read_only(store.clone(), CatalogOptions::default())
         .await
         .unwrap();
@@ -576,7 +575,6 @@ async fn read_only_attach_does_not_fence_the_live_writer() {
         .unwrap();
 
     // Attach a reader while the writer is live.
-    writer.publish_now().await.unwrap();
     let reader = Catalog::open_read_only(store.clone(), CatalogOptions::default())
         .await
         .unwrap();
@@ -596,7 +594,6 @@ async fn read_only_attach_does_not_fence_the_live_writer() {
         .commit(async |tx| tx.create_schema("second").await.map(|_| ()))
         .await
         .unwrap();
-    writer.publish_now().await.unwrap();
 
     // A freshly attached reader sees the newer state.
     let reader2 = Catalog::open_read_only(store.clone(), CatalogOptions::default())

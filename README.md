@@ -81,9 +81,11 @@ availability zone, medians of three runs at `fd1b99e`:
 | read a count once attached | 26 ms | 29 ms | 29 ms | 68 ms |
 | full scan | 138 ms | 54 ms | 36 ms | 75 ms |
 
-A commit on an object store is bound by requests, not by bandwidth: five
-sequential round trips, which is why one connection is slower here than a
-catalog on a local file or a nearby Postgres. Overlapping transactions
+A commit on an object store is bound by requests, not by bandwidth: one
+write-ahead-log flush to make it durable, plus a share of the paced
+publication that makes it visible to other processes — about two requests
+and 47 ms. That durable round trip is why one connection is slower here
+than a catalog on a local file or a nearby Postgres. Overlapping transactions
 within one process share a single write-ahead-log flush, so Moraine's
 throughput rises where the others' falls — their per-commit statement
 chain and conflict retries grow with contention.

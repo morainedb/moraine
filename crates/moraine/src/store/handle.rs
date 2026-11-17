@@ -146,7 +146,8 @@ pub(crate) enum ReadHandle<'a> {
     Writer(&'a Db),
 }
 
-/// A scan that retains and checks its checkpoint protection between batches.
+/// A scan that retains its reader and rechecks the read window between
+/// batches.
 pub(crate) struct ScanIterator {
     iterator: DbIterator,
     checkpoint: Option<Arc<super::checkpoint::CheckpointReader>>,
@@ -166,13 +167,14 @@ impl ScanIterator {
 }
 
 impl ReadHandle<'_> {
-    /// Refuses a checkpoint whose lease no longer protects its backing files.
+    /// Refuses a reader whose read window has elapsed.
     pub(crate) fn validate(&self) -> Result<(), slatedb::Error> {
         if let Self::Checkpoint(reader) = self {
             reader.reader()?;
         }
         Ok(())
     }
+
     /// Point read of one key.
     pub(crate) async fn get<K: AsRef<[u8]> + Send>(
         &self,

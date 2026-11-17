@@ -36,6 +36,11 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// configured (SlateDB's own default).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a reader's view of the store outlives the moment it opened.
+/// A reader keeps no checkpoint, so the collector's retention is what lets a
+/// transaction finish reading the state it started on; it must therefore
+/// exceed the longest transaction.
+pub(crate) const READ_WINDOW: Duration = Duration::from_mins(15);
 /// How often a writer polls the manifest for fencing and compacted state;
 /// each poll is one object-store read.
 const WRITER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -505,6 +510,20 @@ impl<'a> StoreBuilder<'a> {
             min_filter_keys: MIN_FILTER_KEYS,
             ..Default::default()
         };
+
+        // Readers write nothing, so retention is the only thing keeping
+        // what they read: the collector must not take an object a live
+        // transaction still needs.
+        let retained = slatedb::config::GarbageCollectorDirectoryOptions {
+            min_age: READ_WINDOW,
+            ..Default::default()
+        };
+        settings.garbage_collector_options = Some(slatedb::config::GarbageCollectorOptions {
+            wal_options: Some(retained),
+            compacted_options: Some(retained),
+            ..Default::default()
+        });
+
         if self.external_compaction {
             settings.compactor_options = None;
             settings.garbage_collector_options = None;

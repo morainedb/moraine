@@ -168,23 +168,7 @@ pub(crate) async fn await_durable(
         // The flush the pacer performs or waits for is what puts the
         // batch in object storage.
         CommitDurability::Paced(pacer) => {
-            let sequence = handle.seqnum();
-            reporting_stalls(operation, staged, pacer.await_durable(handle, commits)).await?;
-
-            // A bootstrap waits: its catalog has to be readable from another
-            // process the moment the statement returns. Every other commit
-            // is committed once durable, and its publication follows within
-            // the pacing interval.
-            if operation == "bootstrap" {
-                return reporting_stalls(
-                    "checkpoint publication",
-                    staged,
-                    pacer.publish_through(sequence),
-                )
-                .await;
-            }
-            pacer.request_publication(sequence);
-            Ok(())
+            reporting_stalls(operation, staged, pacer.await_durable(handle, commits)).await
         }
     }
 }
@@ -489,11 +473,7 @@ async fn open_attempt(
 ) -> std::result::Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>), OpenFailure> {
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
-    let pacer = if log_resident {
-        FlushPacer::new(db.clone(), flush_spacing)
-    } else {
-        FlushPacer::publishing(db.clone(), flush_spacing, store.admin())
-    };
+    let pacer = FlushPacer::new(db.clone(), flush_spacing);
     info!(
         writer_open_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-write"
@@ -505,11 +485,6 @@ async fn open_attempt(
             let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
             agreed.map_err(OpenFailure::Fatal)?;
-            pacer
-                .publish_through(db.status().durable_seq)
-                .await
-                .map_err(Error::from)
-                .map_err(OpenFailure::Fatal)?;
             return Ok((db, counters, format.format_version, pacer));
         }
         Ok(None) => {}
