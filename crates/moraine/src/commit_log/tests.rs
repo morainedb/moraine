@@ -523,16 +523,13 @@ async fn the_cadence_takes_the_store_folds_and_truncates() {
     while provider.polls() < polls + 2 && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    // A superseded publication keeps the slots it replays from until its
-    // lifetime ends; stand in for that expiry so this flush may truncate.
+    // A reader's own checkpoint keeps the slots it replays from until the
+    // reader lets go; release the superseded ones so this flush may truncate.
     let admin = slatedb::admin::AdminBuilder::new("lake", object_store.clone()).build();
-    let mut published = admin
-        .list_checkpoints(Some(crate::store::checkpoint::PUBLISHED_NAME))
-        .await
-        .unwrap();
-    published.sort_by_key(|checkpoint| checkpoint.manifest_id);
-    published.pop();
-    for checkpoint in published {
+    let mut checkpoints = admin.list_checkpoints(None).await.unwrap();
+    checkpoints.sort_by_key(|checkpoint| checkpoint.manifest_id);
+    checkpoints.pop();
+    for checkpoint in checkpoints {
         admin.delete_checkpoint(checkpoint.id).await.unwrap();
     }
     for name in ["c", "d"] {
@@ -1124,6 +1121,10 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
 /// A fixed read sees committed state without requesting a live-reader poll.
 #[tokio::test]
 async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
+    // Building a managed-checkpoint reader's state and its first poll each
+    // probe the log tail; neither repeats per commit.
+    const ESTABLISH_POLLS: u64 = 2;
+
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -1150,16 +1151,18 @@ async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
     .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let idle = reader_provider.polls();
-    committer
-        .commit_materialized(|tx| tx.create_schema("landed").map(|_| ()))
-        .await
-        .unwrap();
+    for index in 0..4 {
+        committer
+            .commit_materialized(|tx| tx.create_schema(&format!("landed{index}")).map(|_| ()))
+            .await
+            .unwrap();
+    }
     let view = reader.materialized().await.unwrap();
-    assert!(view.schema_by_name("landed").is_some());
-    assert_eq!(
-        reader_provider.polls(),
-        idle,
-        "the fixed checkpoint needs no live-reader refresh"
+    assert!(view.schema_by_name("landed3").is_some());
+    let polls = reader_provider.polls();
+    assert!(
+        polls <= idle + ESTABLISH_POLLS,
+        "a log scope polls to establish its own reader, not once per commit: {polls} polls against {idle} idle"
     );
 
     reader.close().await.unwrap();

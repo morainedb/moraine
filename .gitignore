@@ -32,3 +32,13 @@
 
 # Project
 /docs/plans
+
+# Benchmark infrastructure: provider downloads, and state, which holds the
+# generated database password in clear text. `.terraform.lock.hcl` is
+# committed.
+/benchmark/infra/.terraform
+/benchmark/infra/*.tfstate
+/benchmark/infra/*.tfstate.*
+/benchmark/infra/*.tfvars
+/benchmark/infra/.terraform.tfstate.lock.info
+/benchmark/infra/tfplan

@@ -29,17 +29,30 @@ impl CatalogTarget {
     /// and the AWS region from the environment; without a bucket, keeps the
     /// catalog under `local_root`.
     pub fn from_environment(local_root: PathBuf) -> Self {
-        match env::var("MORAINE_S3_BUCKET") {
-            Ok(bucket) => Self::S3(S3Target {
-                bucket,
-                prefix: env::var("MORAINE_S3_PREFIX").unwrap_or_default(),
-                endpoint: env::var("MORAINE_S3_ENDPOINT").ok(),
-                region: env::var("AWS_REGION")
-                    .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-                    .unwrap_or_else(|_| "us-east-1".to_owned()),
-            }),
-            Err(_) => Self::Local(local_root),
+        match Self::s3_from("MORAINE_S3_BUCKET") {
+            Some(target) => target,
+            None => Self::Local(local_root),
         }
+    }
+
+    /// The S3 Express store named by `MORAINE_S3_EXPRESS_BUCKET`, so one
+    /// run can measure both stores. `None` leaves that backend out.
+    pub fn express_from_environment() -> Option<Self> {
+        Self::s3_from("MORAINE_S3_EXPRESS_BUCKET")
+    }
+
+    /// An S3 target over the bucket named by `bucket_variable`, sharing
+    /// the prefix, endpoint and region of every other S3 target.
+    fn s3_from(bucket_variable: &str) -> Option<Self> {
+        let bucket = env::var(bucket_variable).ok()?;
+        Some(Self::S3(S3Target {
+            bucket,
+            prefix: env::var("MORAINE_S3_PREFIX").unwrap_or_default(),
+            endpoint: env::var("MORAINE_S3_ENDPOINT").ok(),
+            region: env::var("AWS_REGION")
+                .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_owned()),
+        }))
     }
 
     /// As [`from_environment`](Self::from_environment), refusing to run
@@ -66,6 +79,23 @@ impl CatalogTarget {
         matches!(self, Self::S3(_))
     }
 
+    /// The extensions an attach needs ahead of its secret: `httpfs` for
+    /// any S3 store, and `aws` for the credential chain. DuckDB would
+    /// autoload `aws` itself, but autoload resolves against the build's
+    /// own extension repository, which carries only what this repository
+    /// builds.
+    pub fn extensions_sql(&self) -> String {
+        let Self::S3(target) = self else {
+            return String::new();
+        };
+
+        let mut sql = "INSTALL httpfs;\nLOAD httpfs;\n".to_owned();
+        if target.endpoint.is_none() {
+            sql.push_str("INSTALL aws;\nLOAD aws;\n");
+        }
+        sql
+    }
+
     /// The `CREATE SECRET` the attach needs, if any.
     pub fn secret_sql(&self) -> anyhow::Result<Option<String>> {
         let Self::S3(target) = self else {
@@ -73,8 +103,15 @@ impl CatalogTarget {
         };
         let region = sql_literal(&target.region);
         let Some(endpoint) = &target.endpoint else {
+            // The default chain consults the profile file first and fails
+            // where there is none, so a machine whose only credentials are
+            // an instance profile names `instance` here.
+            let chain = env::var("MORAINE_S3_CREDENTIAL_CHAIN")
+                .map(|chain| format!(", CHAIN {}", sql_literal(&chain)))
+                .unwrap_or_default();
             return Ok(Some(format!(
-                "CREATE SECRET moraine_bench (TYPE s3, PROVIDER credential_chain, REGION {region});"
+                "CREATE SECRET moraine_bench (TYPE s3, PROVIDER credential_chain, \
+                 REGION {region}{chain});"
             )));
         };
 
@@ -116,6 +153,42 @@ impl CatalogTarget {
             Self::Local(root) => root.join(leaf).display().to_string(),
         })
     }
+
+    /// The `host:port` a round-trip probe should dial for this store, or
+    /// `None` for a local directory. A directory bucket carries its zone in
+    /// its name, which is what distinguishes the S3 Express host from S3's.
+    pub fn probe_target(&self) -> Option<String> {
+        let Self::S3(target) = self else {
+            return None;
+        };
+
+        if let Some(endpoint) = &target.endpoint {
+            let (scheme, authority) = endpoint
+                .split_once("://")
+                .unwrap_or(("https", endpoint.as_str()));
+            let authority = authority.trim_end_matches('/');
+            if authority.contains(':') {
+                return Some(authority.to_owned());
+            }
+            let port = if scheme == "http" { 80 } else { 443 };
+            return Some(format!("{authority}:{port}"));
+        }
+
+        let host = match express_zone(&target.bucket) {
+            Some(zone) => format!("s3express-{zone}.{}.amazonaws.com", target.region),
+            None => format!("s3.{}.amazonaws.com", target.region),
+        };
+        Some(format!("{host}:443"))
+    }
+}
+
+/// The zone in a directory bucket's name, as `use1-az4` in
+/// `bench--use1-az4--x-s3`.
+fn express_zone(bucket: &str) -> Option<&str> {
+    bucket
+        .strip_suffix("--x-s3")?
+        .rsplit_once("--")
+        .map(|(_, zone)| zone)
 }
 
 /// `value` as a single-quoted SQL string literal.
@@ -134,6 +207,88 @@ mod tests {
         assert!(uri.starts_with("/tmp/bench/reader-"), "{uri}");
         assert!(!target.is_remote());
         assert!(target.secret_sql().unwrap().is_none());
+    }
+
+    #[test]
+    fn only_the_credential_chain_pulls_in_the_aws_extension() {
+        let chain = CatalogTarget::S3(S3Target {
+            bucket: "bench".to_owned(),
+            prefix: String::new(),
+            endpoint: None,
+            region: "us-east-1".to_owned(),
+        });
+        assert_eq!(
+            chain.extensions_sql(),
+            "INSTALL httpfs;\nLOAD httpfs;\nINSTALL aws;\nLOAD aws;\n"
+        );
+
+        // An explicit endpoint carries its own keys, so nothing resolves
+        // a credential chain and `aws` is not needed.
+        let explicit = CatalogTarget::S3(S3Target {
+            bucket: "bench".to_owned(),
+            prefix: String::new(),
+            endpoint: Some("http://127.0.0.1:9124".to_owned()),
+            region: "us-east-1".to_owned(),
+        });
+        assert_eq!(explicit.extensions_sql(), "INSTALL httpfs;\nLOAD httpfs;\n");
+
+        assert!(
+            CatalogTarget::Local(PathBuf::from("/tmp"))
+                .extensions_sql()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_probe_dials_the_express_host_for_a_directory_bucket() {
+        let express = CatalogTarget::S3(S3Target {
+            bucket: "bench-1a2b--use1-az4--x-s3".to_owned(),
+            prefix: String::new(),
+            endpoint: None,
+            region: "us-east-1".to_owned(),
+        });
+        assert_eq!(
+            express.probe_target(),
+            Some("s3express-use1-az4.us-east-1.amazonaws.com:443".to_owned())
+        );
+
+        let standard = CatalogTarget::S3(S3Target {
+            bucket: "bench-1a2b".to_owned(),
+            prefix: String::new(),
+            endpoint: None,
+            region: "eu-west-2".to_owned(),
+        });
+        assert_eq!(
+            standard.probe_target(),
+            Some("s3.eu-west-2.amazonaws.com:443".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_probe_takes_an_explicit_endpoints_own_host_and_port() {
+        let with_port = CatalogTarget::S3(S3Target {
+            bucket: "bench".to_owned(),
+            prefix: String::new(),
+            endpoint: Some("http://127.0.0.1:9124".to_owned()),
+            region: "us-east-1".to_owned(),
+        });
+        assert_eq!(with_port.probe_target(), Some("127.0.0.1:9124".to_owned()));
+
+        let without_port = CatalogTarget::S3(S3Target {
+            bucket: "bench".to_owned(),
+            prefix: String::new(),
+            endpoint: Some("http://store.internal".to_owned()),
+            region: "us-east-1".to_owned(),
+        });
+        assert_eq!(
+            without_port.probe_target(),
+            Some("store.internal:80".to_owned())
+        );
+
+        assert_eq!(
+            CatalogTarget::Local(PathBuf::from("/tmp")).probe_target(),
+            None
+        );
     }
 
     #[test]

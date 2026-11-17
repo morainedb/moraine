@@ -1,0 +1,75 @@
+#!/bin/bash
+set -euo pipefail
+
+dnf install -y tar gzip
+
+# Swap, so memory pressure slows this server rather than wedging it. Under
+# a five-backend sweep the OOM killer took the instance agent with it,
+# leaving a socket that accepted connections and answered none.
+if [ ! -f /swapfile ]; then
+  fallocate -l 4G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo "/swapfile none swap sw 0 0" >> /etc/fstab
+fi
+
+useradd --system --home-dir /var/lib/quack --shell /sbin/nologin quack || true
+install -d -o quack -g quack -m 0750 /var/lib/quack
+install -d -m 0755 /etc/quack
+
+curl -fsSL -o /tmp/duckdb-cli.tar.gz \
+  "https://github.com/duckdb/duckdb/releases/download/${duckdb_version}/${cli_asset}"
+tar -xzf /tmp/duckdb-cli.tar.gz -C /usr/local/bin duckdb
+chmod 0755 /usr/local/bin/duckdb
+rm -f /tmp/duckdb-cli.tar.gz
+
+cat > /etc/quack/server.crt <<'CERT'
+${trimspace(cert_pem)}
+CERT
+cat > /etc/quack/server.key <<'KEY'
+${trimspace(key_pem)}
+KEY
+chown root:quack /etc/quack/server.crt /etc/quack/server.key
+chmod 0644 /etc/quack/server.crt
+chmod 0640 /etc/quack/server.key
+
+# `.bail on` matters: without it a rejected serve call leaves the CLI
+# running with no server, and systemd sees a healthy unit.
+cat > /etc/quack/serve.sql <<'SQL'
+.bail on
+INSTALL quack;
+LOAD quack;
+CALL quack_serve(
+  'quack:0.0.0.0:${port}',
+  token => '${token}',
+  allow_other_hostname => true,
+  ssl_cert_file => '/etc/quack/server.crt',
+  ssl_key_file => '/etc/quack/server.key'
+);
+SQL
+chown root:quack /etc/quack/serve.sql
+chmod 0640 /etc/quack/serve.sql
+
+# The CLI reads its script from stdin and exits at end of input, so the
+# pipe stays open for the life of the service.
+cat > /etc/systemd/system/quack.service <<'UNIT'
+[Unit]
+Description=DuckDB Quack server for moraine benchmarks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=quack
+Environment=HOME=/var/lib/quack
+WorkingDirectory=/var/lib/quack
+ExecStart=/bin/bash -c '{ cat /etc/quack/serve.sql; tail -f /dev/null; } | exec /usr/local/bin/duckdb -batch -csv /var/lib/quack/bench.duckdb'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now quack.service

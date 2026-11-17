@@ -30,21 +30,38 @@ impl Statement {
 }
 
 /// Extracts the `real` seconds from every `Run Time (s)` line, in order.
+/// A warning the CLI prints in colour ends with a reset sequence on the
+/// timer's line, so terminal escapes are stripped before matching.
 pub fn parse_run_times(stdout: &str) -> Vec<f64> {
     stdout
         .lines()
         .filter_map(|line| {
-            let rest = line.strip_prefix("Run Time (s): real ")?;
+            let plain = strip_terminal_escapes(line);
+            let rest = plain.strip_prefix("Run Time (s): real ")?;
             let real = rest.split_whitespace().next()?;
             real.parse().ok()
         })
         .collect()
 }
 
+/// `line` without its `ESC [ ... m` colour sequences.
+pub fn strip_terminal_escapes(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("\x1b[") {
+        plain.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('m') {
+            Some(end) => rest = &after[end + 1..],
+            None => return plain,
+        }
+    }
+    plain.push_str(rest);
+    plain
+}
+
 /// Zips `stdout`'s run-time lines with `statements` by index and sums the
 /// `real` seconds per phase, preserving first-appearance phase order.
-/// A count mismatch means a statement errored or the CLI's output format
-/// changed; both invalidate the whole session, so it is a hard error.
 pub fn phase_seconds(
     statements: &[Statement],
     stdout: &str,
@@ -104,6 +121,14 @@ mod tests {
         let out = "1\nRun Time (s): real 0.316 user 0.001339 sys 0.004215\ncount_star()\n1000\n\
                    Run Time (s): real 0.003 user 0.000679 sys 0.000906\n";
         assert_eq!(parse_run_times(out), vec![0.316, 0.003]);
+    }
+
+    #[test]
+    fn a_colour_reset_before_the_timer_line_does_not_hide_it() {
+        let out = "\x1b[90mWARNING:\n\x1b[00m\x1b[90msome warning text\n\n\
+                   \x1b[00mRun Time (s): real 0.339 user 0.036945 sys 0.020743\n\
+                   Run Time (s): real 0.279 user 0.155977 sys 0.021373\n";
+        assert_eq!(parse_run_times(out), vec![0.339, 0.279]);
     }
 
     #[test]

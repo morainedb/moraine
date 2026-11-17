@@ -16,6 +16,7 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 
+use super::concurrent::{Bound, Outcome};
 use crate::duckdb;
 
 /// The driver's source, relative to the workspace root.
@@ -72,22 +73,27 @@ fn needs_build(source: &Path, binary: &Path) -> bool {
     }
 }
 
-/// Runs one burst of `writers` connections committing `commits_each` times
-/// apiece against `attach`, and returns the window the driver timed.
+/// Runs one burst of `writers` connections against `attach` under
+/// `bound`, and returns the window the driver timed with the commits that
+/// landed in it. `preamble` runs ahead of the attach in the same setup
+/// query, which the driver executes as one multi-statement string.
 pub fn run(
     driver: &Path,
+    preamble: &str,
     attach: &str,
     writers: usize,
-    commits_each: u64,
+    bound: Bound,
     indexed: bool,
-) -> anyhow::Result<Duration> {
+    shared: bool,
+) -> anyhow::Result<Outcome> {
     let output = Command::new(driver)
         .arg(duckdb::extension_install_directory())
         .arg(extension_path()?)
-        .arg(attach)
+        .arg(format!("{preamble}{attach}"))
         .arg(writers.to_string())
-        .arg(commits_each.to_string())
+        .arg(driver_bound(bound))
         .args(indexed.then_some("indexed"))
+        .args(shared.then_some("shared"))
         .output()
         .context("running the concurrent-writer driver")?;
     ensure!(
@@ -96,9 +102,21 @@ pub fn run(
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    Ok(Duration::from_secs_f64(parse_elapsed(
-        &String::from_utf8_lossy(&output.stdout),
-    )?))
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(Outcome {
+        elapsed: Duration::from_secs_f64(parse_elapsed(&stdout)?),
+        commits: parse_commits(&stdout)?,
+    })
+}
+
+/// How the driver is told what bounds a writer: a commit count, or
+/// seconds with a trailing `s`.
+fn driver_bound(bound: Bound) -> String {
+    match bound {
+        Bound::Commits(each) => each.to_string(),
+        Bound::Window(window) => format!("{}s", window.as_secs_f64()),
+    }
 }
 
 /// The packaged extension the driver loads.
@@ -111,6 +129,20 @@ fn extension_path() -> anyhow::Result<PathBuf> {
         path.display()
     );
     Ok(path)
+}
+
+/// Reads the driver's `commits=` line.
+fn parse_commits(stdout: &str) -> anyhow::Result<u64> {
+    let Some(value) = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("commits="))
+    else {
+        bail!("the driver printed no `commits` line:\n{stdout}");
+    };
+    value
+        .parse()
+        .with_context(|| format!("parsing `{value}` as a commit count"))
 }
 
 /// Reads the driver's `elapsed_seconds=` line.
@@ -138,6 +170,21 @@ mod tests {
         };
         assert!(close("elapsed_seconds=1.250000\n", 1.25));
         assert!(close("note: warming up\nelapsed_seconds=0.5\n", 0.5));
+    }
+
+    #[test]
+    fn the_driver_reports_what_it_committed() {
+        assert_eq!(
+            parse_commits("elapsed_seconds=1.0\ncommits=4096\n").unwrap(),
+            4096
+        );
+        assert!(parse_commits("elapsed_seconds=1.0\n").is_err());
+    }
+
+    #[test]
+    fn a_bound_is_a_count_or_seconds_with_a_suffix() {
+        assert_eq!(driver_bound(Bound::Commits(16)), "16");
+        assert_eq!(driver_bound(Bound::Window(Duration::from_secs(5))), "5s");
     }
 
     #[test]
