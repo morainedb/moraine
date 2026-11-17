@@ -66,36 +66,29 @@ SELECT payload FROM lake.events WHERE id = 2;
 ## By the numbers
 
 Identical DuckLake workloads through the same DuckDB CLI, only the catalog
-swapped, each on the store it would really use: Moraine on S3 and on S3
-Express, Postgres on RDS, a DuckDB catalog file on local disk, since that
-is its only option. One `c6i.2xlarge` runner and every endpoint in its
-availability zone, medians of three runs at `fd1b99e`:
+swapped, each on the store it would really use: Moraine on S3, the same
+with its write-ahead log on S3 Express, Postgres on RDS, and a DuckDB
+catalog file on local disk, since that is its only option.
 
-| | Moraine | Moraine on Express | DuckDB file | Postgres |
+| | Moraine | Moraine, log on Express | DuckDB file | Postgres |
 |---|---:|---:|---:|---:|
-| 20 single-row commits, one connection | 1.92 s | 687 ms | 212 ms | 305 ms |
-| commits per second, one process, 1 connection | 11 | 36 | 136 | 90 |
-| commits per second, one process, 8 connections | 55 | 234 | 94 | 45 |
-| commits per second, one process, 16 connections | 113 | 385 | 86 | 28 |
-| attach | 830 ms | 311 ms | 16 ms | 193 ms |
-| read a count once attached | 26 ms | 29 ms | 29 ms | 68 ms |
-| full scan | 138 ms | 54 ms | 36 ms | 75 ms |
+| 20 single-row commits, one connection | 823 ms | 305 ms | 209 ms | 269 ms |
+| commits per second, one process, 1 connection | 30 | 73 | 125 | 87 |
+| commits per second, one process, 8 connections | 186 | 396 | 83 | 37 |
+| commits per second, one process, 16 connections | 353 | 563 | 74 | 26 |
+| attach | 604 ms | 615 ms | 16 ms | 189 ms |
+| read a count once attached | 28 ms | 28 ms | 31 ms | 72 ms |
+| full scan | 135 ms | 131 ms | 37 ms | 75 ms |
 
-A commit on an object store is bound by requests, not by bandwidth: one
-write-ahead-log flush to make it durable, plus a share of the paced
-publication that makes it visible to other processes — about two requests
-and 47 ms. That durable round trip is why one connection is slower here
-than a catalog on a local file or a nearby Postgres. Overlapping transactions
-within one process share a single write-ahead-log flush, so Moraine's
-throughput rises where the others' falls — their per-commit statement
-chain and conflict retries grow with contention.
-
-The curve holds whether those connections write to one table or to a
-table each. Those rows are one process with several connections. Moraine is
-single-writer across processes: a second writer process is fenced, where
-Postgres takes many. Readers are not limited that way — many across
-hosts, against one writer. Attach is a start-up cost, paid once by a
-process that stays attached.
+A commit is one object write, the write-ahead-log entry that makes it
+durable, so its cost is that round trip: about 28 ms on S3 and 15 ms with
+the log on S3 Express. That is why one connection is slower here than a
+catalog on a local file or a nearby Postgres, and why there is no server
+to run. Attach is a start-up cost, paid once by a process that stays
+attached. Moraine is single-writer across processes — a second writer
+process is fenced — and readers are not limited that way. Connections
+within one process share a flush, so when they overlap, throughput rises
+where the others' falls.
 
 For more details, see [Benchmarks](https://morainedb.com/benchmarks/).
 
