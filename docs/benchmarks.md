@@ -34,7 +34,7 @@ commands below stay the way to answer one question.
 | the two needing crate-internal seams | `cargo test -p moraine --lib --release -- --ignored --nocapture measure_` | `MORAINE_MEMORY_FIXTURE` naming a directory, for the writer-generation one |
 | <!-- site:omit -->allocations on the commit path | `cargo test -p moraine --lib --release -- --exact --ignored --test-threads=1 --nocapture transaction::commit::tests::allocation::<name>` | nothing<!-- /site:omit --> |
 | peak heap of a staged index build | `cargo test -p moraine --test staged_build_memory --release -- --ignored --nocapture` | nothing |
-| a commit's conflict check against retained snapshots | `cargo test -p moraine-duckdb --test ducklake_load -- --include-ignored --nocapture measure_staged_conflict_check_by_retained_snapshots` | `MORAINE_DUCKDB_EXT` naming a built extension |
+| a commit's conflict check against retained snapshots | `cargo test -p moraine-duckdb --test ducklake_load -- --include-ignored --nocapture measure_staged_conflict_check_by_retained_snapshots` | `MORAINE_DUCKDB_EXT` and `MORAINE_DUCKDB_CLI` naming a built extension and CLI |
 | the core against AWS S3 | the `Real S3 benchmark` workflow | the AWS stack in [CONTRIBUTING.md](../CONTRIBUTING.md#the-real-s3-benchmark) |
 
 The core harnesses use the in-memory object store, so their durable cost is

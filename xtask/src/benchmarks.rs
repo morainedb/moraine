@@ -291,6 +291,10 @@ fn core_steps(output: &Path) -> Vec<Step> {
         .join("build/release/extension/moraine/moraine.duckdb_extension")
         .display()
         .to_string();
+    let cli = workspace_root()
+        .join("build/release/duckdb")
+        .display()
+        .to_string();
 
     vec![
         Step::cargo(
@@ -359,8 +363,10 @@ fn core_steps(output: &Path) -> Vec<Step> {
                 "measure_staged_conflict_check_by_retained_snapshots",
             ],
         )
-        // It drives a real CLI, which needs the packaged extension named.
-        .with_env("MORAINE_DUCKDB_EXT", &extension),
+        // It drives a real CLI, so both the CLI and the packaged
+        // extension have to be named.
+        .with_env("MORAINE_DUCKDB_EXT", &extension)
+        .with_env("MORAINE_DUCKDB_CLI", &cli),
     ]
 }
 
@@ -652,7 +658,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(named("core-internal"), ["MORAINE_MEMORY_FIXTURE"]);
-        assert_eq!(named("conflict-check"), ["MORAINE_DUCKDB_EXT"]);
+        assert_eq!(
+            named("conflict-check"),
+            ["MORAINE_DUCKDB_EXT", "MORAINE_DUCKDB_CLI"]
+        );
         assert!(named("catalogs-windowed").is_empty());
     }
 
