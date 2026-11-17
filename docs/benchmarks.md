@@ -61,27 +61,27 @@ MORAINE_S3_BUCKET=... MORAINE_S3_PREFIX=... AWS_REGION=... \
 ```
 
 AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
-2026-11-17 at `5f5a20c`<!-- /site:omit -->, medians of seven commits:
+2026-11-17 at `a491fe5`<!-- /site:omit -->, medians of seven commits:
 
 | files | commit | DuckLake metadata | moraine core | durable wait | requests |
 |---:|---:|---:|---:|---:|---|
-| 16 | 47.0 ms | 10.7 ms | 31.6 ms | 31.0 ms | 1.3 PUT 39.1 ms, 0.9 GET 14.2 ms |
-| 128 | 50.0 ms | 14.4 ms | 31.6 ms | 30.9 ms | 1.3 PUT 39.0 ms, 1.1 GET 13.1 ms |
+| 16 | 44.0 ms | 11.0 ms | 26.3 ms | 25.7 ms | 1.0 PUT 25.7 ms |
+| 128 | 48.0 ms | 14.1 ms | 32.1 ms | 31.6 ms | 1.0 PUT 31.4 ms |
 
-- **Two requests per commit**, and only one of them is the commit: the WAL
-  object that makes it durable. The rest is a fraction of a publication —
-  the manifest write that lets another process find the commit, with the
-  probe and the garbage-collection boundary reads around it. Publication is
-  paced, so one of those covers every commit in the interval rather than
-  one each, and the reads still answer 404.
-- The durable wait is the commit: 31 ms against 11 ms of DuckLake metadata
-  SQL. The SQL was a tenth of a commit when every commit published and is
-  now a quarter. On a local store it dominates outright, which is why the
-  same statements looked like the problem there.
+- **One request per commit**, and it is the commit: the object write that
+  makes it durable. Nothing else is on the path. Publication — the manifest
+  write that lets another process find the commit, with the probe and the
+  garbage-collection boundary reads around it — is off it entirely, so the
+  fractional PUT and the two 404 reads that pacing left behind are gone.
+- The durable wait is the commit: 26 ms against 11 ms of DuckLake metadata
+  SQL, and the single PUT accounts for all of it. On a local store the SQL
+  dominates outright, which is why the same statements looked like the
+  problem there.
 - Neither half grows with the file count, so the cost is per commit
   rather than per file.
 - Publishing per commit cost 105 ms and five requests, three of them 404
-  probes. Pacing it took the commit to 47 ms without changing what a
+  probes. Pacing it took the commit to 47 ms and 2.2 requests; taking it
+  off the commit path takes it to 44 ms and one, without changing what a
   reader sees beyond a bounded staleness.
 
 On loopback RustFS the balance inverts, which is where the notes below
