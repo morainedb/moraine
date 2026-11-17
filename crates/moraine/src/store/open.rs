@@ -376,7 +376,8 @@ impl<'a> StoreBuilder<'a> {
         self.open_reader_mode(false).await
     }
 
-    /// Opens a protected fixed view through the commit-log session.
+    /// Opens a reader fixed at the log boundary it finds, through the
+    /// commit-log session when there is one.
     pub(crate) async fn open_fixed_reader(&self) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
         self.open_reader_mode(true).await
     }
@@ -437,10 +438,13 @@ impl<'a> StoreBuilder<'a> {
             }
             Arc::new(wal.build()?)
         };
-        builder = builder.with_wal_reader(Arc::new(super::reader_memory::AdmittedReader::new(
-            wal,
-            crate::MemoryReservation::reserve(0)?,
-        )));
+        let reservation = crate::MemoryReservation::reserve(0)?;
+        let admitted = if fixed {
+            super::reader_memory::AdmittedReader::fixed(wal, reservation)
+        } else {
+            super::reader_memory::AdmittedReader::new(wal, reservation)
+        };
+        builder = builder.with_wal_reader(Arc::new(admitted));
 
         let reader = if fixed && let Some(session) = &self.reader_session {
             session

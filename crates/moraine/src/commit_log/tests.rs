@@ -1121,9 +1121,9 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
 /// A fixed read sees committed state without requesting a live-reader poll.
 #[tokio::test]
 async fn a_read_only_log_scope_does_not_refresh_the_live_reader() {
-    // Building a managed-checkpoint reader's state and its first poll each
-    // probe the log tail; neither repeats per commit.
-    const ESTABLISH_POLLS: u64 = 2;
+    // Building a reader's state probes the log tail once; a fixed reader
+    // answers its own polls from the boundary it opened on.
+    const ESTABLISH_POLLS: u64 = 1;
 
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;

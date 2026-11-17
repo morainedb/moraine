@@ -60,7 +60,9 @@ Reader acquisition works as follows.
    exceed the longest explicit transaction.
 5. Because a reader advances only on its own manifest poll, freshness comes
    from opening one rather than from waiting on one: a scope's reader polls on
-   `READ_WINDOW`, so it cannot re-point while a transaction holds it. A scope
+   `READ_WINDOW` and replays only to the log boundary it opened on, so no
+   poll, including the first one its store runs on opening, re-points it
+   while a transaction holds it. A scope
    shares the reader its predecessor opened for `reader_poll_interval`, and
    opens a newer one past that; a committer, which must read its own commits
    through a reader, opens one per transaction.

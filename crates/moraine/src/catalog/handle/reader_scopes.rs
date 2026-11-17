@@ -126,7 +126,7 @@ impl ReaderScopes {
         let reader = match self
             .builder()
             .reader_mode(slatedb::DbReaderMode::ManagedCheckpoint)
-            .open_reader()
+            .open_fixed_reader()
             .await
         {
             Ok((opened, _)) => CheckpointReader::fixed(opened),
@@ -138,7 +138,7 @@ impl ReaderScopes {
                 let (opened, _) = self
                     .builder()
                     .reader_mode(slatedb::DbReaderMode::FollowLatest)
-                    .open_reader()
+                    .open_fixed_reader()
                     .await?;
                 CheckpointReader::following(opened)
             }
