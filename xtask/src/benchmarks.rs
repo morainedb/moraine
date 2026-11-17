@@ -373,46 +373,51 @@ fn clickbench_steps(checkout: Option<&Path>) -> Vec<Step> {
     ]
 }
 
-/// Where a run records the process holding the output directory.
+/// Where a run records itself, for an operator looking in.
 fn lock_path(output: &Path) -> PathBuf {
     output.join("running.pid")
 }
 
-/// Refuses to start beside a run already using this output directory.
-/// Two runs on one machine share its cores and measure each other, and
-/// their logs land on each other's.
+/// Refuses to start beside another run. Two on one machine share its
+/// cores and measure each other, and their logs land on each other's.
+///
+/// The running processes are the authority, not a file: wiping the output
+/// directory is the first thing anyone does when restarting a run, and a
+/// lock that lives in it would go with it.
 fn claim(output: &Path) -> anyhow::Result<()> {
-    let lock = lock_path(output);
-    if let Ok(holder) = fs::read_to_string(&lock) {
-        let holder = holder.trim();
-        if holder.parse::<u32>().is_ok_and(is_running) {
-            anyhow::bail!(
-                "a run is already going as process {holder}; wait for it, or stop it and \
-                 delete {}",
-                lock.display()
-            );
-        }
+    if let Some(pid) = other_run() {
+        anyhow::bail!(
+            "a run is already going as process {pid}; wait for it, or stop it with \
+             `pkill -f 'xtask benchmarks'`"
+        );
     }
 
+    let lock = lock_path(output);
     fs::write(&lock, std::process::id().to_string())
-        .with_context(|| format!("claiming {}", lock.display()))
+        .with_context(|| format!("recording this run in {}", lock.display()))
 }
 
-/// Whether a process by that id is alive. Asked of `/proc` where there
-/// is one, and of `ps` elsewhere: `kill -0` reads an out-of-range id as
-/// every process and answers yes.
-fn is_running(pid: u32) -> bool {
-    let processes = Path::new("/proc");
-    if processes.is_dir() {
-        return processes.join(pid.to_string()).exists();
-    }
+/// Another `benchmarks` run on this machine, if one is going.
+fn other_run() -> Option<u32> {
+    let mine = std::process::id();
+    let entries = fs::read_dir("/proc").ok()?;
 
-    Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    entries.flatten().find_map(|entry| {
+        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+        if pid == mine {
+            return None;
+        }
+        let command = fs::read(entry.path().join("cmdline")).ok()?;
+        is_benchmarks_run(&command).then_some(pid)
+    })
+}
+
+/// Whether a `/proc` command line is a `benchmarks` run of this xtask.
+/// The arguments are NUL-separated, so the check is on the parts.
+fn is_benchmarks_run(cmdline: &[u8]) -> bool {
+    let parts: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+    parts.iter().any(|part| part.ends_with(b"xtask"))
+        && parts.iter().any(|part| *part == b"benchmarks")
 }
 
 /// `benchmarks [--out <dir>] [--clickbench <checkout>]`.
@@ -596,20 +601,29 @@ mod tests {
     }
 
     #[test]
-    fn a_live_run_keeps_a_second_one_out_and_a_dead_one_does_not() {
+    fn a_benchmarks_command_line_is_told_from_its_neighbours() {
+        assert!(is_benchmarks_run(b"target/debug/xtask\0benchmarks\0"));
+        assert!(is_benchmarks_run(
+            b"/home/me/moraine/target/debug/xtask\0benchmarks\0--out\0/t\0"
+        ));
+
+        // The harnesses a run starts are not themselves runs.
+        assert!(!is_benchmarks_run(
+            b"target/debug/xtask\0bench\0--backends\0moraine\0"
+        ));
+        assert!(!is_benchmarks_run(b"cargo\0test\0-p\0moraine\0"));
+        assert!(!is_benchmarks_run(b"xtask\0"));
+    }
+
+    #[test]
+    fn a_run_records_itself_where_an_operator_will_look() {
         let output = std::env::temp_dir().join(format!("benchmarks-lock-{}", std::process::id()));
         let _ = fs::remove_dir_all(&output);
         fs::create_dir_all(&output).unwrap();
 
         claim(&output).unwrap();
-        let error = claim(&output).unwrap_err().to_string();
-        assert!(error.contains("already going"), "{error}");
-
-        // A run killed mid-flight leaves its id behind; the next one
-        // takes the directory rather than refusing forever.
-        fs::write(lock_path(&output), u32::MAX.to_string()).unwrap();
-        assert!(!is_running(u32::MAX));
-        claim(&output).unwrap();
+        let recorded = fs::read_to_string(lock_path(&output)).unwrap();
+        assert_eq!(recorded, std::process::id().to_string());
 
         fs::remove_dir_all(&output).unwrap();
     }
