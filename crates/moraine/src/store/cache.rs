@@ -656,6 +656,51 @@ impl CacheCounters {
         }
     }
 
+    /// Tallies one request a store moraine wraps itself made, into this
+    /// store's counters and the process's, as SlateDB's own recorder
+    /// would: a count under `op`, its duration where the kind has one, and
+    /// the error tally when it `failed`.
+    pub(crate) fn record_request(
+        &self,
+        store: RequestStore,
+        op: RequestOp,
+        elapsed: Duration,
+        failed: bool,
+    ) {
+        let (count, duration) = match (store, op) {
+            (RequestStore::Main, RequestOp::Get) => (Which::MainGet, Some(Which::MainGetDuration)),
+            (RequestStore::Main, RequestOp::Head) => {
+                (Which::MainHead, Some(Which::MainHeadDuration))
+            }
+            (RequestStore::Main, RequestOp::List) => (Which::MainList, None),
+            (RequestStore::Main, RequestOp::Put) => (Which::MainPut, Some(Which::MainPutDuration)),
+            (RequestStore::Main, RequestOp::Delete) => {
+                (Which::MainDelete, Some(Which::MainDeleteDuration))
+            }
+            (RequestStore::Wal, RequestOp::Get) => (Which::WalGet, Some(Which::WalGetDuration)),
+            (RequestStore::Wal, RequestOp::Head) => (Which::WalHead, Some(Which::WalHeadDuration)),
+            (RequestStore::Wal, RequestOp::List) => (Which::WalList, None),
+            (RequestStore::Wal, RequestOp::Put) => (Which::WalPut, Some(Which::WalPutDuration)),
+            (RequestStore::Wal, RequestOp::Delete) => {
+                (Which::WalDelete, Some(Which::WalDeleteDuration))
+            }
+        };
+        let nanoseconds = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        for counters in [self, COUNTERS.as_ref()] {
+            counters.of(count).fetch_add(1, Ordering::Relaxed);
+            if let Some(duration) = duration {
+                counters
+                    .of(duration)
+                    .fetch_add(nanoseconds, Ordering::Relaxed);
+            }
+            if failed {
+                counters
+                    .of(Which::ObjectStoreError)
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn of(&self, which: Which) -> &AtomicU64 {
         match which {
             Which::MetadataHit => &self.metadata_hits,
@@ -684,6 +729,24 @@ impl CacheCounters {
             Which::WalList => &self.wal_lists,
         }
     }
+}
+
+/// Which of a catalog's two object stores a request went to, as the tally
+/// columns split them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestStore {
+    Main,
+    Wal,
+}
+
+/// The kind of object-store request, as the tally columns split them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestOp {
+    Get,
+    Head,
+    List,
+    Put,
+    Delete,
 }
 
 /// One counter's home in the opening store's [`CacheCounters`] and in the

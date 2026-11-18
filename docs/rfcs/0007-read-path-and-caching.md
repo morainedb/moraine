@@ -389,7 +389,9 @@ surface](0006-extension-surface.md).
 `moraine_object_store_tally` report hits and misses per tier, capacity and
 occupancy, recorded SST metadata bytes, and object-store requests. The
 request tally counts head probes and listings apart from reads that return
-bytes, since an open is mostly the former.
+bytes, since an open is mostly the former, and it covers the write-ahead-log
+reader moraine builds for a read-only handle, which SlateDB's own
+instrumentation does not reach.
 
 **Lake data.** Ordinary lake scans never send data-file bytes through moraine.
 Data bytes are held in DuckDB's external-file cache under its `memory_limit`.

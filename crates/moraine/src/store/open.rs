@@ -22,7 +22,7 @@ use crate::{
     catalog::CachePreload,
     error::{Error, Result},
     store::{
-        cache, census,
+        cache, census, counted,
         handle::{ReadHandle, SCAN_READ_AHEAD_BYTES, ScanShape},
         key, retry,
         segment::TagSegmentExtractor,
@@ -416,16 +416,26 @@ impl<'a> StoreBuilder<'a> {
         let wal: Arc<dyn slatedb::wal::WalReader> = if let Some(session) = &self.reader_session {
             session.reader()
         } else {
+            // SlateDB instruments only the stores it wraps itself; this
+            // reader's requests are tallied here so the tally sees them.
             let mut wal = slatedb::wal::SlateDbWalReaderBuilder::new()
                 .with_path(object_store::path::Path::from(self.path))
-                .with_object_store(Arc::clone(&self.object_store))
+                .with_object_store(counted::CountedStore::wrap(
+                    Arc::clone(&self.object_store),
+                    Arc::clone(&counters),
+                    cache::RequestStore::Main,
+                ))
                 .with_options(slatedb::wal::SlateDbWalReaderOptions {
                     max_buffered_bytes: 512 * 1024,
                     max_fetch_tasks: 2,
                     read_ahead_bytes: 256 * 1024,
                 });
             if let Some(store) = &self.wal_object_store {
-                wal = wal.with_wal_object_store(Arc::clone(store));
+                wal = wal.with_wal_object_store(counted::CountedStore::wrap(
+                    Arc::clone(store),
+                    Arc::clone(&counters),
+                    cache::RequestStore::Wal,
+                ));
             }
             Arc::new(wal.build()?)
         };

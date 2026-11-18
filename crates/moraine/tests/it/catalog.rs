@@ -849,3 +849,29 @@ async fn an_open_reads_no_compactor_state() {
     assert_eq!(counting.take_compactions_requests(), 0, "a read-only open");
     reader.close().await.unwrap();
 }
+/// A read-only attach probes and reads the write-ahead log through a reader
+/// of moraine's own, and those requests are in its tally like any other.
+#[tokio::test]
+async fn a_read_only_attach_counts_its_log_requests() {
+    let objects = Arc::new(InMemory::new());
+    // An idle writer leaves one log file for the reader to find.
+    for _ in 0..2 {
+        Catalog::open(objects.clone(), CatalogOptions::default())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+    }
+
+    let reader = Catalog::open_read_only(objects, CatalogOptions::default())
+        .await
+        .unwrap();
+    let tally = reader.object_store_tally();
+    assert!(
+        tally.main_heads > 0,
+        "the log probes of the open are not counted: {tally:?}"
+    );
+    assert!(tally.main_gets > 0, "{tally:?}");
+    reader.close().await.unwrap();
+}
