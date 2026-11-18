@@ -165,21 +165,16 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: gh workflow run site.yml --ref main
-    - name: Pin descriptor ref to the released commit
+    - name: Pin the descriptor to this release
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
       run: |
-        python3 - "${{ inputs.target }}" <<'PY'
-        import re, sys, pathlib
-        sha = sys.argv[1]
-        p = pathlib.Path("description.yml")
-        p.write_text(re.sub(r'(?m)^(\s*ref:\s*).*$', r'\g<1>' + sha, p.read_text(), count=1))
-        PY
+        cargo run -q -p xtask -- pin-descriptor "${{ inputs.tag }}" "${{ inputs.target }}"
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         if ! git diff --quiet -- description.yml; then
           git add description.yml
-          git commit -m "docs: pin community descriptor ref to ${{ inputs.tag }} [skip ci]"
+          git commit -m "docs: pin community descriptor to ${{ inputs.tag }} [skip ci]"
           git push origin HEAD:main
         fi

@@ -33,6 +33,9 @@
 //!   what the build and validation matrices are generated from.
 //! - `bump-duckdb <version>` moves the primary pin to a new DuckDB release,
 //!   writing every place `check-pins` checks (see `bump.rs`).
+//! - `pin-descriptor <tag> <sha>` stamps `description.yml` with a release;
+//!   `community-pr` opens the pull request carrying it to DuckDB's community
+//!   extension repository (see `community.rs`).
 
 use anyhow::bail;
 
@@ -42,6 +45,7 @@ mod bump;
 mod catalog_target;
 mod clickbench;
 mod commit_bench;
+mod community;
 mod cpp;
 mod duckdb;
 mod ducklake_patch;
@@ -81,17 +85,19 @@ fn main() -> anyhow::Result<()> {
         Some("sign-release-assets") => sign::sign_release_assets(&arguments),
         Some("validate-release-artifact") => release::validate_release_artifact(&arguments),
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
+        Some("pin-descriptor") => community::pin_descriptor(&arguments),
+        Some("community-pr") => community::community_pr(&arguments),
         Some(other) => {
             bail!(
                 "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
                  check-patch-pins, check-release-assets, stage-release-assets, sign-release-assets, validate-release-artifact, \
-                 version-matrix, bump-duckdb"
+                 version-matrix, bump-duckdb, pin-descriptor, community-pr"
             )
         }
         None => bail!(
             "usage: cargo xtask <task>; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
              check-patch-pins, check-release-assets, stage-release-assets, sign-release-assets, validate-release-artifact, \
-             version-matrix, bump-duckdb"
+             version-matrix, bump-duckdb, pin-descriptor, community-pr"
         ),
     }
 }

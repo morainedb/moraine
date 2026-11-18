@@ -88,6 +88,20 @@ platform builds and passes validation, the workflow publishes the binaries
 to that GitHub release and pins the community descriptor to the built
 commit. This does not bump the crate version or publish to crates.io.
 
+The community extension repository holds its own copy of that descriptor
+and takes changes by pull request from a maintainer's fork. After a release
+lands on `main`, pull it and run
+
+```bash
+cargo xtask community-pr
+```
+
+which checks that the descriptor's `ref` carries the `ext-v<version>` tag,
+forks or reuses your fork of `duckdb/community-extensions`, pushes the
+descriptor on a `moraine-v<version>` branch, and opens the pull request, or
+refreshes the branch when one is already open. It needs `git` and `gh`
+logged in as the account listed under `maintainers`.
+
 A tag publishes once. Downstreams pin a release by the SHA-256 of its
 assets, so replacing those bytes changes what the tag means while its name
 stays put, and a consumer that re-downloads gets a checksum mismatch at
