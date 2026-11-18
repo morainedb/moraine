@@ -135,9 +135,6 @@ pub(crate) struct StoreBuilder<'a> {
     checkpoint: Option<Uuid>,
     /// A reader mode chosen by the caller, over the one the open derives.
     reader_mode: Option<DbReaderMode>,
-    /// The manifest's per-segment sizes, when the attach read them; they
-    /// decide how a preload reaches each subspace's first entry.
-    warm_segments: Vec<census::SegmentSize>,
 }
 
 impl<'a> StoreBuilder<'a> {
@@ -165,7 +162,6 @@ impl<'a> StoreBuilder<'a> {
             external_compaction: false,
             checkpoint: None,
             reader_mode: None,
-            warm_segments: Vec::new(),
         }
     }
 
@@ -279,12 +275,6 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// The manifest's per-segment sizes, for sizing the preload's reads.
-    pub(crate) fn warm_segments(mut self, segments: Vec<census::SegmentSize>) -> Self {
-        self.warm_segments = segments;
-        self
-    }
-
     /// Sets whether flushed SST metadata and data blocks enter the decoded
     /// cache as they are written (default: on).
     pub(crate) fn cache_puts(mut self, cache_puts: bool) -> Self {
@@ -357,10 +347,11 @@ impl<'a> StoreBuilder<'a> {
 
         let db = builder.build().await.map_err(Error::from)?;
         if let Some(preload) = self.cache_preload {
+            let segments = census::manifest_bytes(&db.status().current_manifest).segments;
             let tx = db
                 .begin(slatedb::IsolationLevel::Snapshot)
                 .map_err(Error::from)?;
-            warm(preload, ReadHandle::Tx(&tx), &counters, &self.warm_segments).await;
+            warm(preload, ReadHandle::Tx(&tx), &counters, &segments).await;
             tx.rollback();
         }
 
@@ -454,13 +445,8 @@ impl<'a> StoreBuilder<'a> {
             builder.build().await.map_err(Error::from)?
         };
         if let Some(preload) = self.cache_preload {
-            warm(
-                preload,
-                ReadHandle::Reader(&reader),
-                &counters,
-                &self.warm_segments,
-            )
-            .await;
+            let segments = census::manifest_bytes(&reader.status().current_manifest).segments;
+            warm(preload, ReadHandle::Reader(&reader), &counters, &segments).await;
         }
 
         Ok((reader, counters))

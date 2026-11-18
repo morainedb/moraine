@@ -436,7 +436,6 @@ fn writer_store_builder<'a>(
     object_store: &Arc<dyn ObjectStore>,
     options: &'a CatalogOptions,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
-    warm_segments: Vec<census::SegmentSize>,
 ) -> StoreBuilder<'a> {
     StoreBuilder::new(&options.path, Arc::clone(object_store))
         .wal_object_store(wal_object_store)
@@ -447,7 +446,6 @@ fn writer_store_builder<'a>(
         .cache_memory(options.cache_memory)
         .cache_auxiliary_percent(options.cache_auxiliary_percent)
         .cache_preload(options.cache_preload)
-        .warm_segments(warm_segments)
         .cache_puts(options.cache_puts)
         .cache_compaction_puts(options.cache_compaction_puts)
         .external_compaction(external_compaction(options))
@@ -460,7 +458,6 @@ async fn open_writer_store(
     object_store: Arc<dyn ObjectStore>,
     options: &CatalogOptions,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
-    warm_segments: Vec<census::SegmentSize>,
 ) -> Result<OpenedWriter> {
     let flush_spacing = if options.flush_on_commit {
         Duration::ZERO
@@ -468,7 +465,7 @@ async fn open_writer_store(
         options.flush_interval
     };
     let (db, cache, format, pacer) = commit::open_initialized(
-        writer_store_builder(&object_store, options, wal_object_store, warm_segments),
+        writer_store_builder(&object_store, options, wal_object_store),
         options.encrypted,
         options.data_path.as_deref(),
         options.wal_store.as_ref().map(crate::WalStore::name),
@@ -496,19 +493,13 @@ async fn open_writer_db(
     let provider = commit_log_provider(options).ok_or_else(|| {
         Error::Configuration("taking a log store requires a commit-log provider".into())
     })?;
-    let builder = writer_store_builder(
-        &object_store,
-        options,
-        wal_object_store(options),
-        Vec::new(),
-    );
+    let builder = writer_store_builder(&object_store, options, wal_object_store(options));
     let session = provider.writer_session(builder.log_store(), &options.path);
     if !session.adopted().await? {
         commit::drain_own_log(writer_store_builder(
             &object_store,
             options,
             wal_object_store(options),
-            Vec::new(),
         ))
         .await?;
     }
@@ -653,29 +644,6 @@ fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
         .map(|wal| Arc::clone(wal.object_store()))
 }
 
-/// Warns when an `All` preload cannot hold the store it is about to load.
-/// Diagnostics only: a manifest that could not be read is left to the open
-/// itself to report.
-fn warn_if_preload_cannot_fit(options: &CatalogOptions, manifest: Option<&census::ManifestBytes>) {
-    if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
-        return;
-    }
-
-    let Some(store_bytes) = manifest.map(|manifest| manifest.store_bytes) else {
-        return;
-    };
-    if let Some(shortfall) = open::preload_shortfall(store_bytes, options.cache_size) {
-        warn!(
-            path = options.path,
-            store_bytes,
-            cache_size = options.cache_size,
-            shortfall,
-            "preload cannot hold this store: the load stops once the cache is full, leaving \
-             the rest to be fetched on demand"
-        );
-    }
-}
-
 /// Warns when the process's metadata cache is smaller than the store's SST
 /// filters, indexes, and statistics.
 ///
@@ -732,14 +700,34 @@ fn warn_if_block_cache_cannot_hold_index(path: &str, index_bytes: Option<u64>) {
     }
 }
 
+/// Warns when an `All` preload could not hold the store it loaded.
+fn warn_if_preload_cannot_fit(options: &CatalogOptions, manifest: &census::ManifestBytes) {
+    if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
+        return;
+    }
+
+    let store_bytes = manifest.store_bytes;
+    if let Some(shortfall) = open::preload_shortfall(store_bytes, options.cache_size) {
+        warn!(
+            path = options.path,
+            store_bytes,
+            cache_size = options.cache_size,
+            shortfall,
+            "preload cannot hold this store: the load stops once the cache is full, leaving \
+             the rest to be fetched on demand"
+        );
+    }
+}
+
 /// Warns about what this store's own figures say the process's caches
-/// cannot hold. Diagnostics only, from the manifest read the open already
-/// made.
-fn warn_if_caches_cannot_hold(path: &str, manifest: Option<&census::ManifestBytes>) {
-    warn_if_metadata_cache_cannot_hold(path, manifest.map(|manifest| manifest.metadata_bytes));
+/// cannot hold: the preload, the metadata cache, and the block cache's
+/// share. Diagnostics only, from the manifest the open loaded.
+fn warn_if_caches_cannot_hold(options: &CatalogOptions, manifest: &census::ManifestBytes) {
+    warn_if_preload_cannot_fit(options, manifest);
+    warn_if_metadata_cache_cannot_hold(&options.path, Some(manifest.metadata_bytes));
     warn_if_block_cache_cannot_hold_index(
-        path,
-        manifest.and_then(|manifest| manifest.subspace_bytes(crate::store::key::Subspace::Index)),
+        &options.path,
+        manifest.subspace_bytes(crate::store::key::Subspace::Index),
     );
 }
 
@@ -1503,11 +1491,6 @@ impl Catalog {
         }
         let started = Instant::now();
         let located = Arc::clone(&object_store);
-        // One manifest read serves both diagnostics, before the open.
-        let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
-            .await
-            .ok();
-        warn_if_preload_cannot_fit(&options, manifest.as_ref());
         let wal_object_store = options
             .wal_store
             .as_ref()
@@ -1521,13 +1504,13 @@ impl Catalog {
             Arc::clone(&object_store),
             &options,
             wal_object_store.clone(),
-            manifest
-                .as_ref()
-                .map(|manifest| manifest.segments.clone())
-                .unwrap_or_default(),
         )
         .await?;
-        warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
+        // The manifest the open loaded serves the diagnostics.
+        warn_if_caches_cannot_hold(
+            &options,
+            &census::manifest_bytes(&db.status().current_manifest),
+        );
         let elapsed = started.elapsed();
         info!(
             path = options.path,
@@ -1970,11 +1953,6 @@ impl Catalog {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let started = Instant::now();
         let located = Arc::clone(&object_store);
-        // One manifest read serves both diagnostics, before the open.
-        let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
-            .await
-            .ok();
-        warn_if_preload_cannot_fit(&options, manifest.as_ref());
         let wal_object_store = options
             .wal_store
             .as_ref()
@@ -1991,12 +1969,6 @@ impl Catalog {
             .cache_memory(options.cache_memory)
             .cache_auxiliary_percent(options.cache_auxiliary_percent)
             .cache_preload(options.cache_preload)
-            .warm_segments(
-                manifest
-                    .as_ref()
-                    .map(|manifest| manifest.segments.clone())
-                    .unwrap_or_default(),
-            )
             .cache_puts(options.cache_puts)
             .cache_compaction_puts(options.cache_compaction_puts)
             .external_compaction(external_compaction(&options))
@@ -2009,7 +1981,11 @@ impl Catalog {
             commit_log_provider(&options).is_some(),
         )
         .await?;
-        warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
+        // The manifest the open loaded serves the diagnostics.
+        warn_if_caches_cannot_hold(
+            &options,
+            &census::manifest_bytes(&reader.status().current_manifest),
+        );
         let elapsed = started.elapsed();
         info!(
             path = options.path,

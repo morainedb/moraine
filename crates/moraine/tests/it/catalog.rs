@@ -9,7 +9,10 @@ use moraine::{
 };
 use object_store::memory::InMemory;
 
-use crate::fixtures::{col, open_memory, seeded};
+use crate::{
+    counting_store::CountingStore,
+    fixtures::{col, open_memory, seeded},
+};
 
 /// Metadata reads taken at once on a handle that has materialized nothing
 /// yet — the shape DuckLake issues once a statement's scans initialize in
@@ -815,4 +818,34 @@ async fn a_variant_column_is_storable_on_every_column_verb_but_never_indexable()
         refused.to_string().contains("index key can encode"),
         "{refused}"
     );
+}
+
+/// An open reads the manifest through the store it opens and nothing
+/// beside it: the compactor's state, which only diagnostics ever consulted,
+/// is not fetched by a writer or a reader.
+#[tokio::test]
+async fn an_open_reads_no_compactor_state() {
+    let objects = Arc::new(InMemory::new());
+    let seed = Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(objects));
+    let mut options = CatalogOptions::default();
+    // The writer's own compactor reads that state when it runs; this is
+    // about the open.
+    options.external_compaction = true;
+
+    let writer = Catalog::open(counting.clone(), options.clone())
+        .await
+        .unwrap();
+    assert_eq!(counting.take_compactions_requests(), 0, "a writer open");
+    writer.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(counting.clone(), options)
+        .await
+        .unwrap();
+    assert_eq!(counting.take_compactions_requests(), 0, "a read-only open");
+    reader.close().await.unwrap();
 }
