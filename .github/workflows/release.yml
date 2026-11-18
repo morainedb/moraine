@@ -23,6 +23,9 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   # Both gates on one runner and one checkout: the matrix is only ever read
   # when a release is happening, and a second job for it would put another
@@ -137,20 +140,28 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - name: Authenticate git so release-plz can push the tag
+      # The token goes in a git config only the release-plz step reads, not
+      # the global one every later step and build script would inherit.
+      - name: Authenticate git for release-plz
+        env:
+          TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
-          git config --global \
-            url."https://x-access-token:${{ secrets.RELEASE_PLZ_TOKEN }}@github.com/".insteadOf \
+          git config --file "$RUNNER_TEMP/release-gitconfig" \
+            url."https://x-access-token:${TOKEN}@github.com/".insteadOf \
             "https://github.com/"
       - name: Publish crate and create the v<version> release
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5
         with:
           command: release
         env:
+          GIT_CONFIG_GLOBAL: ${{ runner.temp }}/release-gitconfig
           # The musl binary misdetects stack headroom when parsing the changelog.
           CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Forget the release git config
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release-gitconfig"
       - name: Publish the ext-v<version> extension release
         uses: ./.github/actions/publish-extension-release
         with:

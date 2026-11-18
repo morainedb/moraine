@@ -12,6 +12,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   release-pr:
     runs-on: ubuntu-latest
@@ -31,7 +34,7 @@ jobs:
           git config --global \
             url."https://x-access-token:${{ secrets.RELEASE_PLZ_TOKEN }}@github.com/".insteadOf \
             "https://github.com/"
-      - uses: release-plz/action@v0.5
+      - uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5
         with:
           command: release-pr
         env:

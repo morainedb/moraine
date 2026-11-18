@@ -14,6 +14,10 @@ inputs:
     description: PEM private key that signs builds for the extension repository the site serves; empty publishes unsigned builds only.
     required: false
     default: ''
+  allow_unsigned:
+    description: Publish without signatures when no key is configured.
+    required: false
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -44,10 +48,15 @@ runs:
       shell: bash
       env:
         SIGNING_KEY: ${{ inputs.signing_key }}
+        ALLOW_UNSIGNED: ${{ inputs.allow_unsigned }}
       run: |
         set -euo pipefail
         mkdir -p signed
         if [ -z "$SIGNING_KEY" ]; then
+          if [ "$ALLOW_UNSIGNED" != "true" ]; then
+            echo "::error::no signing key configured; refusing to publish unsigned"
+            exit 1
+          fi
           echo "::notice::no signing key configured; publishing unsigned builds only"
           exit 0
         fi

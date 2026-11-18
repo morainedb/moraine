@@ -23,6 +23,9 @@ on:
           - line-tables-only
           - full
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build ${{ inputs.duckdb_ref }} with ${{ inputs.debug_level }} symbols
@@ -52,7 +55,7 @@ jobs:
           git fetch --depth 1 origin "${{ inputs.duckdb_ref }}"
           git checkout FETCH_HEAD
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache
 
       # RelWithDebInfo on the C++ side, so DuckDB's and the shim's frames

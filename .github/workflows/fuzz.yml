@@ -20,6 +20,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -43,7 +46,7 @@ jobs:
       # rust-cache rather than the mbx action the merge gate uses: that one
       # saves from a push or an opted-in trigger, and a scheduled run is
       # neither, so every night would restore an entry and fill none.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
