@@ -356,14 +356,17 @@ exist for. Non-unique equality probes also use the named prefix filter policy
 suffix. A writer polls the manifest every five seconds. These are
 implementation constants and have no attach option.
 
-**Warming.** `CACHE_PRELOAD` warms inside the open: `CachePreload::L0` touches
-every subspace far enough to pull its SST metadata, and `CachePreload::All`
-additionally walks the scan-shaped subspaces whole. Neither walks the `index`
-subspace's data. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
+**Warming.** `CatalogOptions::cache_preload` warms inside the open:
+`CachePreload::L0` touches every subspace far enough to pull its SST metadata,
+and `CachePreload::All` additionally walks the scan-shaped subspaces whole.
+Neither walks the `index` subspace's data. `ReadOnlyCatalog::preload_store`
+does the same after the open, and the extension's `CACHE_PRELOAD` runs it that
+way, on the handle's worker once the attach has returned, so the attach does
+not wait on it. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
 shape, the first entry of each named table's index and inline ranges, eight
 ranges at a time process-wide. The extension runs it after a commit for the
-tables the commit wrote, and with `CACHE_PRELOAD` set, for every table in the
-background after the open.
+tables the commit wrote, and with `CACHE_PRELOAD` set, for every table after
+the store preload.
 
 **Lookup retention.** Row-lookup directories and revision-keyed probe memos
 share the lookup allowance. Directories additionally keep local ceilings of

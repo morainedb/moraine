@@ -11,7 +11,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{info, warn};
 
 use crate::{
-    DataStore, ReadOnlyCatalog, RowSummaryProgress, SnapshotId, TableId,
+    CachePreload, DataStore, ReadOnlyCatalog, RowSummaryProgress, SnapshotId, TableId,
     store::read::{EntityRecord, EntityRecordKind, OwnedEntityCursor, Versions},
 };
 
@@ -97,7 +97,7 @@ pub struct BackgroundRequest(Request);
 
 enum Request {
     Attach {
-        preload: bool,
+        preload: Option<CachePreload>,
     },
     Commit {
         files: Arc<Vec<(TableId, crate::DataFileId)>>,
@@ -107,9 +107,11 @@ enum Request {
 }
 
 impl BackgroundRequest {
-    /// Requests full summary backfill and optional table warming on attach.
+    /// Requests full summary backfill on attach and, with a `preload`
+    /// level, the store preload that level names followed by every table's
+    /// warming, so an attach returns before either runs.
     #[must_use]
-    pub fn attach(preload: bool) -> Self {
+    pub fn attach(preload: Option<CachePreload>) -> Self {
         Self(Request::Attach { preload })
     }
 
@@ -134,6 +136,8 @@ impl BackgroundRequest {
 #[derive(Clone)]
 struct WarmJob {
     tables: Option<BTreeSet<TableId>>,
+    /// The store preload to run before the tables, once per job.
+    store: Option<CachePreload>,
     progress: Arc<tokio::sync::Mutex<Option<Warming>>>,
     reservations: Vec<Arc<crate::MemoryReservation>>,
 }
@@ -193,7 +197,17 @@ impl Job {
 impl WarmJob {
     async fn run(self, catalog: &ReadOnlyCatalog) -> bool {
         let mut progress = self.progress.lock().await;
-        let warming = progress.get_or_insert_with(|| Warming::new(self.tables.as_ref()));
+        if progress.is_none() {
+            if let Some(level) = self.store
+                && let Err(error) = catalog.preload_store(level).await
+            {
+                warn!(%error, "store preload failed; tables warm regardless");
+            }
+            *progress = Some(Warming::new(self.tables.as_ref()));
+        }
+        let Some(warming) = progress.as_mut() else {
+            return true;
+        };
         let started = std::time::Instant::now();
         loop {
             let table = match warming.next(catalog).await {
@@ -270,6 +284,7 @@ impl Pending {
                         (tables, None) => *tables = None,
                         (None, _) => {}
                     }
+                    queued.store = queued.store.or(next.store);
                     queued.reservations.append(&mut next.reservations);
                     return true;
                 }
@@ -353,8 +368,9 @@ impl BackgroundWork {
     pub fn push(&self, request: BackgroundRequest) {
         let (warming, publication) = match request.0 {
             Request::Attach { preload } => (
-                preload.then(|| WarmJob {
+                preload.map(|level| WarmJob {
                     tables: None,
+                    store: Some(level),
                     progress: Arc::default(),
                     reservations: Vec::new(),
                 }),
@@ -367,6 +383,7 @@ impl BackgroundWork {
             } => {
                 let warming = (!files.is_empty()).then(|| WarmJob {
                     tables: Some(files.iter().map(|(table, _)| *table).collect()),
+                    store: None,
                     progress: Arc::default(),
                     reservations: vec![memory.clone()],
                 });

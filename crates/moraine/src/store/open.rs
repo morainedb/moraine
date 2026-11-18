@@ -574,7 +574,7 @@ pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
 /// subspace so its SST metadata is resident; `All` additionally walks the
 /// scan-shaped subspaces whole. Neither reads the `index` subspace's data
 /// blocks.
-async fn warm(
+pub(crate) async fn warm(
     preload: CachePreload,
     handle: ReadHandle<'_>,
     counters: &cache::CacheCounters,

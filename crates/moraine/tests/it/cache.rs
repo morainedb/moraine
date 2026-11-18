@@ -783,6 +783,84 @@ async fn a_preload_warms_before_the_first_read() {
     reader.close().await.unwrap();
 }
 
+/// A preload run after the open warms what one inside the open would, and
+/// is attributed the same way, so a host can attach first and warm after.
+#[tokio::test]
+async fn a_preload_after_the_open_warms_what_one_inside_it_would() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            for n in 0..32 {
+                tx.create_table(schema, &format!("t{n}"), &[col("a")])
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let inside = {
+        let mut options = CatalogOptions::default();
+        options.cache_preload = Some(moraine::CachePreload::All);
+        let reader = Catalog::open_read_only(
+            Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+            options,
+        )
+        .await
+        .unwrap();
+        let tally = reader.cache_tally();
+        reader.close().await.unwrap();
+        tally
+    };
+
+    let reader = Catalog::open_read_only(
+        object_store as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    let before = reader.cache_tally();
+    assert_eq!(
+        before.preload_block_misses + before.preload_metadata_misses,
+        0,
+        "nothing was preloaded inside this open: {before:?}"
+    );
+    reader
+        .preload_store(moraine::CachePreload::All)
+        .await
+        .unwrap();
+    let after = reader.cache_tally();
+
+    let attributed = |tally: &moraine::CacheTally| {
+        tally.preload_metadata_hits
+            + tally.preload_metadata_misses
+            + tally.preload_block_hits
+            + tally.preload_block_misses
+    };
+    assert!(attributed(&after) > 0, "{after:?}");
+    assert_eq!(
+        attributed(&after),
+        attributed(&inside),
+        "a preload after the open touched the cache differently: {after:?} against {inside:?}"
+    );
+    let view = reader.read_scope().await.unwrap();
+    assert!(view.schema_by_name("main").await.unwrap().is_some());
+    reader.close().await.unwrap();
+}
+
 /// One shared cache still reports SST metadata apart from data blocks.
 ///
 /// Nothing outside SlateDB can classify a cached entry, so the split comes

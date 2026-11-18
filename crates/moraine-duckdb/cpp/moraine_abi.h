@@ -1408,13 +1408,13 @@ void moraine_error_free(char *message);
 // catalog projections, commit staging, DuckDB, and allocator retention are
 // outside it. `0` means "not given" for either byte count.
 //
-// `cache_preload` warms this store into that cache before the attach
-// returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
-// scan-shaped subspaces whole. Any other value is
-// [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller always
-// names a level (the extension's `ATTACH` passes `1` unless told
-// otherwise). A non-zero level also warms every table's probe ranges in
-// the background after the open. `cache_puts` admits flushed SST metadata
+// `cache_preload` warms this store into that cache on the handle's
+// worker once the attach has returned: `0` loads nothing, `1` each
+// subspace's SST metadata, `2` the scan-shaped subspaces whole. Any other
+// value is [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller
+// always names a level (the extension's `ATTACH` passes `1` unless told
+// otherwise). A non-zero level then warms every table's probe ranges the
+// same way. `cache_puts` admits flushed SST metadata
 // and data blocks on write; `cache_compaction_puts` independently admits
 // compaction outputs. Both are explicit at this ABI boundary.
 //

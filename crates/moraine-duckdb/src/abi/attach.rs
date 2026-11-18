@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use moraine::CatalogOptions;
+use moraine::{CachePreload, CatalogOptions};
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::{info, warn};
 
@@ -560,7 +560,7 @@ fn handle_for_catalog(
     catalog: AttachedCatalog,
     log_id: crate::logging::HandleId,
     arguments: DataStoreArguments<'_>,
-    preload: bool,
+    preload: Option<CachePreload>,
 ) -> Result<Box<MoraineCatalogHandle>, AbiError> {
     let source = DataSource {
         store_path: arguments.store_path.to_owned(),
@@ -693,13 +693,13 @@ pub(super) fn cache_preload_option(
 /// catalog projections, commit staging, DuckDB, and allocator retention are
 /// outside it. `0` means "not given" for either byte count.
 ///
-/// `cache_preload` warms this store into that cache before the attach
-/// returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
-/// scan-shaped subspaces whole. Any other value is
-/// [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller always
-/// names a level (the extension's `ATTACH` passes `1` unless told
-/// otherwise). A non-zero level also warms every table's probe ranges in
-/// the background after the open. `cache_puts` admits flushed SST metadata
+/// `cache_preload` warms this store into that cache on the handle's
+/// worker once the attach has returned: `0` loads nothing, `1` each
+/// subspace's SST metadata, `2` the scan-shaped subspaces whole. Any other
+/// value is [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller
+/// always names a level (the extension's `ATTACH` passes `1` unless told
+/// otherwise). A non-zero level then warms every table's probe ranges the
+/// same way. `cache_puts` admits flushed SST metadata
 /// and data blocks on write; `cache_compaction_puts` independently admits
 /// compaction outputs. Both are explicit at this ABI boundary.
 ///
@@ -845,7 +845,9 @@ pub unsafe extern "C" fn moraine_attach_with_options(
                 compaction_puts: cache_compaction_puts,
             },
         )?;
-        let preload = options.cache_preload.is_some();
+        // The preload runs on the handle's worker once the attach has
+        // returned, not inside the open.
+        let preload = options.cache_preload.take();
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
         options.wal_store.clone_from(&wal_store);

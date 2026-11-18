@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, SnapshotId, TableId};
+use moraine::{CachePreload, Catalog, CatalogSnapshot, ReadOnlyCatalog, SnapshotId, TableId};
 use tokio::runtime::{Builder, Runtime};
 
 mod background;
@@ -190,16 +190,17 @@ impl MoraineCatalogHandle {
         }
     }
 
-    /// Optionally warms index and inline ranges. Writers with a data store
-    /// also publish missing row summaries; existing summaries cost one header
-    /// read.
-    pub(crate) fn spawn_warm_at_attach(&self, preload: bool) {
+    /// With a `preload` level, warms the store to that level and then every
+    /// table's index and inline ranges, after the attach has returned.
+    /// Writers with a data store also publish missing row summaries;
+    /// existing summaries cost one header read.
+    pub(crate) fn spawn_warm_at_attach(&self, preload: Option<CachePreload>) {
         let publishes = matches!(self.catalog, AttachedCatalog::Writer(_))
             && self
                 .data
                 .resolved()
                 .is_some_and(|files| files.store.is_some());
-        if !preload && !publishes {
+        if preload.is_none() && !publishes {
             return;
         }
         self.enqueue_pass(Pass::attach(preload));

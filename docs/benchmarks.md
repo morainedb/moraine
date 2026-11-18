@@ -555,16 +555,29 @@ the GET count is the slope:
 
 | per-GET latency | churned (38 SSTs) | merged (14 SSTs) |
 |---|---|---|
-| 0 ms | 6.5 ms | 8.0 ms |
-| 10 ms | 202.2 ms | 212.2 ms |
-| slope (GETs) | 19.6 | 20.4 |
+| 0 ms | 0.43 ms | 0.34 ms |
+| 10 ms | 68.2 ms | 68.3 ms |
+| slope (GETs) | 6.8 | 6.8 |
 
-At 10 ms per GET the attach costs 31× its in-memory time. The merge cut
-SSTs by 63% and did not reduce GETs, matching the S3 run above. Measured
-at `c224745`, after a reader stopped
-writing a checkpoint of its own on open; before that (at
-`8146cbf`) the slopes were 22.6 and 23.7, and before the
+The merge cut SSTs by 63% and did not reduce GETs, matching the S3 run
+above. Measured 2026-11-18 at `9ee517d`, after a read-only attach's first
+scope began sharing the reader the attach opened; at `c224745` the slopes
+were 19.6 and 20.4, after a reader stopped writing a checkpoint of its own
+on open, before that (at `8146cbf`) 22.6 and 23.7, and before the
 demand-loaded catalog the merge cut GETs from 14.5 to 12.3.
+
+`measure_preload_overlap_with_the_first_read` asks whether the store
+preload, which the extension runs after the attach returns, fetches blocks
+twice when the first statement runs beside it. 64 tables, a `L0` preload
+and a first schema read, median reads of five; in-memory, 2026-11-18 at
+`9ee517d`:
+
+| one after the other | together |
+|---:|---:|
+| 12 | 12 |
+
+The pair costs the same either way, so warming off the attach path
+duplicates nothing.
 
 `measure_attach_cost_by_index_size` grows only the `index` subspace:
 
