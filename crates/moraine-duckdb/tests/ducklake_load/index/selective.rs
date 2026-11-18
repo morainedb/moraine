@@ -29,7 +29,7 @@ fn summary_scan_is_automatic_without_a_public_switch() {
          PREPARE p AS {query}; EXECUTE p; EXECUTE p;"
         ),
     );
-    assert!(result.lines().any(|line| line == "switches,0"), "{result}");
+    assert!(has_line(&result, "switches,0"), "{result}");
     assert_eq!(
         result.matches("Moraine Summary Scan").count(),
         1,
@@ -134,7 +134,7 @@ fn summary_driven_scan_keeps_join_and_filters() {
         "the join was removed: {result}"
     );
     assert!(
-        result.lines().any(|line| line == "14995989"),
+        has_line(&result, "14995989"),
         "wrong residual result: {result}"
     );
 }
@@ -346,7 +346,7 @@ fn summary_scan_reads_uuid_columns() {
         "no selective scan: {result}"
     );
     assert!(
-        result.lines().any(|line| line == format!("rows,3,{owner}")),
+        has_line(&result, &format!("rows,3,{owner}")),
         "wrong rows: {result}"
     );
 }
@@ -387,6 +387,6 @@ fn indexed_operations_stream_positions_above_the_summary_limit() {
         String::from_utf8_lossy(&output.stderr)
     );
     for answer in ["before,14", "updated,99", "deleted,0"] {
-        assert!(stdout.lines().any(|line| line == answer), "{stdout}");
+        assert!(has_line(&stdout, answer), "{stdout}");
     }
 }

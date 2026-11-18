@@ -227,11 +227,8 @@ fn an_update_matches_explicit_lookup_pruning() {
         );
         let result = run("SELECT 'changed', count(*) FROM lake.main.t WHERE a = 30001 AND b = 'z';
              SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
-        assert!(result.lines().any(|line| line == "changed,1"), "{result}");
-        assert!(
-            result.lines().any(|line| line == "verified,0,0,0"),
-            "{result}"
-        );
+        assert!(has_line(&result, "changed,1"), "{result}");
+        assert!(has_line(&result, "verified,0,0,0"), "{result}");
         read_bytes(&plan)
     };
 
@@ -282,7 +279,7 @@ fn prepared_deletes_obey_transaction_boundaries() {
         SELECT 'final', count(*) FROM lake.main.t WHERE a = 30001;
         SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
     for expected in ["pending,0", "rolled_back,1", "final,0", "verified,0,0,0"] {
-        assert!(result.lines().any(|line| line == expected), "{result}");
+        assert!(has_line(&result, expected), "{result}");
     }
 }
 
@@ -308,14 +305,8 @@ fn deletes_preserve_existing_masks_and_local_rows() {
         COMMIT;
         SELECT 'remaining', count(*) FROM lake.main.t;
         SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
-    assert!(
-        result.lines().any(|line| line == "remaining,98999"),
-        "{result}"
-    );
-    assert!(
-        result.lines().any(|line| line == "verified,0,0,0"),
-        "{result}"
-    );
+    assert!(has_line(&result, "remaining,98999"), "{result}");
+    assert!(has_line(&result, "verified,0,0,0"), "{result}");
 }
 
 /// Deletion-vector tables retain DuckLake's ordinary DELETE operator.
@@ -360,7 +351,7 @@ fn an_indexed_update_maintains_keys_and_row_ids() {
         SELECT 'new', count(*) FROM lake.main.t WHERE a = 200000 AND rowid = (SELECT id FROM original);
         SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
     for expected in ["old,0", "new,1", "verified,0,0,0"] {
-        assert!(result.lines().any(|line| line == expected), "{result}");
+        assert!(has_line(&result, expected), "{result}");
     }
 }
 

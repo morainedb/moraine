@@ -29,7 +29,7 @@ fn native_index_ddl_creates_probes_and_drops() {
          DROP INDEX lake.main.by_b;",
     );
     for expected in ["wrappers,0", "by_a,true", "hit,1", "remaining,0"] {
-        assert!(result.lines().any(|line| line == expected), "{result}");
+        assert!(has_line(&result, expected), "{result}");
     }
 }
 
@@ -85,10 +85,7 @@ fn native_index_ddl_is_execution_only_and_requires_autocommit() {
         "EXPLAIN CREATE INDEX by_a ON lake.main.t(a);
          SELECT 'remaining', count(*) FROM moraine_indexes('lake','main','t');",
     );
-    assert!(
-        explained.lines().any(|line| line == "remaining,0"),
-        "{explained}"
-    );
+    assert!(has_line(&explained, "remaining,0"), "{explained}");
     for sql in [
         "BEGIN; CREATE INDEX by_a ON lake.main.t(a);",
         "BEGIN; DROP INDEX IF EXISTS lake.main.by_a;",
@@ -103,7 +100,7 @@ fn native_index_ddl_is_execution_only_and_requires_autocommit() {
          EXPLAIN DROP INDEX lake.main.by_a;
          SELECT 'remaining', count(*) FROM moraine_indexes('lake','main','t');",
     );
-    assert!(result.lines().any(|line| line == "remaining,1"), "{result}");
+    assert!(has_line(&result, "remaining,1"), "{result}");
     let error = run_ducklake_sql_expect_err(
         store.path(),
         data.path(),

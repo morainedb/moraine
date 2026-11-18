@@ -184,18 +184,12 @@ fn a_clean_pass_certifies_and_a_rebuild_withdraws() {
          CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          SELECT 'rebuilt', certified_at IS NULL FROM moraine_indexes('lake','main','t');",
     );
-    assert!(result.lines().any(|line| line == "fresh,true"), "{result}");
+    assert!(has_line(&result, "fresh,true"), "{result}");
+    assert!(has_line(&result, "pass,0,0,0,true"), "{result}");
+    assert!(has_line(&result, "listed,true"), "{result}");
     assert!(
-        result.lines().any(|line| line == "pass,0,0,0,true"),
-        "{result}"
-    );
-    assert!(result.lines().any(|line| line == "listed,true"), "{result}");
-    assert!(
-        result.lines().any(|line| line == "after_dml,true"),
+        has_line(&result, "after_dml,true"),
         "a maintained DELETE keeps the certificate: {result}"
     );
-    assert!(
-        result.lines().any(|line| line == "rebuilt,true"),
-        "{result}"
-    );
+    assert!(has_line(&result, "rebuilt,true"), "{result}");
 }

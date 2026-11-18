@@ -34,7 +34,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         "the pruning list became a per-row residual: {result}"
     );
     assert!(
-        result.lines().any(|line| line == "3264"),
+        has_line(&result, "3264"),
         "the probe result changed: {result}"
     );
 
@@ -75,7 +75,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
             "cap boundary {expected}: {result}"
         );
         assert!(
-            result.lines().any(|line| line == expected),
+            has_line(&result, expected),
             "cap boundary changed results: {result}"
         );
     }
@@ -98,7 +98,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         "too many metadata predicates: {sparse}"
     );
     assert!(
-        sparse.lines().any(|line| line == "4096"),
+        has_line(&sparse, "4096"),
         "coalesced gaps changed the result: {sparse}"
     );
 }
