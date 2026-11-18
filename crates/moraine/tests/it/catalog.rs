@@ -875,3 +875,52 @@ async fn a_read_only_attach_counts_its_log_requests() {
     assert!(tally.main_gets > 0, "{tally:?}");
     reader.close().await.unwrap();
 }
+
+/// An open reads what the first statement needs while it validates the
+/// store: the first read scope, and the first option read, fetch no table
+/// bytes of their own, on a writer and on a reader alike.
+#[tokio::test]
+async fn an_open_leaves_the_first_statement_nothing_to_fetch() {
+    let objects = Arc::new(InMemory::new());
+    let seed = Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    seed.commit(async |tx| {
+        let schema = tx.schema_by_name("main").await.unwrap().unwrap().id;
+        tx.create_table(schema, "t", &[col("a")]).await?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    seed.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(objects));
+    let mut options = CatalogOptions::default();
+    options.external_compaction = true;
+    for read_only in [false, true] {
+        let catalog = if read_only {
+            Catalog::open_read_only(counting.clone(), options.clone())
+                .await
+                .unwrap()
+        } else {
+            (*Catalog::open(counting.clone(), options.clone())
+                .await
+                .unwrap())
+            .clone()
+        };
+        counting.take_sst_reads();
+
+        let view = catalog.read_scope().await.unwrap();
+        assert!(!view.schemas().await.unwrap().is_empty());
+        let option = moraine::ffi_support::catalog_read::global_option(&catalog, "encrypted")
+            .await
+            .unwrap();
+        assert_eq!(option.as_deref(), Some("false"));
+        assert_eq!(
+            counting.take_sst_reads(),
+            0,
+            "the first statement fetched table bytes the open could have primed (read_only: {read_only})"
+        );
+        catalog.close().await.unwrap();
+    }
+}

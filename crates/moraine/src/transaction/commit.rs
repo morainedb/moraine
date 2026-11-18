@@ -38,8 +38,8 @@ use crate::{
     store::{
         StagedBytes,
         cache::CacheCounters,
-        handle::ReadHandle,
-        key::{EntityKey, Key, SysKey},
+        handle::{ReadHandle, ScanOrder, ScanShape},
+        key::{self, EntityKey, Key, SysKey},
         open::StoreBuilder,
         proto, read, value,
     },
@@ -254,6 +254,50 @@ pub(crate) async fn recorded_wal_store(tx: ReadHandle<'_>) -> Result<Option<Stri
         .and_then(|options| options.options.get("wal_path").cloned()))
 }
 
+/// Validates the store an open found and primes what its first statement
+/// reads, in one batch: the format stamp and migration marker, the
+/// recorded log store, and the newest snapshot record. Each sits in a
+/// different subspace, so one round of table opens serves all three.
+/// Returns the format, or `None` for a store no writer has initialized.
+pub(crate) async fn validate_and_prime(
+    tx: ReadHandle<'_>,
+    wal_path: Option<&str>,
+    log_resident: bool,
+) -> Result<Option<proto::FormatValue>> {
+    let (format, recorded, ()) = futures::try_join!(
+        validate_format(tx, log_resident),
+        recorded_wal_store(tx),
+        prime_newest_snapshot(tx),
+    )?;
+    let Some(format) = format else {
+        return Ok(None);
+    };
+    check_wal_store(recorded.as_deref(), wal_path)?;
+    Ok(Some(format))
+}
+
+/// Reads the newest snapshot record into the cache, best-effort: every
+/// statement resolves its snapshot from it, so the first owes no table
+/// open for it.
+async fn prime_newest_snapshot(tx: ReadHandle<'_>) -> Result<()> {
+    let primed = async {
+        let mut newest = tx
+            .scan_prefix_ordered(
+                key::subspace_prefix(key::Subspace::Snapshot),
+                ..,
+                ScanShape::seek().retain(),
+                ScanOrder::Descending,
+            )
+            .await?;
+        newest.next().await?;
+        Ok::<(), slatedb::Error>(())
+    };
+    if let Err(error) = primed.await {
+        debug!(%error, "could not prime the newest snapshot; the first statement reads it");
+    }
+    Ok(())
+}
+
 /// Writes `db`'s memtable out as a sorted-string table in the catalog
 /// store, which is what carries what the log holds into that store and
 /// moves the store's replay point past it.
@@ -281,9 +325,13 @@ pub(crate) async fn verify_wal_store(db: &Db, configured: Option<&str>) -> Resul
 /// [`move_wal_store`](crate::Catalog::move_wal_store)'s job, which drains
 /// the log it leaves behind first.
 pub(crate) async fn validate_wal_store(tx: ReadHandle<'_>, configured: Option<&str>) -> Result<()> {
-    let recorded = recorded_wal_store(tx).await?;
+    check_wal_store(recorded_wal_store(tx).await?.as_deref(), configured)
+}
 
-    match (recorded.as_deref(), configured) {
+/// Refuses an open whose log store disagrees with the one the catalog
+/// records.
+fn check_wal_store(recorded: Option<&str>, configured: Option<&str>) -> Result<()> {
+    match (recorded, configured) {
         (Some(recorded), None) => Err(Error::Configuration(format!(
             "this catalog keeps its write-ahead log on `{recorded}`, so every open has to name \
              that store (`CatalogOptions::wal_store`, or the extension's `WAL_PATH`); \
@@ -480,11 +528,9 @@ async fn open_attempt(
     );
     let tx = begin_snapshot(&db)?;
 
-    match validate_format(ReadHandle::Tx(&tx), log_resident).await {
+    match validate_and_prime(ReadHandle::Tx(&tx), wal_path, log_resident).await {
         Ok(Some(format)) => {
-            let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
-            agreed.map_err(OpenFailure::Fatal)?;
             return Ok((db, counters, format.format_version, pacer));
         }
         Ok(None) => {}
@@ -522,14 +568,10 @@ async fn open_attempt(
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
             let tx = begin_snapshot(&db)?;
-            let validated = validate_format(ReadHandle::Tx(&tx), log_resident).await;
-            let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
+            let validated = validate_and_prime(ReadHandle::Tx(&tx), wal_path, log_resident).await;
             tx.rollback();
             match validated {
-                Ok(Some(format)) => {
-                    agreed.map_err(OpenFailure::Fatal)?;
-                    Ok((db, counters, format.format_version, pacer))
-                }
+                Ok(Some(format)) => Ok((db, counters, format.format_version, pacer)),
                 Ok(None) => Err(OpenFailure::Fatal(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
                 ))),
@@ -733,11 +775,8 @@ pub(crate) async fn validate_reader(
     wal_path: Option<&str>,
     log_resident: bool,
 ) -> Result<u64> {
-    match validate_format(ReadHandle::Reader(reader), log_resident).await? {
-        Some(format) => {
-            validate_wal_store(ReadHandle::Reader(reader), wal_path).await?;
-            Ok(format.format_version)
-        }
+    match validate_and_prime(ReadHandle::Reader(reader), wal_path, log_resident).await? {
+        Some(format) => Ok(format.format_version),
         None => Err(Error::Corruption(
             "store is not an initialized moraine catalog; a read-only attach \
              needs a writer to have created it first"
