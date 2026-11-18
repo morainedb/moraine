@@ -72,6 +72,7 @@ jobs:
   release:
     needs: [build, validate]
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 30
     permissions:
       contents: write
