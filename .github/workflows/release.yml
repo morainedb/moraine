@@ -127,6 +127,7 @@ jobs:
     needs: [should-release, build-extension, validate, ci]
     if: needs.should-release.outputs.release == 'true'
     runs-on: ubuntu-latest
+    environment: release
     # Bounded rather than left to hold a runner in silence: the releases
     # API has hung indefinitely on uploads it usually moves in seconds.
     timeout-minutes: 30
