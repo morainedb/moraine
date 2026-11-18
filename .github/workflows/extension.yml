@@ -1,5 +1,5 @@
 name: Extension
-# Build and validate every supported platform, then publish an unsigned ext-v* release.
+# Build and validate every supported platform, then publish a signed ext-v* release.
 on:
   workflow_dispatch:
     inputs:
