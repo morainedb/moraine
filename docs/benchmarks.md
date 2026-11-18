@@ -506,9 +506,7 @@ five cold processes per size sharing a cache directory:
 - The plan is what grows, 88 ms to 576 ms, and the warm repeat tracks it
   at 547 ms while issuing no object-store request at all. That cost is
   DuckDB planning over the file list, not the catalog reading it.
-- A cold attach issues seven catalog-store requests at either size,
-  listings and head probes included.
-
+- A cold attach issues seven catalog-store requests.
 <!-- site:omit -->
 Findings, 2026-08, before the demand-loaded catalog:
 
@@ -560,24 +558,16 @@ the GET count is the slope:
 | slope (GETs) | 7.0 | 6.9 |
 
 The merge cut SSTs by 63% and did not reduce GETs, matching the S3 run
-above. Measured 2026-11-18 at `c4fabb0`, after a read-only attach's first
-scope began sharing the reader the attach opened; at `c224745` the slopes
-were 19.6 and 20.4, after a reader stopped writing a checkpoint of its own
-on open, before that (at `8146cbf`) 22.6 and 23.7, and before the
-demand-loaded catalog the merge cut GETs from 14.5 to 12.3.
+above. In-memory, 2026-11-18 at `c4fabb0`.
 
-`measure_preload_overlap_with_the_first_read` asks whether the store
-preload, which the extension runs after the attach returns, fetches blocks
-twice when the first statement runs beside it. 64 tables, a `L0` preload
-and a first schema read, median reads of five; in-memory, 2026-11-18 at
-`c4fabb0`:
+`measure_preload_overlap_with_the_first_read`: does a store preload running
+beside the first read fetch blocks twice? Reads of a `L0` preload and a
+first schema read over 64 tables, run one after the other and together,
+median of five. In-memory, 2026-11-18 at `c4fabb0`:
 
 | one after the other | together |
 |---:|---:|
 | 12 | 12 |
-
-The pair costs the same either way, so warming off the attach path
-duplicates nothing.
 
 `measure_attach_cost_by_index_size` grows only the `index` subspace:
 
