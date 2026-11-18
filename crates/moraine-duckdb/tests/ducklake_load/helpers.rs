@@ -609,6 +609,16 @@ pub fn run_reference_ducklake_sql_expect_err(meta_dir: &Path, data_path: &Path, 
     );
 }
 
+/// Whether `output` holds `expected` as a whole result line. The CLI prints
+/// log records in colour on the same stream, and a record's reset sequence
+/// lands on the front of the line that follows it.
+pub fn has_line(output: &str, expected: &str) -> bool {
+    output
+        .lines()
+        .map(strip_ansi)
+        .any(|line| !is_log_line(&line) && line == expected)
+}
+
 pub fn csv_rows(output: &str) -> Vec<Vec<String>> {
     output
         .lines()
@@ -797,6 +807,19 @@ fn csv_rows_keeps_a_row_that_looks_faintly_like_a_record() {
         csv_rows("header\nplain: value\nducklake:moraine:/tmp/lake\n"),
         vec![vec!["plain: value"], vec!["ducklake:moraine:/tmp/lake"]]
     );
+}
+
+/// A result row still matches behind the reset a printed log record leaves
+/// on it, and a log record never matches as a row.
+#[test]
+fn has_line_sees_past_a_log_records_trailing_reset() {
+    let output = "\u{1b}[90mWARNING:\n\u{1b}[00m\u{1b}[90mmoraine::catalog: summary memory exceeds 1 rows\n\n\u{1b}[00mbefore,14\nupdated,99\n";
+    assert!(has_line(output, "before,14"));
+    assert!(has_line(output, "updated,99"));
+    assert!(!has_line(
+        output,
+        "moraine::catalog: summary memory exceeds 1 rows"
+    ));
 }
 
 #[test]
