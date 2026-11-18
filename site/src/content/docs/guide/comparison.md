@@ -61,7 +61,7 @@ object storage and provides indexes for efficient query planning.
 
 ## Delta Lake
 
-Delta Lake has no catalog: each table is a directory with its own log, and a
+Delta Lake has no catalog: each table is a directory with its own log and a
 commit writes the next numbered log entry with a put-if-absent request. Any
 number of writers can commit to a table that way, and the log is the whole
 truth about that table. Nothing in the format spans two tables, so renames,
