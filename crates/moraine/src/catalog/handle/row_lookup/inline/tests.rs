@@ -1,16 +1,32 @@
-use std::{cell::Cell, sync::Arc};
+use std::{cell::Cell, sync::Arc, time::Duration};
 
-use object_store::memory::InMemory;
+use object_store::{ObjectStore, memory::InMemory};
+use slatedb::DbReader;
 
 use crate::{
     Catalog, CatalogOptions, ColumnDef, InlineChunk, TableId,
     store::{
-        handle::ReadHandle,
+        handle::{ReadHandle, ReadSession},
         key::{InlineKey, InlineOperation, Key, SysKey},
+        open::StoreBuilder,
         value,
     },
     transaction::commit,
 };
+
+/// A session over a reader that follows the manifest every `poll`, so a
+/// writer's batch lands under it mid-read: the shape the retries below
+/// recover from. A catalog's own sessions pin one revision instead.
+async fn following_session(store: &Arc<InMemory>, poll: Duration) -> (ReadSession, Arc<DbReader>) {
+    let objects: Arc<dyn ObjectStore> = Arc::clone(store) as Arc<dyn ObjectStore>;
+    let (reader, _) = StoreBuilder::new("", objects)
+        .poll_interval(poll)
+        .open_reader()
+        .await
+        .unwrap();
+    let reader = Arc::new(reader);
+    (ReadSession::Reader(Arc::clone(&reader)), reader)
+}
 
 async fn fixture() -> (Arc<InMemory>, TableId) {
     let store = Arc::new(InMemory::new());
@@ -250,8 +266,8 @@ async fn manifest_lookup_retries_a_chunk_removed_by_a_maintenance_batch() {
         .await
         .unwrap();
     assert!(reader.recent_row(table, 3).await.unwrap().is_some());
+    let (session, following) = following_session(&store, options.reader_poll_interval).await;
     let writer = Catalog::open(store, options).await.unwrap();
-    let session = reader.begin_read().await.unwrap();
     let attempts = Cell::new(0);
     let rows = reader
         .lookup_inline(
@@ -274,6 +290,7 @@ async fn manifest_lookup_retries_a_chunk_removed_by_a_maintenance_batch() {
     assert!(rows.is_empty());
     assert_eq!(attempts.get(), 2);
     session.finish();
+    following.close().await.unwrap();
     reader.close().await.unwrap();
 }
 #[tokio::test]
@@ -287,8 +304,8 @@ async fn consistent_read_retries_errors_from_a_changed_manifest() {
         .await
         .unwrap();
     assert!(reader.recent_row(table, 3).await.unwrap().is_some());
+    let (session, following) = following_session(&store, options.reader_poll_interval).await;
     let writer = Catalog::open(store, options).await.unwrap();
-    let session = reader.begin_read().await.unwrap();
     let attempts = Cell::new(0);
     let rows = crate::store::read::consistent(session.handle(), || async {
         let head = commit::read_head_value(session.handle()).await?;
@@ -307,6 +324,7 @@ async fn consistent_read_retries_errors_from_a_changed_manifest() {
     assert!(rows.is_empty());
     assert_eq!(attempts.get(), 2);
     session.finish();
+    following.close().await.unwrap();
     reader.close().await.unwrap();
 }
 #[tokio::test]
@@ -319,8 +337,8 @@ async fn full_inline_scan_retries_after_maintenance_removes_selected_rows() {
     let reader = Catalog::open_read_only(store.clone(), options.clone())
         .await
         .unwrap();
+    let (session, following) = following_session(&store, options.reader_poll_interval).await;
     let writer = Catalog::open(store, options).await.unwrap();
-    let session = reader.begin_read().await.unwrap();
     let attempts = Cell::new(0);
     let rows = reader
         .with_inline_rows(session.handle(), table, async |source, rows| {
@@ -342,6 +360,7 @@ async fn full_inline_scan_retries_after_maintenance_removes_selected_rows() {
     );
     assert_eq!(attempts.get(), 2);
     session.finish();
+    following.close().await.unwrap();
     reader.close().await.unwrap();
 }
 

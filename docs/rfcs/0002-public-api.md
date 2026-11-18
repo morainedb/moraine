@@ -49,9 +49,9 @@ writer has initialized.
 paired with the name the catalog records, and every later open must name the
 same store. `checkpoint: Option<String>` pins a read-only open to a checkpoint:
 that reader never sees a later commit. `open` refuses it. A read-only open
-without it pins the writer's publications and writes nothing either;
-`reader_poll_interval` bounds how stale it may be. Other fields configure flush
-timing and caches<!-- site:omit -->, and
+without it keeps a checkpoint of its own, written as it opens and advanced as it
+reads; `reader_poll_interval` bounds how stale it may be. Other fields configure
+flush timing and caches<!-- site:omit -->, and
 [the commit-log seam](0011-commit-log-seam.md)<!-- /site:omit -->.
 
 Checkpoint ids are `String`. A writer mints one with

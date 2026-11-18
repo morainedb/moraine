@@ -31,10 +31,12 @@ read it.
 `DbSnapshot`, so it reads through a `DbReader` of its own.
 `crates/moraine/src/store/checkpoint.rs` holds one open.
 `crates/moraine/src/catalog/handle/reader_scopes.rs` shares those readers
-across transactions. The handle's own `DbReader` follows the latest manifest
-without a checkpoint of its own, polling at `reader_poll_interval`; it serves
-head reads only, and the collector's age threshold protects what it references
-between polls.
+across transactions. The reader a read-only handle opens as it attaches is the
+first one its scopes share: the attach's own validation, head reads, and the
+first transactions all go through it, so attaching and the first transaction
+open one reader rather than two. It stays open for the handle's life for
+status and shutdown, and rotation never retires it. A handle over a commit log
+keeps a base reader apart from its per-transaction views.
 
 Reader acquisition works as follows.
 
@@ -617,6 +619,8 @@ container ceiling remains the final boundary.
 - A reader past its deadline rejects point reads and scan yields.
 - A checkpoint-pinned attach writes nothing to the object store; a reader with
   none to pin records a checkpoint of its own.
+- A read-only attach's first scopes share the reader the attach opened and
+  write no second checkpoint.
 - A shared reader is reused inside `reader_poll_interval`, and a scope past it
   opens a newer one; a committer opens one per transaction.
 - A head change under a lookup rerun reaches `RetryBudgetExhausted` after

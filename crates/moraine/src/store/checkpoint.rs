@@ -1,6 +1,12 @@
 //! Readers over the checkpoints they hold open.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use slatedb::DbReader;
 use tokio::time::Instant;
@@ -21,6 +27,7 @@ pub(crate) struct CheckpointReader {
     /// `None` for a checkpoint whose lifetime someone else owns.
     deadline: Option<Instant>,
     owned: bool,
+    closed: AtomicBool,
 }
 
 impl CheckpointReader {
@@ -40,6 +47,12 @@ impl CheckpointReader {
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
+    /// The store reader itself, for status and shutdown. Reads go through
+    /// [`reader`](Self::reader), which honours the deadline.
+    pub(crate) fn store_reader(&self) -> &Arc<DbReader> {
+        &self.reader
+    }
+
     /// Uses a checkpoint whose lifecycle the caller already owns.
     pub(crate) fn external(reader: Arc<DbReader>) -> Arc<Self> {
         Arc::new(Self {
@@ -47,6 +60,7 @@ impl CheckpointReader {
             reader,
             deadline: None,
             owned: false,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -58,6 +72,7 @@ impl CheckpointReader {
             reader: Arc::new(reader),
             deadline: None,
             owned: true,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -70,19 +85,31 @@ impl CheckpointReader {
             reader: Arc::new(reader),
             deadline: Some(Instant::now() + READ_WINDOW - SKEW_MARGIN),
             owned: true,
+            closed: AtomicBool::new(false),
         })
+    }
+
+    /// Closes the reader now, releasing its checkpoint before the caller
+    /// moves on. Once, however many times it is called; the drop then
+    /// closes nothing.
+    pub(crate) async fn close(&self) -> Result<(), slatedb::Error> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.reader.close().await
     }
 
     /// Releases an unshared reader before its replacement reserves replay
     /// memory.
     pub(crate) async fn retire(self) {
-        let _ = self.reader.close().await;
+        let _ = self.close().await;
     }
 }
 
 impl Drop for CheckpointReader {
     fn drop(&mut self) {
         if self.owned
+            && !self.closed.load(Ordering::Acquire)
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let reader = self.reader.clone();

@@ -9,10 +9,11 @@ use object_store::ObjectStore;
 use slatedb::DbReader;
 use tokio::{sync::Mutex, time::Instant};
 
-use super::{CatalogOptions, commit_log_provider, reader_session};
+use super::{CachePreload, CatalogOptions, commit_log_provider, reader_session};
 use crate::{
     Error, Result,
     store::{
+        cache::CacheCounters,
         checkpoint::CheckpointReader,
         open::{READ_WINDOW, StoreBuilder},
     },
@@ -29,6 +30,10 @@ struct Readers {
     generations: Vec<Weak<CheckpointReader>>,
     /// When the shared reader was opened.
     opened: Option<Instant>,
+    /// The reader the attach opened, held for the catalog's life so the
+    /// handle has one reader to address for status and shutdown. Rotation
+    /// never retires it.
+    anchor: Option<Arc<CheckpointReader>>,
 }
 
 pub(crate) struct ReaderScopes {
@@ -42,16 +47,15 @@ pub(crate) struct ReaderScopes {
 }
 
 impl ReaderScopes {
+    /// `explicit` is the reader a checkpoint-pinned open holds; every scope
+    /// shares it and nothing else is ever opened.
     pub(super) fn new(
         objects: Arc<dyn ObjectStore>,
         options: CatalogOptions,
-        reader: Arc<DbReader>,
+        explicit: Option<Arc<DbReader>>,
         reuse: Duration,
     ) -> Self {
-        let explicit = options
-            .checkpoint
-            .as_ref()
-            .map(|_| CheckpointReader::external(reader));
+        let explicit = explicit.map(CheckpointReader::external);
         Self {
             objects,
             options,
@@ -67,10 +71,12 @@ impl ReaderScopes {
 
     /// The builder every scope reader opens through. Its poll interval is the
     /// read window: a reader that re-pointed mid-scope would advance state a
-    /// transaction had already started reading.
-    fn builder(&self) -> StoreBuilder<'_> {
+    /// transaction had already started reading. `preload` warms the cache
+    /// as the reader opens; only the attach's own reader asks for it.
+    fn builder(&self, preload: Option<CachePreload>) -> StoreBuilder<'_> {
         let builder = StoreBuilder::new(&self.options.path, self.objects.clone())
             .poll_interval(READ_WINDOW)
+            .cache_preload(preload)
             .wal_object_store(
                 self.options
                     .wal_store
@@ -102,7 +108,11 @@ impl ReaderScopes {
     /// Opens a reader over the latest state, keeping a checkpoint of its own
     /// so collection cannot take what it reads. A store that refuses that
     /// write is followed on retention alone, under a read window.
-    async fn open(&self, readers: &mut Readers) -> Result<Arc<CheckpointReader>> {
+    async fn open(
+        &self,
+        readers: &mut Readers,
+        preload: Option<CachePreload>,
+    ) -> Result<(Arc<CheckpointReader>, Arc<CacheCounters>)> {
         readers
             .generations
             .retain(|reader| reader.strong_count() != 0);
@@ -123,30 +133,48 @@ impl ReaderScopes {
             }
         }
 
-        let reader = match self
-            .builder()
+        let (reader, counters) = match self
+            .builder(preload)
             .reader_mode(slatedb::DbReaderMode::ManagedCheckpoint)
             .open_fixed_reader()
             .await
         {
-            Ok((opened, _)) => CheckpointReader::fixed(opened),
+            Ok((opened, counters)) => (CheckpointReader::fixed(opened), counters),
             Err(error) => {
                 tracing::warn!(
                     %error,
                     "could not keep a checkpoint of our own; following the latest manifest"
                 );
-                let (opened, _) = self
-                    .builder()
+                let (opened, counters) = self
+                    .builder(preload)
                     .reader_mode(slatedb::DbReaderMode::FollowLatest)
                     .open_fixed_reader()
                     .await?;
-                CheckpointReader::following(opened)
+                (CheckpointReader::following(opened), counters)
             }
         };
         readers.opened = Some(Instant::now());
         readers.latest = Some(reader.clone());
         readers.generations.push(Arc::downgrade(&reader));
-        Ok(reader)
+        Ok((reader, counters))
+    }
+
+    /// Opens the reader a read-only attach reads through, warming the cache
+    /// per `preload`, and holds it for the catalog's life. Scopes share it
+    /// under the reuse window like any other, but it counts toward no
+    /// transaction limit and rotation never retires it.
+    pub(super) async fn anchor(
+        &self,
+        preload: Option<CachePreload>,
+    ) -> Result<(Arc<CheckpointReader>, Arc<CacheCounters>)> {
+        let mut readers = self.readers.lock().await;
+        let (reader, counters) = self.open(&mut readers, preload).await?;
+        let anchored = Arc::downgrade(&reader);
+        readers
+            .generations
+            .retain(|generation| !Weak::ptr_eq(generation, &anchored));
+        readers.anchor = Some(reader.clone());
+        Ok((reader, counters))
     }
 
     pub(crate) async fn acquire(&self) -> Result<Arc<CheckpointReader>> {
@@ -155,17 +183,28 @@ impl ReaderScopes {
         }
         if self.captures_log() {
             // Replay bytes are admitted by the process working-memory budget.
-            let (reader, _) = self.builder().open_fixed_reader().await?;
+            let (reader, _) = self.builder(None).open_fixed_reader().await?;
             return Ok(CheckpointReader::fixed(reader));
         }
         let mut readers = self.readers.lock().await;
         if let Some(reader) = self.reusable(&readers) {
             return Ok(reader);
         }
-        self.open(&mut readers).await
+        let (reader, _) = self.open(&mut readers, None).await?;
+        Ok(reader)
     }
 
-    pub(super) async fn close(&self) {
-        self.readers.lock().await.latest = None;
+    /// Lets go of the shared reader and closes the attach's own, reporting
+    /// whether there was one to close.
+    pub(super) async fn close(&self) -> Result<bool> {
+        let mut readers = self.readers.lock().await;
+        readers.latest = None;
+        match readers.anchor.take() {
+            Some(anchor) => {
+                anchor.close().await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }

@@ -123,7 +123,8 @@ async fn set_probe(catalog: &Catalog, value: &str) {
 }
 
 /// A read-only attach writes only the checkpoint that keeps collection off
-/// what it reads: one per reader it opens, and nothing else.
+/// what it reads: one per reader it opens, and nothing else. Under a zero
+/// reuse window every scope opens its own, beside the attach's.
 #[tokio::test]
 async fn a_read_only_attach_writes_only_its_own_checkpoints() {
     let objects = Arc::new(InMemory::new());
@@ -160,9 +161,49 @@ async fn a_read_only_attach_writes_only_its_own_checkpoints() {
 
     assert_eq!(
         counting.writes(),
-        4,
-        "two readers, each establishing and refreshing a checkpoint of its own"
+        6,
+        "three readers, each establishing and releasing a checkpoint of its own"
     );
+}
+
+/// A read-only attach's first scopes read through the reader the attach
+/// opened: acquiring one opens no second reader, so it writes no second
+/// checkpoint.
+#[tokio::test]
+async fn the_first_scope_shares_the_attach_reader() {
+    let objects = Arc::new(InMemory::new());
+    let catalog = Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    set_probe(&catalog, "one").await;
+
+    let counting = CountingStore::new(objects);
+    let reader = Catalog::open_read_only(counting.clone(), reader_options(Duration::from_hours(1)))
+        .await
+        .unwrap();
+    let attached = counting.writes();
+    assert_eq!(attached, 1, "the attach keeps one checkpoint of its own");
+
+    let scope = reader.index_read_scope().await.unwrap();
+    assert_eq!(
+        global_option(scope.reads(), "probe")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("one")
+    );
+    assert_eq!(
+        global_option(&reader, "probe").await.unwrap().as_deref(),
+        Some("one")
+    );
+    assert_eq!(
+        counting.writes(),
+        attached,
+        "the scopes opened no reader of their own"
+    );
+    drop(scope);
+    reader.close().await.unwrap();
+    catalog.close().await.unwrap();
 }
 
 #[tokio::test]

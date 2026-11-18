@@ -90,9 +90,6 @@ impl ReadOnlyCatalog {
         let (handle, revision) = if let Some(pinned) = &self.pinned {
             (pinned.handle.clone(), pinned.revision)
         } else if let Some(scopes) = &self.reader_scopes {
-            if !scopes.captures_log() {
-                self.begin_read().await?.finish();
-            }
             let reader = Box::pin(scopes.acquire()).await?;
             let revision = reader.revision;
             (OwnedReadHandle::Checkpoint(reader), revision)

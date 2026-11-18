@@ -361,12 +361,13 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
-    /// Native read-only publication reuse and base-reader manifest polling;
-    /// defaults to 10 seconds. Zero discovers a publication on each native
-    /// transaction. Logged transactions always capture fresh fixed views;
-    /// this interval only advances their managed base reader and must remain
-    /// inside SlateDB's checkpoint lifetime. Explicit checkpoint attaches
-    /// and native writers do not use it.
+    /// How long a read-only catalog's transactions share one store reader
+    /// before opening a newer one, and so how stale a read may be; defaults
+    /// to 10 seconds. Zero opens one per transaction. A committer over a
+    /// commit log captures a fresh view per transaction and uses this only
+    /// to keep its base reader's checkpoint alive, so it must stay inside
+    /// SlateDB's checkpoint lifetime. Explicit checkpoint attaches and
+    /// writers do not use it.
     pub reader_poll_interval: Duration,
     /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
     /// as reported by [`Catalog::create_checkpoint`].
@@ -604,6 +605,50 @@ fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::Commit
         .commit_log
         .clone()
         .or_else(crate::commit_log::registered_commit_log)
+}
+
+/// What a read-only open produces: the store reader, its counters, the
+/// format it stands at, and the scopes its transactions read through.
+type OpenedReader = (
+    Arc<DbReader>,
+    Arc<crate::store::cache::CacheCounters>,
+    u64,
+    Arc<reader_scopes::ReaderScopes>,
+);
+
+/// Opens a plain read-only catalog's reader through the scopes its
+/// transactions share, so the attach and the first transactions open one
+/// reader, and validates the format it finds.
+async fn open_anchored_reader(
+    object_store: Arc<dyn ObjectStore>,
+    options: &CatalogOptions,
+    reuse: Duration,
+) -> Result<OpenedReader> {
+    let scopes = Arc::new(reader_scopes::ReaderScopes::new(
+        object_store,
+        options.clone(),
+        None,
+        reuse,
+    ));
+    let opening = Instant::now();
+    let (anchor, cache) = scopes.anchor(options.cache_preload).await?;
+    let reader = Arc::clone(anchor.store_reader());
+    let opened = opening.elapsed();
+
+    let validating = Instant::now();
+    let format = commit::validate_reader(
+        &reader,
+        options.wal_store.as_ref().map(crate::WalStore::name),
+        commit_log_provider(options).is_some(),
+    )
+    .await?;
+    info!(
+        reader_open_ms = crate::telemetry::milliseconds(opened),
+        validate_ms = crate::telemetry::milliseconds(validating.elapsed()),
+        "opened the store read-only"
+    );
+
+    Ok((reader, cache, format, scopes))
 }
 
 /// How long a scope may share the reader its predecessor opened. A
@@ -1273,12 +1318,15 @@ impl ReadOnlyCatalog {
         if let Some(pinned) = &self.pinned {
             return Ok(ReadSession::Pinned(pinned.handle.clone()));
         }
-        if let Some(scopes) = &self.reader_scopes
-            && scopes.captures_log()
-        {
+        if let Some(scopes) = &self.reader_scopes {
             let reader = Box::pin(scopes.acquire()).await?;
             let handle = crate::store::handle::OwnedReadHandle::Checkpoint(reader);
-            commit::refuse_mid_migration(handle.borrow()).await?;
+            if scopes.captures_log() {
+                commit::refuse_mid_migration(handle.borrow()).await?;
+            } else {
+                let head = commit::read_head_value(handle.borrow()).await?;
+                commit::refuse_mid_migration_at(handle.borrow(), &self.projections, &head).await?;
+            }
             return Ok(ReadSession::Pinned(handle));
         }
         let session = match self.store.as_ref() {
@@ -1319,14 +1367,19 @@ impl ReadOnlyCatalog {
         match self.store.as_ref() {
             Store::Writer { db, .. } => db.close().await.map_err(Error::from),
             Store::Reader(reader) => {
-                if let Some(scopes) = &self.reader_scopes {
-                    scopes.close().await;
+                // The scopes close the attach's own reader when they hold it.
+                let closed = match &self.reader_scopes {
+                    Some(scopes) => scopes.close().await?,
+                    None => false,
+                };
+                if closed {
+                    return Ok(());
                 }
                 reader.close().await.map_err(Error::from)
             }
             Store::Committer { commit_log, .. } => {
                 if let Some(scopes) = &self.reader_scopes {
-                    scopes.close().await;
+                    scopes.close().await?;
                 }
                 commit_log.store.close().await
             }
@@ -1960,27 +2013,41 @@ impl Catalog {
         // A reader over a log is built over a session: the committer's own,
         // or one minted here for a read-only open.
         let session = session.or_else(|| reader_session(Arc::clone(&object_store), &options));
-        let store = StoreBuilder::new(&options.path, object_store)
-            .wal_object_store(wal_object_store.clone())
-            .reader_session(session.clone())
-            .cache_dir(options.cache_dir.clone())
-            .cache_identity(options.cache_identity)
-            .cache_size(options.cache_size)
-            .cache_memory(options.cache_memory)
-            .cache_auxiliary_percent(options.cache_auxiliary_percent)
-            .cache_preload(options.cache_preload)
-            .cache_puts(options.cache_puts)
-            .cache_compaction_puts(options.cache_compaction_puts)
-            .external_compaction(external_compaction(&options))
-            .poll_interval(options.reader_poll_interval)
-            .checkpoint(checkpoint);
-
-        let (reader, cache, format) = commit::open_reader_initialized(
-            store,
-            options.wal_store.as_ref().map(crate::WalStore::name),
-            commit_log_provider(&options).is_some(),
-        )
-        .await?;
+        let wal_path = options.wal_store.as_ref().map(crate::WalStore::name);
+        let log_resident = commit_log_provider(&options).is_some();
+        let reuse = reader_reuse(&options, fresh_reader);
+        // A plain read-only open reads through the reader its scopes share,
+        // so attaching and the first transactions open one reader, not two.
+        // A reader over a log or pinned to a checkpoint keeps its own apart.
+        let anchored = !fresh_reader && session.is_none() && checkpoint.is_none();
+        let (reader, cache, format, reader_scopes) = if anchored {
+            open_anchored_reader(located.clone(), &options, reuse).await?
+        } else {
+            let store = StoreBuilder::new(&options.path, object_store)
+                .wal_object_store(wal_object_store.clone())
+                .reader_session(session.clone())
+                .cache_dir(options.cache_dir.clone())
+                .cache_identity(options.cache_identity)
+                .cache_size(options.cache_size)
+                .cache_memory(options.cache_memory)
+                .cache_auxiliary_percent(options.cache_auxiliary_percent)
+                .cache_preload(options.cache_preload)
+                .cache_puts(options.cache_puts)
+                .cache_compaction_puts(options.cache_compaction_puts)
+                .external_compaction(external_compaction(&options))
+                .poll_interval(options.reader_poll_interval)
+                .checkpoint(checkpoint);
+            let (reader, cache, format) =
+                commit::open_reader_initialized(store, wal_path, log_resident).await?;
+            let reader = Arc::new(reader);
+            let scopes = Arc::new(reader_scopes::ReaderScopes::new(
+                located.clone(),
+                options.clone(),
+                checkpoint.map(|_| Arc::clone(&reader)),
+                reuse,
+            ));
+            (reader, cache, format, scopes)
+        };
         // The manifest the open loaded serves the diagnostics.
         warn_if_caches_cannot_hold(
             &options,
@@ -1996,16 +2063,9 @@ impl Catalog {
         warn_if_slow_open_without_cache(&options, elapsed);
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         crate::catalog::projection::raise_format_floor(&projections, format);
-        let reader = Arc::new(reader);
-        let reader_scopes = Some(Arc::new(reader_scopes::ReaderScopes::new(
-            located.clone(),
-            options.clone(),
-            reader.clone(),
-            reader_reuse(&options, fresh_reader),
-        )));
         Ok(ReadOnlyCatalog {
             pinned: None,
-            reader_scopes,
+            reader_scopes: Some(reader_scopes),
             writer_status: None,
             store: Arc::new(Store::Reader(reader)),
             location: Arc::new(StoreLocation {

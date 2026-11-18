@@ -1431,13 +1431,12 @@ void moraine_error_free(char *message);
 // value with `read_only` false is [`codes::INVALID_ARGUMENT`].
 //
 // `reader_poll_interval_ms` is how stale a read-only attach may be: how
-// long its transactions keep one published checkpoint before looking for
-// a newer one, and how often its reader polls the manifest; `0` keeps the
-// catalog's default. Longer is cheaper and staler, for a dashboard that
-// attaches for the day. On a committer over a commit log it buys no
-// freshness — every read refreshes the reader — and only sets how often
-// the reader polls to keep its checkpoint alive. A `checkpoint` attach
-// polls for nothing and ignores it.
+// long its transactions share one store reader before opening a newer
+// one; `0` keeps the catalog's default. Longer is cheaper and staler, for
+// a dashboard that attaches for the day. On a committer over a commit log
+// it buys no freshness — every read refreshes the reader — and only sets
+// how often the reader polls to keep its checkpoint alive. A `checkpoint`
+// attach polls for nothing and ignores it.
 //
 // `host_threads` is how many execution threads the calling host runs;
 // the handle's worker pool is that count clamped to `[2, 8]`, with `0`
