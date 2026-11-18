@@ -496,7 +496,7 @@ AWS S3 in us-east-1 from the benchmark runner<!-- site:omit -->,
 2026-11-17 at `a491fe5`<!-- /site:omit -->, one table, no delete files,
 five cold processes per size sharing a cache directory:
 
-| files | attach | store open | listing | plan | warm repeat | cold GETs |
+| files | attach | store open | listing | plan | warm repeat | cold requests |
 |---:|---:|---:|---:|---:|---:|---|
 | 2,000 | 586 ms | 351 ms | 10 ms | 88 ms | 64 ms | 7 / 78 ms |
 | 20,000 | 597 ms | 377 ms | 64 ms | 576 ms | 547 ms | 7 / 79 ms |
@@ -506,7 +506,8 @@ five cold processes per size sharing a cache directory:
 - The plan is what grows, 88 ms to 576 ms, and the warm repeat tracks it
   at 547 ms while issuing no object-store request at all. That cost is
   DuckDB planning over the file list, not the catalog reading it.
-- A cold attach reads seven objects at either size.
+- A cold attach issues seven catalog-store requests at either size,
+  listings and head probes included.
 
 <!-- site:omit -->
 Findings, 2026-08, before the demand-loaded catalog:

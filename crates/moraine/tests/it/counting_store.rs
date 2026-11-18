@@ -43,8 +43,7 @@ impl CountingStore {
     }
 
     /// Reads and listings under the compactor's state directory since the
-    /// last call, and resets the tally. An open never needs them: the
-    /// manifest it loads carries every size a diagnostic wants.
+    /// last call, and resets the tally.
     pub fn take_compactions_requests(&self) -> u64 {
         self.compactions_requests.swap(0, Ordering::SeqCst)
     }

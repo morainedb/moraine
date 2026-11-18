@@ -517,6 +517,19 @@ typedef struct MoraineObjectStoreTally {
   uint64_t data_gets;
   // Bytes those reads returned.
   uint64_t data_bytes;
+  // Head probes of the main store: existence checks that return no bytes.
+  uint64_t main_heads;
+  // Summed main-store head-probe latency, in nanoseconds.
+  uint64_t main_head_nanoseconds;
+  // Listings of the main store. Listings stream, so they carry no
+  // duration.
+  uint64_t main_lists;
+  // Head probes of the WAL store.
+  uint64_t wal_heads;
+  // Summed WAL-store head-probe latency, in nanoseconds.
+  uint64_t wal_head_nanoseconds;
+  // Listings of the WAL store.
+  uint64_t wal_lists;
 } MoraineObjectStoreTally;
 
 // One data file carrying located positions, as

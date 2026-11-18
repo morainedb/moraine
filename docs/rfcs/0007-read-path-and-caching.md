@@ -382,7 +382,9 @@ are attach options, one per lake. Both are documented with the [extension
 surface](0006-extension-surface.md).
 `moraine_cache_tally`, `moraine_cache_status`, `moraine_store_census`, and
 `moraine_object_store_tally` report hits and misses per tier, capacity and
-occupancy, recorded SST metadata bytes, and object-store requests.
+occupancy, recorded SST metadata bytes, and object-store requests. The
+request tally counts head probes and listings apart from reads that return
+bytes, since an open is mostly the former.
 
 **Lake data.** Ordinary lake scans never send data-file bytes through moraine.
 Data bytes are held in DuckDB's external-file cache under its `memory_limit`.
