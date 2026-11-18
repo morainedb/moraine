@@ -555,12 +555,12 @@ the GET count is the slope:
 
 | per-GET latency | churned (38 SSTs) | merged (14 SSTs) |
 |---|---|---|
-| 0 ms | 0.43 ms | 0.34 ms |
-| 10 ms | 68.2 ms | 68.3 ms |
-| slope (GETs) | 6.8 | 6.8 |
+| 0 ms | 0.45 ms | 0.41 ms |
+| 10 ms | 70.7 ms | 69.1 ms |
+| slope (GETs) | 7.0 | 6.9 |
 
 The merge cut SSTs by 63% and did not reduce GETs, matching the S3 run
-above. Measured 2026-11-18 at `9ee517d`, after a read-only attach's first
+above. Measured 2026-11-18 at `c4fabb0`, after a read-only attach's first
 scope began sharing the reader the attach opened; at `c224745` the slopes
 were 19.6 and 20.4, after a reader stopped writing a checkpoint of its own
 on open, before that (at `8146cbf`) 22.6 and 23.7, and before the
@@ -570,7 +570,7 @@ demand-loaded catalog the merge cut GETs from 14.5 to 12.3.
 preload, which the extension runs after the attach returns, fetches blocks
 twice when the first statement runs beside it. 64 tables, a `L0` preload
 and a first schema read, median reads of five; in-memory, 2026-11-18 at
-`9ee517d`:
+`c4fabb0`:
 
 | one after the other | together |
 |---:|---:|
