@@ -234,10 +234,12 @@ The default budget without `moraine_cache_memory` is 640 MiB. Within the block
 share an empty attach reserves nothing. Read fills, disk promotions, and
 admitted flush or compaction output grow a store's allowance under pressure:
 first from unassigned bytes, then by borrowing unused allowance from other
-stores, then by reclaiming a fair share from larger borrowers. Transfers happen
-under one process lock, shrinking donors before growing the recipient, and the
-sum of store capacities never exceeds the block share. A store's final detach
-releases its memory allowance. Its disk device stays open and keeps its
+stores, then by reclaiming a fair share from larger borrowers. A donor keeps
+twice what it holds: capacity is split evenly over the shards and evicted per
+shard, so less would cut the fuller shards of a small working set. Transfers
+happen under one process lock, shrinking donors before growing the recipient,
+and the sum of store capacities never exceeds the block share. A store's final
+detach releases its memory allowance. Its disk device stays open and keeps its
 persisted blocks.
 
 **Metadata protection.** SST indexes, filters, and statistics live in the same

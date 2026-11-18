@@ -105,13 +105,17 @@ impl StoreCache {
         // Reclaim unused allowance before evicting any other working set.
         // A grant counts as used until its entry lands: usage shows nothing
         // of it yet, and taking it back would drop that entry on arrival.
+        // Capacity splits evenly over the shards and each evicts on its own,
+        // so a donor left a hair above what it holds loses blocks from the
+        // shards holding more than their share; twice the occupancy keeps
+        // a small working set whole.
         for donor in &donors {
             if available >= target - capacity {
                 break;
             }
             let occupied = as_bytes(donor.tier.usage());
             let protected = occupied
-                .saturating_add(occupied / 3)
+                .saturating_mul(2)
                 .max(donor.admitting.load(Ordering::Relaxed));
             reclaim(donor, protected, target - capacity, &mut available);
         }
