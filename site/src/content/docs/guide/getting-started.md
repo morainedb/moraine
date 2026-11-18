@@ -142,7 +142,7 @@ and limits.
   commit latency, and caching.
 - [Operating manual](../operating/) covers retention, maintenance,
   encryption, backups, and upgrades.
-- [Compared with other catalogs](../comparison/) sets Moraine beside the
-  DuckDB file, Postgres, and Quack catalogs.
+- [Comparison](../comparison/) sets Moraine beside the DuckDB file, SQLite,
+  Postgres, and Quack catalogs, and beside Iceberg and Delta Lake.
 - [Architecture](../architecture/) explains how the catalog is laid out
   and how commits and reads work.

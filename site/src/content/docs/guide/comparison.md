@@ -1,6 +1,6 @@
 ---
 title: Comparison
-description: Moraine beside the DuckDB file, SQLite, Postgres, and Quack catalogs, and beside Iceberg-style catalog services.
+description: Moraine beside the DuckDB file, SQLite, Postgres, and Quack catalogs, and beside Iceberg and Delta Lake.
 sidebar:
   order: 5
 ---
@@ -44,7 +44,8 @@ commits through that process. If writers on several machines must commit
 independently, use Postgres or Quack. Moraine requires no catalog server;
 object-storage costs come from storage and requests. Readers need only
 `s3:GetObject` and `s3:ListBucket`. Moraine also maintains
-[indexes](../getting-started/#index-a-column), which
+[indexes](../getting-started/#index-a-column), so a lookup by key reads the
+files that hold it instead of every file statistics cannot rule out.
 
 ## Iceberg-style catalogs
 
@@ -57,3 +58,17 @@ each table.
 DuckLake replaces the metadata files with database tables, so a query plans from
 a few indexed reads instead of a manifest walk. Moraine stores that database in
 object storage and provides indexes for efficient query planning.
+
+## Delta Lake
+
+Delta Lake has no catalog: each table is a directory with its own log and a
+commit writes the next numbered log entry with a put-if-absent request. Any
+number of writers can commit to a table that way, and the log is the whole
+truth about that table. Nothing in the format spans two tables, so renames,
+namespaces, and multi-table transactions come from a separate service such as
+Unity Catalog or a Hive metastore.
+
+Moraine's commit is also one conditional object write, but the object is a
+batch over the whole catalog. A transaction can write to several tables,
+rename one, and create a schema atomically, and renames never move data
+files. The price is that one process commits to a lake at a time.
