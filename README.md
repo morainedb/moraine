@@ -109,7 +109,7 @@ Moraine. Questions and ideas go to
 - [Operating manual](https://morainedb.com/guide/operating/): retention,
   maintenance, encryption, backups, and upgrades.
 - [Comparison](https://morainedb.com/guide/comparison/): Moraine
-  alongside DuckDB, Postgres, Quack, and Iceberg-style catalogs.
+  alongside DuckDB, Postgres, Quack, Iceberg, and Delta Lake.
 - [Design](https://morainedb.com/rfcs/): key design decisions and
   rationale.
 - [Benchmarks](https://morainedb.com/benchmarks/): performance benchmarks
