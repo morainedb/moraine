@@ -37,7 +37,7 @@ jobs:
       # fingerprints that refer to generated sources outside target/.
       # Pull requests save their work for later pushes; closing a PR
       # removes its scoped entries through cleanup-pr-caches.yml.
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-fmt
           save-on-pull-request: true
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-clippy
           save-on-pull-request: true
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-test
           save-on-pull-request: true
@@ -94,7 +94,7 @@ jobs:
       # A toolchain the command names is the one case the action's probe
       # cannot see, so this entry would otherwise share the default
       # toolchain's key and restore a store that matches nothing.
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-msrv
           save-on-pull-request: true
@@ -107,7 +107,7 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-doc
           save-on-pull-request: true
@@ -122,7 +122,9 @@ jobs:
       # whenever that rate-limits or its token endpoint is down — which it did
       # twice in a row, once with a 429 and once with a 504, neither of them
       # reaching the check. This installs a prebuilt binary instead.
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@4ce04ff71051d1d43b3c1166c70c1e8a958d8dc9 # cargo-deny
+        with:
+          tool: cargo-deny
       # An `ignore` entry whose advisory no longer matches anything is only a
       # warning, and the check still exits 0 — which is how two suppressions
       # outlived their advisories unnoticed. Failing on it makes a stale one
@@ -135,7 +137,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-pins
           save-on-pull-request: true
@@ -158,7 +160,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-e2e
           save-on-pull-request: true
@@ -219,7 +221,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mr-boxington-action@v1
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1
         with:
           cache-generation: v2-s3
           save-on-pull-request: true

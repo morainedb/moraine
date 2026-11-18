@@ -45,7 +45,7 @@ jobs:
       # that repository deploys the gh-pages branch.
       - name: Publish to morainedb.github.io
         if: github.event_name != 'pull_request'
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           deploy_key: ${{ secrets.SITE_DEPLOY_KEY }}
           external_repository: morainedb/morainedb.github.io

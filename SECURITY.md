@@ -8,7 +8,7 @@ Pre-1.0: only the latest release receives security fixes.
 
 Please do **not** open a public issue for security vulnerabilities. Report
 privately via GitHub:
-<https://github.com/alexpropp/moraine/security/advisories/new>
+<https://github.com/morainedb/moraine/security/advisories/new>
 
 You should receive an acknowledgment within a week. Please include a
 reproduction if you can — moraine is a catalog backend, so data-integrity

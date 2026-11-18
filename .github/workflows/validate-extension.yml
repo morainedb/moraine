@@ -54,7 +54,7 @@ jobs:
           path: artifact
           run-id: ${{ inputs.source_run_id || github.run_id }}
           github-token: ${{ github.token }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Declared after rust-cache so this save fires before rust-cache's
       # post-step cleanup of unrecognized target/ directories.
       - uses: actions/cache@v6
