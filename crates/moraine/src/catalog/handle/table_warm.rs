@@ -64,7 +64,7 @@ impl ReadOnlyCatalog {
         }
 
         let session = self.begin_read().await?;
-        open::warm(level, session.handle(), &self.cache, &manifest.segments).await;
+        let _ = open::warm(level, session.handle(), &self.cache, &manifest.segments).await;
         session.finish();
         Ok(())
     }

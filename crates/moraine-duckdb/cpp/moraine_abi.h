@@ -1409,8 +1409,9 @@ void moraine_error_free(char *message);
 // outside it. `0` means "not given" for either byte count.
 //
 // `cache_preload` warms this store into that cache on the handle's
-// worker once the attach has returned: `0` loads nothing, `1` each
-// subspace's SST metadata, `2` the scan-shaped subspaces whole. Any other
+// worker once the attach has returned: `0` loads nothing, `1` the SST
+// metadata of the subspaces every statement reads, `2` every subspace
+// and the scan-shaped ones whole. Any other
 // value is [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller
 // always names a level (the extension's `ATTACH` passes `1` unless told
 // otherwise). A non-zero level then warms every table's probe ranges the

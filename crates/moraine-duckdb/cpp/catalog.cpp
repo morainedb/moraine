@@ -935,8 +935,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		} else if (name == "cache_compaction_puts") {
 			cache_compaction_puts = option.second.GetValue<bool>();
 		} else if (name == "cache_preload") {
-			// Spelled as a level rather than a flag: "l0" is bounded by how far
-			// the store has run since its last merge, "all" by the whole store.
+			// Spelled as a level rather than a flag: "l0" is what every statement
+			// reads, "all" the whole store.
 			auto level = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
 			if (level == "none" || level == "off") {
 				cache_preload = 0;

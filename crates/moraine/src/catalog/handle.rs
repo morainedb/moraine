@@ -421,9 +421,9 @@ impl Default for CatalogOptions {
 /// How much of a store to load into the on-disk object cache as it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePreload {
-    /// The newest objects only — those a compaction has not yet merged
-    /// down. Bounded by how far the store has run since its last merge,
-    /// so an open stays quick.
+    /// The subspaces every statement reads: the system keys, the live
+    /// catalog, and the snapshot records, as far as their SST metadata.
+    /// What the open itself primes, so this level stays cheap.
     L0,
     /// Every object the store's manifest references, in full. The open
     /// waits for a copy of the whole store, so this suits a store that

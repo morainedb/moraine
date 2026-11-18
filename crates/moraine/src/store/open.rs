@@ -351,7 +351,7 @@ impl<'a> StoreBuilder<'a> {
             let tx = db
                 .begin(slatedb::IsolationLevel::Snapshot)
                 .map_err(Error::from)?;
-            warm(preload, ReadHandle::Tx(&tx), &counters, &segments).await;
+            let _ = warm(preload, ReadHandle::Tx(&tx), &counters, &segments).await;
             tx.rollback();
         }
 
@@ -456,7 +456,7 @@ impl<'a> StoreBuilder<'a> {
         };
         if let Some(preload) = self.cache_preload {
             let segments = census::manifest_bytes(&reader.status().current_manifest).segments;
-            warm(preload, ReadHandle::Reader(&reader), &counters, &segments).await;
+            let _ = warm(preload, ReadHandle::Reader(&reader), &counters, &segments).await;
         }
 
         Ok((reader, counters))
@@ -580,17 +580,24 @@ pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
     }
 }
 
-/// Warms the cache by reading, best-effort. `L0` reads one entry of every
-/// subspace so its SST metadata is resident; `All` additionally walks the
-/// scan-shaped subspaces whole. Neither reads the `index` subspace's data
-/// blocks.
+/// Warms the cache by reading, best-effort, and reports how many subspaces
+/// warmed and how many failed. `L0` reads one entry of each subspace every
+/// statement reads — the system keys, the live catalog, and the snapshot
+/// records — so their SST metadata is resident; `All` reads one of every
+/// subspace and walks the scan-shaped ones whole. Neither reads the
+/// `index` subspace's data blocks.
 pub(crate) async fn warm(
     preload: CachePreload,
     handle: ReadHandle<'_>,
     counters: &cache::CacheCounters,
     segments: &[census::SegmentSize],
-) {
-    let metadata_only = [
+) -> (usize, usize) {
+    let every_statement = [
+        key::Subspace::System,
+        key::Subspace::Current,
+        key::Subspace::Snapshot,
+    ];
+    let every_subspace = [
         key::Subspace::System,
         key::Subspace::Current,
         key::Subspace::History,
@@ -606,9 +613,14 @@ pub(crate) async fn warm(
         key::Subspace::Snapshot,
         key::Subspace::Changelog,
     ];
+    let subspaces: Vec<key::Subspace> = match preload {
+        CachePreload::L0 => every_statement.to_vec(),
+        CachePreload::All => every_subspace.to_vec(),
+    };
+    let concurrency = subspaces.len();
 
     let before = counters.tally();
-    let (warmed, failed) = stream::iter(metadata_only.into_iter().map(|subspace| {
+    let (warmed, failed) = stream::iter(subspaces.into_iter().map(|subspace| {
         let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
         let prefix = key::subspace_prefix(subspace);
         let shape = warm_shape(
@@ -619,7 +631,7 @@ pub(crate) async fn warm(
         );
         warm_subspace(handle, subspace, deep, shape)
     }))
-    .buffer_unordered(metadata_only.len())
+    .buffer_unordered(concurrency)
     .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
         match result {
             Ok(()) => (warmed + 1, failed),
@@ -637,6 +649,7 @@ pub(crate) async fn warm(
         },
         "warmed the cache"
     );
+    (warmed, failed)
 }
 
 /// Reads one entry of `subspace` in `shape`, or the whole range in probe
@@ -678,6 +691,27 @@ mod tests {
 
     fn memory_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    /// The `l0` level touches only the three subspaces every statement
+    /// reads; `all` touches every subspace.
+    #[tokio::test]
+    async fn the_l0_preload_touches_what_every_statement_reads() {
+        let (db, counters) = StoreBuilder::new("warm", memory_store())
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
+        assert_eq!(
+            warm(CachePreload::L0, ReadHandle::Tx(&tx), &counters, &[]).await,
+            (3, 0)
+        );
+        assert_eq!(
+            warm(CachePreload::All, ReadHandle::Tx(&tx), &counters, &[]).await,
+            (7, 0)
+        );
+        tx.rollback();
+        db.close().await.unwrap();
     }
 
     /// A subspace whose segment fits one read-ahead warms in probe shape,

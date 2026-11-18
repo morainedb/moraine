@@ -358,10 +358,15 @@ exist for. Non-unique equality probes also use the named prefix filter policy
 suffix. A writer polls the manifest every five seconds. These are
 implementation constants and have no attach option.
 
-**Warming.** `CatalogOptions::cache_preload` warms inside the open:
-`CachePreload::L0` touches every subspace far enough to pull its SST metadata,
-and `CachePreload::All` additionally walks the scan-shaped subspaces whole.
-Neither walks the `index` subspace's data. `ReadOnlyCatalog::preload_store`
+**Warming.** Every open validates the store and primes what its first
+statement reads in one concurrent batch: the format stamp and migration marker
+in `system`, the recorded log store in `current`, and the newest snapshot
+record, so the first statement owes no table open for any of them.
+`CatalogOptions::cache_preload` warms inside the open past that:
+`CachePreload::L0` touches the three subspaces every statement reads far
+enough to pull their SST metadata, and `CachePreload::All` touches every
+subspace and walks the scan-shaped ones whole. Neither walks the `index`
+subspace's data. `ReadOnlyCatalog::preload_store`
 does the same after the open, and the extension's `CACHE_PRELOAD` runs it that
 way, on the handle's worker once the attach has returned, so the attach does
 not wait on it. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
