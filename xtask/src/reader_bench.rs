@@ -419,9 +419,10 @@ fn measure(
         })
         .unwrap_or_default();
     // A reader that must notice the other process's commit polls for it
-    // before every statement.
+    // on a short window: the statements before the commit run inside one
+    // window, and a pause after it puts the next plan outside.
     let poll = if writer_script.is_some() {
-        ", META_READER_POLL_INTERVAL_MS 1"
+        ", META_READER_POLL_INTERVAL_MS 2000"
     } else {
         ""
     };
@@ -464,12 +465,14 @@ fn measure(
     let mut tables = String::from("io_cold AS cold, io_warm AS warm");
     if let Some(writer_script) = writer_script {
         // The other process commits one row and compacts the store while
-        // this one stays attached; the two plans after it are timed.
+        // this one stays attached; the two plans after it are timed. Its
+        // output lands beside its script and is checked after the run.
         let _ = writeln!(
             script,
-            ".system sh -c '{} -unsigned -batch < {} > /dev/null 2>&1'",
+            ".system sh -c '{} -unsigned -batch -csv < {} > {} 2>&1; sleep 3'",
             artifacts.cli.display(),
-            writer_script.display()
+            writer_script.display(),
+            writer_output(writer_script).display()
         );
         script.push_str(".timer on\n");
         let _ = writeln!(
@@ -502,10 +505,24 @@ fn measure(
         "SELECT '{MARKER}', {columns} FROM moraine_object_store_tally('lake') AS after, {tables};"
     );
 
-    parse_sample(
-        &run_script(artifacts, &script, "the reader benchmark")?,
-        writer_script.is_some(),
-    )
+    let stdout = run_script(artifacts, &script, "the reader benchmark")?;
+    if let Some(writer_script) = writer_script {
+        let output = writer_output(writer_script);
+        let written =
+            fs::read_to_string(&output).with_context(|| format!("reading {}", output.display()))?;
+        ensure!(
+            written.lines().any(|line| line.starts_with(WRITER_MARKER)),
+            "the committing process did not report its compaction:\n{written}"
+        );
+    }
+    parse_sample(&stdout, writer_script.is_some())
+}
+
+const WRITER_MARKER: &str = "__MORAINE_READER_BENCH_WRITER__";
+
+/// Where the committing process's output lands, beside its script.
+fn writer_output(writer_script: &Path) -> PathBuf {
+    writer_script.with_extension("out")
 }
 
 /// The script the second process runs under `--compaction`: one small
@@ -528,9 +545,10 @@ fn writer_script(
         "INSERT INTO lake.main.{} VALUES (1000000000, 0);",
         table_name(0)
     );
-    script.push_str(
-        "SELECT count(*) FROM moraine_compact_store('lake', timeout => 600, \
-         require_completed => true);\n",
+    let _ = writeln!(
+        script,
+        "SELECT '{WRITER_MARKER}', count(*) FROM moraine_compact_store('lake', timeout => 600, \
+         require_completed => true);"
     );
     Ok(script)
 }
