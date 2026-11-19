@@ -8,10 +8,10 @@
 //! metadata. Each repeat is a new DuckDB process, so nothing survives from
 //! the one before except what `--cache-dir` keeps on disk.
 //!
-//! `--compaction` keeps that process attached while a second one commits
-//! and compacts the store, then plans twice more: what a long-lived reader
-//! pays on the first plan over the rewritten SSTs, and whether the plan
-//! after that is warm again.
+//! `--commit` keeps that process attached while a second one commits a
+//! thousand more files, then plans twice more: what a long-lived reader
+//! pays on the first plan over the SSTs that commit added, and whether the
+//! plan after that is warm again.
 
 use std::{
     env,
@@ -60,7 +60,7 @@ struct Options {
     deletes: usize,
     repeat: usize,
     cache_dir: Option<PathBuf>,
-    compaction: bool,
+    commit: bool,
 }
 
 fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
@@ -70,12 +70,12 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         deletes: DEFAULT_DELETES,
         repeat: DEFAULT_REPEAT,
         cache_dir: None,
-        compaction: false,
+        commit: false,
     };
     let mut arguments = arguments.iter();
     while let Some(flag) = arguments.next() {
-        if flag == "--compaction" {
-            options.compaction = true;
+        if flag == "--commit" {
+            options.commit = true;
             continue;
         }
         let value = arguments
@@ -107,7 +107,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
             "--cache-dir" => options.cache_dir = Some(PathBuf::from(value)),
             other => bail!(
                 "unknown flag `{other}`; valid: --files, --tables, --deletes, --repeat, \
-                 --cache-dir, --compaction"
+                 --cache-dir, --commit"
             ),
         }
     }
@@ -143,13 +143,13 @@ struct Sample {
     warm_requests: u64,
     warm_request_ms: f64,
     errors: u64,
-    compacted: Option<Compacted>,
+    committed: Option<Committed>,
 }
 
-/// The same process's plans after another process committed and compacted
-/// the store: the first over the rewritten SSTs, and the one after it.
+/// The same process's plans after another process committed more files:
+/// the first over the SSTs that commit added, and the one after it.
 #[derive(Debug, PartialEq)]
-struct Compacted {
+struct Committed {
     plan_ms: f64,
     requests: u64,
     request_ms: f64,
@@ -170,9 +170,9 @@ where
         .with_context(|| format!("parsing `{name}`"))
 }
 
-fn parse_sample(stdout: &str, compaction: bool) -> anyhow::Result<Sample> {
+fn parse_sample(stdout: &str, commit: bool) -> anyhow::Result<Sample> {
     let times = parse_run_times(stdout);
-    let statements = if compaction { 6 } else { 4 };
+    let statements = if commit { 6 } else { 4 };
     ensure!(
         times.len() == statements,
         "expected {statements} timed statements, found {}; output:\n{stdout}",
@@ -184,16 +184,16 @@ fn parse_sample(stdout: &str, compaction: bool) -> anyhow::Result<Sample> {
         .with_context(|| format!("benchmark result row is missing from CLI output:\n{stdout}"))?;
     let fields: Vec<&str> = row.split(',').collect();
     ensure!(
-        fields.len() == if compaction { 11 } else { 7 },
+        fields.len() == if commit { 11 } else { 7 },
         "benchmark result has {} fields",
         fields.len()
     );
-    let compacted = compaction
+    let committed = commit
         .then(|| {
-            Ok::<_, anyhow::Error>(Compacted {
+            Ok::<_, anyhow::Error>(Committed {
                 plan_ms: times[4] * 1_000.0,
-                requests: parse_field(&fields, 7, "compacted_requests")?,
-                request_ms: parse_field(&fields, 8, "compacted_request_ms")?,
+                requests: parse_field(&fields, 7, "committed_requests")?,
+                request_ms: parse_field(&fields, 8, "committed_request_ms")?,
                 settled_ms: times[5] * 1_000.0,
                 settled_requests: parse_field(&fields, 9, "settled_requests")?,
                 settled_request_ms: parse_field(&fields, 10, "settled_request_ms")?,
@@ -211,7 +211,7 @@ fn parse_sample(stdout: &str, compaction: bool) -> anyhow::Result<Sample> {
         warm_requests: parse_field(&fields, 3, "warm_requests")?,
         warm_request_ms: parse_field(&fields, 4, "warm_request_ms")?,
         errors: parse_field(&fields, 5, "errors")?,
-        compacted,
+        committed,
     })
 }
 
@@ -464,10 +464,10 @@ fn measure(
     );
     let mut tables = String::from("io_cold AS cold, io_warm AS warm");
     if let Some(writer_script) = writer_script {
-        // The other process commits one row and compacts the store while
-        // this one stays attached; the two plans after it are timed. The
-        // shell escape re-tokenizes its line, so the command lives in a
-        // wrapper beside the script, and its output beside that.
+        // The other process commits a thousand files while this one stays
+        // attached; the two plans after it are timed. The shell escape
+        // re-tokenizes its line, so the command lives in a wrapper beside
+        // the script, and its output beside that.
         let _ = writeln!(
             script,
             ".system sh {}",
@@ -481,7 +481,7 @@ fn measure(
         );
         script.push_str(".timer off\n");
         script.push_str(
-            "CREATE TEMP TABLE io_compacted AS SELECT * FROM moraine_object_store_tally('lake');\n",
+            "CREATE TEMP TABLE io_committed AS SELECT * FROM moraine_object_store_tally('lake');\n",
         );
         script.push_str(".timer on\n");
         let _ = writeln!(
@@ -490,14 +490,14 @@ fn measure(
             table_name(0)
         );
         script.push_str(".timer off\n");
-        let [compacted_requests, compacted_ms] = tally_sum("compacted");
+        let [committed_requests, committed_ms] = tally_sum("committed");
         let [after_requests, after_ms] = tally_sum("after");
         let _ = write!(
             columns,
-            ", {compacted_requests} - ({warm_requests}), {compacted_ms} - ({warm_ms}), \
-             {after_requests} - ({compacted_requests}), {after_ms} - ({compacted_ms})"
+            ", {committed_requests} - ({warm_requests}), {committed_ms} - ({warm_ms}), \
+             {after_requests} - ({committed_requests}), {after_ms} - ({committed_ms})"
         );
-        tables.push_str(", io_compacted AS compacted");
+        tables.push_str(", io_committed AS committed");
     }
     let _ = writeln!(
         script,
@@ -511,7 +511,7 @@ fn measure(
             fs::read_to_string(&output).with_context(|| format!("reading {}", output.display()))?;
         ensure!(
             written.lines().any(|line| line.starts_with(WRITER_MARKER)),
-            "the committing process did not report its compaction:\n{written}"
+            "the committing process did not report its commit:\n{written}"
         );
     }
     parse_sample(&stdout, writer_script.is_some())
@@ -554,8 +554,9 @@ fn write_writer_scripts(
     fs::write(&path, wrapper).with_context(|| format!("writing {}", path.display()))
 }
 
-/// The script the second process runs under `--compaction`: one small
-/// commit, so the compaction has new work, then a compaction it waits for.
+/// The script the second process runs under `--commit`: one seeding-sized
+/// commit, a thousand files into the measured table, reported by the
+/// table's file count afterwards.
 fn writer_sql(
     artifacts: &Artifacts<'_>,
     target: &CatalogTarget,
@@ -571,13 +572,15 @@ fn writer_sql(
     );
     let _ = writeln!(
         script,
-        "INSERT INTO lake.main.{} VALUES (1000000000, 0);",
-        table_name(0)
+        "INSERT INTO lake.main.{} SELECT 1000000000 + i, i % {FILES_PER_COMMIT} \
+         FROM range(0, {}) t(i);",
+        table_name(0),
+        FILES_PER_COMMIT.saturating_mul(ROWS_PER_FILE)
     );
     let _ = writeln!(
         script,
-        "SELECT '{WRITER_MARKER}', count(*) FROM moraine_compact_store('lake', timeout => 600, \
-         require_completed => true);"
+        "SELECT '{WRITER_MARKER}', count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+         WHERE end_snapshot IS NULL;"
     );
     Ok(script)
 }
@@ -596,7 +599,7 @@ fn count(value: u64) -> f64 {
 }
 
 /// One size's row of medians, and its request-error count when non-zero.
-fn print_row(files: usize, samples: &[Sample], compaction: bool) -> anyhow::Result<()> {
+fn print_row(files: usize, samples: &[Sample], commit: bool) -> anyhow::Result<()> {
     print!(
         "{files:>7}  {:>9.1}  {:>7.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>11.1}  \
          {:>9.1}  {:>11.1}",
@@ -610,18 +613,18 @@ fn print_row(files: usize, samples: &[Sample], compaction: bool) -> anyhow::Resu
         median_of(samples, |sample| count(sample.warm_requests))?,
         median_of(samples, |sample| sample.warm_request_ms)?,
     );
-    if compaction {
-        let compacted = |pick: fn(&Compacted) -> f64| {
+    if commit {
+        let committed = |pick: fn(&Committed) -> f64| {
             median_of(samples, |sample| {
-                sample.compacted.as_ref().map_or(f64::NAN, pick)
+                sample.committed.as_ref().map_or(f64::NAN, pick)
             })
         };
         print!(
             "  {:>12.1}  {:>18.1}  {:>10.1}  {:>16.1}",
-            compacted(|compacted| compacted.plan_ms)?,
-            compacted(|compacted| count(compacted.requests))?,
-            compacted(|compacted| compacted.settled_ms)?,
-            compacted(|compacted| count(compacted.settled_requests))?,
+            committed(|committed| committed.plan_ms)?,
+            committed(|committed| count(committed.requests))?,
+            committed(|committed| committed.settled_ms)?,
+            committed(|committed| count(committed.settled_requests))?,
         );
     }
     println!();
@@ -677,10 +680,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         "warm_requests",
         "warm_request_ms"
     );
-    if options.compaction {
+    if options.commit {
         print!(
             "  {:>12}  {:>18}  {:>10}  {:>16}",
-            "compacted_ms", "compacted_requests", "settled_ms", "settled_requests"
+            "committed_ms", "committed_requests", "settled_ms", "settled_requests"
         );
     }
     println!();
@@ -703,7 +706,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         )?;
 
         let writer = options
-            .compaction
+            .commit
             .then(|| {
                 let path = temp.data().with_file_name("writer.sql");
                 write_writer_scripts(&artifacts, &target, &data_path, &catalog_uri, &path)?;
@@ -722,7 +725,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
                 writer.as_deref(),
             )?);
         }
-        print_row(files, &samples, options.compaction)?;
+        print_row(files, &samples, options.commit)?;
     }
     println!();
     if !target.is_remote() {
@@ -757,15 +760,11 @@ mod tests {
         assert_eq!(options.deletes, 50);
         assert_eq!(options.repeat, 3);
         assert_eq!(options.cache_dir.as_deref(), Some(Path::new("/tmp/c")));
-        assert!(!options.compaction);
+        assert!(!options.commit);
         assert!(
-            parse_options(&[
-                "--compaction".to_owned(),
-                "--repeat".to_owned(),
-                "2".to_owned()
-            ])
-            .unwrap()
-            .compaction
+            parse_options(&["--commit".to_owned(), "--repeat".to_owned(), "2".to_owned()])
+                .unwrap()
+                .commit
         );
         assert!(parse_options(&["--repeat".to_owned(), "0".to_owned()]).is_err());
         assert!(parse_options(&["--files".to_owned(), "0".to_owned()]).is_err());
@@ -826,16 +825,16 @@ mod tests {
                 warm_requests: 0,
                 warm_request_ms: 0.0,
                 errors: 0,
-                compacted: None,
+                committed: None,
             }
         );
         assert!(parse_sample(output, true).is_err());
     }
 
-    /// Under `--compaction` two more statements are timed and the row
-    /// carries the two plans' requests after the warm ones.
+    /// Under `--commit` two more statements are timed and the row carries
+    /// the two plans' requests after the warm ones.
     #[test]
-    fn parses_the_compaction_timings_and_fields() {
+    fn parses_the_commit_timings_and_fields() {
         let output = "Run Time (s): real 0.250 user 0 sys 0\n\
                       Run Time (s): real 0.150 user 0 sys 0\n\
                       Run Time (s): real 0.040 user 0 sys 0\n\
@@ -845,8 +844,8 @@ mod tests {
                       __MORAINE_READER_BENCH__,4,86.5,0,0.0,0,90,12,210.5,0,0.0\n";
         let sample = parse_sample(output, true).unwrap();
         assert_eq!(
-            sample.compacted,
-            Some(Compacted {
+            sample.committed,
+            Some(Committed {
                 plan_ms: 300.0,
                 requests: 12,
                 request_ms: 210.5,
