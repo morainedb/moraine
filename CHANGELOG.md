@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/morainedb/moraine/compare/v0.9.2...v0.10.0) - 2026-11-19
+
+### Fixed
+
+- *(tests)* match result rows behind a printed log record's reset ([#461](https://github.com/morainedb/moraine/pull/461))
+
+### Other
+
+- *(catalog)* admit what a table-scoped metadata cursor reads ([#467](https://github.com/morainedb/moraine/pull/467))
+- *(catalog)* a read-only open needs a checkpoint ([#465](https://github.com/morainedb/moraine/pull/465))
+- *(catalog)* prime a fresh open's first reads in one batch ([#464](https://github.com/morainedb/moraine/pull/464))
+- *(catalog)* cut the round trips a read-only attach pays ([#463](https://github.com/morainedb/moraine/pull/463))
+- *(site)* compare Moraine with Delta Lake ([#459](https://github.com/morainedb/moraine/pull/459))
+
 ## [0.9.2](https://github.com/morainedb/moraine/compare/v0.9.1...v0.9.2) - 2026-11-17
 
 ### Fixed
