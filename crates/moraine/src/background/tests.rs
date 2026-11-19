@@ -42,26 +42,36 @@ async fn started_warming_cannot_absorb_new_work() {
     assert_eq!(work.warming.jobs.lock().unwrap().len(), 2);
 }
 
-/// An attach queues a backfill and nothing else: warming belongs to the
-/// commits that write tables.
+/// An attach queues the store warm and a backfill; the warm joins unstarted
+/// table warming and does not claim its tables.
 #[tokio::test]
-async fn an_attach_queues_backfill_and_no_warming() {
+async fn an_attach_queues_a_store_warm_and_a_backfill() {
     let work = BackgroundWork::default();
     work.push(request(1, 1));
     work.push(BackgroundRequest::attach());
     let Job::Warm(job) = work.warming.next().await else {
         panic!("warming job")
     };
+    assert!(job.store);
     assert_eq!(job.tables, [1].map(TableId::new).into());
     assert!(matches!(work.backfill.next().await, Job::Backfill(_)));
     assert!(matches!(work.commits.next().await, Job::Publish(_)));
     let attach_only = BackgroundWork::default();
     attach_only.push(BackgroundRequest::attach());
-    assert!(attach_only.warming.jobs.lock().unwrap().is_empty());
+    let Job::Warm(job) = attach_only.warming.next().await else {
+        panic!("warming job")
+    };
+    assert!(job.store && job.tables.is_empty());
     assert!(matches!(
         attach_only.backfill.next().await,
         Job::Backfill(_)
     ));
+    let commit_only = BackgroundWork::default();
+    commit_only.push(request(1, 1));
+    let Job::Warm(job) = commit_only.warming.next().await else {
+        panic!("warming job")
+    };
+    assert!(!job.store);
 }
 
 #[tokio::test(start_paused = true)]
@@ -176,7 +186,7 @@ async fn attach_jobs_read_a_real_catalog_without_an_extension() {
         .unwrap();
     let work = BackgroundWork::default();
     work.push(BackgroundRequest::attach());
-    assert!(work.warming.jobs.lock().unwrap().is_empty());
+    assert!(work.warming.next().await.run(&catalog, None, "").await);
     assert!(
         work.backfill
             .next()

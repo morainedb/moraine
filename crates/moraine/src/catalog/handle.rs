@@ -191,6 +191,16 @@ impl Store {
         }
     }
 
+    /// The manifest this handle currently stands on.
+    pub(crate) fn current_manifest(&self) -> slatedb::manifest::VersionedManifest {
+        match self {
+            Self::Writer { db, .. } => db.status().current_manifest,
+            Self::Reader(reader) | Self::Committer { reader, .. } => {
+                reader.status().current_manifest
+            }
+        }
+    }
+
     /// The commit log this store commits through, when its commits are
     /// slots.
     pub(crate) fn commit_log(&self) -> Option<&LogCommitter> {

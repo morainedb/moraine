@@ -151,10 +151,10 @@ SET moraine_cache_size = '2GiB';
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
 ```
 
-A new process starts with an empty cache. The attach reads the few records
-every statement needs, and the cache fills from the reads each statement
-makes, so the first query on a table reads its catalog data from object
-storage once.
+A new process starts with an empty cache. Right after the attach returns, the
+extension warms the catalog records every statement reads, so the first query
+finds them resident and a later process sharing `moraine_cache_dir` reads them
+from disk. Everything else fills in as queries read it.
 
 If the memory budget cannot hold a store's index metadata, the attach logs a
 warning and lookups fetch metadata from object storage. Raise

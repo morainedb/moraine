@@ -577,7 +577,7 @@ fn handle_for_catalog(
 
     let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
     handle.data = Arc::new(DataSlot::new(resolved, source));
-    handle.spawn_backfill_at_attach();
+    handle.spawn_warm_at_attach();
     Ok(Box::new(handle))
 }
 

@@ -190,17 +190,10 @@ impl MoraineCatalogHandle {
         }
     }
 
-    /// A writer with a data store publishes missing row summaries after the
-    /// attach has returned; existing summaries cost one header read.
-    pub(crate) fn spawn_backfill_at_attach(&self) {
-        let publishes = matches!(self.catalog, AttachedCatalog::Writer(_))
-            && self
-                .data
-                .resolved()
-                .is_some_and(|files| files.store.is_some());
-        if !publishes {
-            return;
-        }
+    /// Warms the store's shared reads after the attach has returned. A
+    /// writer with a data store also publishes missing row summaries;
+    /// existing summaries cost one header read.
+    pub(crate) fn spawn_warm_at_attach(&self) {
         self.enqueue_pass(Pass::attach());
     }
 
@@ -584,14 +577,15 @@ mod tests {
     }
 
     /// An attach without a `DATA_PATH` store spawns no warming.
+    /// Every attach warms the store's shared reads, data store or not.
     #[test]
-    fn an_attach_without_a_data_path_store_spawns_no_warming() {
+    fn an_attach_without_a_data_path_store_spawns_one_warming_pass() {
         let lake = TempDir::new("warm-no-store");
         let handle = attach_ok(lake.path());
         // SAFETY: freshly attached above and not yet detached.
         let warming = unsafe { &*handle }.finish_warming();
 
-        assert_eq!(warming, 0);
+        assert_eq!(warming, 1, "the attach spawned no warming pass");
         // SAFETY: attached above, detached exactly once.
         unsafe { moraine_detach(handle) };
     }

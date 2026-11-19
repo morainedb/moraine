@@ -8,6 +8,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use futures::{StreamExt, stream};
 use object_store::ObjectStore;
 use slatedb::{
     BlockCachePolicy, CacheTarget, Db, DbReader, DbReaderMode,
@@ -18,7 +19,12 @@ use uuid::Uuid;
 
 use crate::{
     error::{Error, Result},
-    store::{cache, counted, retry, segment::TagSegmentExtractor},
+    store::{
+        cache, census, counted,
+        handle::{ReadHandle, SCAN_READ_AHEAD_BYTES, ScanShape},
+        key, retry,
+        segment::TagSegmentExtractor,
+    },
 };
 
 /// The default WAL flush cadence when none is configured.
@@ -527,6 +533,58 @@ impl<'a> StoreBuilder<'a> {
     }
 }
 
+/// The shape that reaches one entry of a subspace whose segment holds
+/// `bytes`: probe when the whole segment fits one read-ahead, so the one
+/// request each SST costs anyway brings the segment in and admits it; seek
+/// otherwise, and when the size is unknown.
+pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
+    let read_ahead = u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap_or(u64::MAX);
+    match bytes {
+        Some(bytes) if bytes <= read_ahead => ScanShape::wide().retain(),
+        _ => ScanShape::seek().retain(),
+    }
+}
+
+/// Reads one entry of each subspace every statement reads, the system keys,
+/// the live catalog, and the snapshot records, so their SST metadata is
+/// resident. Best-effort; returns how many subspaces warmed and how many
+/// failed.
+pub(crate) async fn warm_every_statement(
+    handle: ReadHandle<'_>,
+    segments: &[census::SegmentSize],
+) -> (usize, usize) {
+    let subspaces = [
+        key::Subspace::System,
+        key::Subspace::Current,
+        key::Subspace::Snapshot,
+    ];
+
+    let (warmed, failed) = stream::iter(subspaces.into_iter().map(|subspace| {
+        let prefix = key::subspace_prefix(subspace);
+        let shape = warm_shape(
+            segments
+                .iter()
+                .find(|segment| segment.prefix == prefix)
+                .map(|segment| segment.bytes),
+        );
+        async move {
+            let mut iterator = handle.scan_prefix(&prefix, .., shape).await?;
+            iterator.next().await?;
+            Ok::<(), Error>(())
+        }
+    }))
+    .buffer_unordered(subspaces.len())
+    .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
+        match result {
+            Ok(()) => (warmed + 1, failed),
+            Err(_) => (warmed, failed + 1),
+        }
+    })
+    .await;
+    tracing::info!(warmed, failed, "warmed the subspaces every statement reads");
+    (warmed, failed)
+}
+
 #[cfg(test)]
 mod tests {
     use object_store::memory::InMemory;
@@ -537,6 +595,37 @@ mod tests {
 
     fn memory_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    /// The warm touches the three subspaces every statement reads and
+    /// nothing else.
+    #[tokio::test]
+    async fn the_warm_touches_what_every_statement_reads() {
+        let (db, _counters) = StoreBuilder::new("warm", memory_store())
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
+        assert_eq!(warm_every_statement(ReadHandle::Tx(&tx), &[]).await, (3, 0));
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// A subspace whose segment fits one read-ahead warms in probe shape,
+    /// which brings the segment in for one request; a larger or unknown
+    /// segment warms in seek shape.
+    #[test]
+    fn the_warm_shape_follows_the_segments_size() {
+        assert_eq!(warm_shape(Some(4 * 1024)), ScanShape::wide().retain());
+        assert_eq!(
+            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap())),
+            ScanShape::wide().retain()
+        );
+        assert_eq!(
+            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap() + 1)),
+            ScanShape::seek().retain()
+        );
+        assert_eq!(warm_shape(None), ScanShape::seek().retain());
     }
 
     #[test]

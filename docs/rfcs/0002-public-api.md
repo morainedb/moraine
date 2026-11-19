@@ -234,7 +234,7 @@ are `#[doc(hidden)]` and outside the semver contract.
 
 ## Background work
 
-`BackgroundRequest::attach()` requests summary backfill.
+`BackgroundRequest::attach()` requests the store warm and summary backfill.
 `BackgroundRequest::commit(files, committed)` reserves the file input
 and requests publication and warming of touched tables. It can fail working
 memory admission. `BackgroundWork::push` enqueues best-effort work, reporting

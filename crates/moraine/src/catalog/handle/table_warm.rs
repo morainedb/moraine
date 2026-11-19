@@ -1,4 +1,5 @@
-//! Warming one table's probe ranges into the block cache.
+//! Warming the store's shared reads and one table's probe ranges into the
+//! block cache.
 
 use futures::{StreamExt, stream};
 use tracing::debug;
@@ -8,8 +9,10 @@ use crate::{
     catalog::TableId,
     error::Result,
     store::{
+        census,
         handle::{ReadHandle, ScanShape},
         key::{IndexKind, index_index_prefix, table_probe_prefixes},
+        open,
         read::{EntityCursor, EntityRecord, EntityRecordKind, Versions},
     },
 };
@@ -34,6 +37,21 @@ async fn warm_prefix(handle: ReadHandle<'_>, prefix: Vec<u8>) -> Result<()> {
 }
 
 impl ReadOnlyCatalog {
+    /// Warms the SST metadata of the subspaces every statement reads into
+    /// the cache, for a host that attaches first and warms after. Best-effort;
+    /// a block that cannot be read is left to the read that needs it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if no read session can be opened.
+    pub async fn warm_store(&self) -> Result<()> {
+        let manifest = census::manifest_bytes(&self.store.current_manifest());
+        let session = self.begin_read().await?;
+        let _ = open::warm_every_statement(session.handle(), &manifest.segments).await;
+        session.finish();
+        Ok(())
+    }
+
     /// Warms the store ranges a lookup on each of `tables` probes — its
     /// indexes' entries and its inlined data — into the block cache, so a
     /// cold table pays one burst of reads rather than a round trip per probe.

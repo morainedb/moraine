@@ -361,12 +361,17 @@ implementation constants and have no attach option.
 **Warming.** Every open validates the store and primes what its first
 statement reads in one concurrent batch: the format stamp and migration marker
 in `system`, the recorded log store in `current`, and the newest snapshot
-record, so the first statement owes no table open for any of them. Nothing
-else is read ahead: the cache fills from the reads each statement makes.
-`ReadOnlyCatalog::warm_tables` reads, in `seek().retain()` shape, the first
-entry of each named table's index and inline ranges, eight ranges at a time
-process-wide. The extension runs it after a commit for the tables the commit
-wrote.
+record, so the first statement owes no table open for any of them.
+`ReadOnlyCatalog::warm_store` then reads one entry of each of the three
+subspaces every statement reads, `system`, `current`, and `snapshot`, in
+retaining shape, so their SST index and filter are resident for the first
+plan and, through the disk tier, for every later process; a subspace whose
+segment fits one read-ahead is brought in whole. The extension runs it on the
+handle's worker once the attach has returned, so the attach does not wait on
+it, and it is not configurable. `ReadOnlyCatalog::warm_tables` reads, in
+`seek().retain()` shape, the first entry of each named table's index and
+inline ranges, eight ranges at a time process-wide. The extension runs it
+after a commit for the tables the commit wrote.
 
 **Lookup retention.** Row-lookup directories and revision-keyed probe memos
 share the lookup allowance. Directories additionally keep local ceilings of

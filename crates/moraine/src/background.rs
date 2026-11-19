@@ -63,7 +63,7 @@ enum Request {
 }
 
 impl BackgroundRequest {
-    /// Requests full summary backfill on attach.
+    /// Requests the store warm and full summary backfill on attach.
     #[must_use]
     pub fn attach() -> Self {
         Self(Request::Attach)
@@ -89,6 +89,8 @@ impl BackgroundRequest {
 
 #[derive(Clone)]
 struct WarmJob {
+    /// Whether the store's shared reads warm before the tables.
+    store: bool,
     tables: BTreeSet<TableId>,
     progress: Arc<tokio::sync::Mutex<Option<Warming>>>,
     reservations: Vec<Arc<crate::MemoryReservation>>,
@@ -149,8 +151,14 @@ impl Job {
 impl WarmJob {
     async fn run(self, catalog: &ReadOnlyCatalog) -> bool {
         let mut progress = self.progress.lock().await;
-        let warming = progress.get_or_insert_with(|| Warming::new(&self.tables));
         let started = std::time::Instant::now();
+        if progress.is_none()
+            && self.store
+            && let Err(error) = catalog.warm_store().await
+        {
+            warn!(%error, "store warming failed; tables warm regardless");
+        }
+        let warming = progress.get_or_insert_with(|| Warming::new(&self.tables));
         loop {
             let Some(table) = warming.tables.front().copied() else {
                 info!(
@@ -214,6 +222,7 @@ impl Pending {
                 if unstarted
                     && queued.reservations.len() + next.reservations.len() <= MAX_PENDING_JOBS
                 {
+                    queued.store |= next.store;
                     queued.tables.append(&mut next.tables);
                     queued.reservations.append(&mut next.reservations);
                     return true;
@@ -297,13 +306,22 @@ impl BackgroundWork {
     /// can recover publication work that could not be admitted.
     pub fn push(&self, request: BackgroundRequest) {
         let (warming, publication) = match request.0 {
-            Request::Attach => (None, Job::Backfill(BackfillJob::default())),
+            Request::Attach => (
+                Some(WarmJob {
+                    store: true,
+                    tables: BTreeSet::new(),
+                    progress: Arc::default(),
+                    reservations: Vec::new(),
+                }),
+                Job::Backfill(BackfillJob::default()),
+            ),
             Request::Commit {
                 files,
                 committed,
                 memory,
             } => {
                 let warming = (!files.is_empty()).then(|| WarmJob {
+                    store: false,
                     tables: files.iter().map(|(table, _)| *table).collect(),
                     progress: Arc::default(),
                     reservations: vec![memory.clone()],

@@ -917,3 +917,53 @@ async fn warming_a_table_reads_its_probe_ranges() {
     assert_eq!(found, vec![1_500]);
     reader.close().await.unwrap();
 }
+
+/// A store warm after the open consults the cache, and a second warm finds
+/// everything the first admitted resident.
+#[tokio::test]
+async fn a_store_warm_after_the_open_leaves_its_reads_resident() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            for n in 0..32 {
+                tx.create_table(schema, &format!("t{n}"), &[col("a")])
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let after_open = reader.cache_tally();
+    reader.warm_store().await.unwrap();
+    let after_warm = reader.cache_tally();
+    let lookups = |tally: &moraine::CacheTally| {
+        tally.metadata_hits + tally.metadata_misses + tally.block_hits + tally.block_misses
+    };
+    assert!(
+        lookups(&after_warm) > lookups(&after_open),
+        "the warm consulted the cache not at all: {after_warm:?}"
+    );
+
+    reader.warm_store().await.unwrap();
+    let after_second = reader.cache_tally();
+    assert_eq!(
+        (after_second.metadata_misses, after_second.block_misses),
+        (after_warm.metadata_misses, after_warm.block_misses),
+        "a second warm missed on what the first admitted"
+    );
+    reader.close().await.unwrap();
+}
