@@ -54,12 +54,13 @@ Reader acquisition works as follows.
    slots it reads: nothing else references them, since no writer publishes on
    a reader's behalf. The cost is two manifest writes per reader opened, paid
    by the reader rather than by every commit.
-4. A store that refuses that write — read-only credentials — is followed on
-   the latest manifest instead, with no checkpoint. Retention is then the only
-   protection, so such a reader refuses reads past `READ_WINDOW`, fifteen
-   minutes, rather than discovering a collected object mid-scan. `READ_WINDOW`
-   is also the collector's minimum age for log and compacted objects, and must
-   exceed the longest explicit transaction.
+4. A store that refuses that write — read-only credentials — refuses the open,
+   naming the two ways in: a grant to write under the catalog's `manifest/`
+   prefix, the only objects a reader ever writes, or a pinned open against a
+   checkpoint the writer minted, which writes nothing. There is no reader
+   without a checkpoint. `READ_WINDOW`, fifteen minutes, is the collector's
+   minimum age for log and compacted objects, the margin that covers a reader
+   between checkpoint refreshes.
 5. Because a reader advances only on its own manifest poll, freshness comes
    from opening one rather than from waiting on one: a scope's reader polls on
    `READ_WINDOW` and replays only to the log boundary it opened on, so no
@@ -105,15 +106,9 @@ Acquiring a reader works as follows.
    state. The open establishes a checkpoint, which is two manifest writes,
    and replays the write-ahead log, so the reader resolves every commit
    acknowledged before it opened.
-3. A store that refuses the checkpoint write is followed on the latest
-   manifest instead. Such a reader is shared the same way but carries a
-   deadline of `READ_WINDOW` less a one-minute allowance for clock skew,
-   since retention is all that protects it.
-4. Every point read and every scan yield checks that deadline through
-   `CheckpointReader::reader`, which refuses a reader past it with an error
-   telling the caller to restart the transaction. A transaction reading
-   without a checkpoint therefore cannot outlive `READ_WINDOW`.
-5. The reader an operation holds never changes under it: a newer one is a
+3. A store that refuses the checkpoint write fails the acquisition with the
+   alternatives named; no reader runs on retention alone.
+4. The reader an operation holds never changes under it: a newer one is a
    new reader, and the old one lives until its last reference drops.
 
 For native readers, at most `MAX_READER_GENERATIONS` generations,
@@ -121,8 +116,8 @@ eight, may be live in one handle. Acquiring another is refused with `Constraint`
 until an older transaction or cursor finishes. An unshared older generation is
 retired before its replacement reserves replay memory. A new generation never
 changes what an existing transaction sees. An explicit checkpoint attach, named
-through the `checkpoint` attach option, uses an external reader that no deadline
-governs and that writes nothing.
+through the `checkpoint` attach option, uses an external reader whose checkpoint
+someone else owns and that writes nothing.
 
 Logged fixed scopes do not use this generation-count cap. Each acquisition
 opens independently, and WAL replay bytes share the process working-memory
@@ -146,8 +141,8 @@ current records followed by ended ones, applying begin and end visibility at the
 selected snapshot. Across the C ABI a metadata cursor holds one page of at most
 `PAGE_RECORDS` records, sixty-four, or `PAGE_BYTES`, one mebibyte, whichever
 fills first. Freeing the page releases its rows and their working-memory
-reservation. Cancellation or a failed read invalidates the cursor, and a reader
-past its deadline rejects its prefetched entries. The DuckDB metadata tables all
+reservation. Cancellation or a failed read invalidates the cursor. The DuckDB
+metadata tables all
 stream through this cursor, so two scans of one table inside one transaction
 agree even when another connection commits between them.
 
@@ -626,9 +621,9 @@ container ceiling remains the final boundary.
 - A reader scope opened after acknowledgement sees the commit, and an open
   scope keeps its revision across later commits and past the interval a
   reader would otherwise re-point on.
-- A reader past its deadline rejects point reads and scan yields.
 - A checkpoint-pinned attach writes nothing to the object store; a reader with
-  none to pin records a checkpoint of its own.
+  none to pin records a checkpoint of its own, and one whose store refuses that
+  write is refused with the alternatives named.
 - A read-only attach's first scopes share the reader the attach opened and
   write no second checkpoint.
 - A shared reader is reused inside `reader_poll_interval`, and a scope past it

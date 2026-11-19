@@ -36,6 +36,43 @@ struct Readers {
     anchor: Option<Arc<CheckpointReader>>,
 }
 
+/// Whether the store turned a request away for want of permission, which
+/// SlateDB reports with the object store's error in the source chain.
+fn refused_a_write(error: &slatedb::Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let refused = |error: &object_store::Error| {
+            matches!(
+                error,
+                object_store::Error::PermissionDenied { .. }
+                    | object_store::Error::Unauthenticated { .. }
+            )
+        };
+        if cause
+            .downcast_ref::<object_store::Error>()
+            .is_some_and(refused)
+            || cause
+                .downcast_ref::<Arc<object_store::Error>>()
+                .is_some_and(|error| refused(error))
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+/// The refusal a store that would not take a reader's checkpoint write
+/// gets, naming the two ways in.
+fn checkpoint_refused(path: &str, error: &slatedb::Error) -> Error {
+    Error::Configuration(format!(
+        "the store refused the read-only open ({error}); a read-only open keeps a checkpoint \
+         of its own, so its credentials must allow writes under `{path}/manifest/`, the only \
+         objects a reader writes, or the open must pin a checkpoint the writer minted \
+         (`CatalogOptions::checkpoint`, the extension's `CHECKPOINT`)"
+    ))
+}
+
 pub(crate) struct ReaderScopes {
     objects: Arc<dyn ObjectStore>,
     options: CatalogOptions,
@@ -105,7 +142,7 @@ impl ReaderScopes {
 
     /// Opens a reader over the latest state, keeping a checkpoint of its own
     /// so collection cannot take what it reads. A store that refuses that
-    /// write is followed on retention alone, under a read window.
+    /// write refuses the open, with the ways in named.
     async fn open(
         &self,
         readers: &mut Readers,
@@ -137,18 +174,10 @@ impl ReaderScopes {
             .await
         {
             Ok((opened, counters)) => (CheckpointReader::fixed(opened), counters),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "could not keep a checkpoint of our own; following the latest manifest"
-                );
-                let (opened, counters) = self
-                    .builder()
-                    .reader_mode(slatedb::DbReaderMode::FollowLatest)
-                    .open_fixed_reader()
-                    .await?;
-                (CheckpointReader::following(opened), counters)
+            Err(Error::Store(error)) if refused_a_write(&error) => {
+                return Err(checkpoint_refused(&self.options.path, &error));
             }
+            Err(error) => return Err(error),
         };
         readers.opened = Some(Instant::now());
         readers.latest = Some(reader.clone());
