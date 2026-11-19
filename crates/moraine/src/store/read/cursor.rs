@@ -153,7 +153,8 @@ impl OwnedEntityCursor {
 
 /// An append-only snapshot scan at one retained read point.
 pub(crate) struct OwnedSnapshotCursor {
-    handle: OwnedReadHandle,
+    /// Held so the reader the iterator reads through outlives it.
+    _handle: OwnedReadHandle,
     iterator: ScanIterator,
     visited: usize,
 }
@@ -176,7 +177,7 @@ impl OwnedSnapshotCursor {
             )
             .await?;
         Ok(Self {
-            handle,
+            _handle: handle,
             iterator,
             visited: 0,
         })
@@ -185,11 +186,9 @@ impl OwnedSnapshotCursor {
     pub(crate) async fn next(
         &mut self,
     ) -> Result<Option<(crate::store::proto::SnapshotValue, MemoryReservation)>> {
-        self.handle.borrow().validate()?;
         let Some(entry) = self.iterator.next().await? else {
             return Ok(None);
         };
-        self.handle.borrow().validate()?;
         self.visited = self.visited.wrapping_add(1);
         if self.visited.is_multiple_of(1024) {
             tokio::task::yield_now().await;
@@ -260,9 +259,7 @@ impl CursorState {
         handle: ReadHandle<'_>,
     ) -> Result<Option<crate::memory::Reserved<EntityRecord>>> {
         loop {
-            handle.validate()?;
             if let Some(mut entry) = self.iterator.next().await? {
-                handle.validate()?;
                 self.visited = self.visited.wrapping_add(1);
                 if self.visited.is_multiple_of(1024) {
                     tokio::task::yield_now().await;
@@ -295,7 +292,6 @@ impl CursorState {
                     entry = latest.next().await?.ok_or_else(|| {
                         Error::Corruption("history parent disappeared within a fixed read".into())
                     })?;
-                    handle.validate()?;
                 }
                 let memory = MemoryReservation::reserve(
                     (entry.key.len() as u64)

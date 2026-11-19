@@ -146,35 +146,18 @@ pub(crate) enum ReadHandle<'a> {
     Writer(&'a Db),
 }
 
-/// A scan that retains its reader and rechecks the read window between
-/// batches.
+/// A scan over one handle's state.
 pub(crate) struct ScanIterator {
     iterator: DbIterator,
-    checkpoint: Option<Arc<super::checkpoint::CheckpointReader>>,
 }
 
 impl ScanIterator {
     pub(crate) async fn next(&mut self) -> Result<Option<KeyValue>, slatedb::Error> {
-        if let Some(checkpoint) = &self.checkpoint {
-            checkpoint.reader()?;
-        }
-        let next = self.iterator.next().await?;
-        if let Some(checkpoint) = &self.checkpoint {
-            checkpoint.reader()?;
-        }
-        Ok(next)
+        self.iterator.next().await
     }
 }
 
 impl ReadHandle<'_> {
-    /// Refuses a reader whose read window has elapsed.
-    pub(crate) fn validate(&self) -> Result<(), slatedb::Error> {
-        if let Self::Checkpoint(reader) = self {
-            reader.reader()?;
-        }
-        Ok(())
-    }
-
     /// Point read of one key.
     pub(crate) async fn get<K: AsRef<[u8]> + Send>(
         &self,
@@ -185,11 +168,7 @@ impl ReadHandle<'_> {
             Self::Tx(tx) => tx.get(key).await,
             Self::Snapshot(snapshot) => snapshot.get(key).await,
             Self::Reader(reader) => reader.get(key).await,
-            Self::Checkpoint(reader) => {
-                let value = reader.reader()?.get(key).await?;
-                reader.reader()?;
-                Ok(value)
-            }
+            Self::Checkpoint(reader) => reader.reader().get(key).await,
             Self::Writer(db) => db.get(key).await,
         }
     }
@@ -247,7 +226,7 @@ impl ReadHandle<'_> {
             }
             Self::Checkpoint(reader) => {
                 reader
-                    .reader()?
+                    .reader()
                     .scan_prefix_with_options(prefix, subrange, &options)
                     .await
             }
@@ -257,13 +236,7 @@ impl ReadHandle<'_> {
             }
         }?;
         crate::telemetry::read::scan_opened(shape.admission);
-        Ok(ScanIterator {
-            iterator,
-            checkpoint: match self {
-                Self::Checkpoint(reader) => Some((*reader).clone()),
-                _ => None,
-            },
-        })
+        Ok(ScanIterator { iterator })
     }
 
     /// The highest key suffix under `prefix`, or `None` when it holds no

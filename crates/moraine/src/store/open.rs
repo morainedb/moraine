@@ -350,7 +350,7 @@ impl<'a> StoreBuilder<'a> {
             // A managed checkpoint must outlive two polls.
             checkpoint_lifetime: defaults.checkpoint_lifetime.max(self.poll_interval * 3),
             // SlateDB retries a refused write without bound; a mode the caller
-            // chose has a fallback, so it gives up after one retry instead.
+            // chose gives up after one retry, so the refusal reaches them.
             object_store_max_retries: self.reader_mode.map(|_| 1),
             ..defaults
         };

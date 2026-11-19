@@ -91,12 +91,13 @@ fencing error. Stop the second writer before re-attaching the first.
 A deployment that needs concurrent commits funnels them through one
 writer process, where they share a flush.
 
-A read-only attach follows the writer by pinning the checkpoints the writer
-publishes, and writes nothing to the bucket. It looks for new commits at most
-every `META_READER_POLL_INTERVAL_MS`, ten seconds by default, which is a billed
-request each time. To keep reading the same snapshot, attach to a checkpoint
-created ahead of time; see `META_CHECKPOINT` in
-[Configuration](../configuration/#read-only-attaches).
+A read-only attach follows the writer under a checkpoint of its own, the one
+thing it writes to the bucket, so its credentials must allow writes under the
+catalog's `manifest/` prefix. It looks for new commits at most every
+`META_READER_POLL_INTERVAL_MS`, ten seconds by default, which is a billed
+request each time. To keep reading the same snapshot, or to read with
+credentials that cannot write, attach to a checkpoint created ahead of time;
+see `META_CHECKPOINT` in [Configuration](../configuration/#read-only-attaches).
 
 ## Index a column
 

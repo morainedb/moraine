@@ -51,7 +51,7 @@ prefix.
 |---|---|---|
 | `DATA_PATH` | Required | Where DuckLake writes Parquet files. |
 | `READ_WRITE` | On for local paths, off for remote | Open the writer. Required to create or write a lake on S3. |
-| `READ_ONLY` | Off for local paths, on for remote | Open a reader that follows the writer and never fences it. |
+| `READ_ONLY` | Off for local paths, on for remote | Open a reader that follows the writer and never fences it. It keeps a checkpoint of its own, so its credentials must allow writes under the catalog's `manifest/` prefix; credentials that cannot attach to a `META_CHECKPOINT` instead. |
 | `ENCRYPTED` | Off | DuckLake encrypts each Parquet file with a key it stores in the catalog. |
 
 | Moraine option | Default | Meaning |

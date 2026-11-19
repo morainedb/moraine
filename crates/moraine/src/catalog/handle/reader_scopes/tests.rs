@@ -446,27 +446,20 @@ async fn a_reader_keeps_a_checkpoint_of_its_own() {
     reader.close().await.unwrap();
 }
 
-/// A reader whose credentials cannot write follows the latest manifest
-/// instead, protected only by retention.
+/// A reader whose credentials cannot write a checkpoint is refused, with
+/// the manifest grant and the pinned attach named as the ways in.
 #[tokio::test]
-async fn a_reader_that_cannot_write_follows_the_latest_manifest() {
+async fn a_reader_that_cannot_write_a_checkpoint_is_refused_with_guidance() {
     let objects = store_left_by_a_vanished_writer().await;
     let read_only: Arc<dyn ObjectStore> = Arc::new(ReadOnlyStore {
         inner: objects.clone(),
     });
-    let reader = Catalog::open_read_only(read_only, reader_options(Duration::from_secs(1)))
+    let refused = Catalog::open_read_only(read_only, reader_options(Duration::from_secs(1)))
         .await
-        .unwrap();
-    let scope = reader.index_read_scope().await.unwrap();
-    assert_eq!(
-        global_option(scope.reads(), "probe")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("survives")
-    );
+        .expect_err("a reader that cannot keep a checkpoint is refused");
+    let message = refused.to_string();
+    assert!(message.contains("manifest/"), "{message}");
+    assert!(message.contains("checkpoint"), "{message}");
     let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
     assert!(admin.list_checkpoints(None).await.unwrap().is_empty());
-    drop(scope);
-    reader.close().await.unwrap();
 }
