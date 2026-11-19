@@ -3,9 +3,9 @@ name: Site
 on:
   push:
     branches: [main]
-    paths: ['site/**', 'docs/rfcs/**', 'CHANGELOG.md', 'ROADMAP.md']
+    paths: ['site/**', 'docs/rfcs/**', 'docs/benchmarks.md', 'CHANGELOG.md', 'ROADMAP.md']
   pull_request:
-    paths: ['site/**', 'docs/rfcs/**', 'CHANGELOG.md', 'ROADMAP.md']
+    paths: ['site/**', 'docs/rfcs/**', 'docs/benchmarks.md', 'CHANGELOG.md', 'ROADMAP.md']
   workflow_dispatch:
 
 permissions:

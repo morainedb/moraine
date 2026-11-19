@@ -51,6 +51,10 @@ jobs:
             "rumdl==$(cat .rumdl-version)"
       - run: mbx xtask fmt-cpp --check
       - run: target/clang-tools/bin/rumdl check .
+      # The README and the site's landing page publish a digest of the
+      # benchmark tables; this fails a tree where either copy no longer
+      # matches docs/benchmarks.md.
+      - run: mbx xtask headline --check
 
   # moraine-duckdb is a pure Rust static library (the C++ shim and DuckDB
   # link are owned by the extension toolchain, exercised only by the e2e

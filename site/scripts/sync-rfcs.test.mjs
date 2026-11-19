@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
   isPublishedRfc,
@@ -192,4 +193,12 @@ test('the benchmarks page resolves its links from docs/', () => {
     page.includes('](https://github.com/morainedb/moraine/blob/main/benchmark/clickbench/README.md)'),
   );
   assert.ok(page.includes('](/rfcs/0001-storage-format/)'));
+});
+
+test('the published benchmarks page leaves the all-Express store out', async () => {
+  const source = await readFile(new URL('../../docs/benchmarks.md', import.meta.url), 'utf8');
+  const page = transformBenchmarks(source);
+  assert.ok(!page.includes('moraine_express'));
+  assert.ok(!page.includes('all Express'));
+  assert.ok(page.includes('log on Express'));
 });

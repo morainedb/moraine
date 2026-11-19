@@ -18,6 +18,9 @@
 //!   server (see `s3.rs`).
 //! - `rebench` re-runs every harness behind a published number, logging each
 //!   separately (see `rebench.rs`).
+//! - `headline [--check]` writes the published "by the numbers" digest into the
+//!   README and the site's landing page from the AWS tables in
+//!   `docs/benchmarks.md` (see `headline.rs`).
 //! - `check-pins` verifies every place naming a DuckDB version agrees with
 //!   `.github/duckdb-versions` (see `pins.rs`).
 //! - `check-patch-pins` applies the DuckLake patch series to every source
@@ -51,6 +54,7 @@ mod duckdb;
 mod ducklake_patch;
 mod e2e;
 mod filter_bench;
+mod headline;
 mod locate_bench;
 mod pins;
 mod reader_bench;
@@ -74,6 +78,7 @@ fn main() -> anyhow::Result<()> {
         Some("reader-bench") => reader_bench::run(&arguments),
         Some("s3") => s3::s3(),
         Some("benchmarks") => benchmarks::run(&arguments),
+        Some("headline") => headline::run(&arguments),
         Some("check-pins") => pins::check_pins(),
         Some("check-patch-pins") => ducklake_patch::check_pins(),
         Some("check-release-assets") => release::check_release_assets(&arguments),
@@ -89,13 +94,13 @@ fn main() -> anyhow::Result<()> {
         Some("community-pr") => community::community_pr(&arguments),
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
+                "unknown task `{other}`; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, headline, check-pins, \
                  check-patch-pins, check-release-assets, stage-release-assets, sign-release-assets, validate-release-artifact, \
                  version-matrix, bump-duckdb, pin-descriptor, community-pr"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: fmt-cpp, tidy-cpp, e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, s3, headline, check-pins, \
              check-patch-pins, check-release-assets, stage-release-assets, sign-release-assets, validate-release-artifact, \
              version-matrix, bump-duckdb, pin-descriptor, community-pr"
         ),

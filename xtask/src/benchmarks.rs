@@ -17,10 +17,11 @@ use anyhow::Context;
 
 use crate::duckdb::workspace_root;
 
-/// Every backend a networked run compares unless `--backends` narrows
-/// it, which is how a run proceeds while one server is down. Moraine's
-/// Express store is the catalog on the standard bucket with its log on the
-/// directory bucket; everything on the directory bucket is not compared.
+/// Every backend the five-column tables compare unless `--backends`
+/// narrows it, which is how a run proceeds while one server is down.
+/// Moraine's Express store here is the standard bucket with its log on
+/// the directory one; the catalog wholly on that bucket is measured in
+/// `moraine-latency` and published nowhere.
 const ALL_BACKENDS: &str = "moraine,moraine_wal_express,duckdb,postgres,quack";
 
 /// The store variables a local-disk run must not see. The published
@@ -172,7 +173,7 @@ fn networked_steps(output: &Path, backends: &str) -> Vec<Step> {
             &[
                 "bench",
                 "--backends",
-                "moraine,moraine_wal_express",
+                "moraine,moraine_wal_express,moraine_express",
                 "--workloads",
                 "small_commits,wide_small_commits,first_inline_write",
                 "--repeat",
