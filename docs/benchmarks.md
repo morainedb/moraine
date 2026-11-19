@@ -366,7 +366,10 @@ with the standard bucket, the directory bucket, RDS Postgres 16
 (`db.t4g.small`) and a `t4g.large` Quack server in that same zone.
 Measured TCP connects: 0.47 ms to S3, 0.32 ms to RDS, 0.14 ms to Quack.
 Parquet is local, the DuckDB file catalog is local and is the control.
-Three repeats.
+Three repeats. Each workload seeds in one process and measures in
+another, with no cache directory, so every phase below is a freshly
+attached process reading cold. The shared-cache run further down is the
+warm comparison.
 
 Serial phases, medians:
 
