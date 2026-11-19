@@ -653,7 +653,7 @@ fn deleting_one_inlined_row_costs_one_pass_over_the_table() {
             &Attach::Moraine {
                 store_dir: store,
                 data_path,
-                options: ", META_CACHE_PRELOAD 'none'",
+                options: "",
                 read_only: false,
             },
             &format!(

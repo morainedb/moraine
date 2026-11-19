@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use moraine::{CachePreload, CatalogOptions};
+use moraine::CatalogOptions;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::{info, warn};
 
@@ -560,7 +560,6 @@ fn handle_for_catalog(
     catalog: AttachedCatalog,
     log_id: crate::logging::HandleId,
     arguments: DataStoreArguments<'_>,
-    preload: Option<CachePreload>,
 ) -> Result<Box<MoraineCatalogHandle>, AbiError> {
     let source = DataSource {
         store_path: arguments.store_path.to_owned(),
@@ -578,7 +577,7 @@ fn handle_for_catalog(
 
     let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
     handle.data = Arc::new(DataSlot::new(resolved, source));
-    handle.spawn_warm_at_attach(preload);
+    handle.spawn_backfill_at_attach();
     Ok(Box::new(handle))
 }
 
@@ -609,24 +608,18 @@ pub(super) struct CacheArguments<'a> {
     pub(super) size_bytes: u64,
     pub(super) memory_bytes: u64,
     pub(super) auxiliary_percent: u32,
-    pub(super) preload: u8,
     pub(super) puts: bool,
     pub(super) compaction_puts: bool,
 }
 
-/// Applies `arguments` to `options`, failing on an unknown preload name.
-pub(super) fn set_cache_options(
-    options: &mut CatalogOptions,
-    arguments: &CacheArguments<'_>,
-) -> Result<(), AbiError> {
+/// Applies `arguments` to `options`.
+pub(super) fn set_cache_options(options: &mut CatalogOptions, arguments: &CacheArguments<'_>) {
     options.cache_dir = arguments.dir.map(std::path::PathBuf::from);
     options.cache_size = cache_size_option(arguments.size_bytes);
     options.cache_memory = cache_size_option(arguments.memory_bytes);
     options.cache_auxiliary_percent = percent_option(arguments.auxiliary_percent);
-    options.cache_preload = cache_preload_option(arguments.preload)?;
     options.cache_puts = arguments.puts;
     options.cache_compaction_puts = arguments.compaction_puts;
-    Ok(())
 }
 
 /// A percent option, where zero is the caller saying nothing.
@@ -647,23 +640,6 @@ fn flush_interval_option(flush_interval_ms: u64) -> Option<std::time::Duration> 
         0 => None,
         u64::MAX => Some(std::time::Duration::ZERO),
         ms => Some(std::time::Duration::from_millis(ms)),
-    }
-}
-
-/// The preload level an ABI code names: `0` loads nothing, `1` the
-/// newest objects, `2` every object the manifest references. Any other
-/// value is an error.
-pub(super) fn cache_preload_option(
-    cache_preload: u8,
-) -> Result<Option<moraine::CachePreload>, AbiError> {
-    match cache_preload {
-        0 => Ok(None),
-        1 => Ok(Some(moraine::CachePreload::L0)),
-        2 => Ok(Some(moraine::CachePreload::All)),
-        other => Err(AbiError::invalid_argument(format!(
-            "cache_preload {other} names no preload level: 0 loads nothing, 1 what every \
-             statement reads, 2 every object"
-        ))),
     }
 }
 
@@ -693,16 +669,9 @@ pub(super) fn cache_preload_option(
 /// catalog projections, commit staging, DuckDB, and allocator retention are
 /// outside it. `0` means "not given" for either byte count.
 ///
-/// `cache_preload` warms this store into that cache on the handle's
-/// worker once the attach has returned: `0` loads nothing, `1` the SST
-/// metadata of the subspaces every statement reads, `2` every subspace
-/// and the scan-shaped ones whole. Any other
-/// value is [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller
-/// always names a level (the extension's `ATTACH` passes `1` unless told
-/// otherwise). A non-zero level then warms every table's probe ranges the
-/// same way. `cache_puts` admits flushed SST metadata
-/// and data blocks on write; `cache_compaction_puts` independently admits
-/// compaction outputs. Both are explicit at this ABI boundary.
+/// `cache_puts` admits flushed SST metadata and data blocks on write;
+/// `cache_compaction_puts` independently admits compaction outputs. Both
+/// are explicit at this ABI boundary.
 ///
 /// `wal`, if non-null, writes the catalog's write-ahead log to the store
 /// its `path` names — a URI of the same forms `path` takes, with its own
@@ -745,7 +714,7 @@ pub(super) fn cache_preload_option(
 /// strings. `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
 /// `path` is null or a NUL-terminated C string and whose `s3` is null or a
 /// valid [`MoraineS3Config`].
-/// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
+/// `cache_size_bytes`, `cache_memory_bytes`, `cache_puts`,
 /// `cache_compaction_puts`, `flush_on_commit`, `reader_poll_interval_ms`,
 /// and `host_threads` are unconstrained. `probe`, if non-null, must be safe to
 /// call with `probe_ctx` from any thread. `out` must be a valid, writable `*mut
@@ -765,7 +734,6 @@ pub unsafe extern "C" fn moraine_attach_with_options(
     cache_size_bytes: u64,
     cache_memory_bytes: u64,
     cache_auxiliary_percent: u32,
-    cache_preload: u8,
     cache_puts: bool,
     cache_compaction_puts: bool,
     data_path: *const c_char,
@@ -841,14 +809,10 @@ pub unsafe extern "C" fn moraine_attach_with_options(
                 size_bytes: cache_size_bytes,
                 memory_bytes: cache_memory_bytes,
                 auxiliary_percent: cache_auxiliary_percent,
-                preload: cache_preload,
                 puts: cache_puts,
                 compaction_puts: cache_compaction_puts,
             },
-        )?;
-        // The preload runs on the handle's worker once the attach has
-        // returned, not inside the open.
-        let preload = options.cache_preload.take();
+        );
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
         options.wal_store.clone_from(&wal_store);
@@ -893,7 +857,6 @@ pub unsafe extern "C" fn moraine_attach_with_options(
                 read_only,
                 s3_creds: s3_creds.as_ref(),
             },
-            preload,
         )
     };
 
@@ -928,7 +891,6 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
     cache_size_bytes: u64,
     cache_memory_bytes: u64,
     cache_auxiliary_percent: u32,
-    cache_preload: u8,
     cache_puts: bool,
     cache_compaction_puts: bool,
     data_path: *const c_char,
@@ -955,7 +917,6 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
             cache_size_bytes,
             cache_memory_bytes,
             cache_auxiliary_percent,
-            cache_preload,
             cache_puts,
             cache_compaction_puts,
             data_path,
@@ -1168,7 +1129,7 @@ pub struct MoraineMigrationReport {
 /// satisfy [`MoraineS3Config`]'s borrowing contract. `wal`, if non-null, must
 /// point to a valid [`MoraineWalStore`] under the same contract as
 /// [`moraine_attach_with_wal_store`]'s. `cache_dir`, if non-null, must be a
-/// valid NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+/// valid NUL-terminated C string. `cache_size_bytes` and
 /// `cache_puts` are unconstrained. `out`
 /// must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
 /// must be a valid, writable [`MoraineError`]. All for the duration of this
@@ -1181,7 +1142,6 @@ pub unsafe extern "C" fn moraine_migrate_with_wal_store(
     flush_interval_ms: u64,
     cache_dir: *const c_char,
     cache_size_bytes: u64,
-    cache_preload: u8,
     cache_puts: bool,
     checkpoint: bool,
     out: *mut MoraineMigrationReport,
@@ -1223,7 +1183,6 @@ pub unsafe extern "C" fn moraine_migrate_with_wal_store(
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
-        options.cache_preload = cache_preload_option(cache_preload)?;
         options.cache_puts = cache_puts;
         options.cache_compaction_puts = cache_puts;
         options.wal_store = wal_store;

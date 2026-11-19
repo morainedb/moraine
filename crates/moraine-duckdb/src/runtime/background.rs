@@ -60,7 +60,7 @@ mod tests {
             .unwrap();
         let worker = Worker::start(&runtime, (*catalog).clone(), None, String::new());
         let pending = Arc::downgrade(&worker.pending);
-        worker.push(Pass::attach(Some(moraine::CachePreload::L0)));
+        worker.push(Pass::attach());
         worker.stop(&runtime);
         assert!(pending.upgrade().is_none());
         runtime.block_on(catalog.close()).unwrap();

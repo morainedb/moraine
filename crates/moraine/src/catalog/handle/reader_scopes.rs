@@ -9,7 +9,7 @@ use object_store::ObjectStore;
 use slatedb::DbReader;
 use tokio::{sync::Mutex, time::Instant};
 
-use super::{CachePreload, CatalogOptions, commit_log_provider, reader_session};
+use super::{CatalogOptions, commit_log_provider, reader_session};
 use crate::{
     Error, Result,
     store::{
@@ -71,12 +71,10 @@ impl ReaderScopes {
 
     /// The builder every scope reader opens through. Its poll interval is the
     /// read window: a reader that re-pointed mid-scope would advance state a
-    /// transaction had already started reading. `preload` warms the cache
-    /// as the reader opens; only the attach's own reader asks for it.
-    fn builder(&self, preload: Option<CachePreload>) -> StoreBuilder<'_> {
+    /// transaction had already started reading.
+    fn builder(&self) -> StoreBuilder<'_> {
         let builder = StoreBuilder::new(&self.options.path, self.objects.clone())
             .poll_interval(READ_WINDOW)
-            .cache_preload(preload)
             .wal_object_store(
                 self.options
                     .wal_store
@@ -111,7 +109,6 @@ impl ReaderScopes {
     async fn open(
         &self,
         readers: &mut Readers,
-        preload: Option<CachePreload>,
     ) -> Result<(Arc<CheckpointReader>, Arc<CacheCounters>)> {
         readers
             .generations
@@ -134,7 +131,7 @@ impl ReaderScopes {
         }
 
         let (reader, counters) = match self
-            .builder(preload)
+            .builder()
             .reader_mode(slatedb::DbReaderMode::ManagedCheckpoint)
             .open_fixed_reader()
             .await
@@ -146,7 +143,7 @@ impl ReaderScopes {
                     "could not keep a checkpoint of our own; following the latest manifest"
                 );
                 let (opened, counters) = self
-                    .builder(preload)
+                    .builder()
                     .reader_mode(slatedb::DbReaderMode::FollowLatest)
                     .open_fixed_reader()
                     .await?;
@@ -159,16 +156,13 @@ impl ReaderScopes {
         Ok((reader, counters))
     }
 
-    /// Opens the reader a read-only attach reads through, warming the cache
-    /// per `preload`, and holds it for the catalog's life. Scopes share it
-    /// under the reuse window like any other, but it counts toward no
-    /// transaction limit and rotation never retires it.
-    pub(super) async fn anchor(
-        &self,
-        preload: Option<CachePreload>,
-    ) -> Result<(Arc<CheckpointReader>, Arc<CacheCounters>)> {
+    /// Opens the reader a read-only attach reads through and holds it for
+    /// the catalog's life. Scopes share it under the reuse window like any
+    /// other, but it counts toward no transaction limit and rotation never
+    /// retires it.
+    pub(super) async fn anchor(&self) -> Result<(Arc<CheckpointReader>, Arc<CacheCounters>)> {
         let mut readers = self.readers.lock().await;
-        let (reader, counters) = self.open(&mut readers, preload).await?;
+        let (reader, counters) = self.open(&mut readers).await?;
         let anchored = Arc::downgrade(&reader);
         readers
             .generations
@@ -183,14 +177,14 @@ impl ReaderScopes {
         }
         if self.captures_log() {
             // Replay bytes are admitted by the process working-memory budget.
-            let (reader, _) = self.builder(None).open_fixed_reader().await?;
+            let (reader, _) = self.builder().open_fixed_reader().await?;
             return Ok(CheckpointReader::fixed(reader));
         }
         let mut readers = self.readers.lock().await;
         if let Some(reader) = self.reusable(&readers) {
             return Ok(reader);
         }
-        let (reader, _) = self.open(&mut readers, None).await?;
+        let (reader, _) = self.open(&mut readers).await?;
         Ok(reader)
     }
 

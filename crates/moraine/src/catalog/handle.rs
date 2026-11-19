@@ -191,16 +191,6 @@ impl Store {
         }
     }
 
-    /// The manifest this handle currently stands on.
-    pub(crate) fn current_manifest(&self) -> slatedb::manifest::VersionedManifest {
-        match self {
-            Self::Writer { db, .. } => db.status().current_manifest,
-            Self::Reader(reader) | Self::Committer { reader, .. } => {
-                reader.status().current_manifest
-            }
-        }
-    }
-
     /// The commit log this store commits through, when its commits are
     /// slots.
     pub(crate) fn commit_log(&self) -> Option<&LogCommitter> {
@@ -338,13 +328,6 @@ pub struct CatalogOptions {
     /// Parquet metadata and file row summaries. Process-wide and settled by
     /// the first attach; unset takes one eightieth of each configured budget.
     pub cache_auxiliary_percent: Option<u32>,
-    /// What to warm into the cache while the catalog opens, so the first
-    /// query pays no first touch. Warming is reading, so it is bounded by
-    /// the same caps and best-effort throughout — a subspace that cannot
-    /// be read is skipped, never fatal — but it is part of the open, so an
-    /// open that preloads returns only once it has. `None` (the default)
-    /// warms nothing, leaving the cache to fill as reads ask for blocks.
-    pub cache_preload: Option<CachePreload>,
     /// Whether flushed SST metadata and data blocks enter
     /// the process-shared decoded cache on write. Works with or without
     /// [`cache_dir`](Self::cache_dir); admitted blocks remain subject to
@@ -407,7 +390,6 @@ impl Default for CatalogOptions {
             cache_size: None,
             cache_memory: None,
             cache_auxiliary_percent: None,
-            cache_preload: None,
             cache_puts: true,
             cache_compaction_puts: true,
             external_compaction: false,
@@ -416,19 +398,6 @@ impl Default for CatalogOptions {
             checkpoint: None,
         }
     }
-}
-
-/// How much of a store to load into the on-disk object cache as it opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CachePreload {
-    /// The subspaces every statement reads: the system keys, the live
-    /// catalog, and the snapshot records, as far as their SST metadata.
-    /// What the open itself primes, so this level stays cheap.
-    L0,
-    /// Every object the store's manifest references, in full. The open
-    /// waits for a copy of the whole store, so this suits a store that
-    /// fits the cache with room to spare.
-    All,
 }
 
 /// The object store `options` names for the write-ahead log, if any.
@@ -456,7 +425,6 @@ fn writer_store_builder<'a>(
         .cache_size(options.cache_size)
         .cache_memory(options.cache_memory)
         .cache_auxiliary_percent(options.cache_auxiliary_percent)
-        .cache_preload(options.cache_preload)
         .cache_puts(options.cache_puts)
         .cache_compaction_puts(options.cache_compaction_puts)
         .external_compaction(external_compaction(options))
@@ -641,7 +609,7 @@ async fn open_anchored_reader(
         reuse,
     ));
     let opening = Instant::now();
-    let (anchor, cache) = scopes.anchor(options.cache_preload).await?;
+    let (anchor, cache) = scopes.anchor().await?;
     let reader = Arc::clone(anchor.store_reader());
     let opened = opening.elapsed();
 
@@ -755,30 +723,10 @@ fn warn_if_block_cache_cannot_hold_index(path: &str, index_bytes: Option<u64>) {
     }
 }
 
-/// Warns when an `All` preload could not hold the store it loaded.
-fn warn_if_preload_cannot_fit(options: &CatalogOptions, manifest: &census::ManifestBytes) {
-    if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
-        return;
-    }
-
-    let store_bytes = manifest.store_bytes;
-    if let Some(shortfall) = open::preload_shortfall(store_bytes, options.cache_size) {
-        warn!(
-            path = options.path,
-            store_bytes,
-            cache_size = options.cache_size,
-            shortfall,
-            "preload cannot hold this store: the load stops once the cache is full, leaving \
-             the rest to be fetched on demand"
-        );
-    }
-}
-
 /// Warns about what this store's own figures say the process's caches
-/// cannot hold: the preload, the metadata cache, and the block cache's
-/// share. Diagnostics only, from the manifest the open loaded.
+/// cannot hold: the metadata cache and the block cache's share.
+/// Diagnostics only, from the manifest the open loaded.
 fn warn_if_caches_cannot_hold(options: &CatalogOptions, manifest: &census::ManifestBytes) {
-    warn_if_preload_cannot_fit(options, manifest);
     warn_if_metadata_cache_cannot_hold(&options.path, Some(manifest.metadata_bytes));
     warn_if_block_cache_cannot_hold_index(
         &options.path,
@@ -2041,7 +1989,6 @@ impl Catalog {
                 .cache_size(options.cache_size)
                 .cache_memory(options.cache_memory)
                 .cache_auxiliary_percent(options.cache_auxiliary_percent)
-                .cache_preload(options.cache_preload)
                 .cache_puts(options.cache_puts)
                 .cache_compaction_puts(options.cache_compaction_puts)
                 .external_compaction(external_compaction(&options))

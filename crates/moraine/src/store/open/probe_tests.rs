@@ -11,6 +11,7 @@ use slatedb::{
 
 use super::*;
 use crate::store::{
+    handle::ReadHandle,
     index_encoding::{CanonicalKey, IndexKeyValue, IntWidth, encode_key},
     key::{IndexKey, Key},
 };

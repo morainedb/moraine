@@ -854,11 +854,9 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// cache's memory; 0 on the ABI means "not given" for either. All three
 	// configure a cache the process shares rather than this attach's, so
 	// only the first attach in the process sets them — a later attach naming
-	// different ones is served what stands. `CACHE_PUTS` and `CACHE_PRELOAD`
-	// are per attach: the first admits flushed SST blocks by default, while
-	// CACHE_COMPACTION_PUTS independently admits merge outputs (default on).
-	// CACHE_PRELOAD warms this store's bytes as the attach opens
-	// and defaults to 'l0'.
+	// different ones is served what stands. `CACHE_PUTS` is per attach and
+	// admits flushed SST blocks by default, while CACHE_COMPACTION_PUTS
+	// independently admits merge outputs (default on).
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
@@ -878,7 +876,6 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	uint64_t cache_auxiliary_percent = 0;
 	bool cache_puts = true;
 	bool cache_compaction_puts = true;
-	uint8_t cache_preload = 1;
 	std::string checkpoint;
 	// `META_DATA_PATH` arrives here as `data_path`: the DATA_PATH the index
 	// scoped read and maintenance resolve data files against. Optional,
@@ -935,19 +932,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		} else if (name == "cache_compaction_puts") {
 			cache_compaction_puts = option.second.GetValue<bool>();
 		} else if (name == "cache_preload") {
-			// Spelled as a level rather than a flag: "l0" is what every statement
-			// reads, "all" the whole store.
-			auto level = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
-			if (level == "none" || level == "off") {
-				cache_preload = 0;
-			} else if (level == "l0") {
-				cache_preload = 1;
-			} else if (level == "all") {
-				cache_preload = 2;
-			} else {
-				throw duckdb::InvalidInputException(
-				    "moraine: CACHE_PRELOAD must be 'none' (or 'off'), 'l0', or 'all'; got \"%s\"", level);
-			}
+			throw duckdb::InvalidInputException(
+			    "moraine: CACHE_PRELOAD was removed; the cache fills from the reads each statement makes");
 		} else if (name == "checkpoint") {
 			checkpoint = option.second.GetValue<std::string>();
 		}
@@ -995,7 +981,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	auto code = moraine_attach_with_options(
 	    info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms, flush_on_commit,
 	    reader_poll_interval_ms, cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
-	    static_cast<uint32_t>(cache_auxiliary_percent), cache_preload, cache_puts, cache_compaction_puts,
+	    static_cast<uint32_t>(cache_auxiliary_percent), cache_puts, cache_compaction_puts,
 	    data_path.empty() ? nullptr : data_path.c_str(), wal_path.empty() ? nullptr : &wal,
 	    checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads, moraine_shim_is_interrupted, &context, &handle,
 	    &err);

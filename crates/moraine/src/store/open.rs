@@ -8,25 +8,17 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use futures::{StreamExt, stream};
 use object_store::ObjectStore;
 use slatedb::{
     BlockCachePolicy, CacheTarget, Db, DbReader, DbReaderMode,
     admin::AdminBuilder,
     config::{CheckpointOptions, CheckpointScope, DbReaderOptions, Settings, SstBlockSize},
 };
-use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    catalog::CachePreload,
     error::{Error, Result},
-    store::{
-        cache, census, counted,
-        handle::{ReadHandle, SCAN_READ_AHEAD_BYTES, ScanShape},
-        key, retry,
-        segment::TagSegmentExtractor,
-    },
+    store::{cache, counted, retry, segment::TagSegmentExtractor},
 };
 
 /// The default WAL flush cadence when none is configured.
@@ -96,16 +88,6 @@ pub(crate) async fn create_checkpoint(db: &Db, lifetime: Option<Duration>) -> Re
     Ok(created.id)
 }
 
-/// How many bytes of a store a preload bounded by `cache_size` (or the
-/// default disk cap when unset) will not hold, or `None` when all of it
-/// fits.
-pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Option<u64> {
-    let cap = cache_size.unwrap_or(cache::DEFAULT_CACHE_DISK);
-    store_bytes
-        .checked_sub(cap)
-        .filter(|shortfall| *shortfall > 0)
-}
-
 /// Opens a moraine store on `object_store` — a read-write [`Db`] via
 /// [`open_writer`](Self::open_writer) or a read-only [`DbReader`] via
 /// [`open_reader`](Self::open_reader) — carrying the shared open
@@ -128,7 +110,6 @@ pub(crate) struct StoreBuilder<'a> {
     cache_size: Option<u64>,
     cache_memory: Option<u64>,
     cache_auxiliary_percent: Option<u32>,
-    cache_preload: Option<CachePreload>,
     cache_puts: bool,
     cache_compaction_puts: bool,
     external_compaction: bool,
@@ -156,7 +137,6 @@ impl<'a> StoreBuilder<'a> {
             cache_size: None,
             cache_memory: None,
             cache_auxiliary_percent: None,
-            cache_preload: None,
             cache_puts: true,
             cache_compaction_puts: true,
             external_compaction: false,
@@ -267,14 +247,6 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Sets what to load into the cache while the store opens. Per store;
-    /// the load is best-effort and completes before the open returns.
-    /// `None` (the default) loads nothing.
-    pub(crate) fn cache_preload(mut self, cache_preload: Option<CachePreload>) -> Self {
-        self.cache_preload = cache_preload;
-        self
-    }
-
     /// Sets whether flushed SST metadata and data blocks enter the decoded
     /// cache as they are written (default: on).
     pub(crate) fn cache_puts(mut self, cache_puts: bool) -> Self {
@@ -346,14 +318,6 @@ impl<'a> StoreBuilder<'a> {
         }
 
         let db = builder.build().await.map_err(Error::from)?;
-        if let Some(preload) = self.cache_preload {
-            let segments = census::manifest_bytes(&db.status().current_manifest).segments;
-            let tx = db
-                .begin(slatedb::IsolationLevel::Snapshot)
-                .map_err(Error::from)?;
-            let _ = warm(preload, ReadHandle::Tx(&tx), &counters, &segments).await;
-            tx.rollback();
-        }
 
         Ok((db, counters))
     }
@@ -454,11 +418,6 @@ impl<'a> StoreBuilder<'a> {
         } else {
             builder.build().await.map_err(Error::from)?
         };
-        if let Some(preload) = self.cache_preload {
-            let segments = census::manifest_bytes(&reader.status().current_manifest).segments;
-            let _ = warm(preload, ReadHandle::Reader(&reader), &counters, &segments).await;
-        }
-
         Ok((reader, counters))
     }
 
@@ -568,119 +527,6 @@ impl<'a> StoreBuilder<'a> {
     }
 }
 
-/// The shape that reaches one entry of a subspace whose segment holds
-/// `bytes`: probe when the whole segment fits one read-ahead, so the one
-/// request each SST costs anyway brings the segment in and admits it; seek
-/// otherwise, and when the size is unknown.
-pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
-    let read_ahead = u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap_or(u64::MAX);
-    match bytes {
-        Some(bytes) if bytes <= read_ahead => ScanShape::wide().retain(),
-        _ => ScanShape::seek().retain(),
-    }
-}
-
-/// Warms the cache by reading, best-effort, and reports how many subspaces
-/// warmed and how many failed. `L0` reads one entry of each subspace every
-/// statement reads — the system keys, the live catalog, and the snapshot
-/// records — so their SST metadata is resident; `All` reads one of every
-/// subspace and walks the scan-shaped ones whole. Neither reads the
-/// `index` subspace's data blocks.
-pub(crate) async fn warm(
-    preload: CachePreload,
-    handle: ReadHandle<'_>,
-    counters: &cache::CacheCounters,
-    segments: &[census::SegmentSize],
-) -> (usize, usize) {
-    let every_statement = [
-        key::Subspace::System,
-        key::Subspace::Current,
-        key::Subspace::Snapshot,
-    ];
-    let every_subspace = [
-        key::Subspace::System,
-        key::Subspace::Current,
-        key::Subspace::History,
-        key::Subspace::Snapshot,
-        key::Subspace::Changelog,
-        key::Subspace::Index,
-        key::Subspace::Inline,
-    ];
-    let whole = [
-        key::Subspace::System,
-        key::Subspace::Current,
-        key::Subspace::History,
-        key::Subspace::Snapshot,
-        key::Subspace::Changelog,
-    ];
-    let subspaces: Vec<key::Subspace> = match preload {
-        CachePreload::L0 => every_statement.to_vec(),
-        CachePreload::All => every_subspace.to_vec(),
-    };
-    let concurrency = subspaces.len();
-
-    let before = counters.tally();
-    let (warmed, failed) = stream::iter(subspaces.into_iter().map(|subspace| {
-        let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
-        let prefix = key::subspace_prefix(subspace);
-        let shape = warm_shape(
-            segments
-                .iter()
-                .find(|segment| segment.prefix == prefix)
-                .map(|segment| segment.bytes),
-        );
-        warm_subspace(handle, subspace, deep, shape)
-    }))
-    .buffer_unordered(concurrency)
-    .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
-        match result {
-            Ok(()) => (warmed + 1, failed),
-            Err(_) => (warmed, failed + 1),
-        }
-    })
-    .await;
-    counters.record_preload(before, counters.tally(), failed);
-    info!(
-        warmed,
-        failed,
-        level = match preload {
-            CachePreload::L0 => "l0",
-            CachePreload::All => "all",
-        },
-        "warmed the cache"
-    );
-    (warmed, failed)
-}
-
-/// Reads one entry of `subspace` in `shape`, or the whole range in probe
-/// shape when `deep`, admitting blocks without retaining the scanned rows.
-async fn warm_subspace(
-    handle: ReadHandle<'_>,
-    subspace: key::Subspace,
-    deep: bool,
-    shape: ScanShape,
-) -> Result<()> {
-    let prefix = key::subspace_prefix(subspace);
-    if !deep {
-        let mut iterator = handle.scan_prefix(&prefix, .., shape).await?;
-        iterator.next().await?;
-        return Ok(());
-    }
-
-    let mut iterator = handle
-        .scan_prefix(&prefix, .., ScanShape::bounded().retain())
-        .await?;
-    let mut visited = 0_usize;
-    while iterator.next().await?.is_some() {
-        visited = visited.wrapping_add(1);
-        if visited.is_multiple_of(1024) {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use object_store::memory::InMemory;
@@ -691,44 +537,6 @@ mod tests {
 
     fn memory_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
-    }
-
-    /// The `l0` level touches only the three subspaces every statement
-    /// reads; `all` touches every subspace.
-    #[tokio::test]
-    async fn the_l0_preload_touches_what_every_statement_reads() {
-        let (db, counters) = StoreBuilder::new("warm", memory_store())
-            .open_writer()
-            .await
-            .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
-        assert_eq!(
-            warm(CachePreload::L0, ReadHandle::Tx(&tx), &counters, &[]).await,
-            (3, 0)
-        );
-        assert_eq!(
-            warm(CachePreload::All, ReadHandle::Tx(&tx), &counters, &[]).await,
-            (7, 0)
-        );
-        tx.rollback();
-        db.close().await.unwrap();
-    }
-
-    /// A subspace whose segment fits one read-ahead warms in probe shape,
-    /// which brings the segment in for one request; a larger or unknown
-    /// segment warms in seek shape.
-    #[test]
-    fn the_warm_shape_follows_the_segments_size() {
-        assert_eq!(warm_shape(Some(4 * 1024)), ScanShape::wide().retain());
-        assert_eq!(
-            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap())),
-            ScanShape::wide().retain()
-        );
-        assert_eq!(
-            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap() + 1)),
-            ScanShape::seek().retain()
-        );
-        assert_eq!(warm_shape(None), ScanShape::seek().retain());
     }
 
     #[test]
@@ -965,25 +773,6 @@ mod tests {
         );
     }
 
-    /// A preload that cannot fit reports what it will not hold: the cap
-    /// stands where it is, so the shortfall is the operator's to act on.
-    #[test]
-    fn a_preload_larger_than_the_cap_reports_its_shortfall() {
-        // Room to spare, and exactly enough, both fit.
-        assert_eq!(preload_shortfall(3_400_000_000, Some(8_000_000_000)), None);
-        assert_eq!(preload_shortfall(64, Some(64)), None);
-
-        assert_eq!(preload_shortfall(100, Some(64)), Some(36));
-
-        // No configured cap is not an unbounded one: the device's own cap
-        // still governs what a preload may hold.
-        assert_eq!(preload_shortfall(cache::DEFAULT_CACHE_DISK, None), None);
-        assert_eq!(
-            preload_shortfall(cache::DEFAULT_CACHE_DISK + 1, None),
-            Some(1)
-        );
-    }
-
     /// Flush and compaction-output admission both default on and move
     /// independently.
     #[test]
@@ -1026,37 +815,5 @@ mod tests {
                 .with_flush_targets(&[])
                 .with_compaction_output_targets(&[])
         );
-    }
-
-    /// A preload leaves the store readable and costs nothing that a read
-    /// would not: it is a read, so the levels differ in reach, not in
-    /// what they may observe.
-    #[tokio::test]
-    async fn a_preload_opens_a_readable_store_at_every_level() {
-        let object_store = memory_store();
-        let head = Key::Sys(SysKey::Head).encode();
-
-        let (db, _) = StoreBuilder::new("s", Arc::clone(&object_store))
-            .flush_interval(Duration::from_millis(1))
-            .open_writer()
-            .await
-            .unwrap();
-        db.put(&head, b"head").await.unwrap();
-        db.flush().await.unwrap();
-        db.close().await.unwrap();
-
-        for preload in [None, Some(CachePreload::L0), Some(CachePreload::All)] {
-            let (reader, _) = StoreBuilder::new("s", Arc::clone(&object_store))
-                .cache_preload(preload)
-                .open_reader()
-                .await
-                .unwrap();
-            assert_eq!(
-                reader.get(head.clone()).await.unwrap().unwrap().as_ref(),
-                b"head",
-                "preload {preload:?} left the store unreadable"
-            );
-            reader.close().await.unwrap();
-        }
     }
 }

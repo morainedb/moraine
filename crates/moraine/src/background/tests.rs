@@ -17,7 +17,7 @@ async fn coalescing_warming_preserves_every_publication() {
     let Job::Warm(warm) = work.warming.next().await else {
         panic!("warming job")
     };
-    assert_eq!(warm.tables, Some([1, 2].map(TableId::new).into()));
+    assert_eq!(warm.tables, [1, 2].map(TableId::new).into());
     assert!(work.warming.jobs.lock().unwrap().is_empty());
     for file in 1..=3 {
         let Job::Publish(job) = work.commits.next().await else {
@@ -36,28 +36,32 @@ async fn started_warming_cannot_absorb_new_work() {
         let Job::Warm(job) = jobs.front().unwrap() else {
             panic!("warming job")
         };
-        *job.progress.try_lock().unwrap() = Some(Warming::new(job.tables.as_ref()));
+        *job.progress.try_lock().unwrap() = Some(Warming::new(&job.tables));
     }
     work.push(request(2, 2));
     assert_eq!(work.warming.jobs.lock().unwrap().len(), 2);
 }
 
+/// An attach queues a backfill and nothing else: warming belongs to the
+/// commits that write tables.
 #[tokio::test]
-async fn attach_warming_dominates_only_unstarted_warming() {
+async fn an_attach_queues_backfill_and_no_warming() {
     let work = BackgroundWork::default();
     work.push(request(1, 1));
-    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
+    work.push(BackgroundRequest::attach());
     let Job::Warm(job) = work.warming.next().await else {
         panic!("warming job")
     };
-    assert!(job.tables.is_none());
-    assert_eq!(job.store, Some(CachePreload::L0));
+    assert_eq!(job.tables, [1].map(TableId::new).into());
     assert!(matches!(work.backfill.next().await, Job::Backfill(_)));
     assert!(matches!(work.commits.next().await, Job::Publish(_)));
-    let no_preload = BackgroundWork::default();
-    no_preload.push(BackgroundRequest::attach(None));
-    assert!(no_preload.warming.jobs.lock().unwrap().is_empty());
-    assert!(matches!(no_preload.backfill.next().await, Job::Backfill(_)));
+    let attach_only = BackgroundWork::default();
+    attach_only.push(BackgroundRequest::attach());
+    assert!(attach_only.warming.jobs.lock().unwrap().is_empty());
+    assert!(matches!(
+        attach_only.backfill.next().await,
+        Job::Backfill(_)
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -111,7 +115,7 @@ async fn retries_rotate_without_losing_progress() {
 #[tokio::test]
 async fn stalled_warming_and_backfill_do_not_block_commits_and_abort_releases_work() {
     let work = Arc::new(BackgroundWork::default());
-    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
+    work.push(BackgroundRequest::attach());
     work.push(request(1, 1));
     let queue = work.clone();
     let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
@@ -171,8 +175,8 @@ async fn attach_jobs_read_a_real_catalog_without_an_extension() {
         .await
         .unwrap();
     let work = BackgroundWork::default();
-    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
-    assert!(work.warming.next().await.run(&catalog, None, "").await);
+    work.push(BackgroundRequest::attach());
+    assert!(work.warming.jobs.lock().unwrap().is_empty());
     assert!(
         work.backfill
             .next()
@@ -240,25 +244,4 @@ async fn admission_slots_are_released_on_cancellation() {
         let _ = task.await;
     }
     assert_eq!(slots.available_permits(), 1);
-}
-
-#[tokio::test]
-#[ignore = "reads MORAINE_MEMORY_FIXTURE with a small working-memory allowance"]
-async fn preload_streams_a_persisted_catalog() {
-    let root = std::env::var("MORAINE_MEMORY_FIXTURE").unwrap();
-    let objects = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    let catalog = crate::Catalog::open_read_only(
-        objects,
-        crate::CatalogOptions {
-            cache_memory: Some(16 * 1024 * 1024),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let work = BackgroundWork::default();
-    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
-    assert!(work.warming.next().await.run(&catalog, None, "").await);
-    drop(work);
-    catalog.close().await.unwrap();
 }

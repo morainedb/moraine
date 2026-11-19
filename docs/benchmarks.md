@@ -561,15 +561,6 @@ the GET count is the slope:
 The merge cut SSTs by 63% and did not reduce GETs, matching the S3 run
 above. In-memory, 2026-11-18 at `c4fabb0`.
 
-`measure_preload_overlap_with_the_first_read`: does a store preload running
-beside the first read fetch blocks twice? Reads of a `L0` preload and a
-first schema read over 64 tables, run one after the other and together,
-median of five. In-memory, 2026-11-18 at `c4fabb0`:
-
-| one after the other | together |
-|---:|---:|
-| 12 | 12 |
-
 `measure_attach_cost_by_index_size` grows only the `index` subspace:
 
 | entries | `index` bytes | all SSTs | manifest | open | first view |
@@ -749,12 +740,8 @@ five repetitions. 2026-08-16, before the demand-loaded catalog:
 | `cold_first_lookup` | 397 ms | 56 |
 | `warm_second_lookup` | 0.28 ms | 0 |
 | `in_list_lookup_many` (50 keys) | 1.36 ms | 0 |
-| `attach_read_only_l0` | 465 ms | 97 |
-| `cold_first_lookup_l0` | 2.78 ms | 0 |
 
-The first lookup is a chain of about ten dependent round trips. With
-`cache_preload = L0` the attach absorbs it (+120 ms, all concurrent) and
-the first lookup costs 3 ms. The extension preloads `L0` by default.
+The first lookup is a chain of about ten dependent round trips.
 <!-- /site:omit -->
 
 ### Located lookups

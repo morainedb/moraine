@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use moraine::{CachePreload, Catalog, CatalogSnapshot, ReadOnlyCatalog, SnapshotId, TableId};
+use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, SnapshotId, TableId};
 use tokio::runtime::{Builder, Runtime};
 
 mod background;
@@ -190,20 +190,18 @@ impl MoraineCatalogHandle {
         }
     }
 
-    /// With a `preload` level, warms the store to that level and then every
-    /// table's index and inline ranges, after the attach has returned.
-    /// Writers with a data store also publish missing row summaries;
-    /// existing summaries cost one header read.
-    pub(crate) fn spawn_warm_at_attach(&self, preload: Option<CachePreload>) {
+    /// A writer with a data store publishes missing row summaries after the
+    /// attach has returned; existing summaries cost one header read.
+    pub(crate) fn spawn_backfill_at_attach(&self) {
         let publishes = matches!(self.catalog, AttachedCatalog::Writer(_))
             && self
                 .data
                 .resolved()
                 .is_some_and(|files| files.store.is_some());
-        if preload.is_none() && !publishes {
+        if !publishes {
             return;
         }
-        self.enqueue_pass(Pass::attach(preload));
+        self.enqueue_pass(Pass::attach());
     }
 
     /// Warms touched tables and publishes files registered by this commit.
@@ -542,12 +540,9 @@ mod deadline_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, ptr};
-
     use super::{MAX_WORKER_THREADS, MIN_WORKER_THREADS, MoraineCatalogHandle, worker_threads};
     use crate::{
-        abi::{moraine_attach_with_wal_store, moraine_detach},
-        error::{MoraineError, codes},
+        abi::moraine_detach,
         test_support::{TempDir, attach_ok, attach_with_data_path},
     };
 
@@ -610,50 +605,6 @@ mod tests {
         let warming = unsafe { &*handle }.finish_warming();
 
         assert_eq!(warming, 1, "the attach spawned no warming pass");
-        // SAFETY: attached above, detached exactly once.
-        unsafe { moraine_detach(handle) };
-    }
-
-    /// An attach that preloads the cache warms every table's probe ranges
-    /// even without a `DATA_PATH` store.
-    #[test]
-    fn an_attach_with_cache_preload_spawns_one_warming_pass() {
-        let lake = TempDir::new("warm-preload");
-        let c_path = CString::new(lake.path().to_str().expect("test path is UTF-8"))
-            .expect("no NUL in path");
-        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
-        let mut err = MoraineError::default();
-        // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
-        let code = unsafe {
-            moraine_attach_with_wal_store(
-                c_path.as_ptr(),
-                ptr::null(),
-                false,
-                false,
-                0,
-                false,
-                ptr::null(),
-                0,
-                0,
-                0,
-                1,
-                false,
-                false,
-                ptr::null(),
-                ptr::null(),
-                ptr::null(),
-                0,
-                None,
-                ptr::null_mut(),
-                &raw mut handle,
-                &raw mut err,
-            )
-        };
-        assert_eq!(code, codes::OK);
-        // SAFETY: freshly attached above and not yet detached.
-        let warming = unsafe { &*handle }.finish_warming();
-
-        assert_eq!(warming, 1, "the preloading attach spawned no warming pass");
         // SAFETY: attached above, detached exactly once.
         unsafe { moraine_detach(handle) };
     }

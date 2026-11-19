@@ -82,8 +82,7 @@ Owner: [RFC 0007](rfcs/0007-read-path-and-caching.md).
 id parameter is defined in a private module, so an external caller cannot name
 an SST to call either operation.
 
-Export the id type used by these methods. Moraine does not require it for
-preload—subspace reads warm less data and match the catalog's access shape—but
+Export the id type used by these methods. Moraine does not require it, but
 the export would permit precise per-SST warming and eviction when an operator
 needs them.
 

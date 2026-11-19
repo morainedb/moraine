@@ -114,25 +114,6 @@ async fn write_memory_measurement_fixture() {
 }
 
 #[tokio::test]
-#[ignore = "reads MORAINE_MEMORY_FIXTURE with a small working-memory allowance"]
-async fn deep_preload_uses_bounded_working_memory() {
-    let root = std::env::var("MORAINE_MEMORY_FIXTURE").unwrap();
-    let objects = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root).unwrap());
-    let reader = Catalog::open_read_only(
-        objects,
-        CatalogOptions {
-            cache_memory: Some(16 * 1024 * 1024),
-            cache_preload: Some(crate::CachePreload::All),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(reader.cache_tally().preload_failures, 0);
-    reader.close().await.unwrap();
-}
-
-#[tokio::test]
 #[ignore = "measures active-writer generations in MORAINE_MEMORY_FIXTURE"]
 async fn measure_active_writer_reader_generations() {
     let root = std::env::var("MORAINE_MEMORY_FIXTURE").unwrap();

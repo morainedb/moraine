@@ -234,8 +234,8 @@ are `#[doc(hidden)]` and outside the semver contract.
 
 ## Background work
 
-`BackgroundRequest::attach(preload)` requests summary backfill and optional
-warming. `BackgroundRequest::commit(files, committed)` reserves the file input
+`BackgroundRequest::attach()` requests summary backfill.
+`BackgroundRequest::commit(files, committed)` reserves the file input
 and requests publication and warming of touched tables. It can fail working
 memory admission. `BackgroundWork::push` enqueues best-effort work, reporting
 full queues; explicit summary backfill remains the recovery mechanism.

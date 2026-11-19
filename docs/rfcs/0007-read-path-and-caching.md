@@ -361,19 +361,12 @@ implementation constants and have no attach option.
 **Warming.** Every open validates the store and primes what its first
 statement reads in one concurrent batch: the format stamp and migration marker
 in `system`, the recorded log store in `current`, and the newest snapshot
-record, so the first statement owes no table open for any of them.
-`CatalogOptions::cache_preload` warms inside the open past that:
-`CachePreload::L0` touches the three subspaces every statement reads far
-enough to pull their SST metadata, and `CachePreload::All` touches every
-subspace and walks the scan-shaped ones whole. Neither walks the `index`
-subspace's data. `ReadOnlyCatalog::preload_store`
-does the same after the open, and the extension's `CACHE_PRELOAD` runs it that
-way, on the handle's worker once the attach has returned, so the attach does
-not wait on it. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
-shape, the first entry of each named table's index and inline ranges, eight
-ranges at a time process-wide. The extension runs it after a commit for the
-tables the commit wrote, and with `CACHE_PRELOAD` set, for every table after
-the store preload.
+record, so the first statement owes no table open for any of them. Nothing
+else is read ahead: the cache fills from the reads each statement makes.
+`ReadOnlyCatalog::warm_tables` reads, in `seek().retain()` shape, the first
+entry of each named table's index and inline ranges, eight ranges at a time
+process-wide. The extension runs it after a commit for the tables the commit
+wrote.
 
 **Lookup retention.** Row-lookup directories and revision-keyed probe memos
 share the lookup allowance. Directories additionally keep local ceilings of
@@ -389,8 +382,8 @@ facilities hold.
 
 **Configuration.** `moraine_cache_dir`, `moraine_cache_size`,
 `moraine_cache_memory`, and `moraine_cache_auxiliary_percent` are settings,
-one per process; `CACHE_PUTS`, `CACHE_COMPACTION_PUTS`, and `CACHE_PRELOAD`
-are attach options, one per lake. Both are documented with the [extension
+one per process; `CACHE_PUTS` and `CACHE_COMPACTION_PUTS` are attach options,
+one per lake. Both are documented with the [extension
 surface](0006-extension-surface.md).
 `moraine_cache_tally`, `moraine_cache_status`, `moraine_store_census`, and
 `moraine_object_store_tally` report hits and misses per tier, capacity and

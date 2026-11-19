@@ -63,7 +63,6 @@ prefix.
 | `META_WAL_PATH` | The catalog store | A separate object store for the write-ahead log. Recorded in the lake; every attach must name the same one. |
 | `META_CACHE_PUTS` | True | Admit a store's own writes into the cache as they land. |
 | `META_CACHE_COMPACTION_PUTS` | True | Also admit compaction output. Set false if large merges evict what queries warmed. |
-| `META_CACHE_PRELOAD` | `l0` | Warm the cache during attach: `none`, `l0` (SST metadata), or `all`. |
 | `META_MAINTENANCE_*` | Off | Enable a scheduled maintenance pass; see [Operating manual](../operating/#scheduled-maintenance). |
 
 ## Commit latency
@@ -152,11 +151,10 @@ SET moraine_cache_size = '2GiB';
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
 ```
 
-A new process starts with an empty cache. By default the attach loads only
-the objects written since the last compaction; `META_CACHE_PRELOAD 'all'`
-loads the whole store, which takes longer but means the first query reads no
-catalog data from object storage. A store larger than
-`moraine_cache_size` is loaded up to the cap, with a warning in the log.
+A new process starts with an empty cache. The attach reads the few records
+every statement needs, and the cache fills from the reads each statement
+makes, so the first query on a table reads its catalog data from object
+storage once.
 
 If the memory budget cannot hold a store's index metadata, the attach logs a
 warning and lookups fetch metadata from object storage. Raise
