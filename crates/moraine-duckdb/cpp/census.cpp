@@ -424,15 +424,20 @@ duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientCont
 
 	// `data_*` count the Parquet store, which the `main_`/`wal_` columns do
 	// not reach: a statement can read data files while showing no main-store
-	// request at all.
-	names = {"main_gets",      "main_get_ms",   "main_puts",  "main_put_ms", "main_deletes",
-	         "main_delete_ms", "wal_gets",      "wal_get_ms", "wal_puts",    "wal_put_ms",
-	         "wal_deletes",    "wal_delete_ms", "errors",     "data_gets",   "data_bytes"};
+	// request at all. `*_gets` are reads that return bytes; head probes and
+	// listings, most of what an open costs, have columns of their own.
+	// Listings stream, so they carry no duration.
+	names = {"main_gets", "main_get_ms", "main_puts",  "main_put_ms", "main_deletes", "main_delete_ms",
+	         "wal_gets",  "wal_get_ms",  "wal_puts",   "wal_put_ms",  "wal_deletes",  "wal_delete_ms",
+	         "errors",    "data_gets",   "data_bytes", "main_heads",  "main_head_ms", "main_lists",
+	         "wal_heads", "wal_head_ms", "wal_lists"};
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
 	                duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
 	                duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
-	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT};
 	return bind_data;
 }
 
@@ -470,6 +475,12 @@ void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionI
 	output.SetValue(12, 0, duckdb::Value::UBIGINT(tally.errors));
 	output.SetValue(13, 0, duckdb::Value::UBIGINT(tally.data_gets));
 	output.SetValue(14, 0, duckdb::Value::UBIGINT(tally.data_bytes));
+	output.SetValue(15, 0, duckdb::Value::UBIGINT(tally.main_heads));
+	output.SetValue(16, 0, milliseconds(tally.main_head_nanoseconds));
+	output.SetValue(17, 0, duckdb::Value::UBIGINT(tally.main_lists));
+	output.SetValue(18, 0, duckdb::Value::UBIGINT(tally.wal_heads));
+	output.SetValue(19, 0, milliseconds(tally.wal_head_nanoseconds));
+	output.SetValue(20, 0, duckdb::Value::UBIGINT(tally.wal_lists));
 	output.SetChildCardinality(1);
 }
 

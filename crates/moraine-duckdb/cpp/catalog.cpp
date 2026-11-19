@@ -862,9 +862,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
-	// `READER_POLL_INTERVAL_MS` is how often a read-only attach looks for
-	// what a writer has committed, and so how stale its reads may be;
-	// longer is cheaper and staler, for a dashboard attached for the day.
+	// `READER_POLL_INTERVAL_MS` is how long a read-only attach's transactions
+	// share one store reader before opening a newer one, and so how stale its
+	// reads may be; longer is cheaper and staler, for a dashboard attached
+	// for the day.
 	// On a committer it keeps the reader's checkpoint alive rather than
 	// its view fresh: every query refreshes the reader itself.
 	bool encrypted = false;

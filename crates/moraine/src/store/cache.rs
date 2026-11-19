@@ -364,7 +364,8 @@ pub struct RowSummaryOccupancy {
 /// retries. Client-internal retries and caches are not visible here. WAL
 /// objects land in the `main_*` fields while the WAL shares the main store.
 /// Durations sum completed request latency, so concurrent requests can exceed
-/// wall-clock time.
+/// wall-clock time. Head probes and listings are counted apart from the
+/// reads that return bytes; listings stream, so they carry no duration.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ObjectStoreTally {
@@ -395,6 +396,18 @@ pub struct ObjectStoreTally {
     /// Failed request attempts across both stores, including errors SlateDB
     /// handles internally such as missing-object probes.
     pub errors: u64,
+    /// Head probes of the main store: existence checks that return no bytes.
+    pub main_heads: u64,
+    /// Time spent in completed main-store head probes.
+    pub main_head_duration: Duration,
+    /// Listings of the main store.
+    pub main_lists: u64,
+    /// Head probes of the WAL store.
+    pub wal_heads: u64,
+    /// Time spent in completed WAL-store head probes.
+    pub wal_head_duration: Duration,
+    /// Listings of the WAL store.
+    pub wal_lists: u64,
     /// Byte ranges read from the data store: Parquet footers, row-id
     /// columns, delete files, and scoped reads. A store may coalesce
     /// adjacent ranges into fewer requests.
@@ -477,6 +490,16 @@ impl ObjectStoreTally {
                 .wal_delete_duration
                 .saturating_sub(before.wal_delete_duration),
             errors: self.errors.saturating_sub(before.errors),
+            main_heads: self.main_heads.saturating_sub(before.main_heads),
+            main_head_duration: self
+                .main_head_duration
+                .saturating_sub(before.main_head_duration),
+            main_lists: self.main_lists.saturating_sub(before.main_lists),
+            wal_heads: self.wal_heads.saturating_sub(before.wal_heads),
+            wal_head_duration: self
+                .wal_head_duration
+                .saturating_sub(before.wal_head_duration),
+            wal_lists: self.wal_lists.saturating_sub(before.wal_lists),
             data_gets: self.data_gets.saturating_sub(before.data_gets),
             data_bytes: self.data_bytes.saturating_sub(before.data_bytes),
         }
@@ -522,6 +545,12 @@ pub(crate) struct CacheCounters {
     wal_put_nanoseconds: AtomicU64,
     wal_deletes: AtomicU64,
     wal_delete_nanoseconds: AtomicU64,
+    main_heads: AtomicU64,
+    main_head_nanoseconds: AtomicU64,
+    main_lists: AtomicU64,
+    wal_heads: AtomicU64,
+    wal_head_nanoseconds: AtomicU64,
+    wal_lists: AtomicU64,
     object_store_errors: AtomicU64,
 }
 
@@ -616,8 +645,59 @@ impl CacheCounters {
             wal_deletes: load(&self.wal_deletes),
             wal_delete_duration: duration(&self.wal_delete_nanoseconds),
             errors: load(&self.object_store_errors),
+            main_heads: load(&self.main_heads),
+            main_head_duration: duration(&self.main_head_nanoseconds),
+            main_lists: load(&self.main_lists),
+            wal_heads: load(&self.wal_heads),
+            wal_head_duration: duration(&self.wal_head_nanoseconds),
+            wal_lists: load(&self.wal_lists),
             data_gets: 0,
             data_bytes: 0,
+        }
+    }
+
+    /// Tallies one request a store moraine wraps itself made, into this
+    /// store's counters and the process's, as SlateDB's own recorder
+    /// would: a count under `op`, its duration where the kind has one, and
+    /// the error tally when it `failed`.
+    pub(crate) fn record_request(
+        &self,
+        store: RequestStore,
+        op: RequestOp,
+        elapsed: Duration,
+        failed: bool,
+    ) {
+        let (count, duration) = match (store, op) {
+            (RequestStore::Main, RequestOp::Get) => (Which::MainGet, Some(Which::MainGetDuration)),
+            (RequestStore::Main, RequestOp::Head) => {
+                (Which::MainHead, Some(Which::MainHeadDuration))
+            }
+            (RequestStore::Main, RequestOp::List) => (Which::MainList, None),
+            (RequestStore::Main, RequestOp::Put) => (Which::MainPut, Some(Which::MainPutDuration)),
+            (RequestStore::Main, RequestOp::Delete) => {
+                (Which::MainDelete, Some(Which::MainDeleteDuration))
+            }
+            (RequestStore::Wal, RequestOp::Get) => (Which::WalGet, Some(Which::WalGetDuration)),
+            (RequestStore::Wal, RequestOp::Head) => (Which::WalHead, Some(Which::WalHeadDuration)),
+            (RequestStore::Wal, RequestOp::List) => (Which::WalList, None),
+            (RequestStore::Wal, RequestOp::Put) => (Which::WalPut, Some(Which::WalPutDuration)),
+            (RequestStore::Wal, RequestOp::Delete) => {
+                (Which::WalDelete, Some(Which::WalDeleteDuration))
+            }
+        };
+        let nanoseconds = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        for counters in [self, COUNTERS.as_ref()] {
+            counters.of(count).fetch_add(1, Ordering::Relaxed);
+            if let Some(duration) = duration {
+                counters
+                    .of(duration)
+                    .fetch_add(nanoseconds, Ordering::Relaxed);
+            }
+            if failed {
+                counters
+                    .of(Which::ObjectStoreError)
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -641,8 +721,32 @@ impl CacheCounters {
             Which::WalGetDuration => &self.wal_get_nanoseconds,
             Which::WalPutDuration => &self.wal_put_nanoseconds,
             Which::WalDeleteDuration => &self.wal_delete_nanoseconds,
+            Which::MainHead => &self.main_heads,
+            Which::MainHeadDuration => &self.main_head_nanoseconds,
+            Which::MainList => &self.main_lists,
+            Which::WalHead => &self.wal_heads,
+            Which::WalHeadDuration => &self.wal_head_nanoseconds,
+            Which::WalList => &self.wal_lists,
         }
     }
+}
+
+/// Which of a catalog's two object stores a request went to, as the tally
+/// columns split them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestStore {
+    Main,
+    Wal,
+}
+
+/// The kind of object-store request, as the tally columns split them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestOp {
+    Get,
+    Head,
+    List,
+    Put,
+    Delete,
 }
 
 /// One counter's home in the opening store's [`CacheCounters`] and in the
@@ -673,6 +777,12 @@ enum Which {
     WalGetDuration,
     WalPutDuration,
     WalDeleteDuration,
+    MainHead,
+    MainHeadDuration,
+    MainList,
+    WalHead,
+    WalHeadDuration,
+    WalList,
 }
 
 impl CounterFn for Slot {
@@ -714,7 +824,22 @@ fn object_store_metric(labels: &[(&str, &str)], duration: bool) -> Option<Which>
             .iter()
             .find_map(|(name, value)| (*name == key).then_some(*value))
     };
+    // SlateDB labels every read-shaped request `get`; the `api` label tells
+    // the reads that return bytes from head probes and listings.
+    let api = label("api");
+    let head = api == Some("head");
+    let list = matches!(
+        api,
+        Some("list" | "list_with_offset" | "list_with_delimiter")
+    );
     match (label("store_type"), label("op"), duration) {
+        (Some("main"), Some("get"), false) if head => Some(Which::MainHead),
+        (Some("main"), Some("get"), true) if head => Some(Which::MainHeadDuration),
+        (Some("wal"), Some("get"), false) if head => Some(Which::WalHead),
+        (Some("wal"), Some("get"), true) if head => Some(Which::WalHeadDuration),
+        (Some("main"), Some("get"), false) if list => Some(Which::MainList),
+        (Some("wal"), Some("get"), false) if list => Some(Which::WalList),
+        (_, Some("get"), true) if list => None,
         (Some("main"), Some("get"), false) => Some(Which::MainGet),
         (Some("main"), Some("put"), false) => Some(Which::MainPut),
         (Some("main"), Some("delete"), false) => Some(Which::MainDelete),
@@ -1884,6 +2009,57 @@ mod tests {
         assert_eq!(tally.main_gets, 3);
         assert_eq!(tally.main_get_duration, Duration::from_millis(25));
         assert_eq!(tally.wal_puts, 0);
+    }
+
+    /// Head probes and listings are requests of their own, apart from the
+    /// reads that return bytes: an open's cost is mostly the former.
+    #[test]
+    fn the_recorder_splits_heads_and_listings_from_reads() {
+        let counters = Arc::new(CacheCounters::default());
+        let recorder = CacheRecorder {
+            store: Arc::clone(&counters),
+        };
+        let labels = |store_type: &'static str, api: &'static str| {
+            [
+                ("component", "db"),
+                ("store_type", store_type),
+                ("op", "get"),
+                ("api", api),
+            ]
+        };
+        let count = |store_type, api, by: u64| {
+            recorder
+                .register_counter(
+                    "slatedb.object_store.request_count",
+                    "",
+                    &labels(store_type, api),
+                )
+                .increment(by);
+        };
+
+        count("main", "get", 1);
+        count("main", "head", 4);
+        count("main", "list", 2);
+        count("main", "list_with_delimiter", 1);
+        count("wal", "head", 8);
+        count("wal", "list_with_offset", 1);
+        recorder
+            .register_histogram(
+                "slatedb.object_store.request_duration_seconds",
+                "",
+                &labels("main", "head"),
+                &[],
+            )
+            .record(0.010);
+
+        let tally = counters.object_store_tally();
+        assert_eq!(tally.main_gets, 1);
+        assert_eq!(tally.main_heads, 4);
+        assert_eq!(tally.main_head_duration, Duration::from_millis(10));
+        assert_eq!(tally.main_lists, 3);
+        assert_eq!(tally.wal_heads, 8);
+        assert_eq!(tally.wal_lists, 1);
+        assert_eq!(tally.wal_gets, 0);
     }
 
     /// Two stores share the cache but not the counters; the process's set

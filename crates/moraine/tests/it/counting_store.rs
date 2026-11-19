@@ -26,6 +26,7 @@ pub struct CountingStore {
     bytes: AtomicU64,
     wal_puts: AtomicU64,
     manifest_puts: AtomicU64,
+    compactions_requests: AtomicU64,
 }
 
 impl CountingStore {
@@ -37,6 +38,19 @@ impl CountingStore {
             bytes: AtomicU64::new(0),
             wal_puts: AtomicU64::new(0),
             manifest_puts: AtomicU64::new(0),
+            compactions_requests: AtomicU64::new(0),
+        }
+    }
+
+    /// Reads and listings under the compactor's state directory since the
+    /// last call, and resets the tally.
+    pub fn take_compactions_requests(&self) -> u64 {
+        self.compactions_requests.swap(0, Ordering::SeqCst)
+    }
+
+    fn record_read(&self, location: Option<&Path>) {
+        if location.is_some_and(|path| path.as_ref().contains("compactions")) {
+            self.compactions_requests.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -115,6 +129,7 @@ impl ObjectStore for CountingStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        self.record_read(Some(location));
         let result = self.inner.get_opts(location, options).await?;
         self.bytes
             .fetch_add(result.range.end - result.range.start, Ordering::SeqCst);
@@ -128,6 +143,7 @@ impl ObjectStore for CountingStore {
     ) -> object_store::Result<Vec<bytes::Bytes>> {
         self.ranged_gets
             .fetch_add(ranges.len() as u64, Ordering::SeqCst);
+        self.record_read(Some(location));
         self.bytes.fetch_add(
             ranges.iter().map(|range| range.end - range.start).sum(),
             Ordering::SeqCst,
@@ -143,10 +159,12 @@ impl ObjectStore for CountingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.record_read(prefix);
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.record_read(prefix);
         self.inner.list_with_delimiter(prefix).await
     }
 

@@ -716,17 +716,27 @@ pub(crate) async fn open_reader_initialized(
     let opened = started.elapsed();
 
     let started = Instant::now();
-    let format = validate_format(ReadHandle::Reader(&reader), log_resident).await?;
+    let format = validate_reader(&reader, wal_path, log_resident).await?;
     info!(
         reader_open_ms = crate::telemetry::milliseconds(opened),
         validate_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-only"
     );
 
-    match format {
+    Ok((reader, counters, format))
+}
+
+/// Validates the format an open reader finds and returns it. Never
+/// bootstraps: an uninitialized store is refused.
+pub(crate) async fn validate_reader(
+    reader: &DbReader,
+    wal_path: Option<&str>,
+    log_resident: bool,
+) -> Result<u64> {
+    match validate_format(ReadHandle::Reader(reader), log_resident).await? {
         Some(format) => {
-            validate_wal_store(ReadHandle::Reader(&reader), wal_path).await?;
-            Ok((reader, counters, format.format_version))
+            validate_wal_store(ReadHandle::Reader(reader), wal_path).await?;
+            Ok(format.format_version)
         }
         None => Err(Error::Corruption(
             "store is not an initialized moraine catalog; a read-only attach \

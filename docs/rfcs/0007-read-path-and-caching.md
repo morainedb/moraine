@@ -31,10 +31,12 @@ read it.
 `DbSnapshot`, so it reads through a `DbReader` of its own.
 `crates/moraine/src/store/checkpoint.rs` holds one open.
 `crates/moraine/src/catalog/handle/reader_scopes.rs` shares those readers
-across transactions. The handle's own `DbReader` follows the latest manifest
-without a checkpoint of its own, polling at `reader_poll_interval`; it serves
-head reads only, and the collector's age threshold protects what it references
-between polls.
+across transactions. The reader a read-only handle opens as it attaches is the
+first one its scopes share: the attach's own validation, head reads, and the
+first transactions all go through it, so attaching and the first transaction
+open one reader rather than two. It stays open for the handle's life for
+status and shutdown, and rotation never retires it. A handle over a commit log
+keeps a base reader apart from its per-transaction views.
 
 Reader acquisition works as follows.
 
@@ -232,10 +234,12 @@ The default budget without `moraine_cache_memory` is 640 MiB. Within the block
 share an empty attach reserves nothing. Read fills, disk promotions, and
 admitted flush or compaction output grow a store's allowance under pressure:
 first from unassigned bytes, then by borrowing unused allowance from other
-stores, then by reclaiming a fair share from larger borrowers. Transfers happen
-under one process lock, shrinking donors before growing the recipient, and the
-sum of store capacities never exceeds the block share. A store's final detach
-releases its memory allowance. Its disk device stays open and keeps its
+stores, then by reclaiming a fair share from larger borrowers. A donor keeps
+twice what it holds: capacity is split evenly over the shards and evicted per
+shard, so less would cut the fuller shards of a small working set. Transfers
+happen under one process lock, shrinking donors before growing the recipient,
+and the sum of store capacities never exceeds the block share. A store's final
+detach releases its memory allowance. Its disk device stays open and keeps its
 persisted blocks.
 
 **Metadata protection.** SST indexes, filters, and statistics live in the same
@@ -354,14 +358,17 @@ exist for. Non-unique equality probes also use the named prefix filter policy
 suffix. A writer polls the manifest every five seconds. These are
 implementation constants and have no attach option.
 
-**Warming.** `CACHE_PRELOAD` warms inside the open: `CachePreload::L0` touches
-every subspace far enough to pull its SST metadata, and `CachePreload::All`
-additionally walks the scan-shaped subspaces whole. Neither walks the `index`
-subspace's data. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
+**Warming.** `CatalogOptions::cache_preload` warms inside the open:
+`CachePreload::L0` touches every subspace far enough to pull its SST metadata,
+and `CachePreload::All` additionally walks the scan-shaped subspaces whole.
+Neither walks the `index` subspace's data. `ReadOnlyCatalog::preload_store`
+does the same after the open, and the extension's `CACHE_PRELOAD` runs it that
+way, on the handle's worker once the attach has returned, so the attach does
+not wait on it. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
 shape, the first entry of each named table's index and inline ranges, eight
 ranges at a time process-wide. The extension runs it after a commit for the
-tables the commit wrote, and with `CACHE_PRELOAD` set, for every table in the
-background after the open.
+tables the commit wrote, and with `CACHE_PRELOAD` set, for every table after
+the store preload.
 
 **Lookup retention.** Row-lookup directories and revision-keyed probe memos
 share the lookup allowance. Directories additionally keep local ceilings of
@@ -382,7 +389,11 @@ are attach options, one per lake. Both are documented with the [extension
 surface](0006-extension-surface.md).
 `moraine_cache_tally`, `moraine_cache_status`, `moraine_store_census`, and
 `moraine_object_store_tally` report hits and misses per tier, capacity and
-occupancy, recorded SST metadata bytes, and object-store requests.
+occupancy, recorded SST metadata bytes, and object-store requests. The
+request tally counts head probes and listings apart from reads that return
+bytes, since an open is mostly the former, and it covers the write-ahead-log
+reader moraine builds for a read-only handle, which SlateDB's own
+instrumentation does not reach.
 
 **Lake data.** Ordinary lake scans never send data-file bytes through moraine.
 Data bytes are held in DuckDB's external-file cache under its `memory_limit`.
@@ -615,6 +626,8 @@ container ceiling remains the final boundary.
 - A reader past its deadline rejects point reads and scan yields.
 - A checkpoint-pinned attach writes nothing to the object store; a reader with
   none to pin records a checkpoint of its own.
+- A read-only attach's first scopes share the reader the attach opened and
+  write no second checkpoint.
 - A shared reader is reused inside `reader_poll_interval`, and a scope past it
   opens a newer one; a committer opens one per transaction.
 - A head change under a lookup rerun reaches `RetryBudgetExhausted` after

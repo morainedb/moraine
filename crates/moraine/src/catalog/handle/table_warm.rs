@@ -3,13 +3,16 @@
 use futures::{StreamExt, stream};
 use tracing::debug;
 
-use super::ReadOnlyCatalog;
+use super::{CachePreload, ReadOnlyCatalog};
 use crate::{
     catalog::TableId,
     error::Result,
     store::{
+        cache::cache_status,
+        census,
         handle::{ReadHandle, ScanShape},
         key::{IndexKind, index_index_prefix, table_probe_prefixes},
+        open,
         read::{EntityCursor, EntityRecord, EntityRecordKind, Versions},
     },
 };
@@ -34,6 +37,38 @@ async fn warm_prefix(handle: ReadHandle<'_>, prefix: Vec<u8>) -> Result<()> {
 }
 
 impl ReadOnlyCatalog {
+    /// Warms the store into the cache as [`CatalogOptions::cache_preload`]
+    /// would during the open, for a host that attaches first and warms
+    /// after: `L0` reaches each subspace's SST metadata, `All` walks the
+    /// scan-shaped subspaces whole. Best-effort; a block that cannot be
+    /// read is left to the read that needs it.
+    ///
+    /// [`CatalogOptions::cache_preload`]: crate::CatalogOptions::cache_preload
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if no read session can be opened.
+    pub async fn preload_store(&self, level: CachePreload) -> Result<()> {
+        let manifest = census::manifest_bytes(&self.store.current_manifest());
+        if level == CachePreload::All
+            && let Some(disk) = cache_status().block_disk_capacity_bytes
+            && let Some(shortfall) = open::preload_shortfall(manifest.store_bytes, Some(disk))
+        {
+            tracing::warn!(
+                store_bytes = manifest.store_bytes,
+                disk,
+                shortfall,
+                "preload cannot hold this store: the load stops once the cache is full, leaving \
+                 the rest to be fetched on demand"
+            );
+        }
+
+        let session = self.begin_read().await?;
+        open::warm(level, session.handle(), &self.cache, &manifest.segments).await;
+        session.finish();
+        Ok(())
+    }
+
     /// Warms the store ranges a lookup on each of `tables` probes — its
     /// indexes' entries and its inlined data — into the block cache, so a
     /// cold table pays one burst of reads rather than a round trip per probe.

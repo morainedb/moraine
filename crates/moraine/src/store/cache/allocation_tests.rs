@@ -10,10 +10,14 @@ use super::*;
 const CHILD: &str = "MORAINE_CACHE_ALLOCATION_CHILD";
 
 async fn probe(db: &Db, counters: &CacheCounters, version: u8, label: &str) -> u64 {
+    probe_keys(db, counters, version, 16384, label).await
+}
+
+async fn probe_keys(db: &Db, counters: &CacheCounters, version: u8, keys: u64, label: &str) -> u64 {
     let before = counters.object_store_tally();
     let before_cache = counters.tally();
     let started = std::time::Instant::now();
-    for key in (0_u64..16384).step_by(17) {
+    for key in (0_u64..keys).step_by(17) {
         assert_eq!(
             db.get(key.to_be_bytes()).await.unwrap().unwrap().as_ref(),
             &[version; 128]
@@ -29,8 +33,12 @@ async fn probe(db: &Db, counters: &CacheCounters, version: u8, label: &str) -> u
 }
 
 async fn write(db: &Db, version: u8) {
+    write_keys(db, version, 16384).await;
+}
+
+async fn write_keys(db: &Db, version: u8, keys: u64) {
     let mut batch = WriteBatch::new();
-    for key in 0_u64..16384 {
+    for key in 0_u64..keys {
         batch.put(key.to_be_bytes(), [version; 128]);
     }
     db.write(batch).await.unwrap();
@@ -219,6 +227,118 @@ async fn idle_attaches_do_not_evict_an_active_working_set() {
         );
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+const SMALL_SET_CHILD: &str = "MORAINE_CACHE_SMALL_SET_CHILD";
+
+/// Opens a store on the shared cache under `identity`.
+async fn open_store(
+    path: &str,
+    config: &CacheConfig,
+    settings: &Settings,
+    objects: &Arc<object_store::memory::InMemory>,
+    identity: crate::CacheIdentity,
+) -> (Db, Arc<CacheCounters>) {
+    let counters = store_counters();
+    let location = StoreLocation {
+        identity,
+        path: path.to_owned(),
+    };
+    let db = Db::builder(path, objects.clone())
+        .with_settings(settings.clone())
+        .with_db_cache(shared(config, location, store_counters()).await.unwrap(), 1)
+        .with_metrics_recorder(recorder(counters.clone()))
+        .build()
+        .await
+        .unwrap();
+    (db, counters)
+}
+
+/// A store holding a few dozen blocks, then a peer growing beside it. The
+/// cache splits capacity evenly over its shards and evicts per shard, so
+/// a reclaim that left the donor a hair above its occupancy would cut the
+/// fuller shards below what they hold.
+async fn small_working_set_scenario() {
+    let config = CacheConfig {
+        auxiliary_percent: None,
+        memory: Some(8 * 1024 * 1024),
+        dir: None,
+        disk_size: None,
+    };
+    let objects = Arc::new(object_store::memory::InMemory::new());
+    let identity = crate::CacheIdentity::new("small-set-test");
+    let settings = Settings {
+        flush_interval: None,
+        compactor_options: None,
+        manifest_poll_interval: Duration::from_mins(1),
+        ..Settings::default()
+    };
+    let (active, counters) = open_store("active", &config, &settings, &objects, identity).await;
+    write_keys(&active, 1, 3000).await;
+    probe_keys(&active, &counters, 1, 3000, "initial").await;
+    assert_eq!(
+        probe_keys(&active, &counters, 1, 3000, "warm alone").await,
+        0
+    );
+
+    // Each peer takes its fair share from the donor holding the least,
+    // which is the active store; three bring it to the reclaim floor.
+    let mut peers = Vec::new();
+    for number in 0..3 {
+        let path = format!("peer-{number}");
+        let (peer, peer_counters) = open_store(&path, &config, &settings, &objects, identity).await;
+        write(&peer, 2).await;
+        probe(&peer, &peer_counters, 2, &path).await;
+        peers.push(peer);
+    }
+
+    let (capacity, occupied) = {
+        let caches = caches();
+        let store = &caches.stores[&StoreLocation {
+            identity,
+            path: "active".to_owned(),
+        }];
+        (
+            store.capacity.load(Ordering::Relaxed),
+            as_bytes(store.tier.usage()),
+        )
+    };
+    assert!(
+        capacity >= occupied.saturating_mul(2),
+        "the peer's reclaim left the donor {capacity} bytes for {occupied} held"
+    );
+    assert_eq!(
+        probe_keys(&active, &counters, 1, 3000, "warm beside a busy peer").await,
+        0,
+        "a peer's growth evicted a small working set"
+    );
+    assert_budget();
+    for peer in peers {
+        peer.close().await.unwrap();
+    }
+    active.close().await.unwrap();
+}
+
+/// A donor keeps twice what it holds through a peer's reclaim, so shard
+/// skew in a small working set evicts nothing.
+#[tokio::test]
+async fn a_reclaim_leaves_a_donor_twice_what_it_holds() {
+    if std::env::var(SMALL_SET_CHILD).is_ok() {
+        small_working_set_scenario().await;
+        return;
+    }
+    let name = "store::cache::allocation_tests::a_reclaim_leaves_a_donor_twice_what_it_holds";
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(SMALL_SET_CHILD, "1")
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 const GRANT_CHILD: &str = "MORAINE_CACHE_GRANT_CHILD";

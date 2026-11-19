@@ -168,18 +168,10 @@ pub(crate) async fn l0_files(path: &str, object_store: Arc<dyn ObjectStore>) -> 
         .unwrap_or(0))
 }
 
-/// The manifest's byte totals, from one manifest read.
-pub(crate) async fn manifest_bytes(
-    path: &str,
-    object_store: Arc<dyn ObjectStore>,
-) -> Result<ManifestBytes> {
-    let view = AdminBuilder::new(path, object_store)
-        .build()
-        .read_compactor_state_view()
-        .await
-        .map_err(Error::from)?;
-
-    let segments = census_of_manifest(view.manifest()).segments;
+/// The manifest's byte totals, from the manifest an open store already
+/// holds: no object-store read.
+pub(crate) fn manifest_bytes(manifest: &VersionedManifest) -> ManifestBytes {
+    let segments = census_of_manifest(manifest).segments;
     let (store_bytes, metadata_bytes) =
         segments
             .iter()
@@ -193,11 +185,11 @@ pub(crate) async fn manifest_bytes(
                 )
             });
 
-    Ok(ManifestBytes {
+    ManifestBytes {
         store_bytes,
         metadata_bytes,
         segments,
-    })
+    }
 }
 
 /// Totals the store's objects and, when the write-ahead log lives
@@ -444,10 +436,7 @@ mod tests {
             total + segment.filter_bytes + segment.index_bytes + segment.stats_bytes
         });
 
-        let counted = manifest_bytes("census/metadata", store)
-            .await
-            .unwrap()
-            .metadata_bytes;
+        let counted = manifest_bytes(&db.status().current_manifest).metadata_bytes;
         assert_eq!(counted, expected);
 
         // Not compared against segment bytes: at two keys the metadata

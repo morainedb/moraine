@@ -46,15 +46,16 @@ async fn started_warming_cannot_absorb_new_work() {
 async fn attach_warming_dominates_only_unstarted_warming() {
     let work = BackgroundWork::default();
     work.push(request(1, 1));
-    work.push(BackgroundRequest::attach(true));
+    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
     let Job::Warm(job) = work.warming.next().await else {
         panic!("warming job")
     };
     assert!(job.tables.is_none());
+    assert_eq!(job.store, Some(CachePreload::L0));
     assert!(matches!(work.backfill.next().await, Job::Backfill(_)));
     assert!(matches!(work.commits.next().await, Job::Publish(_)));
     let no_preload = BackgroundWork::default();
-    no_preload.push(BackgroundRequest::attach(false));
+    no_preload.push(BackgroundRequest::attach(None));
     assert!(no_preload.warming.jobs.lock().unwrap().is_empty());
     assert!(matches!(no_preload.backfill.next().await, Job::Backfill(_)));
 }
@@ -110,7 +111,7 @@ async fn retries_rotate_without_losing_progress() {
 #[tokio::test]
 async fn stalled_warming_and_backfill_do_not_block_commits_and_abort_releases_work() {
     let work = Arc::new(BackgroundWork::default());
-    work.push(BackgroundRequest::attach(true));
+    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
     work.push(request(1, 1));
     let queue = work.clone();
     let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
@@ -170,7 +171,7 @@ async fn attach_jobs_read_a_real_catalog_without_an_extension() {
         .await
         .unwrap();
     let work = BackgroundWork::default();
-    work.push(BackgroundRequest::attach(true));
+    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
     assert!(work.warming.next().await.run(&catalog, None, "").await);
     assert!(
         work.backfill
@@ -256,7 +257,7 @@ async fn preload_streams_a_persisted_catalog() {
     .await
     .unwrap();
     let work = BackgroundWork::default();
-    work.push(BackgroundRequest::attach(true));
+    work.push(BackgroundRequest::attach(Some(CachePreload::L0)));
     assert!(work.warming.next().await.run(&catalog, None, "").await);
     drop(work);
     catalog.close().await.unwrap();

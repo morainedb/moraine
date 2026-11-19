@@ -8,6 +8,7 @@ pub(crate) mod cache_identity;
 pub(crate) mod census;
 pub(crate) mod checkpoint;
 pub(crate) mod compaction;
+pub(crate) mod counted;
 pub(crate) mod frame;
 pub(crate) mod handle;
 pub(crate) mod index_encoding;

@@ -212,11 +212,19 @@ SELECT count(*) FROM moraine_object_store_tally('lake');
 
 query I
 SELECT main_gets > 0 AND main_puts > 0
-   AND errors <= main_gets + main_puts + main_deletes
-              + wal_gets + wal_puts + wal_deletes
+   AND errors <= main_gets + main_puts + main_deletes + main_heads + main_lists
+              + wal_gets + wal_puts + wal_deletes + wal_heads + wal_lists
    AND main_get_ms >= 0 AND main_put_ms >= 0 AND main_delete_ms >= 0
    AND wal_get_ms >= 0 AND wal_put_ms >= 0 AND wal_delete_ms >= 0
+   AND main_head_ms >= 0 AND wal_head_ms >= 0
 FROM moraine_object_store_tally('lake');
+----
+true
+
+# An open lists the manifest directory and probes for the end of the
+# write-ahead log; neither is a read that returns bytes.
+query I
+SELECT main_lists > 0 AND main_heads > 0 FROM moraine_object_store_tally('lake');
 ----
 true
 

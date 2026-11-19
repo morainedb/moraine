@@ -22,7 +22,7 @@ use crate::{
     catalog::CachePreload,
     error::{Error, Result},
     store::{
-        cache, census,
+        cache, census, counted,
         handle::{ReadHandle, SCAN_READ_AHEAD_BYTES, ScanShape},
         key, retry,
         segment::TagSegmentExtractor,
@@ -135,9 +135,6 @@ pub(crate) struct StoreBuilder<'a> {
     checkpoint: Option<Uuid>,
     /// A reader mode chosen by the caller, over the one the open derives.
     reader_mode: Option<DbReaderMode>,
-    /// The manifest's per-segment sizes, when the attach read them; they
-    /// decide how a preload reaches each subspace's first entry.
-    warm_segments: Vec<census::SegmentSize>,
 }
 
 impl<'a> StoreBuilder<'a> {
@@ -165,7 +162,6 @@ impl<'a> StoreBuilder<'a> {
             external_compaction: false,
             checkpoint: None,
             reader_mode: None,
-            warm_segments: Vec::new(),
         }
     }
 
@@ -279,12 +275,6 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// The manifest's per-segment sizes, for sizing the preload's reads.
-    pub(crate) fn warm_segments(mut self, segments: Vec<census::SegmentSize>) -> Self {
-        self.warm_segments = segments;
-        self
-    }
-
     /// Sets whether flushed SST metadata and data blocks enter the decoded
     /// cache as they are written (default: on).
     pub(crate) fn cache_puts(mut self, cache_puts: bool) -> Self {
@@ -357,10 +347,11 @@ impl<'a> StoreBuilder<'a> {
 
         let db = builder.build().await.map_err(Error::from)?;
         if let Some(preload) = self.cache_preload {
+            let segments = census::manifest_bytes(&db.status().current_manifest).segments;
             let tx = db
                 .begin(slatedb::IsolationLevel::Snapshot)
                 .map_err(Error::from)?;
-            warm(preload, ReadHandle::Tx(&tx), &counters, &self.warm_segments).await;
+            warm(preload, ReadHandle::Tx(&tx), &counters, &segments).await;
             tx.rollback();
         }
 
@@ -425,16 +416,26 @@ impl<'a> StoreBuilder<'a> {
         let wal: Arc<dyn slatedb::wal::WalReader> = if let Some(session) = &self.reader_session {
             session.reader()
         } else {
+            // SlateDB instruments only the stores it wraps itself; this
+            // reader's requests are tallied here so the tally sees them.
             let mut wal = slatedb::wal::SlateDbWalReaderBuilder::new()
                 .with_path(object_store::path::Path::from(self.path))
-                .with_object_store(Arc::clone(&self.object_store))
+                .with_object_store(counted::CountedStore::wrap(
+                    Arc::clone(&self.object_store),
+                    Arc::clone(&counters),
+                    cache::RequestStore::Main,
+                ))
                 .with_options(slatedb::wal::SlateDbWalReaderOptions {
                     max_buffered_bytes: 512 * 1024,
                     max_fetch_tasks: 2,
                     read_ahead_bytes: 256 * 1024,
                 });
             if let Some(store) = &self.wal_object_store {
-                wal = wal.with_wal_object_store(Arc::clone(store));
+                wal = wal.with_wal_object_store(counted::CountedStore::wrap(
+                    Arc::clone(store),
+                    Arc::clone(&counters),
+                    cache::RequestStore::Wal,
+                ));
             }
             Arc::new(wal.build()?)
         };
@@ -454,13 +455,8 @@ impl<'a> StoreBuilder<'a> {
             builder.build().await.map_err(Error::from)?
         };
         if let Some(preload) = self.cache_preload {
-            warm(
-                preload,
-                ReadHandle::Reader(&reader),
-                &counters,
-                &self.warm_segments,
-            )
-            .await;
+            let segments = census::manifest_bytes(&reader.status().current_manifest).segments;
+            warm(preload, ReadHandle::Reader(&reader), &counters, &segments).await;
         }
 
         Ok((reader, counters))
@@ -588,7 +584,7 @@ pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
 /// subspace so its SST metadata is resident; `All` additionally walks the
 /// scan-shaped subspaces whole. Neither reads the `index` subspace's data
 /// blocks.
-async fn warm(
+pub(crate) async fn warm(
     preload: CachePreload,
     handle: ReadHandle<'_>,
     counters: &cache::CacheCounters,

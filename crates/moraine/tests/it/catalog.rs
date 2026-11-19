@@ -9,7 +9,10 @@ use moraine::{
 };
 use object_store::memory::InMemory;
 
-use crate::fixtures::{col, open_memory, seeded};
+use crate::{
+    counting_store::CountingStore,
+    fixtures::{col, open_memory, seeded},
+};
 
 /// Metadata reads taken at once on a handle that has materialized nothing
 /// yet — the shape DuckLake issues once a statement's scans initialize in
@@ -815,4 +818,60 @@ async fn a_variant_column_is_storable_on_every_column_verb_but_never_indexable()
         refused.to_string().contains("index key can encode"),
         "{refused}"
     );
+}
+
+/// An open reads the manifest through the store it opens and nothing
+/// beside it: the compactor's state, which only diagnostics ever consulted,
+/// is not fetched by a writer or a reader.
+#[tokio::test]
+async fn an_open_reads_no_compactor_state() {
+    let objects = Arc::new(InMemory::new());
+    let seed = Catalog::open(objects.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(objects));
+    let mut options = CatalogOptions::default();
+    // The writer's own compactor reads that state when it runs; this is
+    // about the open.
+    options.external_compaction = true;
+
+    let writer = Catalog::open(counting.clone(), options.clone())
+        .await
+        .unwrap();
+    assert_eq!(counting.take_compactions_requests(), 0, "a writer open");
+    writer.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(counting.clone(), options)
+        .await
+        .unwrap();
+    assert_eq!(counting.take_compactions_requests(), 0, "a read-only open");
+    reader.close().await.unwrap();
+}
+/// A read-only attach probes and reads the write-ahead log through a reader
+/// of moraine's own, and those requests are in its tally like any other.
+#[tokio::test]
+async fn a_read_only_attach_counts_its_log_requests() {
+    let objects = Arc::new(InMemory::new());
+    // An idle writer leaves one log file for the reader to find.
+    for _ in 0..2 {
+        Catalog::open(objects.clone(), CatalogOptions::default())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+    }
+
+    let reader = Catalog::open_read_only(objects, CatalogOptions::default())
+        .await
+        .unwrap();
+    let tally = reader.object_store_tally();
+    assert!(
+        tally.main_heads > 0,
+        "the log probes of the open are not counted: {tally:?}"
+    );
+    assert!(tally.main_gets > 0, "{tally:?}");
+    reader.close().await.unwrap();
 }

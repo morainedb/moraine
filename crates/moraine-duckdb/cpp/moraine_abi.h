@@ -517,6 +517,19 @@ typedef struct MoraineObjectStoreTally {
   uint64_t data_gets;
   // Bytes those reads returned.
   uint64_t data_bytes;
+  // Head probes of the main store: existence checks that return no bytes.
+  uint64_t main_heads;
+  // Summed main-store head-probe latency, in nanoseconds.
+  uint64_t main_head_nanoseconds;
+  // Listings of the main store. Listings stream, so they carry no
+  // duration.
+  uint64_t main_lists;
+  // Head probes of the WAL store.
+  uint64_t wal_heads;
+  // Summed WAL-store head-probe latency, in nanoseconds.
+  uint64_t wal_head_nanoseconds;
+  // Listings of the WAL store.
+  uint64_t wal_lists;
 } MoraineObjectStoreTally;
 
 // One data file carrying located positions, as
@@ -1395,13 +1408,13 @@ void moraine_error_free(char *message);
 // catalog projections, commit staging, DuckDB, and allocator retention are
 // outside it. `0` means "not given" for either byte count.
 //
-// `cache_preload` warms this store into that cache before the attach
-// returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
-// scan-shaped subspaces whole. Any other value is
-// [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller always
-// names a level (the extension's `ATTACH` passes `1` unless told
-// otherwise). A non-zero level also warms every table's probe ranges in
-// the background after the open. `cache_puts` admits flushed SST metadata
+// `cache_preload` warms this store into that cache on the handle's
+// worker once the attach has returned: `0` loads nothing, `1` each
+// subspace's SST metadata, `2` the scan-shaped subspaces whole. Any other
+// value is [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller
+// always names a level (the extension's `ATTACH` passes `1` unless told
+// otherwise). A non-zero level then warms every table's probe ranges the
+// same way. `cache_puts` admits flushed SST metadata
 // and data blocks on write; `cache_compaction_puts` independently admits
 // compaction outputs. Both are explicit at this ABI boundary.
 //
@@ -1418,13 +1431,12 @@ void moraine_error_free(char *message);
 // value with `read_only` false is [`codes::INVALID_ARGUMENT`].
 //
 // `reader_poll_interval_ms` is how stale a read-only attach may be: how
-// long its transactions keep one published checkpoint before looking for
-// a newer one, and how often its reader polls the manifest; `0` keeps the
-// catalog's default. Longer is cheaper and staler, for a dashboard that
-// attaches for the day. On a committer over a commit log it buys no
-// freshness — every read refreshes the reader — and only sets how often
-// the reader polls to keep its checkpoint alive. A `checkpoint` attach
-// polls for nothing and ignores it.
+// long its transactions share one store reader before opening a newer
+// one; `0` keeps the catalog's default. Longer is cheaper and staler, for
+// a dashboard that attaches for the day. On a committer over a commit log
+// it buys no freshness — every read refreshes the reader — and only sets
+// how often the reader polls to keep its checkpoint alive. A `checkpoint`
+// attach polls for nothing and ignores it.
 //
 // `host_threads` is how many execution threads the calling host runs;
 // the handle's worker pool is that count clamped to `[2, 8]`, with `0`

@@ -400,6 +400,19 @@ pub struct MoraineObjectStoreTally {
     pub data_gets: u64,
     /// Bytes those reads returned.
     pub data_bytes: u64,
+    /// Head probes of the main store: existence checks that return no bytes.
+    pub main_heads: u64,
+    /// Summed main-store head-probe latency, in nanoseconds.
+    pub main_head_nanoseconds: u64,
+    /// Listings of the main store. Listings stream, so they carry no
+    /// duration.
+    pub main_lists: u64,
+    /// Head probes of the WAL store.
+    pub wal_heads: u64,
+    /// Summed WAL-store head-probe latency, in nanoseconds.
+    pub wal_head_nanoseconds: u64,
+    /// Listings of the WAL store.
+    pub wal_lists: u64,
 }
 
 /// Returns the process-wide lookup-cache allowance and estimated occupancy.
@@ -514,6 +527,12 @@ impl From<moraine::ObjectStoreTally> for MoraineObjectStoreTally {
             errors: tally.errors,
             data_gets: tally.data_gets,
             data_bytes: tally.data_bytes,
+            main_heads: tally.main_heads,
+            main_head_nanoseconds: duration_nanoseconds(tally.main_head_duration),
+            main_lists: tally.main_lists,
+            wal_heads: tally.wal_heads,
+            wal_head_nanoseconds: duration_nanoseconds(tally.wal_head_duration),
+            wal_lists: tally.wal_lists,
         }
     }
 }

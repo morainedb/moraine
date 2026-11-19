@@ -9,12 +9,7 @@ async fn open_raw(
     object_store: Arc<dyn ObjectStore>,
     options: &CatalogOptions,
 ) -> Result<(Db, Option<Arc<dyn crate::WriterSession>>)> {
-    let builder = writer_store_builder(
-        &object_store,
-        options,
-        wal_object_store(options),
-        Vec::new(),
-    );
+    let builder = writer_store_builder(&object_store, options, wal_object_store(options));
     let session = if let Some(provider) = commit_log_provider(options) {
         let session = provider.writer_session(builder.log_store(), &options.path);
         if session.adopted().await? {

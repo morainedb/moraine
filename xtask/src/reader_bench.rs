@@ -127,10 +127,10 @@ struct Sample {
     files_ms: f64,
     plan_ms: f64,
     warm_ms: f64,
-    cold_gets: u64,
-    cold_get_ms: f64,
-    warm_gets: u64,
-    warm_get_ms: f64,
+    cold_requests: u64,
+    cold_request_ms: f64,
+    warm_requests: u64,
+    warm_request_ms: f64,
     errors: u64,
 }
 
@@ -169,10 +169,10 @@ fn parse_sample(stdout: &str) -> anyhow::Result<Sample> {
         files_ms: times[1] * 1_000.0,
         plan_ms: times[2] * 1_000.0,
         warm_ms: times[3] * 1_000.0,
-        cold_gets: parse_field(&fields, 1, "cold_gets")?,
-        cold_get_ms: parse_field(&fields, 2, "cold_get_ms")?,
-        warm_gets: parse_field(&fields, 3, "warm_gets")?,
-        warm_get_ms: parse_field(&fields, 4, "warm_get_ms")?,
+        cold_requests: parse_field(&fields, 1, "cold_requests")?,
+        cold_request_ms: parse_field(&fields, 2, "cold_request_ms")?,
+        warm_requests: parse_field(&fields, 3, "warm_requests")?,
+        warm_request_ms: parse_field(&fields, 4, "warm_request_ms")?,
         errors: parse_field(&fields, 5, "errors")?,
     })
 }
@@ -395,9 +395,13 @@ fn measure(
     script.push_str(".timer off\n");
     let _ = writeln!(
         script,
-        "SELECT '{MARKER}', cold.main_gets + cold.wal_gets, cold.main_get_ms + cold.wal_get_ms, \
-         after.main_gets + after.wal_gets - cold.main_gets - cold.wal_gets, \
-         after.main_get_ms + after.wal_get_ms - cold.main_get_ms - cold.wal_get_ms, after.errors, \
+        "SELECT '{MARKER}', \
+         cold.main_gets + cold.main_heads + cold.main_lists + cold.wal_gets + cold.wal_heads + cold.wal_lists, \
+         cold.main_get_ms + cold.main_head_ms + cold.wal_get_ms + cold.wal_head_ms, \
+         after.main_gets + after.main_heads + after.main_lists + after.wal_gets + after.wal_heads + after.wal_lists \
+         - cold.main_gets - cold.main_heads - cold.main_lists - cold.wal_gets - cold.wal_heads - cold.wal_lists, \
+         after.main_get_ms + after.main_head_ms + after.wal_get_ms + after.wal_head_ms \
+         - cold.main_get_ms - cold.main_head_ms - cold.wal_get_ms - cold.wal_head_ms, after.errors, \
          {STORE_OPEN_SQL} \
          FROM moraine_object_store_tally('lake') AS after, io_cold AS cold;"
     );
@@ -455,10 +459,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         "files_ms",
         "plan_ms",
         "warm_ms",
-        "cold_gets",
-        "cold_get_ms",
-        "warm_gets",
-        "warm_get_ms"
+        "cold_requests",
+        "cold_request_ms",
+        "warm_requests",
+        "warm_request_ms"
     );
 
     for files in options.files {
@@ -497,10 +501,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
             median_of(&samples, |sample| sample.files_ms)?,
             median_of(&samples, |sample| sample.plan_ms)?,
             median_of(&samples, |sample| sample.warm_ms)?,
-            median_of(&samples, |sample| count(sample.cold_gets))?,
-            median_of(&samples, |sample| sample.cold_get_ms)?,
-            median_of(&samples, |sample| count(sample.warm_gets))?,
-            median_of(&samples, |sample| sample.warm_get_ms)?,
+            median_of(&samples, |sample| count(sample.cold_requests))?,
+            median_of(&samples, |sample| sample.cold_request_ms)?,
+            median_of(&samples, |sample| count(sample.warm_requests))?,
+            median_of(&samples, |sample| sample.warm_request_ms)?,
         );
         if errors > 0 {
             println!(
@@ -596,10 +600,10 @@ mod tests {
                 files_ms: 150.0,
                 plan_ms: 40.0,
                 warm_ms: 2.0,
-                cold_gets: 4,
-                cold_get_ms: 86.5,
-                warm_gets: 0,
-                warm_get_ms: 0.0,
+                cold_requests: 4,
+                cold_request_ms: 86.5,
+                warm_requests: 0,
+                warm_request_ms: 0.0,
                 errors: 0,
             }
         );
