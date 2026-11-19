@@ -72,16 +72,16 @@ catalog file on local disk, since that is its only option.
 
 | | Moraine | Moraine, log on Express | DuckDB file | Postgres |
 |---|---:|---:|---:|---:|
-| 20 single-row commits, one connection | 697 ms | 263 ms | 200 ms | 246 ms |
-| commits per second, one process, 1 connection | 30 | 87 | 134 | 107 |
-| commits per second, one process, 8 connections | 206 | 441 | 80 | 49 |
-| commits per second, one process, 16 connections | 372 | 588 | 76 | 35 |
-| attach | 617 ms | 632 ms | 16 ms | 182 ms |
-| read a count once attached | 26 ms | 26 ms | 27 ms | 63 ms |
-| full scan | 129 ms | 132 ms | 36 ms | 69 ms |
+| 20 single-row commits, one connection | 637 ms | 277 ms | 209 ms | 273 ms |
+| commits per second, one process, 1 connection | 22 | 85 | 128 | 96 |
+| commits per second, one process, 8 connections | 145 | 430 | 77 | 47 |
+| commits per second, one process, 16 connections | 303 | 582 | 85 | 23 |
+| attach | 543 ms | 574 ms | 20 ms | 194 ms |
+| read a count once attached | 26 ms | 26 ms | 29 ms | 70 ms |
+| full scan | 143 ms | 131 ms | 37 ms | 78 ms |
 
 A commit is one object write, the write-ahead-log entry that makes it
-durable, so its cost is that round trip: about 35 ms on S3 and 13 ms with
+durable, so its cost is that round trip: about 32 ms on S3 and 14 ms with
 the log on S3 Express. That is why one connection is slower here than a
 catalog on a local file or a nearby Postgres, and why there is no server
 to run. Attach is a start-up cost, paid once by a process that stays
