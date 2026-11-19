@@ -154,7 +154,9 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake (READ_WRITE);
 A new process starts with an empty cache. Right after the attach returns, the
 extension warms the catalog records every statement reads, so the first query
 finds them resident and a later process sharing `moraine_cache_dir` reads them
-from disk. Everything else fills in as queries read it.
+from disk. What a query reads about a table stays cached for the next query,
+so a reader keeps up with the writer's flushes and compactions without
+re-reading from object storage.
 
 If the memory budget cannot hold a store's index metadata, the attach logs a
 warning and lookups fetch metadata from object storage. Raise

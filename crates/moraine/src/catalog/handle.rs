@@ -617,6 +617,7 @@ async fn open_anchored_reader(
         options.clone(),
         None,
         reuse,
+        crate::store::cache::store_counters(),
     ));
     let opening = Instant::now();
     let (anchor, cache) = scopes.anchor().await?;
@@ -2012,6 +2013,7 @@ impl Catalog {
                 options.clone(),
                 checkpoint.map(|_| Arc::clone(&reader)),
                 reuse,
+                Arc::clone(&cache),
             ));
             (reader, cache, format, scopes)
         };

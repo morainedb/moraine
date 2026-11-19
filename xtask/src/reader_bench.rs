@@ -7,6 +7,11 @@
 //! Parquet stays local so every measured object-store request belongs to
 //! metadata. Each repeat is a new DuckDB process, so nothing survives from
 //! the one before except what `--cache-dir` keeps on disk.
+//!
+//! `--commit` keeps that process attached while a second one commits a
+//! thousand more files, then plans twice more: what a long-lived reader
+//! pays on the first plan over the SSTs that commit added, and whether the
+//! plan after that is warm again.
 
 use std::{
     env,
@@ -55,6 +60,7 @@ struct Options {
     deletes: usize,
     repeat: usize,
     cache_dir: Option<PathBuf>,
+    commit: bool,
 }
 
 fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
@@ -64,9 +70,14 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         deletes: DEFAULT_DELETES,
         repeat: DEFAULT_REPEAT,
         cache_dir: None,
+        commit: false,
     };
     let mut arguments = arguments.iter();
     while let Some(flag) = arguments.next() {
+        if flag == "--commit" {
+            options.commit = true;
+            continue;
+        }
         let value = arguments
             .next()
             .with_context(|| format!("flag `{flag}` needs a value"))?;
@@ -96,7 +107,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
             "--cache-dir" => options.cache_dir = Some(PathBuf::from(value)),
             other => bail!(
                 "unknown flag `{other}`; valid: --files, --tables, --deletes, --repeat, \
-                 --cache-dir"
+                 --cache-dir, --commit"
             ),
         }
     }
@@ -132,6 +143,19 @@ struct Sample {
     warm_requests: u64,
     warm_request_ms: f64,
     errors: u64,
+    committed: Option<Committed>,
+}
+
+/// The same process's plans after another process committed more files:
+/// the first over the SSTs that commit added, and the one after it.
+#[derive(Debug, PartialEq)]
+struct Committed {
+    plan_ms: f64,
+    requests: u64,
+    request_ms: f64,
+    settled_ms: f64,
+    settled_requests: u64,
+    settled_request_ms: f64,
 }
 
 fn parse_field<T>(fields: &[&str], index: usize, name: &str) -> anyhow::Result<T>
@@ -146,11 +170,12 @@ where
         .with_context(|| format!("parsing `{name}`"))
 }
 
-fn parse_sample(stdout: &str) -> anyhow::Result<Sample> {
+fn parse_sample(stdout: &str, commit: bool) -> anyhow::Result<Sample> {
     let times = parse_run_times(stdout);
+    let statements = if commit { 6 } else { 4 };
     ensure!(
-        times.len() == 4,
-        "expected four timed statements, found {}; output:\n{stdout}",
+        times.len() == statements,
+        "expected {statements} timed statements, found {}; output:\n{stdout}",
         times.len()
     );
     let row = stdout
@@ -159,10 +184,22 @@ fn parse_sample(stdout: &str) -> anyhow::Result<Sample> {
         .with_context(|| format!("benchmark result row is missing from CLI output:\n{stdout}"))?;
     let fields: Vec<&str> = row.split(',').collect();
     ensure!(
-        fields.len() == 7,
+        fields.len() == if commit { 11 } else { 7 },
         "benchmark result has {} fields",
         fields.len()
     );
+    let committed = commit
+        .then(|| {
+            Ok::<_, anyhow::Error>(Committed {
+                plan_ms: times[4] * 1_000.0,
+                requests: parse_field(&fields, 7, "committed_requests")?,
+                request_ms: parse_field(&fields, 8, "committed_request_ms")?,
+                settled_ms: times[5] * 1_000.0,
+                settled_requests: parse_field(&fields, 9, "settled_requests")?,
+                settled_request_ms: parse_field(&fields, 10, "settled_request_ms")?,
+            })
+        })
+        .transpose()?;
     Ok(Sample {
         attach_ms: times[0] * 1_000.0,
         open_ms: parse_field(&fields, 6, "open_ms")?,
@@ -174,7 +211,21 @@ fn parse_sample(stdout: &str) -> anyhow::Result<Sample> {
         warm_requests: parse_field(&fields, 3, "warm_requests")?,
         warm_request_ms: parse_field(&fields, 4, "warm_request_ms")?,
         errors: parse_field(&fields, 5, "errors")?,
+        committed,
     })
+}
+
+/// The request count and summed request time one tally holds.
+fn tally_sum(alias: &str) -> [String; 2] {
+    [
+        format!(
+            "{alias}.main_gets + {alias}.main_heads + {alias}.main_lists + {alias}.wal_gets \
+             + {alias}.wal_heads + {alias}.wal_lists"
+        ),
+        format!(
+            "{alias}.main_get_ms + {alias}.main_head_ms + {alias}.wal_get_ms + {alias}.wal_head_ms"
+        ),
+    ]
 }
 
 struct Artifacts<'a> {
@@ -354,6 +405,7 @@ fn measure(
     data_path: &Path,
     catalog_uri: &str,
     cache_dir: Option<&Path>,
+    writer_script: Option<&Path>,
 ) -> anyhow::Result<Sample> {
     let mut script = preamble(artifacts, target)?;
     // `META_`-prefixed: the attach is DuckLake's, which passes the option
@@ -366,11 +418,19 @@ fn measure(
             )
         })
         .unwrap_or_default();
+    // A reader that must notice the other process's commit polls for it
+    // on a short window: the statements before the commit run inside one
+    // window, and a pause after it puts the next plan outside.
+    let poll = if writer_script.is_some() {
+        ", META_READER_POLL_INTERVAL_MS 2000"
+    } else {
+        ""
+    };
     script.push_str("CALL enable_logging(level => 'info', storage => 'memory');\n");
     script.push_str(".timer on\n");
     let _ = writeln!(
         script,
-        "ATTACH {} AS lake (DATA_PATH {}, READ_ONLY{cache});",
+        "ATTACH {} AS lake (DATA_PATH {}, READ_ONLY{cache}{poll});",
         sql_literal(&format!("ducklake:moraine:{catalog_uri}")),
         sql_literal(&data_path.display().to_string())
     );
@@ -393,20 +453,136 @@ fn measure(
         table_name(0)
     );
     script.push_str(".timer off\n");
+    script.push_str(
+        "CREATE TEMP TABLE io_warm AS SELECT * FROM moraine_object_store_tally('lake');\n",
+    );
+    let [cold_requests, cold_ms] = tally_sum("cold");
+    let [warm_requests, warm_ms] = tally_sum("warm");
+    let mut columns = format!(
+        "{cold_requests}, {cold_ms}, {warm_requests} - ({cold_requests}), {warm_ms} - ({cold_ms}), \
+         after.errors, {STORE_OPEN_SQL}"
+    );
+    let mut tables = String::from("io_cold AS cold, io_warm AS warm");
+    if let Some(writer_script) = writer_script {
+        // The other process commits a thousand files while this one stays
+        // attached; the two plans after it are timed. The shell escape
+        // re-tokenizes its line, so the command lives in a wrapper beside
+        // the script, and its output beside that.
+        let _ = writeln!(
+            script,
+            ".system sh {}",
+            writer_wrapper(writer_script).display()
+        );
+        script.push_str(".timer on\n");
+        let _ = writeln!(
+            script,
+            "SELECT count(*) FROM lake.main.{} WHERE k = 9 AND id = 9;",
+            table_name(0)
+        );
+        script.push_str(".timer off\n");
+        script.push_str(
+            "CREATE TEMP TABLE io_committed AS SELECT * FROM moraine_object_store_tally('lake');\n",
+        );
+        script.push_str(".timer on\n");
+        let _ = writeln!(
+            script,
+            "SELECT count(*) FROM lake.main.{} WHERE k = 10 AND id = 10;",
+            table_name(0)
+        );
+        script.push_str(".timer off\n");
+        let [committed_requests, committed_ms] = tally_sum("committed");
+        let [after_requests, after_ms] = tally_sum("after");
+        let _ = write!(
+            columns,
+            ", {committed_requests} - ({warm_requests}), {committed_ms} - ({warm_ms}), \
+             {after_requests} - ({committed_requests}), {after_ms} - ({committed_ms})"
+        );
+        tables.push_str(", io_committed AS committed");
+    }
     let _ = writeln!(
         script,
-        "SELECT '{MARKER}', \
-         cold.main_gets + cold.main_heads + cold.main_lists + cold.wal_gets + cold.wal_heads + cold.wal_lists, \
-         cold.main_get_ms + cold.main_head_ms + cold.wal_get_ms + cold.wal_head_ms, \
-         after.main_gets + after.main_heads + after.main_lists + after.wal_gets + after.wal_heads + after.wal_lists \
-         - cold.main_gets - cold.main_heads - cold.main_lists - cold.wal_gets - cold.wal_heads - cold.wal_lists, \
-         after.main_get_ms + after.main_head_ms + after.wal_get_ms + after.wal_head_ms \
-         - cold.main_get_ms - cold.main_head_ms - cold.wal_get_ms - cold.wal_head_ms, after.errors, \
-         {STORE_OPEN_SQL} \
-         FROM moraine_object_store_tally('lake') AS after, io_cold AS cold;"
+        "SELECT '{MARKER}', {columns} FROM moraine_object_store_tally('lake') AS after, {tables};"
     );
 
-    parse_sample(&run_script(artifacts, &script, "the reader benchmark")?)
+    let stdout = run_script(artifacts, &script, "the reader benchmark")?;
+    if let Some(writer_script) = writer_script {
+        let output = writer_output(writer_script);
+        let written =
+            fs::read_to_string(&output).with_context(|| format!("reading {}", output.display()))?;
+        ensure!(
+            written.lines().any(|line| line.starts_with(WRITER_MARKER)),
+            "the committing process did not report its commit:\n{written}"
+        );
+    }
+    parse_sample(&stdout, writer_script.is_some())
+}
+
+const WRITER_MARKER: &str = "__MORAINE_READER_BENCH_WRITER__";
+
+/// Where the committing process's output lands, beside its script.
+fn writer_output(writer_script: &Path) -> PathBuf {
+    writer_script.with_extension("out")
+}
+
+/// The shell wrapper the reader's `.system` runs, beside the script.
+fn writer_wrapper(writer_script: &Path) -> PathBuf {
+    writer_script.with_extension("sh")
+}
+
+/// Writes the committing process's script and the wrapper that runs it:
+/// the CLI over the script, output captured, then a pause longer than the
+/// reader's poll window so its next plan looks for the commit.
+fn write_writer_scripts(
+    artifacts: &Artifacts<'_>,
+    target: &CatalogTarget,
+    data_path: &Path,
+    catalog_uri: &str,
+    writer_script: &Path,
+) -> anyhow::Result<()> {
+    fs::write(
+        writer_script,
+        writer_sql(artifacts, target, data_path, catalog_uri)?,
+    )
+    .with_context(|| format!("writing {}", writer_script.display()))?;
+    let wrapper = format!(
+        "{} -unsigned -batch -csv < {} > {} 2>&1\nsleep 3\n",
+        artifacts.cli.display(),
+        writer_script.display(),
+        writer_output(writer_script).display()
+    );
+    let path = writer_wrapper(writer_script);
+    fs::write(&path, wrapper).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The script the second process runs under `--commit`: one seeding-sized
+/// commit, a thousand files into the measured table, reported by the
+/// table's file count afterwards.
+fn writer_sql(
+    artifacts: &Artifacts<'_>,
+    target: &CatalogTarget,
+    data_path: &Path,
+    catalog_uri: &str,
+) -> anyhow::Result<String> {
+    let mut script = preamble(artifacts, target)?;
+    let _ = writeln!(
+        script,
+        "ATTACH {} AS lake (DATA_PATH {}, META_FLUSH_INTERVAL_MS 1, READ_WRITE);",
+        sql_literal(&format!("ducklake:moraine:{catalog_uri}")),
+        sql_literal(&data_path.display().to_string())
+    );
+    let _ = writeln!(
+        script,
+        "INSERT INTO lake.main.{} SELECT 1000000000 + i, i % {FILES_PER_COMMIT} \
+         FROM range(0, {}) t(i);",
+        table_name(0),
+        FILES_PER_COMMIT.saturating_mul(ROWS_PER_FILE)
+    );
+    let _ = writeln!(
+        script,
+        "SELECT '{WRITER_MARKER}', count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+         WHERE end_snapshot IS NULL;"
+    );
+    Ok(script)
 }
 
 fn median_of(samples: &[Sample], pick: impl Fn(&Sample) -> f64) -> anyhow::Result<f64> {
@@ -420,6 +596,46 @@ fn median_of(samples: &[Sample], pick: impl Fn(&Sample) -> f64) -> anyhow::Resul
 )]
 fn count(value: u64) -> f64 {
     value as f64
+}
+
+/// One size's row of medians, and its request-error count when non-zero.
+fn print_row(files: usize, samples: &[Sample], commit: bool) -> anyhow::Result<()> {
+    print!(
+        "{files:>7}  {:>9.1}  {:>7.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>11.1}  \
+         {:>9.1}  {:>11.1}",
+        median_of(samples, |sample| sample.attach_ms)?,
+        median_of(samples, |sample| sample.open_ms)?,
+        median_of(samples, |sample| sample.files_ms)?,
+        median_of(samples, |sample| sample.plan_ms)?,
+        median_of(samples, |sample| sample.warm_ms)?,
+        median_of(samples, |sample| count(sample.cold_requests))?,
+        median_of(samples, |sample| sample.cold_request_ms)?,
+        median_of(samples, |sample| count(sample.warm_requests))?,
+        median_of(samples, |sample| sample.warm_request_ms)?,
+    );
+    if commit {
+        let committed = |pick: fn(&Committed) -> f64| {
+            median_of(samples, |sample| {
+                sample.committed.as_ref().map_or(f64::NAN, pick)
+            })
+        };
+        print!(
+            "  {:>12.1}  {:>18.1}  {:>10.1}  {:>16.1}",
+            committed(|committed| committed.plan_ms)?,
+            committed(|committed| count(committed.requests))?,
+            committed(|committed| committed.settled_ms)?,
+            committed(|committed| count(committed.settled_requests))?,
+        );
+    }
+    println!();
+    let errors: u64 = samples.iter().map(|sample| sample.errors).sum();
+    if errors > 0 {
+        println!(
+            "# {files} files: {errors} object-store request errors across all processes, \
+             missing-object probes included"
+        );
+    }
+    Ok(())
 }
 
 /// Builds the extension and measures cold read-only attaches over one
@@ -451,7 +667,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
             .as_ref()
             .map_or_else(|| "none".to_owned(), |dir| dir.display().to_string())
     );
-    println!(
+    print!(
         "{:>7}  {:>9}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>11}  {:>9}  {:>11}",
         "files",
         "attach_ms",
@@ -464,6 +680,13 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         "warm_requests",
         "warm_request_ms"
     );
+    if options.commit {
+        print!(
+            "  {:>12}  {:>18}  {:>10}  {:>16}",
+            "committed_ms", "committed_requests", "settled_ms", "settled_requests"
+        );
+    }
+    println!();
 
     for files in options.files {
         let temp = TempDir::new(env::temp_dir().join(format!(
@@ -482,6 +705,15 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
             options.deletes,
         )?;
 
+        let writer = options
+            .commit
+            .then(|| {
+                let path = temp.data().with_file_name("writer.sql");
+                write_writer_scripts(&artifacts, &target, &data_path, &catalog_uri, &path)?;
+                Ok::<_, anyhow::Error>(path)
+            })
+            .transpose()?;
+
         let mut samples = Vec::with_capacity(options.repeat);
         for _ in 0..options.repeat {
             samples.push(measure(
@@ -490,28 +722,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
                 &data_path,
                 &catalog_uri,
                 options.cache_dir.as_deref(),
+                writer.as_deref(),
             )?);
         }
-        let errors: u64 = samples.iter().map(|sample| sample.errors).sum();
-        println!(
-            "{files:>7}  {:>9.1}  {:>7.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>11.1}  \
-             {:>9.1}  {:>11.1}",
-            median_of(&samples, |sample| sample.attach_ms)?,
-            median_of(&samples, |sample| sample.open_ms)?,
-            median_of(&samples, |sample| sample.files_ms)?,
-            median_of(&samples, |sample| sample.plan_ms)?,
-            median_of(&samples, |sample| sample.warm_ms)?,
-            median_of(&samples, |sample| count(sample.cold_requests))?,
-            median_of(&samples, |sample| sample.cold_request_ms)?,
-            median_of(&samples, |sample| count(sample.warm_requests))?,
-            median_of(&samples, |sample| sample.warm_request_ms)?,
-        );
-        if errors > 0 {
-            println!(
-                "# {files} files: {errors} object-store request errors across all processes, \
-                 missing-object probes included"
-            );
-        }
+        print_row(files, &samples, options.commit)?;
     }
     println!();
     if !target.is_remote() {
@@ -546,6 +760,12 @@ mod tests {
         assert_eq!(options.deletes, 50);
         assert_eq!(options.repeat, 3);
         assert_eq!(options.cache_dir.as_deref(), Some(Path::new("/tmp/c")));
+        assert!(!options.commit);
+        assert!(
+            parse_options(&["--commit".to_owned(), "--repeat".to_owned(), "2".to_owned()])
+                .unwrap()
+                .commit
+        );
         assert!(parse_options(&["--repeat".to_owned(), "0".to_owned()]).is_err());
         assert!(parse_options(&["--files".to_owned(), "0".to_owned()]).is_err());
         assert!(parse_options(&["--tables".to_owned(), "0".to_owned()]).is_err());
@@ -593,7 +813,7 @@ mod tests {
                       Run Time (s): real 0.002 user 0 sys 0\n\
                       __MORAINE_READER_BENCH__,4,86.5,0,0.0,0,90\n";
         assert_eq!(
-            parse_sample(output).unwrap(),
+            parse_sample(output, false).unwrap(),
             Sample {
                 attach_ms: 250.0,
                 open_ms: 90.0,
@@ -605,7 +825,34 @@ mod tests {
                 warm_requests: 0,
                 warm_request_ms: 0.0,
                 errors: 0,
+                committed: None,
             }
+        );
+        assert!(parse_sample(output, true).is_err());
+    }
+
+    /// Under `--commit` two more statements are timed and the row carries
+    /// the two plans' requests after the warm ones.
+    #[test]
+    fn parses_the_commit_timings_and_fields() {
+        let output = "Run Time (s): real 0.250 user 0 sys 0\n\
+                      Run Time (s): real 0.150 user 0 sys 0\n\
+                      Run Time (s): real 0.040 user 0 sys 0\n\
+                      Run Time (s): real 0.002 user 0 sys 0\n\
+                      Run Time (s): real 0.300 user 0 sys 0\n\
+                      Run Time (s): real 0.003 user 0 sys 0\n\
+                      __MORAINE_READER_BENCH__,4,86.5,0,0.0,0,90,12,210.5,0,0.0\n";
+        let sample = parse_sample(output, true).unwrap();
+        assert_eq!(
+            sample.committed,
+            Some(Committed {
+                plan_ms: 300.0,
+                requests: 12,
+                request_ms: 210.5,
+                settled_ms: 3.0,
+                settled_requests: 0,
+                settled_request_ms: 0.0,
+            })
         );
     }
 }

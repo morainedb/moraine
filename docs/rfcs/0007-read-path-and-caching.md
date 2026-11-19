@@ -315,9 +315,12 @@ completeness.
 
 Entity cursors take an explicit `CacheAdmission` from their caller. Backfill
 and sequential metadata enumeration reuse existing blocks without admitting
-misses; targeted transaction reads and table warming retain misses. Selecting
-a table no longer implicitly chooses retention. Both current and historical
-segments use the requested policy.
+misses; targeted transaction reads and table warming retain misses. The
+extension's metadata cursors retain when scoped to a table, since that is a
+plan reading the records later plans read again, after a flush or compaction
+has replaced the SSTs the attach warmed; unscoped, they walk the catalog whole
+and reuse only. Both current and historical segments use the requested
+policy.
 
 **Read activity monitoring.** While reads arrive, an info event named
 `read cache activity: cumulative process totals` reports at most once every

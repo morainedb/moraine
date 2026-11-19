@@ -918,6 +918,47 @@ async fn warming_a_table_reads_its_probe_ranges() {
     reader.close().await.unwrap();
 }
 
+/// A reader a later transaction opens past the reuse window reports to the
+/// same tally as the attach's own, so the tally sees every request.
+#[tokio::test]
+async fn readers_opened_after_the_attach_report_to_its_tally() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            tx.create_table(schema, "t", &[col("a")]).await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let mut options = CatalogOptions::default();
+    options.reader_poll_interval = std::time::Duration::ZERO;
+    let reader = Catalog::open_read_only(object_store, options)
+        .await
+        .unwrap();
+    let before = reader.object_store_tally();
+    let view = reader.read_scope().await.unwrap();
+    assert!(view.schema_by_name("main").await.unwrap().is_some());
+    drop(view);
+    let after = reader.object_store_tally();
+    assert!(
+        after.main_gets > before.main_gets,
+        "a scope's reader opened past the window issued requests the tally missed: \
+         {before:?} then {after:?}"
+    );
+    reader.close().await.unwrap();
+}
+
 /// A store warm after the open consults the cache, and a second warm finds
 /// everything the first admitted resident.
 #[tokio::test]

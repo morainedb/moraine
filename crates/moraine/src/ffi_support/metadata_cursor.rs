@@ -118,15 +118,15 @@ impl MetadataSource {
         }
         let head = crate::transaction::commit::read_head_value(handle.borrow()).await?;
         let versions = read::versions_for(live_bound, Some(head.snapshot_id));
+        // A table-scoped cursor is a plan reading one table's records, the set
+        // later plans read again; an unscoped one walks the catalog whole.
+        let admission = if table_id.is_some() {
+            crate::read_policy::CacheAdmission::Retain
+        } else {
+            crate::read_policy::CacheAdmission::ReuseOnly
+        };
         Ok(Self::Entities(
-            OwnedEntityCursor::open(
-                handle,
-                kind,
-                versions,
-                table_id,
-                crate::read_policy::CacheAdmission::ReuseOnly,
-            )
-            .await?,
+            OwnedEntityCursor::open(handle, kind, versions, table_id, admission).await?,
         ))
     }
 }
@@ -635,6 +635,73 @@ mod tests {
             }
         }
         catalog.close().await.unwrap();
+    }
+
+    /// A table-scoped cursor admits the blocks it reads, so the next one
+    /// over the same table misses nothing; an unscoped walk admits none.
+    #[tokio::test]
+    async fn table_scoped_cursors_admit_what_they_read_and_unscoped_ones_do_not() {
+        let objects = Arc::new(object_store::memory::InMemory::new());
+        let options = CatalogOptions {
+            cache_puts: false,
+            ..Default::default()
+        };
+        let writer = Catalog::open(objects.clone(), options.clone())
+            .await
+            .unwrap();
+        let write = writer.begin_write_tx().unwrap();
+        for table_id in 1..=2 {
+            for id in 1..=256 {
+                write
+                    .put(
+                        Key::current(EntityKey::File {
+                            table_id,
+                            data_file_id: id,
+                        })
+                        .encode(),
+                        crate::store::value::encode_value(&DataFileRecord {
+                            table_id,
+                            data_file_id: id,
+                            path: format!("{table_id}/{id}.parquet"),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        writer.commit_write_tx(write).await.unwrap();
+        writer.close().await.unwrap();
+
+        let reader = Catalog::open_read_only(objects, options).await.unwrap();
+        let reader = &reader;
+        let read_all = |table_id: Option<u64>| async move {
+            let mut cursor = MetadataCursor::open(reader, TableKind::DataFile, table_id, None)
+                .await
+                .unwrap();
+            let mut rows = 0;
+            loop {
+                let page = cursor.data_files().await.unwrap();
+                if page.records.is_empty() {
+                    break rows;
+                }
+                rows += page.records.len();
+            }
+        };
+        for (pass, (table_id, rows)) in [(None, 512), (None, 512), (Some(1), 256), (Some(1), 256)]
+            .into_iter()
+            .enumerate()
+        {
+            let before = reader.cache_tally();
+            assert_eq!(read_all(table_id).await, rows);
+            let reads = reader.cache_tally().since(before);
+            if pass == 3 {
+                assert!(reads.block_hits > 0, "{reads:?}");
+                assert_eq!(reads.block_misses, 0, "{reads:?}");
+            } else {
+                assert!(reads.block_misses > 0, "{reads:?}");
+            }
+        }
+        reader.close().await.unwrap();
     }
 
     #[tokio::test]
