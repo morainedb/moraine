@@ -82,16 +82,16 @@ catalog file on local disk, since that is its only option.
 | full scan, cold cache | 143 ms | 131 ms | 37 ms | 78 ms |
 
 A commit is one object write, the write-ahead-log entry that makes it
-durable, so its cost is that round trip: about 32 ms on S3 and 14 ms with
-the log on S3 Express. That is why one connection is slower here than a
-catalog on a local file or a nearby Postgres, and why there is no server
-to run. Attach is a start-up cost, paid once by a process that stays
-attached. It and the scan are measured in a fresh process with no cache
-directory, so the scan reads its catalog metadata cold; a cache
-directory shared across attaches serves those reads instead. Moraine is
-single-writer across processes — a second writer process is fenced — and
-readers are not limited that way. Connections within one process share a
-flush, so when they overlap, throughput rises where the others' falls.
+durable, so its cost is that round trip: the twenty above take 637 ms
+on S3 and 277 ms with the log on S3 Express. That is why one connection
+is slower here than a catalog on a local file or a nearby Postgres, and
+why there is no server to run. Attach is a start-up cost, paid once by a
+process that stays attached. It and the scan are a fresh process with no
+cache directory, so the scan reads cold; a shared cache directory serves
+those reads instead. Moraine is single-writer across processes — a second
+writer process is fenced — and readers are not limited that way.
+Connections within one process share a flush, so when they overlap,
+throughput rises where the others' falls.
 
 <!-- headline:end -->
 
