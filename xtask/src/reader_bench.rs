@@ -465,14 +465,13 @@ fn measure(
     let mut tables = String::from("io_cold AS cold, io_warm AS warm");
     if let Some(writer_script) = writer_script {
         // The other process commits one row and compacts the store while
-        // this one stays attached; the two plans after it are timed. Its
-        // output lands beside its script and is checked after the run.
+        // this one stays attached; the two plans after it are timed. The
+        // shell escape re-tokenizes its line, so the command lives in a
+        // wrapper beside the script, and its output beside that.
         let _ = writeln!(
             script,
-            ".system sh -c '{} -unsigned -batch -csv < {} > {} 2>&1; sleep 3'",
-            artifacts.cli.display(),
-            writer_script.display(),
-            writer_output(writer_script).display()
+            ".system sh {}",
+            writer_wrapper(writer_script).display()
         );
         script.push_str(".timer on\n");
         let _ = writeln!(
@@ -525,9 +524,39 @@ fn writer_output(writer_script: &Path) -> PathBuf {
     writer_script.with_extension("out")
 }
 
+/// The shell wrapper the reader's `.system` runs, beside the script.
+fn writer_wrapper(writer_script: &Path) -> PathBuf {
+    writer_script.with_extension("sh")
+}
+
+/// Writes the committing process's script and the wrapper that runs it:
+/// the CLI over the script, output captured, then a pause longer than the
+/// reader's poll window so its next plan looks for the commit.
+fn write_writer_scripts(
+    artifacts: &Artifacts<'_>,
+    target: &CatalogTarget,
+    data_path: &Path,
+    catalog_uri: &str,
+    writer_script: &Path,
+) -> anyhow::Result<()> {
+    fs::write(
+        writer_script,
+        writer_sql(artifacts, target, data_path, catalog_uri)?,
+    )
+    .with_context(|| format!("writing {}", writer_script.display()))?;
+    let wrapper = format!(
+        "{} -unsigned -batch -csv < {} > {} 2>&1\nsleep 3\n",
+        artifacts.cli.display(),
+        writer_script.display(),
+        writer_output(writer_script).display()
+    );
+    let path = writer_wrapper(writer_script);
+    fs::write(&path, wrapper).with_context(|| format!("writing {}", path.display()))
+}
+
 /// The script the second process runs under `--compaction`: one small
 /// commit, so the compaction has new work, then a compaction it waits for.
-fn writer_script(
+fn writer_sql(
     artifacts: &Artifacts<'_>,
     target: &CatalogTarget,
     data_path: &Path,
@@ -677,11 +706,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
             .compaction
             .then(|| {
                 let path = temp.data().with_file_name("writer.sql");
-                fs::write(
-                    &path,
-                    writer_script(&artifacts, &target, &data_path, &catalog_uri)?,
-                )
-                .with_context(|| format!("writing {}", path.display()))?;
+                write_writer_scripts(&artifacts, &target, &data_path, &catalog_uri, &path)?;
                 Ok::<_, anyhow::Error>(path)
             })
             .transpose()?;
