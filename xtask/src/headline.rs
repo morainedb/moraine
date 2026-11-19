@@ -63,12 +63,12 @@ const ROWS: [(&str, SourceTable, &str); 6] = [
         "8",
     ),
     ("attach, a fresh process", SourceTable::Serial, "attach"),
+    ("full scan, cold cache", SourceTable::Serial, "full scan"),
     (
         "read a count, already attached",
         SourceTable::Warm,
         "count after it",
     ),
-    ("full scan, cold cache", SourceTable::Serial, "full scan"),
 ];
 
 /// A published copy of the digest, with the comment syntax its format
