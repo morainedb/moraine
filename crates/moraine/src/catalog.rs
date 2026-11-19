@@ -23,11 +23,11 @@ pub use census::{
 #[cfg(test)]
 pub(crate) use handle::BACKFILL_FILE_READ_CONCURRENCY;
 pub use handle::{
-    CachePreload, Catalog, CatalogOptions, CommitMember, Demoted, ExcludedPositions,
-    IndexComparison, IndexPredicate, IndexPredicateRows, IndexReadIdentity, IndexReadScope,
-    IndexVerification, LocatedDeletion, LocatedRowScan, MaintenanceReport, MaintenanceRequest,
-    MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog,
-    RowSummaryProgress, RowSummaryPublish,
+    Catalog, CatalogOptions, CommitMember, Demoted, ExcludedPositions, IndexComparison,
+    IndexPredicate, IndexPredicateRows, IndexReadIdentity, IndexReadScope, IndexVerification,
+    LocatedDeletion, LocatedRowScan, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
+    MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog, RowSummaryProgress,
+    RowSummaryPublish,
 };
 pub(crate) use handle::{InlineScan, Store};
 pub use snapshot::CatalogSnapshot;

@@ -93,16 +93,16 @@ live with the owning document.
 | `CACHE_DIR`, `CACHE_SIZE`, `CACHE_MEMORY`, `CACHE_AUXILIARY_PERCENT` | the cache settings below, which these stand in for on the first attach; accepted for existing attaches | the settings |
 | `CACHE_PUTS` | `CatalogOptions::cache_puts` | `true` |
 | `CACHE_COMPACTION_PUTS` | `CatalogOptions::cache_compaction_puts` | `true` |
-| `CACHE_PRELOAD` | `CatalogOptions::cache_preload`, one of `none`, `off`, `l0`, `all` | `l0` |
 | `MAINTENANCE_INTERVAL`, `MAINTENANCE_BATCH_SIZE`, `MAINTENANCE_TABLE_BATCHES`, `MAINTENANCE_PROGRESS`, `MAINTENANCE_SWEEP_INDEXES` | shim `MaintenanceConfig`, see [maintenance](0010-maintenance.md) | pass disabled |
 | `MAINTENANCE_COMPACT_STORE`, `MAINTENANCE_COMPACT_STORE_SUBSPACE`, `MAINTENANCE_COMPACT_STORE_TIMEOUT` | shim `MaintenanceConfig`, subspace validated at attach | off |
 | `MAINTENANCE_<step>`, `MAINTENANCE_<step>_<parameter>` | shim `MaintenanceConfig`, steps `expire_snapshots`, `flush_inlined_data`, `merge_adjacent_files`, `rewrite_data_files`, `cleanup_old_files`, `delete_orphaned_files` | off |
 
-A misspelled `CACHE_PRELOAD` level is refused. An unknown
-`MAINTENANCE_COMPACT_STORE_SUBSPACE` is refused at attach by asking the core
-through `moraine_subspace_is_known`. The shim also reads DuckDB's `threads`
-setting and the buffer manager's memory limit at attach, passing the first as
-`host_threads` and checking the second through `moraine_validate_host_memory`.
+`CACHE_PRELOAD`, a removed option, is refused with a message naming it. An
+unknown `MAINTENANCE_COMPACT_STORE_SUBSPACE` is refused at attach by asking
+the core through `moraine_subspace_is_known`. The shim also reads DuckDB's
+`threads` setting and the buffer manager's memory limit at attach, passing the
+first as `host_threads` and checking the second through
+`moraine_validate_host_memory`.
 
 ## Attach modes
 

@@ -36,9 +36,9 @@ use arrow::{
 };
 use futures::stream::{self, StreamExt};
 use moraine::{
-    CachePreload, Catalog, CatalogOptions, CensusRequest, ColumnDef, ColumnId, CompactStoreRequest,
-    DataFile, FileIndexEntry, IndexDef, IndexId, IndexKeyValue, IntWidth, MergeOutcome,
-    ReadOnlyCatalog, SubspaceName, TableId,
+    Catalog, CatalogOptions, CensusRequest, ColumnDef, ColumnId, CompactStoreRequest, DataFile,
+    FileIndexEntry, IndexDef, IndexId, IndexKeyValue, IntWidth, MergeOutcome, ReadOnlyCatalog,
+    SubspaceName, TableId,
 };
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -748,8 +748,7 @@ impl PhaseSamples {
 /// pays the probe-range burst explicitly and `lookup_after_warm` is the
 /// first lookup behind it. `locate_row_ids` runs with no data store,
 /// so it prices the catalog side only. Entries live in the store alone, so
-/// no Parquet object is written. The `_l0` rows repeat attach, cold first
-/// lookup and `warm_tables` on attaches that preload L0 SST metadata.
+/// no Parquet object is written.
 ///
 /// A measurement, not an assertion — it prints and passes.
 #[tokio::test]
@@ -790,7 +789,6 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
         "# {INDEX_LOOKUP_REPEATS} repetitions, a fresh read-only attach each; \
          steady_lookup pools {INDEX_LOOKUP_STEADY_KEYS} keys per attach"
     );
-    println!("# _l0 rows attach with cache_preload = L0 (SST metadata preloaded at open)");
     println!(
         "# in_list is one index_lookup_many of {INDEX_LOOKUP_IN_LIST_KEYS} keys; \
          range is one index_range over {INDEX_LOOKUP_RANGE_ENTRIES} entries"
@@ -811,11 +809,6 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
     let mut locate = PhaseSamples::default();
     let mut warm_burst = PhaseSamples::default();
     let mut after_warm = PhaseSamples::default();
-    let mut attach_l0 = PhaseSamples::default();
-    let mut cold_first_l0 = PhaseSamples::default();
-    let mut warm_burst_l0 = PhaseSamples::default();
-    let mut l0_options = options.clone();
-    l0_options.cache_preload = Some(CachePreload::L0);
 
     for repeat in 0..INDEX_LOOKUP_REPEATS as u64 {
         let salt = repeat * 97;
@@ -920,33 +913,6 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
         assert_eq!(rows.unwrap(), vec![key]);
         after_warm.push(elapsed, gets);
         reader.close().await.unwrap();
-
-        let attach_start = Instant::now();
-        let reader = Catalog::open_read_only(store.clone(), l0_options.clone())
-            .await
-            .unwrap();
-        attach_l0.push(
-            attach_start.elapsed(),
-            reader.object_store_tally().main_gets,
-        );
-
-        let key = spread_keys(1, salt + 23)[0];
-        let (elapsed, gets, rows) = timed(
-            &reader,
-            reader.index_lookup(fixture.table, fixture.unique, &[int_key(key)]),
-        )
-        .await;
-        assert_eq!(rows.unwrap(), vec![key]);
-        cold_first_l0.push(elapsed, gets);
-        reader.close().await.unwrap();
-
-        let reader = Catalog::open_read_only(store.clone(), l0_options.clone())
-            .await
-            .unwrap();
-        let (elapsed, gets, warmed) = timed(&reader, reader.warm_tables(&[fixture.table])).await;
-        warmed.unwrap();
-        warm_burst_l0.push(elapsed, gets);
-        reader.close().await.unwrap();
     }
 
     attach.print("attach_read_only");
@@ -959,9 +925,6 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
     locate.print("locate_row_ids");
     warm_burst.print("warm_tables");
     after_warm.print("lookup_after_warm");
-    attach_l0.print("attach_read_only_l0");
-    cold_first_l0.print("cold_first_lookup_l0");
-    warm_burst_l0.print("warm_tables_l0");
     println!();
 }
 

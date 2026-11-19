@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 
 use super::*;
 use crate::store::{
-    handle::ScanShape,
+    handle::{ReadHandle, ScanShape},
     index_encoding::{CanonicalKey, IndexKeyValue, IntWidth, encode_key},
     key::{IndexKey, IndexKind, Key, index_index_prefix, index_value_above, index_value_suffix},
 };

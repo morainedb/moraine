@@ -726,141 +726,6 @@ async fn attached_catalogs_share_one_cache() {
     );
 }
 
-/// A preload warms the cache before anything reads through it, so the
-/// first read after an attach finds more resident than it would have.
-#[tokio::test]
-async fn a_preload_warms_before_the_first_read() {
-    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
-    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
-        .await
-        .unwrap();
-    writer
-        .commit(async |tx| {
-            let schema = tx
-                .schema_by_name("main")
-                .await
-                .unwrap()
-                .expect("bootstrap")
-                .id;
-            for n in 0..32 {
-                tx.create_table(schema, &format!("t{n}"), &[col("a")])
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
-
-    let mut options = CatalogOptions::default();
-    options.cache_preload = Some(moraine::CachePreload::All);
-
-    let reader = Catalog::open_read_only(object_store, options)
-        .await
-        .unwrap();
-    let after_open = reader.cache_tally();
-
-    // The warm ran during the open, before any read was issued.
-    let open_lookups = after_open.metadata_hits
-        + after_open.metadata_misses
-        + after_open.block_hits
-        + after_open.block_misses;
-    assert!(
-        open_lookups > 0,
-        "a preload consulted the cache not at all: {after_open:?}"
-    );
-    let attributed = after_open.preload_metadata_hits
-        + after_open.preload_metadata_misses
-        + after_open.preload_block_hits
-        + after_open.preload_block_misses;
-    assert!(
-        attributed > 0 && attributed <= open_lookups,
-        "preload traffic was not attributed separately: {after_open:?}"
-    );
-
-    let view = reader.read_scope().await.unwrap();
-    assert!(view.schema_by_name("main").await.unwrap().is_some());
-    reader.close().await.unwrap();
-}
-
-/// A preload run after the open warms what one inside the open would, and
-/// is attributed the same way, so a host can attach first and warm after.
-#[tokio::test]
-async fn a_preload_after_the_open_warms_what_one_inside_it_would() {
-    let object_store = Arc::new(InMemory::new());
-    let writer = Catalog::open(
-        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
-        CatalogOptions::default(),
-    )
-    .await
-    .unwrap();
-    writer
-        .commit(async |tx| {
-            let schema = tx
-                .schema_by_name("main")
-                .await
-                .unwrap()
-                .expect("bootstrap")
-                .id;
-            for n in 0..32 {
-                tx.create_table(schema, &format!("t{n}"), &[col("a")])
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
-
-    let inside = {
-        let mut options = CatalogOptions::default();
-        options.cache_preload = Some(moraine::CachePreload::All);
-        let reader = Catalog::open_read_only(
-            Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
-            options,
-        )
-        .await
-        .unwrap();
-        let tally = reader.cache_tally();
-        reader.close().await.unwrap();
-        tally
-    };
-
-    let reader = Catalog::open_read_only(
-        object_store as Arc<dyn object_store::ObjectStore>,
-        CatalogOptions::default(),
-    )
-    .await
-    .unwrap();
-    let before = reader.cache_tally();
-    assert_eq!(
-        before.preload_block_misses + before.preload_metadata_misses,
-        0,
-        "nothing was preloaded inside this open: {before:?}"
-    );
-    reader
-        .preload_store(moraine::CachePreload::All)
-        .await
-        .unwrap();
-    let after = reader.cache_tally();
-
-    let attributed = |tally: &moraine::CacheTally| {
-        tally.preload_metadata_hits
-            + tally.preload_metadata_misses
-            + tally.preload_block_hits
-            + tally.preload_block_misses
-    };
-    assert!(attributed(&after) > 0, "{after:?}");
-    assert_eq!(
-        attributed(&after),
-        attributed(&inside),
-        "a preload after the open touched the cache differently: {after:?} against {inside:?}"
-    );
-    let view = reader.read_scope().await.unwrap();
-    assert!(view.schema_by_name("main").await.unwrap().is_some());
-    reader.close().await.unwrap();
-}
-
 /// One shared cache still reports SST metadata apart from data blocks.
 ///
 /// Nothing outside SlateDB can classify a cached entry, so the split comes
@@ -1050,5 +915,55 @@ async fn warming_a_table_reads_its_probe_ranges() {
         .await
         .unwrap();
     assert_eq!(found, vec![1_500]);
+    reader.close().await.unwrap();
+}
+
+/// A store warm after the open consults the cache, and a second warm finds
+/// everything the first admitted resident.
+#[tokio::test]
+async fn a_store_warm_after_the_open_leaves_its_reads_resident() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(async |tx| {
+            let schema = tx
+                .schema_by_name("main")
+                .await
+                .unwrap()
+                .expect("bootstrap")
+                .id;
+            for n in 0..32 {
+                tx.create_table(schema, &format!("t{n}"), &[col("a")])
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let after_open = reader.cache_tally();
+    reader.warm_store().await.unwrap();
+    let after_warm = reader.cache_tally();
+    let lookups = |tally: &moraine::CacheTally| {
+        tally.metadata_hits + tally.metadata_misses + tally.block_hits + tally.block_misses
+    };
+    assert!(
+        lookups(&after_warm) > lookups(&after_open),
+        "the warm consulted the cache not at all: {after_warm:?}"
+    );
+
+    reader.warm_store().await.unwrap();
+    let after_second = reader.cache_tally();
+    assert_eq!(
+        (after_second.metadata_misses, after_second.block_misses),
+        (after_warm.metadata_misses, after_warm.block_misses),
+        "a second warm missed on what the first admitted"
+    );
     reader.close().await.unwrap();
 }

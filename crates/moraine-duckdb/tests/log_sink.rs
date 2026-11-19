@@ -36,6 +36,27 @@ fn take_received() -> Vec<(usize, String)> {
     std::mem::take(&mut *received().lock().unwrap())
 }
 
+/// Drains events until the attach's background warming reports completion,
+/// so a later assertion is not reading that handle's stragglers.
+fn take_received_through_warming() -> Vec<(usize, String)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut events = Vec::new();
+    loop {
+        events.append(&mut take_received());
+        if events
+            .iter()
+            .any(|(_, message)| message.contains("background warming completed"))
+        {
+            return events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the attach's warming never reported completion: {events:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Attaches a fresh in-memory catalog through the ABI.
 fn attach_memory() -> *mut MoraineCatalogHandle {
     let path = CString::new("memory://").unwrap();
@@ -52,7 +73,6 @@ fn attach_memory() -> *mut MoraineCatalogHandle {
             0,
             false,
             std::ptr::null(),
-            0,
             0,
             0,
             0,
@@ -83,8 +103,9 @@ fn each_handles_events_reach_only_its_own_sink() {
     unsafe { moraine_register_log_sink(first, Some(collect), std::ptr::without_provenance_mut(1)) };
 
     // Registration flushes the attach's own buffered events — emitted on
-    // this thread and on the handle's worker threads — through the sink.
-    let backlog = take_received();
+    // this thread and on the handle's worker threads — through the sink,
+    // and the attach's warming finishes on the worker after it.
+    let backlog = take_received_through_warming();
     assert!(
         backlog
             .iter()
@@ -110,7 +131,7 @@ fn each_handles_events_reach_only_its_own_sink() {
     unsafe {
         moraine_register_log_sink(second, Some(collect), std::ptr::without_provenance_mut(2));
     };
-    let second_backlog = take_received();
+    let second_backlog = take_received_through_warming();
     assert!(
         second_backlog
             .iter()

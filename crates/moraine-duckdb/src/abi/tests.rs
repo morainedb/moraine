@@ -764,7 +764,6 @@ fn a_data_path_recorded_after_attach_is_adopted_on_first_use() {
             0,
             0,
             0,
-            0,
             false,
             false,
             ptr::null(),
@@ -862,7 +861,6 @@ fn an_encrypted_lake_resolves_no_data_store() {
             0,
             0,
             0,
-            0,
             false,
             false,
             c_data.as_ptr(),
@@ -908,7 +906,6 @@ fn a_recorded_data_path_containing_the_store_is_refused_on_adoption() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -985,7 +982,6 @@ fn attach_refuses_a_conflicting_data_path() {
             0,
             0,
             0,
-            0,
             false,
             false,
             c_bad.as_ptr(),
@@ -1026,7 +1022,6 @@ fn attach_refuses_a_conflicting_data_path() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -1073,7 +1068,6 @@ fn maintain_reports_through_the_out_parameters() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -1230,7 +1224,6 @@ fn census_reports_every_subspace_through_the_abi() {
             0,
             0,
             0,
-            0,
             false,
             false,
             ptr::null(),
@@ -1329,7 +1322,6 @@ fn compact_store_reports_rows_and_refuses_unknown_subspaces() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -1486,7 +1478,6 @@ fn attach_refuses_a_data_path_containing_the_store() {
             0,
             0,
             0,
-            0,
             false,
             false,
             c_data.as_ptr(),
@@ -1529,7 +1520,6 @@ fn attach_refuses_a_data_path_containing_the_store() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -1580,7 +1570,6 @@ fn attach_records_a_missing_data_path_then_fixes_it() {
             0,
             0,
             0,
-            0,
             false,
             false,
             c_first.as_ptr(),
@@ -1617,7 +1606,6 @@ fn attach_records_a_missing_data_path_then_fixes_it() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -1666,7 +1654,6 @@ fn read_only_attach_of_fresh_store_hints_read_write() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -1721,7 +1708,6 @@ fn attach_encrypted_is_fixed_at_bootstrap_and_reported() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -2060,7 +2046,6 @@ fn attach_on_unwritable_path_reports_invalid_argument() {
             0,
             0,
             0,
-            0,
             false,
             false,
             ptr::null(),
@@ -2104,7 +2089,6 @@ fn attach_rejects_unknown_store_scheme() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -2170,7 +2154,6 @@ fn attach_null_path_reports_invalid_argument_without_crashing() {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,
@@ -2626,7 +2609,6 @@ fn attach_is_cancelled_by_a_firing_probe() {
             0,
             0,
             0,
-            0,
             false,
             false,
             ptr::null(),
@@ -2736,25 +2718,6 @@ fn a_zero_cache_size_leaves_the_default_cap() {
     assert_eq!(cache_size_option(64 * 1024 * 1024), Some(64 * 1024 * 1024));
 }
 
-/// The preload codes the ABI takes, and the refusal of one it does
-/// not: a level nobody can act on is a caller mistake, not a default
-/// to fall back to.
-#[test]
-fn cache_preload_codes_map_to_levels_and_reject_the_rest() {
-    assert_eq!(cache_preload_option(0).unwrap(), None);
-    assert_eq!(
-        cache_preload_option(1).unwrap(),
-        Some(moraine::CachePreload::L0)
-    );
-    assert_eq!(
-        cache_preload_option(2).unwrap(),
-        Some(moraine::CachePreload::All)
-    );
-    let refused = cache_preload_option(7).unwrap_err();
-    assert_eq!(refused.code, codes::INVALID_ARGUMENT);
-    assert!(refused.message.contains('7'), "{}", refused.message);
-}
-
 /// `cache_puts` crosses the ABI and opens either way; the core tests
 /// what it governs.
 #[test]
@@ -2780,7 +2743,6 @@ fn an_attach_takes_the_write_admission_flag() {
                 0,
                 false,
                 c_cache.as_ptr(),
-                0,
                 0,
                 0,
                 0,
@@ -2829,7 +2791,6 @@ fn an_attach_takes_a_bounded_disk_cache() {
             64 * 1024 * 1024,
             0,
             0,
-            0,
             false,
             false,
             ptr::null(),
@@ -2872,7 +2833,6 @@ fn a_second_attach_outlives_the_cache_builders_runtime() {
                 0,
                 false,
                 c_cache.as_ptr(),
-                0,
                 0,
                 0,
                 0,
@@ -3019,7 +2979,6 @@ fn attach_with_wal(dir: &Path, wal_path: Option<&Path>) -> (i32, String) {
             0,
             false,
             ptr::null(),
-            0,
             0,
             0,
             0,

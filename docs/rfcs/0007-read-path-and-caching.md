@@ -358,17 +358,20 @@ exist for. Non-unique equality probes also use the named prefix filter policy
 suffix. A writer polls the manifest every five seconds. These are
 implementation constants and have no attach option.
 
-**Warming.** `CatalogOptions::cache_preload` warms inside the open:
-`CachePreload::L0` touches every subspace far enough to pull its SST metadata,
-and `CachePreload::All` additionally walks the scan-shaped subspaces whole.
-Neither walks the `index` subspace's data. `ReadOnlyCatalog::preload_store`
-does the same after the open, and the extension's `CACHE_PRELOAD` runs it that
-way, on the handle's worker once the attach has returned, so the attach does
-not wait on it. `ReadOnlyCatalog::warm_tables` reads, in `seek().retain()`
-shape, the first entry of each named table's index and inline ranges, eight
-ranges at a time process-wide. The extension runs it after a commit for the
-tables the commit wrote, and with `CACHE_PRELOAD` set, for every table after
-the store preload.
+**Warming.** Every open validates the store and primes what its first
+statement reads in one concurrent batch: the format stamp and migration marker
+in `system`, the recorded log store in `current`, and the newest snapshot
+record, so the first statement owes no table open for any of them.
+`ReadOnlyCatalog::warm_store` then reads one entry of each of the three
+subspaces every statement reads, `system`, `current`, and `snapshot`, in
+retaining shape, so their SST index and filter are resident for the first
+plan and, through the disk tier, for every later process; a subspace whose
+segment fits one read-ahead is brought in whole. The extension runs it on the
+handle's worker once the attach has returned, so the attach does not wait on
+it, and it is not configurable. `ReadOnlyCatalog::warm_tables` reads, in
+`seek().retain()` shape, the first entry of each named table's index and
+inline ranges, eight ranges at a time process-wide. The extension runs it
+after a commit for the tables the commit wrote.
 
 **Lookup retention.** Row-lookup directories and revision-keyed probe memos
 share the lookup allowance. Directories additionally keep local ceilings of
@@ -384,8 +387,8 @@ facilities hold.
 
 **Configuration.** `moraine_cache_dir`, `moraine_cache_size`,
 `moraine_cache_memory`, and `moraine_cache_auxiliary_percent` are settings,
-one per process; `CACHE_PUTS`, `CACHE_COMPACTION_PUTS`, and `CACHE_PRELOAD`
-are attach options, one per lake. Both are documented with the [extension
+one per process; `CACHE_PUTS` and `CACHE_COMPACTION_PUTS` are attach options,
+one per lake. Both are documented with the [extension
 surface](0006-extension-surface.md).
 `moraine_cache_tally`, `moraine_cache_status`, `moraine_store_census`, and
 `moraine_object_store_tally` report hits and misses per tier, capacity and

@@ -1408,15 +1408,9 @@ void moraine_error_free(char *message);
 // catalog projections, commit staging, DuckDB, and allocator retention are
 // outside it. `0` means "not given" for either byte count.
 //
-// `cache_preload` warms this store into that cache on the handle's
-// worker once the attach has returned: `0` loads nothing, `1` each
-// subspace's SST metadata, `2` the scan-shaped subspaces whole. Any other
-// value is [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller
-// always names a level (the extension's `ATTACH` passes `1` unless told
-// otherwise). A non-zero level then warms every table's probe ranges the
-// same way. `cache_puts` admits flushed SST metadata
-// and data blocks on write; `cache_compaction_puts` independently admits
-// compaction outputs. Both are explicit at this ABI boundary.
+// `cache_puts` admits flushed SST metadata and data blocks on write;
+// `cache_compaction_puts` independently admits compaction outputs. Both
+// are explicit at this ABI boundary.
 //
 // `wal`, if non-null, writes the catalog's write-ahead log to the store
 // its `path` names — a URI of the same forms `path` takes, with its own
@@ -1459,7 +1453,7 @@ void moraine_error_free(char *message);
 // strings. `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
 // `path` is null or a NUL-terminated C string and whose `s3` is null or a
 // valid [`MoraineS3Config`].
-// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
+// `cache_size_bytes`, `cache_memory_bytes`, `cache_puts`,
 // `cache_compaction_puts`, `flush_on_commit`, `reader_poll_interval_ms`,
 // and `host_threads` are unconstrained. `probe`, if non-null, must be safe to
 // call with `probe_ctx` from any thread. `out` must be a valid, writable `*mut
@@ -1476,7 +1470,6 @@ int32_t moraine_attach_with_options(const char *path,
                                     uint64_t cache_size_bytes,
                                     uint64_t cache_memory_bytes,
                                     uint32_t cache_auxiliary_percent,
-                                    uint8_t cache_preload,
                                     bool cache_puts,
                                     bool cache_compaction_puts,
                                     const char *data_path,
@@ -1504,7 +1497,6 @@ int32_t moraine_attach_with_wal_store(const char *path,
                                       uint64_t cache_size_bytes,
                                       uint64_t cache_memory_bytes,
                                       uint32_t cache_auxiliary_percent,
-                                      uint8_t cache_preload,
                                       bool cache_puts,
                                       bool cache_compaction_puts,
                                       const char *data_path,
@@ -1588,7 +1580,7 @@ int32_t moraine_raise_catalog_version(struct MoraineCatalogHandle *handle,
 // satisfy [`MoraineS3Config`]'s borrowing contract. `wal`, if non-null, must
 // point to a valid [`MoraineWalStore`] under the same contract as
 // [`moraine_attach_with_wal_store`]'s. `cache_dir`, if non-null, must be a
-// valid NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+// valid NUL-terminated C string. `cache_size_bytes` and
 // `cache_puts` are unconstrained. `out`
 // must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
 // must be a valid, writable [`MoraineError`]. All for the duration of this
@@ -1599,7 +1591,6 @@ int32_t moraine_migrate_with_wal_store(const char *path,
                                        uint64_t flush_interval_ms,
                                        const char *cache_dir,
                                        uint64_t cache_size_bytes,
-                                       uint8_t cache_preload,
                                        bool cache_puts,
                                        bool checkpoint,
                                        struct MoraineMigrationReport *out,
@@ -2083,12 +2074,7 @@ int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
                             uint64_t *out_metadata_misses,
                             uint64_t *out_block_hits,
                             uint64_t *out_block_misses,
-                            uint64_t *out_errors,
-                            uint64_t *out_preload_metadata_hits,
-                            uint64_t *out_preload_metadata_misses,
-                            uint64_t *out_preload_block_hits,
-                            uint64_t *out_preload_block_misses,
-                            uint64_t *out_preload_failures);
+                            uint64_t *out_errors);
 
 // Of the hits [`moraine_cache_tally`] reports, those the disk tier served
 // after the memory tier missed; the rest were resident in memory. Zero
@@ -2124,12 +2110,7 @@ int32_t moraine_catalog_cache_tally(struct MoraineCatalogHandle *handle,
                                     uint64_t *out_metadata_misses,
                                     uint64_t *out_block_hits,
                                     uint64_t *out_block_misses,
-                                    uint64_t *out_errors,
-                                    uint64_t *out_preload_metadata_hits,
-                                    uint64_t *out_preload_metadata_misses,
-                                    uint64_t *out_preload_block_hits,
-                                    uint64_t *out_preload_block_misses,
-                                    uint64_t *out_preload_failures);
+                                    uint64_t *out_errors);
 
 // Returns process-wide cache capacity, occupancy, and eviction counters.
 //

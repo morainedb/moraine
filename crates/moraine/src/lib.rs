@@ -313,10 +313,10 @@ pub use memory::{
 mod transaction;
 
 pub use catalog::{
-    BuildStep, CATALOG_VERSION, CachePreload, Catalog, CatalogCursor, CatalogOptions,
-    CatalogSnapshot, CensusRequest, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder,
-    ColumnStats, CommitMember, CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile,
-    DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, Demoted, ExcludedPositions,
+    BuildStep, CATALOG_VERSION, Catalog, CatalogCursor, CatalogOptions, CatalogSnapshot,
+    CensusRequest, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
+    CommitMember, CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId,
+    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, Demoted, ExcludedPositions,
     FileColumnStats, FileIndexEntry, FileIndexRemoval, FileRowCandidate, FlushedDataFile,
     IndexComparison, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexPredicate,
     IndexPredicateRows, IndexReadIdentity, IndexReadScope, IndexState, IndexVerification,

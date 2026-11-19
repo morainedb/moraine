@@ -819,11 +819,6 @@ pub unsafe extern "C" fn moraine_cache_tally(
     out_block_hits: *mut u64,
     out_block_misses: *mut u64,
     out_errors: *mut u64,
-    out_preload_metadata_hits: *mut u64,
-    out_preload_metadata_misses: *mut u64,
-    out_preload_block_hits: *mut u64,
-    out_preload_block_misses: *mut u64,
-    out_preload_failures: *mut u64,
 ) -> i32 {
     let attempt = || {
         if out_metadata_hits.is_null()
@@ -831,11 +826,6 @@ pub unsafe extern "C" fn moraine_cache_tally(
             || out_block_hits.is_null()
             || out_block_misses.is_null()
             || out_errors.is_null()
-            || out_preload_metadata_hits.is_null()
-            || out_preload_metadata_misses.is_null()
-            || out_preload_block_hits.is_null()
-            || out_preload_block_misses.is_null()
-            || out_preload_failures.is_null()
         {
             return codes::INVALID_ARGUMENT;
         }
@@ -847,11 +837,6 @@ pub unsafe extern "C" fn moraine_cache_tally(
             *out_block_hits = tally.block_hits;
             *out_block_misses = tally.block_misses;
             *out_errors = tally.errors;
-            *out_preload_metadata_hits = tally.preload_metadata_hits;
-            *out_preload_metadata_misses = tally.preload_metadata_misses;
-            *out_preload_block_hits = tally.preload_block_hits;
-            *out_preload_block_misses = tally.preload_block_misses;
-            *out_preload_failures = tally.preload_failures;
         }
         codes::OK
     };
@@ -931,11 +916,6 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally(
     out_block_hits: *mut u64,
     out_block_misses: *mut u64,
     out_errors: *mut u64,
-    out_preload_metadata_hits: *mut u64,
-    out_preload_metadata_misses: *mut u64,
-    out_preload_block_hits: *mut u64,
-    out_preload_block_misses: *mut u64,
-    out_preload_failures: *mut u64,
 ) -> i32 {
     let attempt = || {
         if handle.is_null()
@@ -944,11 +924,6 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally(
             || out_block_hits.is_null()
             || out_block_misses.is_null()
             || out_errors.is_null()
-            || out_preload_metadata_hits.is_null()
-            || out_preload_metadata_misses.is_null()
-            || out_preload_block_hits.is_null()
-            || out_preload_block_misses.is_null()
-            || out_preload_failures.is_null()
         {
             return codes::INVALID_ARGUMENT;
         }
@@ -961,11 +936,6 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally(
             *out_block_hits = tally.block_hits;
             *out_block_misses = tally.block_misses;
             *out_errors = tally.errors;
-            *out_preload_metadata_hits = tally.preload_metadata_hits;
-            *out_preload_metadata_misses = tally.preload_metadata_misses;
-            *out_preload_block_hits = tally.preload_block_hits;
-            *out_preload_block_misses = tally.preload_block_misses;
-            *out_preload_failures = tally.preload_failures;
         }
         codes::OK
     };

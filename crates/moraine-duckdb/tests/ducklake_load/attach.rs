@@ -284,12 +284,11 @@ fn ducklake_attach_flush_on_commit_option_is_applied() {
 }
 
 /// The cache options end to end: `ATTACH (META_CACHE_DIR '…',
-/// META_CACHE_SIZE 67108864, META_CACHE_PUTS true, META_CACHE_PRELOAD
-/// 'all')` → DuckLake's `META_` passthrough → this shim's inner attach →
-/// the store's on-disk object cache, its cap, its write-path filling, and
-/// its open-time load. A cap shows only as disk that stays bounded, so the
-/// assertion is that the four are accepted, commits land through the capped
-/// cache, and the cache directory fills.
+/// META_CACHE_SIZE 67108864, META_CACHE_PUTS true)` → DuckLake's `META_`
+/// passthrough → this shim's inner attach → the store's on-disk object
+/// cache, its cap, and its write-path filling. A cap shows only as disk that
+/// stays bounded, so the assertion is that the options are accepted, commits
+/// land through the capped cache, and the cache directory fills.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_cache_options_are_applied() {
@@ -299,7 +298,7 @@ fn ducklake_attach_cache_options_are_applied() {
 
     let attach_options = format!(
         ", META_CACHE_DIR '{}', META_CACHE_SIZE 67108864, META_CACHE_PUTS true, \
-         META_CACHE_COMPACTION_PUTS true, META_CACHE_PRELOAD 'all'",
+         META_CACHE_COMPACTION_PUTS true",
         cache_dir.path().display()
     );
     run_ducklake_sql_with_options(
@@ -341,7 +340,7 @@ fn settings_size_the_cache_the_first_attach_opens() {
     let session = |sql: &str| {
         run_unattached(&format!(
             "SET moraine_cache_dir = '{}'; SET moraine_cache_size = '64MB'; \
-             ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}', META_CACHE_PRELOAD 'all'); {sql}",
+             ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'); {sql}",
             cache_dir.path().display(),
             dir.path().display(),
             data_dir.path().display(),
@@ -454,39 +453,6 @@ fn ducklake_attach_writes_the_wal_to_the_store_it_names() {
     );
 }
 
-/// `META_CACHE_PRELOAD` on a lake with an indexed table: the attach also
-/// warms every table's probe ranges in the background, and a lookup that
-/// may race that warm still resolves. The tally shows the attach read
-/// through the cache; how much the warm itself served is timing-dependent
-/// and not asserted.
-#[test]
-#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn ducklake_attach_cache_preload_warms_indexed_tables() {
-    let dir = TempDir::new("preload-warm-store");
-    let data_dir = TempDir::new("preload-warm-data");
-    let meta = format!(", META_DATA_PATH '{}'", data_dir.path().display());
-
-    let create = |sql: &str| run_ducklake_sql_with_options(dir.path(), data_dir.path(), &meta, sql);
-    create("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
-    create("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    create("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
-
-    let rows = csv_rows(&run_ducklake_sql_with_options(
-        dir.path(),
-        data_dir.path(),
-        ", META_CACHE_PRELOAD 'all'",
-        "SELECT (SELECT count(DISTINCT row_id) \
-                 FROM moraine_index_lookup('lake','main','t','by_a',42)) AS found, \
-                (SELECT metadata_hits + metadata_misses + block_hits + block_misses > 0 \
-                 FROM moraine_cache_tally('lake')) AS read_through;",
-    ));
-    assert_eq!(
-        rows,
-        vec![vec!["1".to_string(), "true".to_string()]],
-        "a lookup on a preloading attach resolves and reads through the cache"
-    );
-}
-
 /// The memory tally separates per-catalog write buffers and projections
 /// from process-shared cache occupancy, and remembers the landed commit.
 #[test]
@@ -519,61 +485,6 @@ fn ducklake_attach_reports_attributed_memory() {
     ));
     assert_eq!(rows.last(), Some(&vec!["true".to_string(); 4]));
 }
-
-/// An attach naming no `META_CACHE_PRELOAD` preloads at the `'l0'` level:
-/// the open-time warm reads through the cache, and its counters are settled
-/// by the time ATTACH returns.
-#[test]
-#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn ducklake_attach_preloads_by_default() {
-    let dir = TempDir::new("preload-default-store");
-    let data_dir = TempDir::new("preload-default-data");
-    run_ducklake_sql(
-        dir.path(),
-        data_dir.path(),
-        "CREATE TABLE lake.main.t(id BIGINT); INSERT INTO lake.main.t VALUES (1), (2);",
-    );
-
-    assert_eq!(
-        csv_rows(&run_ducklake_sql(
-            dir.path(),
-            data_dir.path(),
-            PRELOAD_TRAFFIC_SQL
-        )),
-        vec![vec!["true".to_string()]],
-        "an attach without META_CACHE_PRELOAD preloaded nothing"
-    );
-}
-
-/// `META_CACHE_PRELOAD 'none'` turns the default preload off: the attach
-/// records no preload traffic and no preload failures.
-#[test]
-#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn ducklake_attach_cache_preload_none_preloads_nothing() {
-    let dir = TempDir::new("preload-none-store");
-    let data_dir = TempDir::new("preload-none-data");
-    run_ducklake_sql(
-        dir.path(),
-        data_dir.path(),
-        "CREATE TABLE lake.main.t(id BIGINT); INSERT INTO lake.main.t VALUES (1), (2);",
-    );
-
-    for level in ["'none'", "'off'"] {
-        assert_eq!(
-            csv_rows(&run_ducklake_sql_with_options(
-                dir.path(),
-                data_dir.path(),
-                &format!(", META_CACHE_PRELOAD {level}"),
-                PRELOAD_TRAFFIC_SQL,
-            )),
-            vec![vec!["false".to_string()]],
-            "META_CACHE_PRELOAD {level} still preloaded"
-        );
-    }
-}
-
-/// Whether the attach's preload touched the cache or failed at all.
-const PRELOAD_TRAFFIC_SQL: &str = "SELECT preload_metadata_hits + preload_metadata_misses      + preload_block_hits + preload_block_misses + preload_failures > 0      FROM moraine_cache_tally('lake');";
 
 /// `ENCRYPTED` end to end. The flag travels `ATTACH (ENCRYPTED,
 /// META_ENCRYPTED true)` → DuckLake's `META_` passthrough → this

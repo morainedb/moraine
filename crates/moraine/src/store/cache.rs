@@ -273,16 +273,6 @@ pub struct CacheTally {
     /// Lookups the cache itself failed, which read through rather than
     /// failing the caller.
     pub errors: u64,
-    /// Metadata-cache hits performed by attach-time preloads.
-    pub preload_metadata_hits: u64,
-    /// Metadata-cache misses performed by attach-time preloads.
-    pub preload_metadata_misses: u64,
-    /// Data-block cache hits performed by attach-time preloads.
-    pub preload_block_hits: u64,
-    /// Data-block cache misses performed by attach-time preloads.
-    pub preload_block_misses: u64,
-    /// Subspaces an attach-time preload could not warm.
-    pub preload_failures: u64,
 }
 
 /// Current size and pressure of the process-shared caches. The disk figure
@@ -429,21 +419,6 @@ impl CacheTally {
                 .saturating_sub(before.metadata_disk_hits),
             block_disk_hits: self.block_disk_hits.saturating_sub(before.block_disk_hits),
             errors: self.errors.saturating_sub(before.errors),
-            preload_metadata_hits: self
-                .preload_metadata_hits
-                .saturating_sub(before.preload_metadata_hits),
-            preload_metadata_misses: self
-                .preload_metadata_misses
-                .saturating_sub(before.preload_metadata_misses),
-            preload_block_hits: self
-                .preload_block_hits
-                .saturating_sub(before.preload_block_hits),
-            preload_block_misses: self
-                .preload_block_misses
-                .saturating_sub(before.preload_block_misses),
-            preload_failures: self
-                .preload_failures
-                .saturating_sub(before.preload_failures),
         }
     }
 
@@ -528,11 +503,6 @@ pub(crate) struct CacheCounters {
     metadata_disk_hits: AtomicU64,
     block_disk_hits: AtomicU64,
     errors: AtomicU64,
-    preload_metadata_hits: AtomicU64,
-    preload_metadata_misses: AtomicU64,
-    preload_block_hits: AtomicU64,
-    preload_block_misses: AtomicU64,
-    preload_failures: AtomicU64,
     main_gets: AtomicU64,
     main_get_nanoseconds: AtomicU64,
     main_puts: AtomicU64,
@@ -592,38 +562,6 @@ impl CacheCounters {
             metadata_disk_hits: self.metadata_disk_hits.load(Ordering::Relaxed),
             block_disk_hits: self.block_disk_hits.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
-            preload_metadata_hits: self.preload_metadata_hits.load(Ordering::Relaxed),
-            preload_metadata_misses: self.preload_metadata_misses.load(Ordering::Relaxed),
-            preload_block_hits: self.preload_block_hits.load(Ordering::Relaxed),
-            preload_block_misses: self.preload_block_misses.load(Ordering::Relaxed),
-            preload_failures: self.preload_failures.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Attributes cache traffic and failures from one completed preload to
-    /// this attach and to the process-wide totals.
-    pub(crate) fn record_preload(&self, before: CacheTally, after: CacheTally, failures: usize) {
-        let failures = u64::try_from(failures).unwrap_or(u64::MAX);
-        for counters in [self, COUNTERS.as_ref()] {
-            counters.preload_metadata_hits.fetch_add(
-                after.metadata_hits.saturating_sub(before.metadata_hits),
-                Ordering::Relaxed,
-            );
-            counters.preload_metadata_misses.fetch_add(
-                after.metadata_misses.saturating_sub(before.metadata_misses),
-                Ordering::Relaxed,
-            );
-            counters.preload_block_hits.fetch_add(
-                after.block_hits.saturating_sub(before.block_hits),
-                Ordering::Relaxed,
-            );
-            counters.preload_block_misses.fetch_add(
-                after.block_misses.saturating_sub(before.block_misses),
-                Ordering::Relaxed,
-            );
-            counters
-                .preload_failures
-                .fetch_add(failures, Ordering::Relaxed);
         }
     }
 

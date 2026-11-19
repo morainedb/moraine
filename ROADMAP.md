@@ -84,9 +84,9 @@ Moraine 0.8 supports DuckDB 2.0.0.
   storage; `moraine_move_wal` moves an existing lake's log either way.
 - [x] Attach-tunable flush cadence; group commit, so concurrent commits
   share one flush.
-- [x] One block cache per process with a disk tier, metadata protected in
-  memory, and a preload at attach; row summaries published beside data
-  files so pruning skips Parquet footers
+- [x] One block cache per process with a disk tier and metadata protected in
+  memory; row summaries published beside data files so pruning skips
+  Parquet footers
   ([read path](docs/rfcs/0007-read-path-and-caching.md)).
 - [x] Commit-served projections and shared commit preparation, so commit
   latency does not grow with snapshot history.

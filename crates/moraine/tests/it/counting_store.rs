@@ -27,6 +27,7 @@ pub struct CountingStore {
     wal_puts: AtomicU64,
     manifest_puts: AtomicU64,
     compactions_requests: AtomicU64,
+    sst_reads: AtomicU64,
 }
 
 impl CountingStore {
@@ -39,6 +40,19 @@ impl CountingStore {
             wal_puts: AtomicU64::new(0),
             manifest_puts: AtomicU64::new(0),
             compactions_requests: AtomicU64::new(0),
+            sst_reads: AtomicU64::new(0),
+        }
+    }
+
+    /// Reads of sorted-string tables since the last call, and resets the
+    /// tally: the catalog's own bytes, as opposed to manifests and the log.
+    pub fn take_sst_reads(&self) -> u64 {
+        self.sst_reads.swap(0, Ordering::SeqCst)
+    }
+
+    fn record_sst_read(&self, location: &Path, ranges: u64) {
+        if location.as_ref().contains("compacted/") {
+            self.sst_reads.fetch_add(ranges, Ordering::SeqCst);
         }
     }
 
@@ -130,6 +144,7 @@ impl ObjectStore for CountingStore {
     ) -> object_store::Result<GetResult> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         self.record_read(Some(location));
+        self.record_sst_read(location, 1);
         let result = self.inner.get_opts(location, options).await?;
         self.bytes
             .fetch_add(result.range.end - result.range.start, Ordering::SeqCst);
@@ -144,6 +159,7 @@ impl ObjectStore for CountingStore {
         self.ranged_gets
             .fetch_add(ranges.len() as u64, Ordering::SeqCst);
         self.record_read(Some(location));
+        self.record_sst_read(location, ranges.len() as u64);
         self.bytes.fetch_add(
             ranges.iter().map(|range| range.end - range.start).sum(),
             Ordering::SeqCst,

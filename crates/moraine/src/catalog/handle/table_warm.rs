@@ -1,14 +1,14 @@
-//! Warming one table's probe ranges into the block cache.
+//! Warming the store's shared reads and one table's probe ranges into the
+//! block cache.
 
 use futures::{StreamExt, stream};
 use tracing::debug;
 
-use super::{CachePreload, ReadOnlyCatalog};
+use super::ReadOnlyCatalog;
 use crate::{
     catalog::TableId,
     error::Result,
     store::{
-        cache::cache_status,
         census,
         handle::{ReadHandle, ScanShape},
         key::{IndexKind, index_index_prefix, table_probe_prefixes},
@@ -37,34 +37,17 @@ async fn warm_prefix(handle: ReadHandle<'_>, prefix: Vec<u8>) -> Result<()> {
 }
 
 impl ReadOnlyCatalog {
-    /// Warms the store into the cache as [`CatalogOptions::cache_preload`]
-    /// would during the open, for a host that attaches first and warms
-    /// after: `L0` reaches each subspace's SST metadata, `All` walks the
-    /// scan-shaped subspaces whole. Best-effort; a block that cannot be
-    /// read is left to the read that needs it.
-    ///
-    /// [`CatalogOptions::cache_preload`]: crate::CatalogOptions::cache_preload
+    /// Warms the SST metadata of the subspaces every statement reads into
+    /// the cache, for a host that attaches first and warms after. Best-effort;
+    /// a block that cannot be read is left to the read that needs it.
     ///
     /// # Errors
     ///
     /// Returns a store error if no read session can be opened.
-    pub async fn preload_store(&self, level: CachePreload) -> Result<()> {
+    pub async fn warm_store(&self) -> Result<()> {
         let manifest = census::manifest_bytes(&self.store.current_manifest());
-        if level == CachePreload::All
-            && let Some(disk) = cache_status().block_disk_capacity_bytes
-            && let Some(shortfall) = open::preload_shortfall(manifest.store_bytes, Some(disk))
-        {
-            tracing::warn!(
-                store_bytes = manifest.store_bytes,
-                disk,
-                shortfall,
-                "preload cannot hold this store: the load stops once the cache is full, leaving \
-                 the rest to be fetched on demand"
-            );
-        }
-
         let session = self.begin_read().await?;
-        open::warm(level, session.handle(), &self.cache, &manifest.segments).await;
+        let _ = open::warm_every_statement(session.handle(), &manifest.segments).await;
         session.finish();
         Ok(())
     }

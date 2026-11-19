@@ -183,25 +183,11 @@ struct TallyBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
                                                    duckdb::vector<duckdb::Identifier> &names) {
-	names = {"metadata_hits",
-	         "metadata_misses",
-	         "metadata_hit_rate",
-	         "block_hits",
-	         "block_misses",
-	         "block_hit_rate",
-	         "errors",
-	         "preload_metadata_hits",
-	         "preload_metadata_misses",
-	         "preload_block_hits",
-	         "preload_block_misses",
-	         "preload_failures",
-	         "metadata_disk_hits",
-	         "block_disk_hits"};
+	names = {"metadata_hits",  "metadata_misses", "metadata_hit_rate",  "block_hits",     "block_misses",
+	         "block_hit_rate", "errors",          "metadata_disk_hits", "block_disk_hits"};
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
-	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
-	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
-	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
 
 	auto bind_data = duckdb::make_uniq<TallyBindData>();
 	if (!input.inputs.empty()) {
@@ -236,19 +222,11 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	uint64_t block_hits = 0;
 	uint64_t block_misses = 0;
 	uint64_t errors = 0;
-	uint64_t preload_metadata_hits = 0;
-	uint64_t preload_metadata_misses = 0;
-	uint64_t preload_block_hits = 0;
-	uint64_t preload_block_misses = 0;
-	uint64_t preload_failures = 0;
-	auto code = bind_data.catalog_name.empty()
-	                ? moraine_cache_tally(&metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors,
-	                                      &preload_metadata_hits, &preload_metadata_misses, &preload_block_hits,
-	                                      &preload_block_misses, &preload_failures)
-	                : moraine_catalog_cache_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(),
-	                                              &metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors,
-	                                              &preload_metadata_hits, &preload_metadata_misses, &preload_block_hits,
-	                                              &preload_block_misses, &preload_failures);
+	auto code =
+	    bind_data.catalog_name.empty()
+	        ? moraine_cache_tally(&metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors)
+	        : moraine_catalog_cache_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(),
+	                                      &metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors);
 	if (code != MORAINE_OK) {
 		throw duckdb::InternalException("moraine_cache_tally: could not read the cache counters");
 	}
@@ -278,13 +256,8 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	output.SetValue(4, 0, duckdb::Value::UBIGINT(block_misses));
 	output.SetValue(5, 0, rate(block_hits, block_misses));
 	output.SetValue(6, 0, duckdb::Value::UBIGINT(errors));
-	output.SetValue(7, 0, duckdb::Value::UBIGINT(preload_metadata_hits));
-	output.SetValue(8, 0, duckdb::Value::UBIGINT(preload_metadata_misses));
-	output.SetValue(9, 0, duckdb::Value::UBIGINT(preload_block_hits));
-	output.SetValue(10, 0, duckdb::Value::UBIGINT(preload_block_misses));
-	output.SetValue(11, 0, duckdb::Value::UBIGINT(preload_failures));
-	output.SetValue(12, 0, duckdb::Value::UBIGINT(metadata_disk_hits));
-	output.SetValue(13, 0, duckdb::Value::UBIGINT(block_disk_hits));
+	output.SetValue(7, 0, duckdb::Value::UBIGINT(metadata_disk_hits));
+	output.SetValue(8, 0, duckdb::Value::UBIGINT(block_disk_hits));
 	output.SetChildCardinality(1);
 }
 
