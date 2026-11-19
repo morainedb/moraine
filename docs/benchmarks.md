@@ -509,6 +509,24 @@ five cold processes per size sharing a cache directory:
   DuckDB planning over the file list, not the catalog reading it.
 - A cold attach issues twenty catalog-store requests at either size,
   listings, head probes, and the log reader's own requests included.
+
+`--commit` keeps the reader attached while a second process commits a
+thousand more files, then times the next two plans: the first over the
+SSTs that commit added, and the one after it. The same runner,
+2026-11-19 at `53376c7`, three repeats, against the same build with
+table-scoped cursors reading reuse-only:
+
+| files | plan after the commit | requests | plan after that | requests |
+|---:|---:|---:|---:|---:|
+| 2,000, retaining | 671 ms | 33 | 122 ms | 0 |
+| 2,000, reuse-only | 802 ms | 37 | 298 ms | 7 |
+| 20,000, retaining | 1,216 ms | 33 | 605 ms | 0 |
+| 20,000, reuse-only | 1,343 ms | 38 | 792 ms | 7 |
+
+- The plan after the commit pays the same either way: a new reader over
+  the new manifest and the commit's SST.
+- The plan after that is warm again with retaining cursors, and pays the
+  new file records' blocks on every plan without them.
 <!-- site:omit -->
 Findings, 2026-08, before the demand-loaded catalog:
 
