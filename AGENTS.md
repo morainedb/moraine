@@ -79,7 +79,9 @@ summary; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
   entry names the question, the command, and a headline number stamped
   with date, commit, and machine. A performance PR that moves a headline
   number updates its stamp there; the investigation narrative goes in the
-  PR description, never into `docs/`.
+  PR description, never into `docs/`. `README.md` and the site's landing
+  page publish a digest of its five-catalog tables, written by
+  `cargo xtask headline` and never by hand.
 
 ## The local gate
 
@@ -89,7 +91,8 @@ cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets 
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
   && cargo deny check -D advisory-not-detected \
-  && cargo xtask check-pins && cargo xtask check-patch-pins && cargo xtask e2e
+  && cargo xtask check-pins && cargo xtask check-patch-pins \
+  && cargo xtask headline --check && cargo xtask e2e
 ```
 
 `e2e` compiles DuckDB itself, and DuckDB's cmake picks up `ccache` or

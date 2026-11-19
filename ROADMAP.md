@@ -15,13 +15,13 @@ Moraine 0.8 supports DuckDB 2.0.0.
 - [ ] Windows builds. The extension is built and proven for Linux and macOS
   on x86-64 and arm64; Windows is unverified and WebAssembly is out of scope,
   since the Rust core's dependencies do not target it.
-- [ ] Lower per-commit overhead on DuckLake's side. Of a 23 to 25 ms one-row
-  commit, DuckLake's metadata SQL is 14.5 ms against 3.3 ms of Moraine's own
-  work, and nearly all of it is parsing, binding, and optimizing the
-  generated SQL, which DuckDB re-plans on every execution
-  ([measurement](docs/benchmarks.md#commit-timing)). Moraine
-  reports a catalog version so that plan reuse is possible once DuckDB
-  stops re-planning; the rest of the gain is upstream.
+- [ ] Lower per-commit overhead on DuckLake's side. Of a 42 ms one-row
+  commit against S3, 28 ms is the write that makes it durable and 10 ms is
+  DuckLake's metadata SQL, nearly all of that parsing, binding, and
+  optimizing the generated SQL, which DuckDB re-plans on every execution
+  ([measurement](docs/benchmarks.md#commit-timing)). Moraine reports a
+  catalog version so that plan reuse is possible once DuckDB stops
+  re-planning; the rest of the gain is upstream.
 
 ## Done
 

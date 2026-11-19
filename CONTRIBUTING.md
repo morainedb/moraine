@@ -71,6 +71,7 @@ cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check -D advisory-not-detected
 cargo xtask tidy-cpp
+cargo xtask headline --check
 cargo xtask e2e
 ```
 

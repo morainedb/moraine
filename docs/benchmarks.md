@@ -23,6 +23,12 @@ so a lone commit costs about 11 ms there.
 its own log and report under `target/benchmarks` — the whole set behind a
 restamp.
 
+A restamp that moves [the five-catalog tables](#five-catalogs-on-aws) ends
+with `cargo xtask headline`, which rewrites the digest `README.md` and the
+site's landing page publish from them; neither is edited by hand.
+`cargo xtask headline --check` fails a tree whose copies have drifted, and
+runs in CI.
+
 | question | command | needs |
 |---|---|---|
 | commit timing | `cargo xtask commit-bench` | an S3 endpoint in `MORAINE_S3_BUCKET` |

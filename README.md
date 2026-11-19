@@ -53,8 +53,8 @@ SELECT payload FROM lake.events WHERE id = 2;
 ## When not to use Moraine
 
 - **Sub-5 ms commits.** A commit is durable once one write-ahead-log PUT
-  lands: 50 to 100 ms on S3 Standard, 5 to 10 ms with the log on S3 Express
-  One Zone via
+  lands: roughly 30 ms on S3 Standard and 15 ms with the log on S3
+  Express One Zone via
   [`META_WAL_PATH`](https://morainedb.com/guide/configuration/#the-write-ahead-log-on-a-faster-and-cheaper-bucket).
 - **Many independent writer processes.** One process writes; the rest
   attach `READ_ONLY`. See
@@ -69,6 +69,8 @@ Identical DuckLake workloads through the same DuckDB CLI, only the catalog
 swapped, each on the store it would really use: Moraine on S3, the same
 with its write-ahead log on S3 Express, Postgres on RDS, and a DuckDB
 catalog file on local disk, since that is its only option.
+
+<!-- headline:start -->
 
 | | Moraine | Moraine, log on Express | DuckDB file | Postgres |
 |---|---:|---:|---:|---:|
@@ -89,6 +91,8 @@ attached. Moraine is single-writer across processes — a second writer
 process is fenced — and readers are not limited that way. Connections
 within one process share a flush, so when they overlap, throughput rises
 where the others' falls.
+
+<!-- headline:end -->
 
 For more details, see [Benchmarks](https://morainedb.com/benchmarks/).
 

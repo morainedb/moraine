@@ -66,8 +66,8 @@ SELECT payload FROM lake.events WHERE id = 2;
 ## When not to use Moraine
 
 - **Sub-5 ms commits.** A commit is durable once one write-ahead-log PUT
-  lands: 50 to 100 ms on S3 Standard, 5 to 10 ms with the log on S3 Express
-  One Zone via
+  lands: roughly 30 ms on S3 Standard and 15 ms with the log on S3
+  Express One Zone via
   [`META_WAL_PATH`](guide/configuration/#the-write-ahead-log-on-a-faster-and-cheaper-bucket).
 - **Many independent writer processes.** One process writes; the rest
   attach `READ_ONLY`. See
@@ -83,18 +83,20 @@ swapped, each on the store it would really use: Moraine on S3, the same
 with its write-ahead log on S3 Express, Postgres on RDS, and a DuckDB
 catalog file on local disk, since that is its only option.
 
+{/* headline:start */}
+
 | | Moraine | Moraine, log on Express | DuckDB file | Postgres |
 |---|---:|---:|---:|---:|
-| 20 single-row commits, one connection | 823 ms | 305 ms | 209 ms | 269 ms |
-| commits per second, one process, 1 connection | 30 | 73 | 125 | 87 |
-| commits per second, one process, 8 connections | 186 | 396 | 83 | 37 |
-| commits per second, one process, 16 connections | 353 | 563 | 74 | 26 |
-| attach | 604 ms | 615 ms | 16 ms | 189 ms |
-| read a count once attached | 28 ms | 28 ms | 31 ms | 72 ms |
-| full scan | 135 ms | 131 ms | 37 ms | 75 ms |
+| 20 single-row commits, one connection | 637 ms | 277 ms | 209 ms | 273 ms |
+| commits per second, one process, 1 connection | 22 | 85 | 128 | 96 |
+| commits per second, one process, 8 connections | 145 | 430 | 77 | 47 |
+| commits per second, one process, 16 connections | 303 | 582 | 85 | 23 |
+| attach | 543 ms | 574 ms | 20 ms | 194 ms |
+| read a count once attached | 26 ms | 26 ms | 29 ms | 70 ms |
+| full scan | 143 ms | 131 ms | 37 ms | 78 ms |
 
 A commit is one object write, the write-ahead-log entry that makes it
-durable, so its cost is that round trip: about 28 ms on S3 and 15 ms with
+durable, so its cost is that round trip: about 32 ms on S3 and 14 ms with
 the log on S3 Express. That is why one connection is slower here than a
 catalog on a local file or a nearby Postgres, and why there is no server
 to run. Attach is a start-up cost, paid once by a process that stays
@@ -102,6 +104,8 @@ attached. Moraine is single-writer across processes — a second writer
 process is fenced — and readers are not limited that way. Connections
 within one process share a flush, so when they overlap, throughput rises
 where the others' falls.
+
+{/* headline:end */}
 
 For more details, see
 [Benchmarks](benchmarks/).
