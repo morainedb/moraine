@@ -46,7 +46,7 @@ enum SourceTable {
 
 /// Every digest row: what the digest calls it, which table holds it, and
 /// that table's own label for it.
-const ROWS: [(&str, SourceTable, &str); 7] = [
+const ROWS: [(&str, SourceTable, &str); 6] = [
     (
         "20 single-row commits, one connection",
         SourceTable::Serial,
@@ -62,18 +62,13 @@ const ROWS: [(&str, SourceTable, &str); 7] = [
         SourceTable::Rate,
         "8",
     ),
+    ("attach, a fresh process", SourceTable::Serial, "attach"),
     (
-        "commits per second, one process, 16 connections",
-        SourceTable::Rate,
-        "16",
-    ),
-    ("attach", SourceTable::Serial, "attach"),
-    (
-        "read a count once attached",
+        "read a count, already attached",
         SourceTable::Warm,
         "count after it",
     ),
-    ("full scan", SourceTable::Serial, "full scan"),
+    ("full scan, cold cache", SourceTable::Serial, "full scan"),
 ];
 
 /// A published copy of the digest, with the comment syntax its format
@@ -200,10 +195,12 @@ fn paragraph(standard: i64, express: i64) -> String {
          the log on S3 Express. That is why one connection is slower here than a\n\
          catalog on a local file or a nearby Postgres, and why there is no server\n\
          to run. Attach is a start-up cost, paid once by a process that stays\n\
-         attached. Moraine is single-writer across processes — a second writer\n\
-         process is fenced — and readers are not limited that way. Connections\n\
-         within one process share a flush, so when they overlap, throughput rises\n\
-         where the others' falls."
+         attached. It and the scan are measured in a fresh process with no cache\n\
+         directory, so the scan reads its catalog metadata cold; a cache\n\
+         directory shared across attaches serves those reads instead. Moraine is\n\
+         single-writer across processes — a second writer process is fenced — and\n\
+         readers are not limited that way. Connections within one process share a\n\
+         flush, so when they overlap, throughput rises where the others' falls."
     )
 }
 
@@ -373,17 +370,25 @@ attached again in one process, each attach timed.
     #[test]
     fn the_digest_takes_its_cells_from_the_source_tables() {
         let digest = digest(FIXTURE).expect("the fixture carries every table");
-        assert!(digest.contains("| attach | 543 ms | 574 ms | 20 ms | 194 ms |\n"));
+        assert!(
+            digest.contains("| attach, a fresh process | 543 ms | 574 ms | 20 ms | 194 ms |\n")
+        );
         assert!(digest.contains(
             "| 20 single-row commits, one connection | 637 ms | 277 ms | 209 ms | 273 ms |"
         ));
         assert!(
             digest.contains(
-                "| commits per second, one process, 16 connections | 303 | 582 | 85 | 23 |"
+                "| commits per second, one process, 8 connections | 145 | 430 | 77 | 47 |"
             )
         );
-        assert!(digest.contains("| read a count once attached | 26 ms | 26 ms | 29 ms | 70 ms |"));
+        assert!(
+            digest.contains("| read a count, already attached | 26 ms | 26 ms | 29 ms | 70 ms |")
+        );
         assert!(!digest.contains("165 ms"), "Quack stays out of the digest");
+        assert!(
+            !digest.contains("16 connections"),
+            "the sixteen-connection row stays out of the digest"
+        );
     }
 
     /// The paragraph's figures are the serial row over its commit count.
