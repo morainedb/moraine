@@ -46,7 +46,7 @@ enum SourceTable {
 
 /// Every digest row: what the digest calls it, which table holds it, and
 /// that table's own label for it.
-const ROWS: [(&str, SourceTable, &str); 7] = [
+const ROWS: [(&str, SourceTable, &str); 6] = [
     (
         "20 single-row commits, one connection",
         SourceTable::Serial,
@@ -62,18 +62,13 @@ const ROWS: [(&str, SourceTable, &str); 7] = [
         SourceTable::Rate,
         "8",
     ),
+    ("attach, a fresh process", SourceTable::Serial, "attach"),
+    ("full scan, cold cache", SourceTable::Serial, "full scan"),
     (
-        "commits per second, one process, 16 connections",
-        SourceTable::Rate,
-        "16",
-    ),
-    ("attach", SourceTable::Serial, "attach"),
-    (
-        "read a count once attached",
+        "read a count, already attached",
         SourceTable::Warm,
         "count after it",
     ),
-    ("full scan", SourceTable::Serial, "full scan"),
 ];
 
 /// A published copy of the digest, with the comment syntax its format
@@ -163,24 +158,10 @@ fn digest(source: &str) -> anyhow::Result<String> {
     }
 
     let commits = serial.row(COMMITS_ROW)?;
-    let count = commit_count()?;
-    let per_commit = |cell: &String| -> anyhow::Result<i64> {
-        let each = microseconds(cell)? / count;
-        Ok((each + 500) / 1_000)
-    };
-    let standard = per_commit(cell(commits, 0)?)?;
-    let express = per_commit(cell(commits, 1)?)?;
+    let standard = cell(commits, 0)?;
+    let express = cell(commits, 1)?;
 
     Ok([table.join("\n"), paragraph(standard, express)].join("\n\n"))
-}
-
-/// The commit count the serial row measures, which its label states.
-fn commit_count() -> anyhow::Result<i64> {
-    COMMITS_ROW
-        .split_whitespace()
-        .next()
-        .and_then(|count| count.parse().ok())
-        .with_context(|| format!("`{COMMITS_ROW}` does not open with a commit count"))
 }
 
 /// One cell of a row, by position among the published catalogs.
@@ -190,20 +171,23 @@ fn cell(values: &[String], index: usize) -> anyhow::Result<&String> {
         .with_context(|| format!("{SOURCE}: a row is missing column {}", index + 1))
 }
 
-/// The closing paragraph, whose two figures are the per-commit cost on
-/// each store. Wrapped here with room for a three-digit figure, so a
+/// The closing paragraph, whose two figures are the commits row's own
+/// cells, so a reader checks them against the table above rather than
+/// dividing. Wrapped here with room for a four-character cell, so a
 /// slower run stays inside the line limit.
-fn paragraph(standard: i64, express: i64) -> String {
+fn paragraph(standard: &str, express: &str) -> String {
     format!(
         "A commit is one object write, the write-ahead-log entry that makes it\n\
-         durable, so its cost is that round trip: about {standard} ms on S3 and {express} ms with\n\
-         the log on S3 Express. That is why one connection is slower here than a\n\
-         catalog on a local file or a nearby Postgres, and why there is no server\n\
-         to run. Attach is a start-up cost, paid once by a process that stays\n\
-         attached. Moraine is single-writer across processes — a second writer\n\
-         process is fenced — and readers are not limited that way. Connections\n\
-         within one process share a flush, so when they overlap, throughput rises\n\
-         where the others' falls."
+         durable, so its cost is that round trip: the twenty above take {standard}\n\
+         on S3 and {express} with the log on S3 Express. That is why one connection\n\
+         is slower here than a catalog on a local file or a nearby Postgres, and\n\
+         why there is no server to run. Attach is a start-up cost, paid once by a\n\
+         process that stays attached. It and the scan are a fresh process with no\n\
+         cache directory, so the scan reads cold; a shared cache directory serves\n\
+         those reads instead. Moraine is single-writer across processes — a second\n\
+         writer process is fenced — and readers are not limited that way.\n\
+         Connections within one process share a flush, so when they overlap,\n\
+         throughput rises where the others' falls."
     )
 }
 
@@ -301,37 +285,6 @@ fn cells(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// Microseconds from a cell like `637 ms` or `1.05 s`, in whole units so
-/// a published figure divides exactly.
-fn microseconds(cell: &str) -> anyhow::Result<i64> {
-    let (value, unit) = cell
-        .split_once(' ')
-        .with_context(|| format!("{SOURCE}: `{cell}` is not a duration"))?;
-    let scale: i64 = match unit {
-        "ms" => 1_000,
-        "s" => 1_000_000,
-        other => bail!("{SOURCE}: `{cell}` is in `{other}`, not milliseconds or seconds"),
-    };
-
-    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-    let whole: i64 = whole
-        .parse()
-        .with_context(|| format!("{SOURCE}: `{cell}` is not a duration"))?;
-    if fraction.is_empty() {
-        return Ok(whole * scale);
-    }
-
-    let digits = u32::try_from(fraction.len())
-        .with_context(|| format!("{SOURCE}: `{cell}` carries too many decimals"))?;
-    let fraction: i64 = fraction
-        .parse()
-        .with_context(|| format!("{SOURCE}: `{cell}` is not a duration"))?;
-    let divisor = 10_i64
-        .checked_pow(digits)
-        .with_context(|| format!("{SOURCE}: `{cell}` carries too many decimals"))?;
-    Ok(whole * scale + fraction * scale / divisor)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,34 +326,34 @@ attached again in one process, each attach timed.
     #[test]
     fn the_digest_takes_its_cells_from_the_source_tables() {
         let digest = digest(FIXTURE).expect("the fixture carries every table");
-        assert!(digest.contains("| attach | 543 ms | 574 ms | 20 ms | 194 ms |\n"));
+        assert!(
+            digest.contains("| attach, a fresh process | 543 ms | 574 ms | 20 ms | 194 ms |\n")
+        );
         assert!(digest.contains(
             "| 20 single-row commits, one connection | 637 ms | 277 ms | 209 ms | 273 ms |"
         ));
         assert!(
             digest.contains(
-                "| commits per second, one process, 16 connections | 303 | 582 | 85 | 23 |"
+                "| commits per second, one process, 8 connections | 145 | 430 | 77 | 47 |"
             )
         );
-        assert!(digest.contains("| read a count once attached | 26 ms | 26 ms | 29 ms | 70 ms |"));
+        assert!(
+            digest.contains("| read a count, already attached | 26 ms | 26 ms | 29 ms | 70 ms |")
+        );
         assert!(!digest.contains("165 ms"), "Quack stays out of the digest");
+        assert!(
+            !digest.contains("16 connections"),
+            "the sixteen-connection row stays out of the digest"
+        );
     }
 
-    /// The paragraph's figures are the serial row over its commit count.
+    /// The paragraph quotes the commits row's own cells, so a reader can
+    /// check it against the table above.
     #[test]
-    fn the_per_commit_cost_divides_the_serial_row_by_its_commits() {
+    fn the_paragraph_quotes_the_commits_row() {
         let digest = digest(FIXTURE).expect("the fixture carries every table");
-        assert!(digest.contains("about 32 ms on S3 and 14 ms with"));
-    }
-
-    /// A cell in seconds reads as the same duration, decimals and all.
-    #[test]
-    fn a_duration_in_seconds_reads_as_microseconds() {
-        assert_eq!(microseconds("1.05 s").expect("a duration"), 1_050_000);
-        assert_eq!(microseconds("637 ms").expect("a duration"), 637_000);
-        assert_eq!(microseconds("27.7 ms").expect("a duration"), 27_700);
-        assert!(microseconds("637").is_err());
-        assert!(microseconds("637 µs").is_err());
+        assert!(digest.contains("the twenty above take 637 ms"));
+        assert!(digest.contains("277 ms with the log on S3 Express"));
     }
 
     /// A reworded source says which anchor stopped matching.

@@ -361,12 +361,14 @@ cargo xtask benchmarks
 ```
 <!-- /site:omit -->
 
-2026-11-19 at `7eaff76`; a `c6i.2xlarge` runner in us-east-1 `us-east-1c`,
+<!-- site:omit -->2026-11-19 at `7eaff76`.<!-- /site:omit -->
+A `c6i.2xlarge` runner in us-east-1 `us-east-1c`,
 with the standard bucket, the directory bucket, RDS Postgres 16
 (`db.t4g.small`) and a `t4g.large` Quack server in that same zone.
 Measured TCP connects: 0.47 ms to S3, 0.32 ms to RDS, 0.14 ms to Quack.
 Parquet is local, the DuckDB file catalog is local and is the control.
-Three repeats.
+Three repeats. Each workload seeds in one process and measures in
+another (no cache directory).
 
 Serial phases, medians:
 
@@ -378,11 +380,12 @@ Serial phases, medians:
 | 20 repeated deletes | 1.05 s | 651 ms | 403 ms | 484 ms | 1.01 s |
 | merge adjacent files | 203 ms | 180 ms | 54 ms | 89 ms | 101 ms |
 
-- **A commit is 14 ms with the log on Express**, the same as RDS Postgres,
-  4 ms behind the local file, and twice as fast as Quack: a database's
-  commit latency with no database to run. On the standard bucket alone it
-  is 32 ms; the store under the log is the difference, and attach and scan
-  do not move with it, since a read never touches the log.
+- **Twenty commits take 277 ms with the log on Express**, against 273 ms
+  for RDS Postgres, 209 ms for the local file, and 525 ms for Quack: a
+  database's commit latency with no database to run. The same twenty take
+  637 ms on the standard bucket alone, so the store under the log is the
+  difference. Attach and the scan differ by under a tenth either way —
+  the run-to-run spread — since a read never touches the log.
 - **Attach is the cost**: about 550 ms against 20 ms for the file and under
   200 for the servers, paid once per process. A long-lived writer pays it
   once; a process that attaches per invocation pays it every time.
@@ -518,8 +521,9 @@ five cold processes per size sharing a cache directory:
 
 `--commit` keeps the reader attached while a second process commits a
 thousand more files, then times the next two plans: the first over the
-SSTs that commit added, and the one after it. The same runner,
-2026-11-19 at `53376c7`, three repeats, against the same build with
+SSTs that commit added, and the one after it.
+<!-- site:omit -->2026-11-19 at `53376c7`.<!-- /site:omit -->
+The same runner, three repeats, against the same build with
 table-scoped cursors reading reuse-only:
 
 | files | plan after the commit | requests | plan after that | requests |
@@ -775,10 +779,11 @@ Row summaries (a range, Roaring bitmap, or sorted vector per data file)
 map a row id to the files that hold it, so a lookup opens the files that
 hold the row rather than every file of the table.
 
-On the benchmark runner at `a491fe5` (2026-11-17), 16 files × 2,000 rows
-over AWS S3: 166,008 summary bytes, a cold lookup of 78 ms and a warm one
-of 0.8 ms. After six update batches the row-id path reads 7 files where the
-located join reads 1.
+<!-- site:omit -->2026-11-17 at `a491fe5`.<!-- /site:omit -->
+On the benchmark runner, 16 files × 2,000 rows over AWS S3: 166,008
+summary bytes, a cold lookup of 78 ms and a warm one of 0.8 ms. After
+six update batches the row-id path reads 7 files where the located join
+reads 1.
 
 <!-- site:omit -->
 `cargo xtask locate-bench [--files N] [--rows-per-file N] [--update-batches N]`

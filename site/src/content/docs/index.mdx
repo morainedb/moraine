@@ -90,20 +90,21 @@ catalog file on local disk, since that is its only option.
 | 20 single-row commits, one connection | 637 ms | 277 ms | 209 ms | 273 ms |
 | commits per second, one process, 1 connection | 22 | 85 | 128 | 96 |
 | commits per second, one process, 8 connections | 145 | 430 | 77 | 47 |
-| commits per second, one process, 16 connections | 303 | 582 | 85 | 23 |
-| attach | 543 ms | 574 ms | 20 ms | 194 ms |
-| read a count once attached | 26 ms | 26 ms | 29 ms | 70 ms |
-| full scan | 143 ms | 131 ms | 37 ms | 78 ms |
+| attach, a fresh process | 543 ms | 574 ms | 20 ms | 194 ms |
+| full scan, cold cache | 143 ms | 131 ms | 37 ms | 78 ms |
+| read a count, already attached | 26 ms | 26 ms | 29 ms | 70 ms |
 
 A commit is one object write, the write-ahead-log entry that makes it
-durable, so its cost is that round trip: about 32 ms on S3 and 14 ms with
-the log on S3 Express. That is why one connection is slower here than a
-catalog on a local file or a nearby Postgres, and why there is no server
-to run. Attach is a start-up cost, paid once by a process that stays
-attached. Moraine is single-writer across processes — a second writer
-process is fenced — and readers are not limited that way. Connections
-within one process share a flush, so when they overlap, throughput rises
-where the others' falls.
+durable, so its cost is that round trip: the twenty above take 637 ms
+on S3 and 277 ms with the log on S3 Express. That is why one connection
+is slower here than a catalog on a local file or a nearby Postgres, and
+why there is no server to run. Attach is a start-up cost, paid once by a
+process that stays attached. It and the scan are a fresh process with no
+cache directory, so the scan reads cold; a shared cache directory serves
+those reads instead. Moraine is single-writer across processes — a second
+writer process is fenced — and readers are not limited that way.
+Connections within one process share a flush, so when they overlap,
+throughput rises where the others' falls.
 
 {/* headline:end */}
 
