@@ -109,6 +109,7 @@ pub(crate) struct StoreBuilder<'a> {
     writer_session: Option<Arc<dyn crate::WriterSession>>,
     /// The commit-log session supplying durable WAL for a reader.
     reader_session: Option<Arc<dyn crate::ReaderSession>>,
+    counters: Option<Arc<cache::CacheCounters>>,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -136,6 +137,7 @@ impl<'a> StoreBuilder<'a> {
             wal_object_store: None,
             writer_session: None,
             reader_session: None,
+            counters: None,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -176,6 +178,17 @@ impl<'a> StoreBuilder<'a> {
     pub(crate) fn reader_session(mut self, session: Option<Arc<dyn crate::ReaderSession>>) -> Self {
         self.reader_session = session;
         self
+    }
+
+    /// The counters this store's requests and cache lookups land in, so
+    /// every store one attach opens reports to one tally.
+    pub(crate) fn counters(mut self, counters: Arc<cache::CacheCounters>) -> Self {
+        self.counters = Some(counters);
+        self
+    }
+
+    fn take_counters(&self) -> Arc<cache::CacheCounters> {
+        self.counters.clone().unwrap_or_else(cache::store_counters)
     }
 
     /// The store the log lives on: the separate log store when one is
@@ -300,7 +313,7 @@ impl<'a> StoreBuilder<'a> {
             .l0_sst_size_bytes
             .min(settings.max_unflushed_bytes / 2)
             .max(1);
-        let counters = cache::store_counters();
+        let counters = self.take_counters();
         let mut builder = Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
             .with_sst_block_size(SST_BLOCK_SIZE)
@@ -354,7 +367,7 @@ impl<'a> StoreBuilder<'a> {
             object_store_max_retries: self.reader_mode.map(|_| 1),
             ..defaults
         };
-        let counters = cache::store_counters();
+        let counters = self.take_counters();
         let mut builder = DbReader::builder(self.path.to_owned(), Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_filter_policies(super::index_filter::policies())

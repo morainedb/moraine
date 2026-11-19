@@ -78,6 +78,8 @@ pub(crate) struct ReaderScopes {
     options: CatalogOptions,
     readers: Mutex<Readers>,
     explicit: Option<Arc<CheckpointReader>>,
+    /// The attach's counters; every reader opened here reports to them.
+    counters: Arc<CacheCounters>,
     /// How long a scope may share the reader its predecessor opened before
     /// opening a newer one. Zero opens one per scope.
     reuse: Duration,
@@ -91,6 +93,7 @@ impl ReaderScopes {
         options: CatalogOptions,
         explicit: Option<Arc<DbReader>>,
         reuse: Duration,
+        counters: Arc<CacheCounters>,
     ) -> Self {
         let explicit = explicit.map(CheckpointReader::external);
         Self {
@@ -98,6 +101,7 @@ impl ReaderScopes {
             options,
             readers: Mutex::new(Readers::default()),
             explicit,
+            counters,
             reuse,
         }
     }
@@ -111,6 +115,7 @@ impl ReaderScopes {
     /// transaction had already started reading.
     fn builder(&self) -> StoreBuilder<'_> {
         let builder = StoreBuilder::new(&self.options.path, self.objects.clone())
+            .counters(self.counters.clone())
             .poll_interval(READ_WINDOW)
             .wal_object_store(
                 self.options
