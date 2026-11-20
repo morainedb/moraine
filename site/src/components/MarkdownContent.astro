@@ -1,0 +1,27 @@
+---
+// Both the Nova theme and the blog override this component. A blog post
+// gets the blog's version, which adds the post's date, author, and tags
+// around the content, plus the theme's copy button for code blocks; every
+// other page gets the theme's version unchanged.
+import NovaMarkdownContent from 'starlight-theme-nova/components/MarkdownContent.astro';
+import CodeCopy from 'starlight-theme-nova/components/CodeCopy.astro';
+import BlogMarkdownContent from 'starlight-blog/components/MarkdownContent.astro';
+
+const { id } = Astro.locals.starlightRoute;
+const isBlogPost = Astro.locals.starlightBlog.posts.some((post) => post.entry.id === id);
+---
+
+{
+	isBlogPost ? (
+		<>
+			<BlogMarkdownContent>
+				<slot />
+			</BlogMarkdownContent>
+			<CodeCopy />
+		</>
+	) : (
+		<NovaMarkdownContent>
+			<slot />
+		</NovaMarkdownContent>
+	)
+}

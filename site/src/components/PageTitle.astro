@@ -1,0 +1,36 @@
+---
+// Starlight's page title, with a link back to the blog above a post's.
+import Default from '@astrojs/starlight/components/PageTitle.astro';
+
+const { id } = Astro.locals.starlightRoute;
+const isBlogPost = Astro.locals.starlightBlog.posts.some((post) => post.entry.id === id);
+---
+
+{
+	isBlogPost ? (
+		<div class="blog-title">
+			<a href="/blog/">Blog</a>
+			<Default />
+		</div>
+	) : (
+		<Default />
+	)
+}
+
+<style>
+	.blog-title a {
+		display: inline-block;
+		margin-top: 1rem;
+		font-size: var(--sl-text-sm);
+		color: var(--sl-color-text-accent);
+		text-decoration: none;
+	}
+
+	.blog-title a:hover {
+		text-decoration: underline;
+	}
+
+	.blog-title :global(h1) {
+		margin-top: 0.5rem;
+	}
+</style>
