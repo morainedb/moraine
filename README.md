@@ -122,6 +122,7 @@ Moraine. Questions and ideas go to
 - [Releases](https://morainedb.com/releases/): changelog, extension
   downloads, and the DuckDB compatibility table.
 - [Roadmap](https://morainedb.com/roadmap/): what's next for Moraine.
+- [Blog](https://morainedb.com/blog/): announcements and engineering notes.
 
 ## In this repository
 

@@ -1,0 +1,59 @@
+---
+// The blog index: every post as one line, newest first. This file route
+// takes precedence over the plugin's own index, which renders previews.
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { getCollection } from 'astro:content';
+
+const posts = (await getCollection('docs', (entry) => entry.id.startsWith('blog/')))
+	.filter((entry) => entry.data.date !== undefined)
+	.toSorted((a, b) => b.data.date!.valueOf() - a.data.date!.valueOf());
+
+const formatDate = (date: Date) =>
+	date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+---
+
+<StarlightPage frontmatter={{ title: 'Blog', tableOfContents: false }} hasSidebar={false}>
+	<ul class="posts not-content">
+		{
+			posts.map((post) => (
+				<li>
+					<a href={`/${post.id}/`}>{post.data.title}</a>
+					<time datetime={post.data.date!.toISOString()}>{formatDate(post.data.date!)}</time>
+				</li>
+			))
+		}
+	</ul>
+</StarlightPage>
+
+<style>
+	.posts {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+	}
+
+	.posts li {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 1.5rem;
+		padding-block: 0.75rem;
+		border-bottom: 1px solid var(--sl-color-hairline);
+	}
+
+	.posts a {
+		font-weight: 600;
+		color: var(--sl-color-white);
+		text-decoration: none;
+	}
+
+	.posts a:hover {
+		color: var(--sl-color-text-accent);
+	}
+
+	.posts time {
+		flex-shrink: 0;
+		font-size: var(--sl-text-sm);
+		color: var(--sl-color-gray-3);
+	}
+</style>

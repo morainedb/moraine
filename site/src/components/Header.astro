@@ -65,6 +65,12 @@ import MobileMenuToggle from 'starlight-theme-nova/components/MobileMenuToggle.a
 		display: none;
 	}
 
+	/* The blog's feed stays discoverable through the page head; its icon
+	   does not join the header. */
+	.social :global(a[href$='/rss.xml']) {
+		display: none;
+	}
+
 	.mobile-toggle {
 		display: flex;
 		align-items: center;
