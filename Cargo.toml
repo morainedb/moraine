@@ -21,6 +21,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # Diff iterator misses updates past a shared leaf before 7.0.2; regression pinned in commit/diff.rs.
 imbl = "7.0.2"
 hashbrown = { version = "0.17.1", default-features = false }
+http = "1"
 lru-slab = "0.1.2"
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.10.0" }
@@ -38,7 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 flate2 = "1"
-slatedb = "0.18.1"
+slatedb = { version = "0.18.1", default-features = false }
 # must move in lockstep with slatedb: it is where the metrics traits live
 slatedb-common = "0.18.1"
 storekey = "0.11"

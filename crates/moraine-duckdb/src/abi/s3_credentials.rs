@@ -95,22 +95,32 @@ impl CredentialProvider for RefreshingCredentials {
     type Credential = AwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
-        let mut cache = Arc::clone(&self.cache).lock_owned().await;
+        let cache = Arc::clone(&self.cache).lock_owned().await;
         if let Some(cached) = cache.as_ref()
             && Instant::now() < cached.refresh_at
         {
             return Ok(Arc::clone(&cached.credential));
         }
         let source = Arc::clone(&self.source);
-        // The blocking job owns the lock and source even if its caller is cancelled.
-        tokio::task::spawn_blocking(move || {
+        let refresh = move || {
+            let mut cache = cache;
             let refreshed = source.load()?;
             let credential = Arc::clone(&refreshed.credential);
             *cache = Some(refreshed);
             Ok(credential)
-        })
-        .await
-        .map_err(|_| credential_error("S3 credential refresh worker failed"))?
+        };
+        // The blocking job owns the lock and source even if its caller is
+        // cancelled. A browser has no blocking pool, so there it runs inline.
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            tokio::task::spawn_blocking(refresh)
+                .await
+                .map_err(|_| credential_error("S3 credential refresh worker failed"))?
+        }
+        #[cfg(target_os = "emscripten")]
+        {
+            refresh()
+        }
     }
 }
 

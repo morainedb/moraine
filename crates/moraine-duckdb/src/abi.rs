@@ -19,6 +19,7 @@
 
 mod attach;
 mod fault;
+pub mod http_transport;
 mod indexes;
 mod lookup;
 mod maintenance;

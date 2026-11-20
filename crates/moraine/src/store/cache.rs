@@ -1472,6 +1472,7 @@ const MIN_AUXILIARY_DISK: u64 = 4 * MIN_DISK_CACHE_BLOCK;
 static CACHE_RUNTIME: std::sync::LazyLock<Option<Arc<tokio::runtime::Runtime>>> =
     std::sync::LazyLock::new(|| build_cache_runtime().map(Arc::new));
 
+#[cfg(not(target_os = "emscripten"))]
 fn build_cache_runtime() -> Option<tokio::runtime::Runtime> {
     match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1488,6 +1489,12 @@ fn build_cache_runtime() -> Option<tokio::runtime::Runtime> {
             None
         }
     }
+}
+
+/// A browser has no thread to give the cache; it stays in memory.
+#[cfg(target_os = "emscripten")]
+fn build_cache_runtime() -> Option<tokio::runtime::Runtime> {
+    None
 }
 
 /// Finishes `memory` as a hybrid cache over a disk device of `disk` bytes

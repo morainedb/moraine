@@ -227,6 +227,53 @@ typedef struct MoraineMemoryBudgets {
   uint64_t host_headroom;
 } MoraineMemoryBudgets;
 
+// Mirrors the C `MoraineHttpRequest`: one request for the host to perform.
+// Strings are NUL-terminated and, with the body, valid until `send`
+// returns.
+typedef struct MoraineHttpRequest {
+  // The HTTP method, upper-case.
+  const char *method;
+  // The absolute, percent-encoded URL.
+  const char *url;
+  // Request header names, one per `header_values` entry.
+  const char *const *header_names;
+  // Request header values, in `header_names` order.
+  const char *const *header_values;
+  // The number of headers.
+  size_t header_count;
+  // The request body; may be null when `body_len` is zero.
+  const uint8_t *body;
+  // The request body length in bytes.
+  size_t body_len;
+} MoraineHttpRequest;
+
+// Receives the response to one request. Strings are NUL-terminated and,
+// with the body, valid until this call returns.
+typedef void (*MoraineHttpReceiver)(void *output,
+                                    uint16_t status,
+                                    const char *const *header_names,
+                                    const char *const *header_values,
+                                    size_t header_count,
+                                    const uint8_t *body,
+                                    size_t body_len);
+
+// Performs one request to completion. Calls `receiver` exactly once with
+// the response before returning true; returns false when no response
+// arrived. Must not unwind. Callable from any thread for the process's
+// lifetime.
+typedef bool (*MoraineHttpSend)(void *context,
+                                const struct MoraineHttpRequest *request,
+                                MoraineHttpReceiver receiver,
+                                void *output);
+
+// A host transport, registered once per process before the first attach.
+typedef struct MoraineHttpTransport {
+  // Opaque state passed to `send`.
+  void *context;
+  // The request function; null is refused at registration.
+  MoraineHttpSend send;
+} MoraineHttpTransport;
+
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -1683,6 +1730,17 @@ int32_t moraine_validate_host_memory(uint64_t duckdb_bytes,
 // Arms a stall for the cancellable call entering on this thread.
 // The shim consumes its session-owned arm before making this handoff.
 void moraine_fault_stall_next_read(uint64_t milliseconds);
+
+// Registers `transport` as the process's HTTP transport, replacing any
+// earlier one. A null `send` is `INVALID_ARGUMENT`.
+//
+// # Safety
+//
+// `transport` must obey the contract on [`MoraineHttpSend`] for the
+// process's lifetime. `err`, if non-null, must be a valid, writable
+// [`MoraineError`].
+int32_t moraine_register_http_transport(struct MoraineHttpTransport transport,
+                                        struct MoraineError *err);
 
 // Creates an equality index, committing autonomously. With `staged`, runs
 // the multi-commit build — required when the table's backfill exceeds what

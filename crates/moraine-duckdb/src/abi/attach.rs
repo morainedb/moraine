@@ -8,7 +8,9 @@ use std::{
 };
 
 use moraine::CatalogOptions;
-use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
+#[cfg(not(target_arch = "wasm32"))]
+use object_store::local::LocalFileSystem;
+use object_store::{ObjectStore, aws::AmazonS3Builder, memory::InMemory};
 use tracing::{info, warn};
 
 use super::{
@@ -233,6 +235,12 @@ impl StoreKind {
         if path == "memory://" || path == "memory:" {
             return Ok((Self::Memory, String::new()));
         }
+        if cfg!(target_arch = "wasm32") {
+            return Err(AbiError::invalid_argument(format!(
+                "moraine_attach: a local path (`{path}`) has no store in the browser build \
+                 (supported: `memory://` or `s3://`)"
+            )));
+        }
         Ok((Self::LocalFile, String::new()))
     }
 
@@ -242,6 +250,11 @@ impl StoreKind {
         s3: Option<&S3Creds>,
     ) -> Result<(Arc<dyn ObjectStore>, moraine::CacheIdentity), AbiError> {
         match self {
+            #[cfg(target_arch = "wasm32")]
+            Self::LocalFile => Err(AbiError::invalid_argument(format!(
+                "moraine_attach: a local path (`{path}`) has no store in the browser build"
+            ))),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::LocalFile => {
                 std::fs::create_dir_all(path).map_err(|e| {
                     AbiError::invalid_argument(format!(
@@ -261,6 +274,16 @@ impl StoreKind {
             Self::Memory => Ok((Arc::new(InMemory::new()), moraine::CacheIdentity::default())),
             Self::S3 { bucket } => {
                 let builder = s3_builder(bucket, s3);
+                #[cfg(target_os = "emscripten")]
+                let builder = {
+                    let Some(connector) = super::http_transport::registered() else {
+                        return Err(AbiError::invalid_argument(
+                            "moraine_attach: the browser build needs an HTTP transport \
+                             registered before an s3:// store opens",
+                        ));
+                    };
+                    builder.with_http_connector(connector)
+                };
                 let identity = s3_cache_identity(&builder);
                 let store = builder.build().map_err(|e| {
                     AbiError::invalid_argument(format!(
@@ -455,6 +478,7 @@ pub(crate) fn adopt_data_root(source: &DataSource, root: &str) -> Result<DataFil
 /// Opens the data root with its bucket-relative key prefix.
 fn open_data_files(path: &str, s3_creds: Option<&S3Creds>) -> Result<DataFiles, AbiError> {
     let (kind, prefix) = StoreKind::from_path(path)?;
+    #[cfg(not(target_arch = "wasm32"))]
     if matches!(kind, StoreKind::LocalFile) {
         std::fs::create_dir_all(path).map_err(|error| {
             AbiError::invalid_argument(format!("cannot create data directory `{path}`: {error}"))

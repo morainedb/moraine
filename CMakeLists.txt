@@ -6,6 +6,11 @@ project(${TARGET_NAME} CXX)
 # Build the moraine Rust core (crates/moraine-duckdb) as a static library and
 # expose it as the CMake target `moraine-duckdb`. Corrosion forwards the
 # crate's native link requirements (frameworks, system libs) to consumers.
+# Corrosion infers no cargo target for the Emscripten toolchain.
+if(EMSCRIPTEN)
+    set(Rust_CARGO_TARGET wasm32-unknown-emscripten CACHE STRING "Target triple")
+endif()
+
 include(FetchContent)
 FetchContent_Declare(
     Corrosion
@@ -64,6 +69,10 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/staged_write.cpp
     ${CPP_DIR}/transaction_manager.cpp
 )
+if(EMSCRIPTEN)
+    # The browser performs the S3 client's requests.
+    list(APPEND EXTENSION_SOURCES ${CPP_DIR}/http_transport.cpp)
+endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} "-no-warnings" ${EXTENSION_SOURCES})
@@ -75,6 +84,9 @@ if(APPLE)
     set(RUST_PLATFORM_LIBS m c resolv
         "-framework CoreFoundation" "-framework SystemConfiguration" "-framework Security"
         "-framework IOKit")
+elseif(EMSCRIPTEN)
+    # The browser supplies libc and performs the network I/O.
+    set(RUST_PLATFORM_LIBS "")
 elseif(UNIX)
     set(RUST_PLATFORM_LIBS m c resolv)
 else()

@@ -331,6 +331,10 @@ fn admit(queue: &mut PendingDelivery, record: LogRecord) {
 /// Delivery runs on a thread of its own, so logging no longer proves
 /// arrival.
 pub(crate) fn flush_delivery(timeout: std::time::Duration) {
+    // Without a delivery thread, the flush is the delivery.
+    if cfg!(target_os = "emscripten") {
+        deliver_queued();
+    }
     let (lock, waiting) = pending();
     let Ok(mut queue) = lock.lock() else {
         return;
@@ -348,9 +352,13 @@ pub(crate) fn flush_delivery(timeout: std::time::Duration) {
     }
 }
 
-/// Starts the thread that delivers queued records, once per process.
+/// Starts the thread that delivers queued records, once per process. A
+/// browser has no thread to give it; there `flush_delivery` delivers.
 fn start_delivery_thread() {
     static STARTED: OnceLock<()> = OnceLock::new();
+    if cfg!(target_os = "emscripten") {
+        return;
+    }
     STARTED.get_or_init(|| {
         let _ = std::thread::Builder::new()
             .name("moraine-logs".to_owned())
@@ -362,7 +370,7 @@ fn start_delivery_thread() {
 /// caller to pull when no sink is registered.
 fn deliver_forever() {
     loop {
-        let (records, dropped) = {
+        {
             let (lock, waiting) = pending();
             let Ok(mut queue) = lock.lock() else {
                 return;
@@ -373,30 +381,40 @@ fn deliver_forever() {
                 };
                 queue = next;
             }
-            (
-                queue.records.drain(..).collect::<Vec<_>>(),
-                std::mem::take(&mut queue.dropped),
-            )
-        };
+        }
+        deliver_queued();
+    }
+}
 
-        if dropped > 0 {
-            deliver(&LogRecord {
-                handle: None,
-                level: levels::WARNING,
-                message: format!(
-                    "moraine: {dropped} diagnostic record(s) dropped; delivery fell behind"
-                ),
-            });
-        }
-        for record in &records {
-            deliver(record);
-        }
-        if let Ok(mut queue) = pending().0.lock() {
-            queue.delivered = queue
-                .delivered
-                .saturating_add(records.len().try_into().unwrap_or(u64::MAX));
-            pending().1.notify_all();
-        }
+/// Delivers what the queue holds now and counts it delivered.
+fn deliver_queued() {
+    let (records, dropped) = {
+        let Ok(mut queue) = pending().0.lock() else {
+            return;
+        };
+        (
+            queue.records.drain(..).collect::<Vec<_>>(),
+            std::mem::take(&mut queue.dropped),
+        )
+    };
+
+    if dropped > 0 {
+        deliver(&LogRecord {
+            handle: None,
+            level: levels::WARNING,
+            message: format!(
+                "moraine: {dropped} diagnostic record(s) dropped; delivery fell behind"
+            ),
+        });
+    }
+    for record in &records {
+        deliver(record);
+    }
+    if let Ok(mut queue) = pending().0.lock() {
+        queue.delivered = queue
+            .delivered
+            .saturating_add(records.len().try_into().unwrap_or(u64::MAX));
+        pending().1.notify_all();
     }
 }
 
@@ -726,6 +744,39 @@ mod tests {
     fn draining_without_a_sink_is_a_no_op() {
         // SAFETY: a null sink is the documented no-op case.
         unsafe { moraine_drain_logs(None, std::ptr::null_mut()) };
+    }
+
+    /// A record admitted to the queue reaches its handle's sink through one
+    /// `deliver_queued`, with no delivery thread involved.
+    #[test]
+    fn deliver_queued_hands_queued_records_to_the_sink() {
+        let handle = allocate_handle_id();
+        // SAFETY: `receive` is a valid sink that never unwinds, emits no
+        // events, and re-enters nothing.
+        unsafe { register_sink(handle, receive, std::ptr::without_provenance_mut(11)) };
+        {
+            let mut queue = pending().0.lock().unwrap();
+            admit(
+                &mut queue,
+                LogRecord {
+                    handle: Some(handle),
+                    level: levels::INFO,
+                    message: "queued for inline delivery".to_owned(),
+                },
+            );
+        }
+
+        deliver_queued();
+
+        assert!(pending().0.lock().unwrap().records.is_empty());
+        let pushed = std::mem::take(&mut *received().lock().unwrap());
+        assert!(
+            pushed
+                .iter()
+                .any(|(ctx, message)| *ctx == 11 && message.contains("inline delivery")),
+            "deliver_queued should hand the record to the handle's sink: {pushed:?}"
+        );
+        unregister_sink(handle);
     }
 
     /// What the routing test's sinks received: `(ctx-as-number, message)`.

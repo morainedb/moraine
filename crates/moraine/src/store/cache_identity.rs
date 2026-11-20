@@ -1,5 +1,6 @@
 //! Explicit object-store namespaces for memory and disk caches.
 
+#[cfg(not(target_arch = "wasm32"))]
 use object_store::{local::LocalFileSystem, path::Path};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -38,6 +39,7 @@ impl CacheIdentity {
     ///
     /// # Errors
     /// Returns an error if the store cannot resolve a filesystem path.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn local(store: &LocalFileSystem) -> object_store::Result<Self> {
         // A fixed child resolves the root without requiring that child to exist.
         let member = store.path_to_filesystem(&Path::from(".moraine-cache-identity"))?;
