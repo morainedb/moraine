@@ -55,7 +55,6 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0005-feat-change-DuckLake-rows-by-position.patch
             ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch
             ${CMAKE_CURRENT_LIST_DIR}/0009-perf-bound-the-commit-time-head-lookup.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0010-fix-record-the-data-path-on-a-catalog-that-serves-none.patch
             ${CMAKE_CURRENT_LIST_DIR}/0011-perf-stage-snapshots-and-defer-inline-appends.patch
             ${CMAKE_CURRENT_LIST_DIR}/0012-perf-scope-and-stage-append-statistics.patch
     )

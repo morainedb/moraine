@@ -38,6 +38,12 @@ public:
 	duckdb::unique_ptr<duckdb::QueryResult> Query(duckdb::string &query) override;
 	duckdb::unique_ptr<duckdb::QueryResult> AttachMetadata(const duckdb::string &attach_query) override;
 
+	//! Records the attach's `DATA_PATH` as the lake's `data_path` tag when
+	//! the lake serves none. DuckLake writes that tag only while bootstrapping
+	//! a catalog it creates, which a lake moraine's genesis created skips.
+	//! A read-only attach records nothing.
+	duckdb::DuckLakeMetadata LoadDuckLake() override;
+
 	using duckdb::DuckLakeMetadataManager::GetSnapshot;
 
 	//! Reads the pinned head and catalog version without planning metadata SQL.

@@ -133,11 +133,12 @@ registering a data or delete file on a table with a maintained index fails with
 `Constraint`, naming the file, when moraine has no `DATA_PATH` store: the lake
 records no data path, or is encrypted, since moraine reads no byte of an
 encrypted file.
-The bundled DuckLake records the attach's `DATA_PATH` in the `data_path`
-metadata option when the catalog serves none, and moraine adopts it on first
-use when the attach named no `META_DATA_PATH`; it is served back as
-DuckLake's `ducklake_metadata` row, and a re-attach supplying a conflicting
-value is refused.
+The extension's metadata manager records the attach's `DATA_PATH` in the
+`data_path` metadata option when the catalog serves none (DuckLake writes it
+only while bootstrapping a catalog it creates, which a lake genesis created
+skips), and moraine adopts it on first use when the attach named no
+`META_DATA_PATH`; it is served back as DuckLake's `ducklake_metadata` row,
+and a re-attach supplying a conflicting value is refused.
 A table whose rows stay inlined needs no data store. A unique index's scoped
 read is synchronous at commit and a failed read aborts it; the check is never
 skipped.
