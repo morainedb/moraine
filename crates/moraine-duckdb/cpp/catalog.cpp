@@ -879,7 +879,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	std::string checkpoint;
 	// `META_DATA_PATH` arrives here as `data_path`: the DATA_PATH the index
 	// scoped read and maintenance resolve data files against. Optional,
-	// since the core adopts the DATA_PATH the bundled DuckLake records on
+	// since the core adopts the DATA_PATH the metadata manager records on
 	// the first attach. (DuckLake keeps its own unprefixed `DATA_PATH` for
 	// the data layer and does not forward it to this metadata attach.)
 	std::string data_path;

@@ -442,9 +442,9 @@ impl Transaction {
     }
     /// Registers a delete file targeting a live data file's rows, removing
     /// the equality-index entries of the rows it kills. Each removal names
-    /// the killed row by id — inside a dense target's row-id range, or a
-    /// per-row-id target's embedded id — with the values the dead row was
-    /// indexed under. Table statistics are unchanged.
+    /// the killed row by id, within the recorded bounds of the target's
+    /// embedded row-id column or else its dense range, with the values the
+    /// dead row was indexed under. Table statistics are unchanged.
     ///
     /// # Errors
     ///
@@ -453,9 +453,9 @@ impl Transaction {
     /// `index_entries` entry names an index not live on the table.
     /// Returns [`crate::Error::Constraint`] if the table has live indexes and a
     /// non-empty delete file supplies no `index_entries`, an empty delete
-    /// file supplies any, an entry's row id is outside a dense target's
-    /// row-id range, or an entry's value count does not match its index's
-    /// column count.
+    /// file supplies any, an entry's row id is outside the ids the target
+    /// holds, or an entry's value count does not match its index's column
+    /// count.
     pub async fn register_delete_file(
         &mut self,
         table: TableId,

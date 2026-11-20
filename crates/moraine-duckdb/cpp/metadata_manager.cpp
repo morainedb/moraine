@@ -143,6 +143,24 @@ duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::AttachMetadata(c
 	return duckdb::DuckLakeMetadataManager::AttachMetadata(attach_query);
 }
 
+duckdb::DuckLakeMetadata MoraineMetadataManager::LoadDuckLake() {
+	auto metadata = duckdb::DuckLakeMetadataManager::LoadDuckLake();
+	auto &lake = transaction.GetCatalog();
+	bool recorded = std::any_of(metadata.tags.begin(), metadata.tags.end(),
+	                            [](const duckdb::DuckLakeTag &tag) { return tag.key == "data_path"; });
+	if (recorded || lake.DataPath().empty() || lake.GetAttached().IsReadOnly()) {
+		return metadata;
+	}
+	duckdb::string insert = duckdb::StringUtil::Format(
+	    "INSERT INTO {METADATA_CATALOG}.ducklake_metadata (key, value) VALUES ('data_path', %s);",
+	    duckdb::SQLString(StorePath(lake.DataPath())));
+	auto result = Execute(insert);
+	if (result->HasError()) {
+		result->ThrowError("moraine: recording the attach's DATA_PATH: ");
+	}
+	return metadata;
+}
+
 bool MoraineMetadataManager::TryWriteSnapshot(duckdb::DuckLakeSnapshot snapshot) {
 	auto &context = *transaction.GetConnection().context;
 	auto &catalog = ResolveMoraineCatalog(context, transaction.GetCatalog().MetadataDatabaseName());

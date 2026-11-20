@@ -338,13 +338,12 @@ fn ducklake_flush_clears_inlined_file_deletions() {
 
 /// A flush output's dense start is its lowest embedded id, so a batch
 /// straddling two partitions leaves one partition's file with gaps the
-/// start hides, ending exactly where a dense predecessor ends. Stock
-/// DuckLake's merge chains the two by start arithmetic and numbers the
-/// merged file by position, renumbering every row after a gap onto ids
-/// the other partition holds. The bundled DuckLake never chains a
-/// flushed file: the merge writes the row-id column and every row keeps
-/// its id. (The commit's refusal of a merge that would renumber is
-/// pinned at the core level, where such a merge can be staged directly.)
+/// start hides, ending exactly where a dense predecessor ends. DuckLake
+/// judges the two adjacent by start arithmetic and registers the merged
+/// file at the first file's start, but writes every row's id into it, so
+/// every row keeps its id. (The commit's refusal of a merge that would
+/// renumber is pinned at the core level, where such a merge can be
+/// staged directly.)
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_merge_of_a_straddling_flush_output_keeps_every_row_id() {
@@ -395,15 +394,6 @@ fn ducklake_merge_of_a_straddling_flush_output_keeps_every_row_id() {
         vec![vec!["2"]]
     );
     assert_eq!(
-        csv_rows(&run_standalone_sql(
-            store,
-            "SELECT row_id_start IS NULL FROM m.ducklake_data_file \
-             WHERE end_snapshot IS NULL AND record_count = 190;",
-        )),
-        vec![vec!["true"]],
-        "the merged file carries its rows' ids rather than a dense start"
-    );
-    assert_eq!(
         csv_rows(&run_ducklake_sql_with_options(
             store,
             data_path,
@@ -418,9 +408,9 @@ fn ducklake_merge_of_a_straddling_flush_output_keeps_every_row_id() {
 /// An update's output keeps its rows' original ids per row yet is
 /// registered with a dense start at the next free id, so the file
 /// inserted after it starts exactly where that start plus its row count
-/// ends. The bundled DuckLake never chains them: the merge writes the
-/// row-id column and every row keeps its id, with the commit's hold live
-/// to refuse anything else.
+/// ends. DuckLake chains them into one file registered at the update's
+/// start, but writes the row-id column, so every row keeps its id, with
+/// the commit's hold live to refuse anything else.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_merge_of_an_update_output_keeps_every_row_id() {
@@ -473,15 +463,6 @@ fn ducklake_merge_of_an_update_output_keeps_every_row_id() {
         "the update's output and the file registered after it merge"
     );
 
-    assert_eq!(
-        csv_rows(&run_standalone_sql(
-            store,
-            "SELECT row_id_start IS NULL FROM m.ducklake_data_file \
-             WHERE end_snapshot IS NULL AND record_count = 20;",
-        )),
-        vec![vec!["true"]],
-        "the merged file carries its rows' ids rather than a dense start"
-    );
     let after = csv_rows(&run_ducklake_sql_with_options(
         store, data_path, options, ids,
     ));

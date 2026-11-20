@@ -1537,9 +1537,10 @@ impl Transaction {
 
     /// Registers a delete file targeting a live data file's rows, removing
     /// the equality-index entries of the rows it kills. Each removal names
-    /// the killed row by id — inside a dense target's row-id range, or a
-    /// per-row-id target's embedded id — with the values the dead row was
-    /// indexed under. Table statistics are unchanged.
+    /// the killed row by id — within the ids the target's rows hold: the
+    /// recorded bounds of its embedded row-id column, else its dense range
+    /// — with the values the dead row was indexed under. Table statistics
+    /// are unchanged.
     ///
     /// # Errors
     ///
@@ -1548,9 +1549,9 @@ impl Transaction {
     /// `index_entries` entry names an index not live on the table.
     /// Returns [`Error::Constraint`] if the table has live indexes and a
     /// non-empty delete file supplies no `index_entries`, an empty delete
-    /// file supplies any, an entry's row id is outside a dense target's
-    /// row-id range, or an entry's value count does not match its index's
-    /// column count.
+    /// file supplies any, an entry's row id is outside the ids the target
+    /// holds, or an entry's value count does not match its index's column
+    /// count.
     pub fn register_delete_file(
         &mut self,
         table: TableId,
@@ -1597,18 +1598,9 @@ impl Transaction {
             )));
         }
 
-        // A dense target's ids are `row_id_start..row_id_start +
-        // record_count`; a per-row-id target's are the writer's to supply.
-        if let Some(start) = data_file.row_id_start {
-            let end = start.checked_add(data_file.record_count).ok_or_else(|| {
-                Error::Constraint(format!(
-                    "register_delete_file: target data file {}'s row-id range overflows u64 \
-                     on table {table}",
-                    file.data_file_id
-                ))
-            })?;
+        if let Some((low, end)) = self.file_row_id_range(table, &data_file)? {
             for entry in index_entries {
-                if entry.row_id < start || entry.row_id >= end {
+                if entry.row_id < low || entry.row_id >= end {
                     return Err(Error::Constraint(format!(
                         "register_delete_file: index entry row id {} is outside the target \
                          file's row-id range on table {table}",
@@ -1644,6 +1636,48 @@ impl Transaction {
         });
 
         Ok(DeleteFileId::new(delete_file_id))
+    }
+
+    /// The half-open range of ids a data file's rows hold: the recorded
+    /// bounds of its embedded row-id column when it carries them or the
+    /// dense range at its start. A file with neither leaves its ids to the
+    /// writer.
+    fn file_row_id_range(
+        &self,
+        table: TableId,
+        data_file: &DataFileValue,
+    ) -> Result<Option<(u64, u64)>> {
+        let overflow = || {
+            Error::Constraint(format!(
+                "register_delete_file: target data file {}'s row-id range overflows u64 \
+                 on table {table}",
+                data_file.data_file_id
+            ))
+        };
+        let recorded = self
+            .state
+            .file_column_stats
+            .get(&table.get())
+            .and_then(|stats| {
+                stats.get(&(data_file.data_file_id, crate::data_file::ROW_ID_FIELD_ID))
+            });
+        let parse = |value: &Option<String>| -> Option<u64> {
+            u64::try_from(value.as_ref()?.parse::<i64>().ok()?).ok()
+        };
+        if let Some(stats) = recorded
+            && let (Some(low), Some(high)) = (parse(&stats.min_value), parse(&stats.max_value))
+            && low <= high
+        {
+            return Ok(Some((low, high.checked_add(1).ok_or_else(overflow)?)));
+        }
+
+        let Some(start) = data_file.row_id_start else {
+            return Ok(None);
+        };
+        let end = start
+            .checked_add(data_file.record_count)
+            .ok_or_else(overflow)?;
+        Ok(Some((start, end)))
     }
 
     /// Stages the entry removals a delete file's index entries name, each
@@ -3727,6 +3761,125 @@ mod tests {
                 .any(|e| e.delete && e.row_id == 42),
             "the removal is staged under the supplied row id"
         );
+    }
+
+    /// A `DataFileValue` registered at a dense start whose rows carry
+    /// other ids, with the row-id statistics DuckLake records for the
+    /// embedded column: a merged file, as DuckLake registers one.
+    fn seed_merged_file(transaction: &mut Transaction, table: TableId, data_file_id: u64) {
+        transaction.state.put_data_file(DataFileValue {
+            data_file_id,
+            table_id: table.get(),
+            begin_snapshot: 1,
+            end_snapshot: None,
+            file_order: None,
+            path: "merged.parquet".into(),
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: 20,
+            file_size_bytes: 1024,
+            footer_size: 64,
+            row_id_start: Some(100),
+            partition_id: None,
+            encryption_key: None,
+            mapping_id: None,
+            partial_max: None,
+            partition_values: vec![],
+            row_group_count: None,
+        });
+        transaction
+            .state
+            .put_file_column_stats(FileColumnStatsValue {
+                data_file_id,
+                table_id: table.get(),
+                column_id: crate::data_file::ROW_ID_FIELD_ID,
+                column_size_bytes: 160,
+                value_count: Some(20),
+                null_count: Some(0),
+                min_value: Some("9".into()),
+                max_value: Some("119".into()),
+                contains_nan: None,
+                extra_stats: None,
+                variant_stats: vec![],
+                min_is_exact: None,
+                max_is_exact: None,
+            });
+    }
+
+    #[test]
+    fn delete_removals_against_a_merged_target_are_checked_against_its_embedded_ids() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let col_a = transaction.state.columns_of(t)[0].id;
+        let index = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![col_a],
+                    unique: false,
+                },
+                &[],
+            )
+            .unwrap();
+        seed_merged_file(&mut transaction, t, 91);
+
+        // Row id 9 lies below the dense start yet is the file's lowest
+        // embedded id.
+        transaction
+            .register_delete_file(
+                t,
+                delete_file_over(DataFileId::new(91), 1),
+                &[FileIndexRemoval {
+                    index,
+                    row_id: 9,
+                    values: removal_value(7),
+                }],
+            )
+            .unwrap();
+        assert!(
+            transaction
+                .index_entries
+                .iter()
+                .any(|e| e.delete && e.row_id == 9),
+            "the removal is staged under the embedded row id"
+        );
+    }
+
+    #[test]
+    fn delete_removals_outside_a_merged_targets_embedded_ids_are_refused() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let col_a = transaction.state.columns_of(t)[0].id;
+        let index = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![col_a],
+                    unique: false,
+                },
+                &[],
+            )
+            .unwrap();
+        seed_merged_file(&mut transaction, t, 91);
+
+        // Row id 120 would be inside the dense range [100, 120) only if
+        // it were half-open from 100; the file's ids end at 119.
+        let err = transaction
+            .register_delete_file(
+                t,
+                delete_file_over(DataFileId::new(91), 1),
+                &[FileIndexRemoval {
+                    index,
+                    row_id: 120,
+                    values: removal_value(7),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
     }
 
     #[test]
