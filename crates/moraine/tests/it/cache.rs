@@ -186,15 +186,18 @@ async fn a_read_only_handle_scans_once_for_many_dumps() {
     )
     .await
     .unwrap();
-    counting.take_reads();
+    counting.take_sst_reads();
 
     // Reader discovery is excluded; only the dump populates this measurement.
+    // Table bytes are counted as SST ranges rather than GETs: the cold dump
+    // coalesces its ranges into one GET, which leaves no room for the
+    // manifest poll a slow run can pay during the warm dumps.
     let first = moraine::ffi_support::dump_data_files(&reader)
         .await
         .unwrap();
-    let cold = counting.take_reads();
+    let cold = counting.take_sst_reads();
     assert!(!first.is_empty(), "seed did not land");
-    assert!(cold > 0, "a cold dump read nothing");
+    assert!(cold > 0, "a cold dump read no table bytes");
 
     // Repeated dumps must reuse the blocks populated by the first dump.
     for _ in 0..12 {
@@ -203,11 +206,11 @@ async fn a_read_only_handle_scans_once_for_many_dumps() {
             .unwrap();
         assert_eq!(again.len(), first.len());
     }
-    let warm = counting.take_reads();
+    let warm = counting.take_sst_reads();
 
     assert!(
         warm < cold,
-        "twelve further dumps cost {warm} reads against {cold} for one: the reader is \
+        "twelve further dumps read {warm} SST ranges against {cold} for one: the reader is \
          rescanning per dump"
     );
 }
