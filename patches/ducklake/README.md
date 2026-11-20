@@ -66,27 +66,6 @@ applies them) and then the series below, in file-name order:
    positions directly. Rollback, repeated deletes, prepared statements,
    and autocommit are covered by `cargo xtask e2e`.
 
-`0007-fix-keep-the-row-ids-a-merged-file-carries.patch` stops
-`ducklake_merge_adjacent_files` registering the merged file at a dense
-`row_id_start`. DuckLake writes the row-id column into every merged file,
-then judges two files adjacent from `row_id_start + record_count` and
-registers the merge at the first file's start, which discards those ids. A
-file's start says nothing about the ids its rows carry: a flushed file
-whose batch straddled two partitions holds ids with gaps under a start that
-is only the lowest of them, and an update's output holds its rows' original
-ids under a start at the next free id. Either chains onto a neighbour, and
-every row after a gap is renumbered onto ids other rows hold. Covered by
-`cargo xtask e2e`, which merges both shapes and reads the ids back.
-
-`0008-fix-bound-compaction-input-files.patch` makes `max_compacted_files`
-count input files, including files within a single merge group. Previously,
-eight adjacent files could all merge with a limit of four because the
-counter advanced once per group. The inner candidate loop now stops at the
-remaining allowance, and only scheduled inputs consume it. A merge with
-room for just one input skips it because a merge needs two; later passes
-continue the remaining work. The maintenance CLI regressions cover the
-limit, preserved rows, and pending-work status.
-
 `0009-perf-bound-the-commit-time-head-lookup.patch` adds
 `snapshot_id >= {SNAPSHOT_ID}` to both halves of the commit-time head
 lookup in `GetSnapshotAndStatsAndChangesQuery`: the outer row and the
