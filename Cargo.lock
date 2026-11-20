@@ -2036,6 +2036,7 @@ dependencies = [
  "bytes",
  "cbindgen",
  "futures",
+ "http",
  "moraine",
  "object_store",
  "parquet",

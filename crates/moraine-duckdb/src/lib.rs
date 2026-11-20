@@ -192,6 +192,18 @@
 //! -- run the workload, then:
 //! SELECT log_level, message FROM duckdb_logs WHERE type = 'moraine';
 //! ```
+//!
+//! # Browser build
+//!
+//! Compiled for `wasm32-unknown-emscripten`, the extension is a read-only
+//! catalog for DuckDB-Wasm: attach with `READ_ONLY` over `s3://` or
+//! `memory://`. Its S3 client sends every request through the transport the
+//! shim registers with `moraine_register_http_transport` (see
+//! [`abi::http_transport`]), a synchronous request from the Web Worker
+//! DuckDB-Wasm runs in, so the bucket's CORS policy must allow `GET` and
+//! `HEAD` from the page's origin and expose `ETag`, `Content-Length`,
+//! `Content-Range`, and `Last-Modified`. The runtime is single-threaded and
+//! advances only inside a call; a request in flight cannot be interrupted.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

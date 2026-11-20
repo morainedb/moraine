@@ -205,7 +205,7 @@ where
         // which the waiters above cannot.
         crate::telemetry::reporting_phase(
             "index-encoding-hold",
-            tokio::task::spawn_blocking(move || {
+            crate::blocking::offload(move || {
                 let _permit = permit;
                 let _memory = memory;
                 work()

@@ -501,7 +501,7 @@ async fn publish_summary(
         let rows = Arc::clone(rows);
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = CancelOnDrop(Arc::clone(&cancelled));
-        let bytes = tokio::task::spawn_blocking(move || {
+        let bytes = crate::blocking::offload(move || {
             let _permit = permit;
             let bytes = sidecar::encode_checked(
                 identity_of(&owned_file, table, data_file),
@@ -617,7 +617,7 @@ pub(super) async fn read_row_ids_limited(
     let _cancel = CancelOnDrop(Arc::clone(&cancelled));
     // Permits move with CPU work: cancelling its waiter cannot admit another
     // build while the blocking task still owns its buffers.
-    tokio::task::spawn_blocking(move || {
+    crate::blocking::offload(move || {
         let (_permit, _background, _memory) = (permit, background, memory);
         PositionedRowSet::from_file_order_checked(row_ids, || {
             if cancelled.load(Ordering::Relaxed) {

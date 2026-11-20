@@ -295,6 +295,7 @@
 
 mod background;
 pub use background::{BackgroundRequest, BackgroundWork};
+mod blocking;
 mod catalog;
 mod commit_log;
 mod data_file;
