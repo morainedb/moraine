@@ -7,4 +7,8 @@ namespace moraine_duckdb {
 // Consumes only the driving session's armed read stall.
 uint64_t TakeMoraineReadStall(duckdb::ClientContext &context);
 
+// Consumes the driving session's armed acknowledgement drop for its next
+// commit.
+bool TakeMoraineDroppedCommitAck(duckdb::ClientContext &context);
+
 } // namespace moraine_duckdb

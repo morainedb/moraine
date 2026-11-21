@@ -1680,6 +1680,10 @@ int32_t moraine_validate_host_memory(uint64_t duckdb_bytes,
                                      bool writer,
                                      struct MoraineError *err);
 
+// Arms the next commit on this thread to land and then report its outcome
+// as unknown, as a commit whose acknowledgement was lost does.
+void moraine_fault_drop_next_commit_ack(void);
+
 // Arms a stall for the cancellable call entering on this thread.
 // The shim consumes its session-owned arm before making this handoff.
 void moraine_fault_stall_next_read(uint64_t milliseconds);

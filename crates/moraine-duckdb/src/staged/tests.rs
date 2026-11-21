@@ -70,6 +70,52 @@ fn a_commit_registering_data_files_warms_those_tables() {
     unsafe { moraine_detach(handle) };
 }
 
+/// An armed acknowledgement drop lands the commit and reports its outcome
+/// as unknown, as a commit whose acknowledgement was lost does.
+#[test]
+fn a_dropped_acknowledgement_lands_the_commit_and_reports_it_unknown() {
+    let lake = TempDir::new("commit-dropped-ack");
+    let data = TempDir::new("commit-dropped-ack-data");
+    let handle = attach_with_data_path(lake.path(), data.path());
+
+    let tx = begin(handle);
+    let mut arena = StrArena::new();
+    stage_table_row(tx, &mut arena, 1, (1, None), 0, "t", "t/");
+    stage_snapshot_and_changes(tx, &mut arena, 1, 1, 2, r#"created_table:"main"."t""#);
+    stage(tx, 11, 0, &[u64_cell(1), u64_cell(1), u64_cell(1)]);
+    crate::abi::moraine_fault_drop_next_commit_ack();
+    let mut id: u64 = 0;
+    let mut err = MoraineError::default();
+    // SAFETY: `tx` is live; outputs are valid local slots.
+    let code = unsafe { moraine_tx_commit(tx, &raw mut id, None, ptr::null_mut(), &raw mut err) };
+    assert_eq!(code, codes::COMMIT_OUTCOME_UNKNOWN);
+    // SAFETY: `err.message` was written by `moraine_tx_commit` on failure.
+    let message = unsafe { std::ffi::CStr::from_ptr(err.message) }
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        message.contains("commit outcome unknown"),
+        "the fixed unknown-outcome message must be reported: {message}"
+    );
+    // SAFETY: `err.message` is freed exactly once.
+    unsafe { crate::abi::moraine_error_free(err.message) };
+
+    // SAFETY: attached above and not yet detached.
+    let catalog = unsafe { &*handle };
+    let head = catalog
+        .block_on(async { catalog.catalog.reads().read_scope().await })
+        .unwrap()
+        .current_snapshot()
+        .id
+        .get();
+    assert_eq!(
+        head, 1,
+        "the commit landed although it was reported unknown"
+    );
+    // SAFETY: attached above, detached exactly once.
+    unsafe { moraine_detach(handle) };
+}
+
 /// A commit that registers no data files spawns no warming.
 #[test]
 fn a_commit_registering_no_data_files_warms_nothing() {
