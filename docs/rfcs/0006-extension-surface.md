@@ -297,6 +297,7 @@ path as its first argument, as noted.
 | `moraine_index_nulls` | catalog, schema, table, index, prefix | null-aware prefix lookup | [indexes](0009-equality-indexes.md) |
 | `moraine_index_verify` | catalog, schema, table, index | verifies and certifies an index | [indexes](0009-equality-indexes.md) |
 | `moraine_fault_stall_next_read` | milliseconds | arms a stall in the next cancellable read, for cancellation tests | this document |
+| `moraine_fault_drop_next_commit_ack` | | arms the next commit to land and report its outcome as unknown, for retention tests | this document |
 
 `CREATE INDEX` and `DROP INDEX` on a moraine-backed table are intercepted by
 `RegisterMoraineIndexDdl`. The scan operators `moraine_metadata_scan`,
@@ -435,10 +436,16 @@ Every entry point wraps its body, `block_on` included, in `catch_unwind` through
 with a fixed message that never derives from the panic payload, so no unwind
 crosses the C boundary.
 
-The extension ships one fault seam for proving cancellation:
+The extension ships two fault seams.
 `moraine_fault_stall_next_read(milliseconds)` arms a sleep that the next
-cancellable call awaits inside its `select!`, in place of a slow store. One
-arming stalls one call, and only the probe hop transfers it.
+cancellable call awaits inside its `select!`, in place of a slow store, for
+proving cancellation. One arming stalls one call, and only the probe hop
+transfers it. `moraine_fault_drop_next_commit_ack()` arms the session's next
+commit to land and then report `COMMIT_OUTCOME_UNKNOWN`, as a commit whose
+acknowledgement was lost does, for proving that the bundled DuckLake retains the
+files such a commit wrote. The commit runs on DuckLake's own metadata
+connection, so the transaction manager reads the arming from the driving session
+the metadata manager recorded.
 
 ## Logging
 

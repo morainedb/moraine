@@ -3,6 +3,8 @@
 #include "duckdb/common/allocator.hpp"
 
 #include "catalog.hpp"
+#include "fault.hpp"
+#include "metadata_manager.hpp"
 
 #include <mutex>
 #include <unordered_map>
@@ -204,6 +206,13 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 	}
 	uint64_t new_snapshot_id = 0;
 	MoraineError err {};
+	// The commit runs on the metadata connection DuckLake holds; a fault the
+	// driving session armed is read from that session.
+	auto parent_state = context.registered_state->Get<ParentContextState>(ParentContextState::KEY);
+	auto parent = parent_state ? parent_state->parent.lock() : nullptr;
+	if (TakeMoraineDroppedCommitAck(parent ? *parent : context)) {
+		moraine_fault_drop_next_commit_ack();
+	}
 	// Cancellation before polling submits nothing. Once the call starts,
 	// cancellation reports COMMIT_OUTCOME_UNKNOWN and the write may still land.
 	auto code = moraine_tx_commit(staged, &new_snapshot_id, moraine_shim_is_interrupted, &context, &err);

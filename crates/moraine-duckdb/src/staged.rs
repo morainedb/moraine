@@ -447,6 +447,15 @@ pub unsafe extern "C" fn moraine_tx_commit(
             }
         }
 
+        // An armed fault loses the acknowledgement of a commit that landed,
+        // which is what a caller sees when the store stops answering after
+        // its write.
+        if crate::abi::take_dropped_commit_ack() {
+            return Err(AbiError::from(moraine::Error::CommitOutcomeUnknown(
+                "fault-injection: the acknowledgement of a landed commit was dropped".to_owned(),
+            )));
+        }
+
         Ok(report.snapshot_id.get())
     };
 
