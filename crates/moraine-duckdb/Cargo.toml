@@ -21,11 +21,22 @@ async-trait = { workspace = true }
 arrow = { workspace = true, features = ["ffi", "ipc"] }
 bytes = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
 moraine = { workspace = true }
-object_store = { workspace = true, features = ["aws"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# The browser build has no socket or TLS stack: the S3 client runs over an
+# HTTP connector the host supplies, so only the request logic is linked.
+[target.'cfg(not(target_os = "emscripten"))'.dependencies]
+object_store = { workspace = true, features = ["aws"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
+
+# A browser has no threads: the runtime is single-threaded and runs only
+# while the host is inside a call.
+[target.'cfg(target_os = "emscripten")'.dependencies]
+object_store = { workspace = true, features = ["aws-base"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 
 [build-dependencies]
 cbindgen = { workspace = true }

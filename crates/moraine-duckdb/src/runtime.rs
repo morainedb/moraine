@@ -1,5 +1,5 @@
 //! Opaque handles owned across the FFI boundary, and the sync↔async
-//! bridge: one tokio multi-threaded runtime per attached catalog.
+//! bridge: one tokio runtime per attached catalog.
 
 use std::{
     ffi::c_void,
@@ -485,14 +485,27 @@ pub(crate) fn worker_threads(requested: usize) -> usize {
 /// tell which catalog a worker or driver belongs to. The size is fixed
 /// at attach.
 pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result<Runtime> {
-    let runtime = Builder::new_multi_thread()
+    let mut builder = flavor();
+    builder
         .worker_threads(worker_threads(requested))
         .enable_all()
         // At most 15 bytes: the kernel truncates longer names in `/proc`.
         .thread_name(format!("moraine-{log_id}"))
-        .on_thread_start(move || tag_thread_for_handle(log_id))
-        .build()?;
-    Ok(runtime)
+        .on_thread_start(move || tag_thread_for_handle(log_id));
+    builder.build()
+}
+
+/// Multi-threaded where threads exist. A browser has one thread, so its
+/// runtime advances only while a call is inside `block_on`.
+fn flavor() -> Builder {
+    #[cfg(not(target_os = "emscripten"))]
+    {
+        Builder::new_multi_thread()
+    }
+    #[cfg(target_os = "emscripten")]
+    {
+        Builder::new_current_thread()
+    }
 }
 
 #[cfg(test)]

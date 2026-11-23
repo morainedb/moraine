@@ -59,6 +59,8 @@ Rust embedders.
   attach, options, functions, relocating a copied lake, the C ABI, runtime
 - [Maintenance](0010-maintenance.md) — expiry and compaction translation,
   the scheduled pass, sweeps
+- [Browser build](0013-browser-build.md) — the read-only DuckDB-Wasm build:
+  host HTTP transport, single-threaded runtime, platform gates
 
 ### Internal
 

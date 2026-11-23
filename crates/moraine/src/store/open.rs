@@ -304,6 +304,11 @@ impl<'a> StoreBuilder<'a> {
     /// Opens (or creates) the store as a read-write [`Db`], with the
     /// per-store counters its reads tally into.
     pub(crate) async fn open_writer(&self) -> Result<(Db, Arc<cache::CacheCounters>)> {
+        if cfg!(target_os = "emscripten") {
+            return Err(Error::Unsupported(
+                "the browser build is read-only; attach with READ_ONLY".into(),
+            ));
+        }
         let mut settings = self.settings();
         let limit = crate::memory::store_memory_budget()?;
         settings.max_unflushed_bytes = usize::try_from(limit).map_err(|_| {
@@ -357,6 +362,14 @@ impl<'a> StoreBuilder<'a> {
     }
 
     async fn open_reader_mode(&self, fixed: bool) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
+        // A reader over a commit log keeps a checkpoint of its own, which is a
+        // write.
+        if cfg!(target_os = "emscripten") && self.reader_session.is_some() {
+            return Err(Error::Unsupported(
+                "the browser build reads the latest manifest or a pinned checkpoint, not a commit log"
+                    .into(),
+            ));
+        }
         let defaults = DbReaderOptions::default();
         let options = DbReaderOptions {
             manifest_poll_interval: self.poll_interval,

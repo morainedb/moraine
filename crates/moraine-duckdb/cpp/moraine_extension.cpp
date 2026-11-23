@@ -42,6 +42,10 @@ void RegisterMoraineCheckpointFunctions(duckdb::ExtensionLoader &loader);
 extern "C" void moraine_enterprise_init(void);
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include "http_transport.hpp"
+#endif
+
 namespace duckdb {
 
 // Registers the bundled DuckLake and records it as the loaded `ducklake`
@@ -75,6 +79,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// it registers.
 	LoadBundledDuckLake(loader);
 	loader.SetDescription("moraine: a SlateDB-backed DuckLake catalog, DuckLake bundled");
+#ifdef __EMSCRIPTEN__
+	// The S3 client has no socket stack here; every request goes through
+	// the browser.
+	moraine_duckdb::RegisterMoraineHttpTransport();
+#endif
 	moraine_duckdb::RegisterMoraineMetadataManager();
 	moraine_duckdb::RegisterMoraineStorageExtension(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineSettings(loader.GetDatabaseInstance().config);
