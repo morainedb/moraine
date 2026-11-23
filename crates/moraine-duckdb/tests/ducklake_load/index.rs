@@ -3,6 +3,8 @@ use std::fmt::Write;
 use crate::helpers::*;
 
 mod delete_rewrite;
+mod located_types;
+mod located_update;
 mod native_ddl;
 mod predicates;
 mod prepared;
@@ -859,12 +861,11 @@ fn moraine_index_survives_update_and_compaction() {
     assert_eq!(lookup_count(7), vec![vec!["1".to_string()]]);
     assert_eq!(
         count(
-            // The located file id is part of the join: an UPDATE leaves an
-            // expired physical copy behind, and only the visible one matches.
+            // An UPDATE leaves an expired physical copy behind; the located
+            // join returns only the visible one.
             "SELECT data.b FROM lake.main.t data \
              JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 7) hits \
-               ON data.rowid = hits.row_id \
-              AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;"
+               ON data.rowid = hits.row_id;"
         ),
         vec![vec!["updated".to_string()]],
         "the row-id join follows the preserved id into the UPDATE file"
@@ -932,10 +933,9 @@ fn total_files_read(plan: &str) -> u64 {
         .unwrap_or_else(|| panic!("no `Total Files Read` in the analyzed plan:\n{plan}"))
 }
 
-/// A join against an index read restricts the scan to the rows the lookup
-/// already resolved. The condition alone does not: a hash join's runtime
-/// filters arrive after DuckLake has built its file list, and null-safe
-/// equality generates none at all.
+/// A join against an index read replaces the scan with the located one, which
+/// opens only the file holding the row. DuckLake's row-id statistics alone
+/// admit every update file whose row-id range spans the id.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_join_reads_only_the_file_holding_the_row() {
@@ -952,10 +952,6 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
 
     let located_join = "SELECT data.b FROM lake.main.t data \
          JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
-           ON data.rowid = hits.row_id \
-          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
-    let row_id_join = "SELECT data.b FROM lake.main.t data \
-         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
            ON data.rowid = hits.row_id";
 
     assert_eq!(
@@ -965,14 +961,17 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
     );
 
     let located = total_files_read(&run(&format!("EXPLAIN ANALYZE {located_join};")));
-    let row_id_only = total_files_read(&run(&format!("EXPLAIN ANALYZE {row_id_join};")));
+    // Row 150 was the 151st inserted, so its id is 150.
+    let by_statistics = total_files_read(&run(
+        "EXPLAIN ANALYZE SELECT b FROM lake.main.t WHERE rowid = 150;",
+    ));
     assert_eq!(
         located, 1,
         "the located join read more than the holding file"
     );
     assert!(
-        row_id_only > located,
-        "the row-id join read {row_id_only} files and the located join {located}; \
+        by_statistics > located,
+        "row-id statistics admitted {by_statistics} files and the located join read {located}; \
          the update files no longer overlap, so this proves nothing"
     );
 
@@ -990,8 +989,7 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
 
 /// An UPDATE out of a file into inline data leaves the row two candidates:
 /// the expired copy the file still carries, and the live inlined one. The
-/// restriction must admit both, or the scan reads only the copy DuckLake
-/// then adjudicates away and the join returns nothing.
+/// located join reads both and returns the live one, once.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_join_follows_a_row_updated_out_of_its_file() {
@@ -1010,23 +1008,16 @@ fn a_located_join_follows_a_row_updated_out_of_its_file() {
 
     assert_eq!(
         csv_rows(&run(
-            // Rendered rather than compared as NULL, so the ordering and the
-            // absent file id are both unambiguous.
-            "SELECT row_id, coalesce(data_file_id::VARCHAR, 'inlined') \
-             FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42) ORDER BY 2;"
+            "SELECT row_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"
         )),
-        vec![
-            vec!["42".to_string(), "0".to_string()],
-            vec!["42".to_string(), "inlined".to_string()],
-        ],
-        "the lookup stopped offering both the file copy and the inlined one"
+        vec![vec!["42".to_string()]],
+        "the lookup names the row once, whichever copies it has"
     );
 
     assert_eq!(
         csv_rows(&run("SELECT data.b FROM lake.main.t data \
              JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 42) hits \
-               ON data.rowid = hits.row_id \
-              AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;")),
+               ON data.rowid = hits.row_id;")),
         vec![vec!["now-inlined".to_string()]],
         "the located join lost the live inlined copy of an updated row"
     );
@@ -1068,8 +1059,7 @@ fn a_prepared_located_join_resolves_each_key_it_is_executed_with() {
 
     let prepare = "PREPARE located AS SELECT data.b AS value FROM lake.main.t data \
          JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', $1) hits \
-           ON data.rowid = hits.row_id \
-          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;";
+           ON data.rowid = hits.row_id;";
 
     // One header per result set, and these executions produce four.
     let executed: Vec<Vec<String>> = csv_rows(&run(&format!(
@@ -1142,8 +1132,7 @@ fn a_located_delete_reads_only_the_file_holding_the_row() {
 
     let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t \
          USING moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
-         WHERE t.rowid = hits.row_id \
-           AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
+         WHERE t.rowid = hits.row_id;");
     assert_eq!(
         total_files_read(&plan),
         1,
@@ -1176,8 +1165,7 @@ fn a_located_update_reads_only_the_file_holding_the_row() {
     let plan = run("EXPLAIN ANALYZE UPDATE lake.main.t \
          SET b = 'relocated' \
          FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
-         WHERE t.rowid = hits.row_id \
-           AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
+         WHERE t.rowid = hits.row_id;");
     assert_eq!(
         total_files_read(&plan),
         1,
@@ -1210,8 +1198,7 @@ fn a_located_exists_probe_reads_only_the_file_holding_the_row() {
     let probe = "SELECT data.b FROM lake.main.t data \
          WHERE EXISTS (SELECT 1 \
              FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
-            WHERE data.rowid = hits.row_id \
-              AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id)";
+            WHERE data.rowid = hits.row_id)";
 
     assert_eq!(
         csv_rows(&run(&format!("{probe};"))),
@@ -1261,8 +1248,7 @@ fn a_wide_located_probe_still_prunes_by_file_id() {
     let probe = format!(
         "SELECT count(data.b) FROM lake.main.t data \
          JOIN moraine_index_in('lake', 'main', 't', 'by_a', [{keys}]) hits \
-           ON data.rowid = hits.row_id \
-          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id"
+           ON data.rowid = hits.row_id"
     );
 
     assert_eq!(

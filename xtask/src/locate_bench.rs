@@ -2,8 +2,8 @@
 //!
 //! Reports the four numbers the design rests on: the bytes the summary cache
 //! holds, the time to build a sparse file's summary, the time a located
-//! lookup takes cold and warm, and the files a DuckLake scan reads with and
-//! without the located join.
+//! lookup takes cold and warm, and the files a DuckLake scan reads through
+//! the located join against naming the row id as a constant.
 
 use std::{fmt::Write as _, path::Path, process::Command, time::Instant};
 
@@ -227,34 +227,22 @@ fn warm_lookups(cli: &Path, preamble: &str, options: &Options) -> anyhow::Result
     Ok((first_elapsed, per_lookup))
 }
 
-/// Files a scan reads when the located id is already a constant.
-///
-/// This is the ceiling the join is aiming at: the same predicate, known
-/// before DuckLake builds its file list rather than during the join.
+/// Files a scan reads when the row id is a constant: DuckLake's own row-id
+/// statistics decide, with no located read.
 fn files_read_static(cli: &Path, preamble: &str, key: usize) -> anyhow::Result<Option<u64>> {
     let located = run_sql(
         cli,
         &format!(
-            "{preamble}SELECT row_id, data_file_id FROM \
+            "{preamble}SELECT 'row_id', row_id FROM \
              moraine_index_lookup('lake', 'main', 't', 'by_a', {key});\n"
         ),
     )?;
-    let Some((row_id, data_file_id)) = located
-        .lines()
-        .find_map(|line| line.split_once('|'))
-        .and_then(|(row, file)| Some((row.trim().parse::<u64>().ok()?, file.trim().to_owned())))
-    else {
+    let Ok(row_id) = marked_number(&located, "row_id") else {
         return Ok(None);
     };
-    if data_file_id.is_empty() {
-        return Ok(None);
-    }
     let plan = run_sql(
         cli,
-        &format!(
-            "{preamble}EXPLAIN ANALYZE SELECT b FROM lake.main.t \
-             WHERE rowid = {row_id} AND data_file_id = {data_file_id};\n"
-        ),
+        &format!("{preamble}EXPLAIN ANALYZE SELECT b FROM lake.main.t WHERE rowid = {row_id};\n"),
     )?;
     Ok(total_files_read(&plan))
 }
@@ -281,28 +269,14 @@ fn introduce_overlap(
     Ok(())
 }
 
-/// Files a scan reads when it joins on the row id alone, and when it also
-/// takes the located file id.
-fn files_read(
-    cli: &Path,
-    preamble: &str,
-    key: usize,
-) -> anyhow::Result<(Option<u64>, Option<u64>)> {
-    let row_id_only = format!(
+/// Files a scan reads when it joins on the located row id.
+fn files_read(cli: &Path, preamble: &str, key: usize) -> anyhow::Result<Option<u64>> {
+    let located = format!(
         "{preamble}EXPLAIN ANALYZE SELECT data.b FROM lake.main.t data \
          JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', {key}) hits \
            ON data.rowid = hits.row_id;\n"
     );
-    let located = format!(
-        "{preamble}EXPLAIN ANALYZE SELECT data.b FROM lake.main.t data \
-         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', {key}) hits \
-           ON data.rowid = hits.row_id \
-          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;\n"
-    );
-    Ok((
-        total_files_read(&run_sql(cli, &row_id_only)?),
-        total_files_read(&run_sql(cli, &located)?),
-    ))
+    Ok(total_files_read(&run_sql(cli, &located)?))
 }
 
 /// Builds a lake, then reports what locating its rows costs and saves.
@@ -323,17 +297,17 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let key = options.rows_per_file / 2;
     let (cold_ms, cache_bytes) = cold_lookup(&cli, &preamble, key)?;
     let (first_ms, warm_ms) = warm_lookups(&cli, &preamble, &options)?;
-    let (row_id_files, located_files) = files_read(&cli, &preamble, key)?;
+    let located_files = files_read(&cli, &preamble, key)?;
 
-    // Then the same measurement per update batch: the row-id path's cost
-    // grows with update history, not with file count, so one batch
+    // Then the same measurement per update batch: what statistics alone
+    // admit grows with update history, not with file count, so one batch
     // understates it.
     let mut overlap = Vec::new();
     for batch in 1..=options.update_batches {
         introduce_overlap(&cli, &preamble, &options, batch)?;
-        let (row_id_files, located_files) = files_read(&cli, &preamble, key)?;
+        let located_files = files_read(&cli, &preamble, key)?;
         let static_files = files_read_static(&cli, &preamble, key)?;
-        overlap.push((batch, row_id_files, located_files, static_files));
+        overlap.push((batch, located_files, static_files));
     }
 
     let report = |name: &str, value: String| println!("{name:<32}{value}");
@@ -345,20 +319,15 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     report("first lookup ms (builds)", format!("{first_ms:.1}"));
     report("warm lookup ms", format!("{warm_ms:.1}"));
     report(
-        "files read, row id only",
-        row_id_files.map_or_else(|| "none reported".to_owned(), |files| files.to_string()),
-    );
-    report(
-        "files read, located",
+        "files read, located join",
         located_files.map_or_else(|| "none reported".to_owned(), |files| files.to_string()),
     );
     println!("\nfiles read after each update batch:");
-    println!("batch  row id only  located  id as a constant");
+    println!("batch  located join  id as a constant");
     let show = |files: Option<u64>| files.map_or_else(|| "-".to_owned(), |count| count.to_string());
-    for (batch, row_id_files, located_files, static_files) in overlap {
+    for (batch, located_files, static_files) in overlap {
         println!(
-            "{batch:<7}{:<13}{:<9}{}",
-            show(row_id_files),
+            "{batch:<7}{:<14}{}",
             show(located_files),
             show(static_files)
         );

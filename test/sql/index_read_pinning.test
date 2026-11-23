@@ -30,7 +30,7 @@ statement ok
 CREATE INDEX by_a ON indexed.main.t(a);
 
 statement ok reader
-PREPARE probe AS SELECT count(*) FROM indexed.main.t data JOIN moraine_index_lookup('indexed','main','t','by_a',1) hits ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+PREPARE probe AS SELECT count(*) FROM indexed.main.t data JOIN moraine_index_lookup('indexed','main','t','by_a',1) hits ON data.rowid=hits.row_id;
 
 statement ok reader
 BEGIN;

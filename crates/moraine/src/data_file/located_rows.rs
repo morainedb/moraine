@@ -54,9 +54,12 @@ impl Stream for TimedBatches {
 /// The row-id column every located batch carries after its logical columns.
 pub(crate) const ROW_ID_COLUMN: &str = "row_id";
 
-/// The data-file column every located batch ends with; NULL for an inlined
-/// row.
+/// The data-file column that follows the row ids; NULL for an inlined row.
 pub(crate) const DATA_FILE_ID_COLUMN: &str = "data_file_id";
+
+/// The column every located batch ends with: each row's position within
+/// its data file, NULL for an inlined row.
+pub(crate) const POSITION_COLUMN: &str = "position";
 
 /// Opens a projected, position-selected reader without buffering its result.
 pub(crate) async fn scoped_read_row_stream(
@@ -99,21 +102,23 @@ pub(crate) async fn scoped_read_row_stream(
             let _decode_memory = &decode_memory;
             let batch = batch.map_err(corrupt("located read"))?;
             let batch = normalize_batch(batch, normalization.as_ref())?;
+            // Each emitted row's position in the file, which is also its id
+            // offset when the file carries no row-id column.
+            let positions = (0..batch.num_rows())
+                .map(|row| ordinals.borrowed().at(emitted.saturating_add(row)))
+                .collect::<Result<Vec<u64>>>()?;
             let row_ids: ArrayRef = if let Some(position) = row_id_output {
                 let column = batch.columns().get(position).ok_or_else(|| {
                     Error::Corruption("located read: row-id column is out of bounds".to_owned())
                 })?;
                 cast(column.as_ref(), &DataType::UInt64).map_err(corrupt("located read"))?
             } else {
-                let ids = (0..batch.num_rows())
-                    .map(|row| {
-                        ordinals
-                            .borrowed()
-                            .at(emitted.saturating_add(row))
-                            .map(|ordinal| row_id_start.saturating_add(ordinal))
-                    })
-                    .collect::<Result<Vec<u64>>>()?;
-                Arc::new(UInt64Array::from(ids))
+                Arc::new(UInt64Array::from(
+                    positions
+                        .iter()
+                        .map(|ordinal| row_id_start.saturating_add(*ordinal))
+                        .collect::<Vec<u64>>(),
+                ))
             };
             emitted = emitted.saturating_add(batch.num_rows());
 
@@ -128,6 +133,7 @@ pub(crate) async fn scoped_read_row_stream(
                 })
                 .collect::<Result<Vec<_>>>()?;
             arrays.push(row_ids);
+            arrays.push(Arc::new(UInt64Array::from(positions)));
             let batch = unnamed_batch(arrays, batch.num_rows())?;
             crate::MemoryReservation::reserve(batch.get_array_memory_size() as u64)?
                 .into_record_batch(batch)
@@ -165,36 +171,42 @@ pub(crate) fn inline_rows_batch(
         .map(|column| take(column.as_ref(), &indices, None).map_err(corrupt("inline take")))
         .collect::<Result<Vec<_>>>()?;
     arrays.push(Arc::new(UInt64Array::from(row_ids.to_vec())));
+    arrays.push(new_null_array(&DataType::UInt64, offsets.len()));
 
     unnamed_batch(arrays, offsets.len())
 }
 
-/// Names a projected batch and appends its file identity without copying
+/// Names a projected batch, whose last two columns are its rows' ids and
+/// positions, and inserts its file identity between them without copying
 /// columns.
 pub(crate) fn located_batch(
     batch: &RecordBatch,
     names: &[String],
     data_file_id: Option<u64>,
 ) -> Result<RecordBatch> {
-    if batch.num_columns() != names.len().saturating_add(1) {
+    if batch.num_columns() != names.len().saturating_add(2) {
         return Err(Error::Corruption(
             "located batch does not match the table's columns".to_owned(),
         ));
     }
     let rows = batch.num_rows();
+    let (columns, trailing) = batch.columns().split_at(names.len());
     let mut fields: Vec<Field> = names
         .iter()
-        .zip(batch.columns())
+        .zip(columns)
         .map(|(name, array)| Field::new(name, array.data_type().clone(), true))
         .collect();
     fields.push(Field::new(ROW_ID_COLUMN, DataType::UInt64, false));
     fields.push(Field::new(DATA_FILE_ID_COLUMN, DataType::UInt64, true));
+    fields.push(Field::new(POSITION_COLUMN, DataType::UInt64, true));
 
-    let mut arrays = batch.columns().to_vec();
+    let mut arrays = columns.to_vec();
+    arrays.push(trailing[0].clone());
     arrays.push(match data_file_id {
         Some(id) => Arc::new(UInt64Array::from(vec![id; rows])) as ArrayRef,
         None => new_null_array(&DataType::UInt64, rows),
     });
+    arrays.push(trailing[1].clone());
 
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new_with_options(

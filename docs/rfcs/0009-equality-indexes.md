@@ -364,7 +364,7 @@ written `…` below; `moraine_indexes` stops at the table.
 
 | Function | Effect |
 |---|---|
-| `moraine_index_lookup(…, v…)` | `(row_id, data_file_id)` for one equality key, one variadic value per indexed column. |
+| `moraine_index_lookup(…, v…)` | The `row_id` of each row holding one equality key, one variadic value per indexed column. |
 | `moraine_index_in(…, keys)` | Rows for the union of complete keys: a list of scalars for a single-column index, a list of `row(...)` values for a composite one. A key containing NULL matches no row. |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | Rows for a value window. A NULL bound is an open side. |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | Rows for an `IS NULL` query. A `NULL` argument means `IS NULL`, any other means equality. |
@@ -378,11 +378,12 @@ the revision the current DuckDB transaction pinned. A `Constraint` raised on
 the SQL write path carries none of the substrings DuckLake's commit loop
 retries on (`conflict`, `concurrent`, `unique`, `primary key`), while a genuine
 `CommitConflict` does, so DuckLake retries, the re-read finds the winner's
-entry, and the permanent `Constraint` surfaces then. `data_file_id` is NULL for
-an inlined or unlocated row, so a statement naming exact rows joins with
-`rowid = row_id AND data_file_id IS NOT DISTINCT FROM hits.data_file_id`; tuple
-`IN` against these columns drops every NULL file id and is unsafe as a DELETE
-or UPDATE predicate.
+entry, and the permanent `Constraint` surfaces then. Each read names a row
+once, however many copies the file directory still holds for it; the
+`(row_id, data_file_id)` candidates behind the read stay in its bind data for
+the located scan. A statement naming exact rows joins the lookup to the table
+on `rowid = row_id`, and the extension replaces the table's scan beneath that
+join with the located scan, which returns the live copy of each row.
 
 ## Verification and the certificate
 
@@ -445,11 +446,13 @@ Index scans use four components:
   chunks. They update as the file map changes and use the
   [published row summaries](0007-read-path-and-caching.md#published-row-summaries).
 
-Candidate row ids and file ids feed DuckLake's scan as filters on `rowid` and
-the virtual `data_file_id` column, so both the file list and the rows read
-narrow. Results are memoized per pinned revision. A transaction with staged
-writes keeps probing at the revision it started on, because entries carry no
-transaction-local overlay.
+The located scan replaces DuckLake's scan beneath the join or the predicate
+and reads the candidate rows by position, serving DuckLake's `UPDATE` the file
+and position of each row as its own scan would. Where it declines, the plan
+runs as written: no filter derived from the index reaches DuckLake's scan,
+whose file list and row-id statistics stay its own. Results are memoized per
+pinned revision. A transaction with staged writes keeps probing at the
+revision it started on, because entries carry no transaction-local overlay.
 
 The rule declines, leaving the ordinary plan, for a scan at a snapshot other
 than the transaction's, a transaction with local inserts, no ready index over a

@@ -70,7 +70,7 @@ void ReplaceEmptyIndexReads(duckdb::ClientContext &context, duckdb::unique_ptr<d
 // join against a list of constants the planner can already see. Restating that
 // list as a filter on the other side reaches the scan, which a join condition
 // alone does not: a hash join's runtime filters arrive after the file list is
-// built, and null-safe equality generates none at all.
+// built.
 //
 // The pass runs after DuckDB's own optimizers, because that is when every
 // qualifying join exists: DELETE and UPDATE bind their join through the WHERE
@@ -91,12 +91,6 @@ constexpr duckdb::idx_t MAX_EXACT_ROW_ID_VALUES = 256;
 
 // DuckLake expands these into metadata predicates as well as scan filters.
 constexpr duckdb::idx_t MAX_ROW_PRUNING_RANGES = 16;
-
-// Most distinct file ids one derived filter will list. The list dedups to the
-// files holding the rows and is checked against each file's constant id, not
-// against every row, so it stays worthwhile far past the row-id bound; this
-// only keeps a pathological plan bounded.
-constexpr duckdb::idx_t MAX_DERIVED_FILE_ID_VALUES = 16384;
 
 duckdb::LogicalGet *IndexReadGet(duckdb::LogicalOperator &op) {
 	if (op.type != duckdb::LogicalOperatorType::LOGICAL_GET) {
@@ -171,67 +165,35 @@ bool ReferencedColumnBeneath(const duckdb::Expression &expression, duckdb::Logic
 	return ReferencedColumn(expression, get, column);
 }
 
-// The distinct values `rows` carries in `column`, and whether any was NULL.
-// False if the column is not one the located rows describe, or if there are
-// more values than a filter should list.
-bool ResolvedValues(const std::vector<MoraineRowId> &rows, duckdb::idx_t column, duckdb::vector<duckdb::Value> &values,
-                    bool &any_null) {
+// The distinct row ids `rows` carries. False if `column` is not the row id
+// or there are more values than a filter should list.
+bool ResolvedRowIds(const std::vector<MoraineRowId> &rows, duckdb::idx_t column,
+                    duckdb::vector<duckdb::Value> &values) {
+	if (column != INDEX_READ_ROW_ID_COLUMN) {
+		return false;
+	}
 	std::set<uint64_t> seen;
-	any_null = false;
-	auto most_values = column == INDEX_READ_ROW_ID_COLUMN ? MAX_DERIVED_ROW_ID_VALUES : MAX_DERIVED_FILE_ID_VALUES;
 	for (auto &row : rows) {
-		if (column == INDEX_READ_ROW_ID_COLUMN) {
-			if (seen.insert(row.value).second) {
-				values.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(row.value)));
-			}
-		} else if (column == INDEX_READ_DATA_FILE_ID_COLUMN) {
-			if (!row.has_data_file_id) {
-				any_null = true;
-			} else if (seen.insert(row.data_file_id).second) {
-				values.push_back(duckdb::Value::UBIGINT(row.data_file_id));
-			}
-		} else {
-			return false;
+		if (seen.insert(row.value).second) {
+			values.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(row.value)));
 		}
-		if (values.size() > most_values) {
+		if (values.size() > MAX_DERIVED_ROW_ID_VALUES) {
 			return false;
 		}
 	}
 	return true;
 }
 
-// `expression comparison value` for each resolved value, OR-ed together.
-// Under plain equality a NULL value matches nothing and so contributes no
-// disjunct; under null-safe equality it matches a NULL column.
+// `expression IN (values)`.
 duckdb::unique_ptr<duckdb::Expression> DerivedFilter(const duckdb::Expression &expression,
-                                                     duckdb::ExpressionType comparison,
-                                                     const duckdb::vector<duckdb::Value> &values, bool any_null) {
-	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> disjuncts;
-
-	if (!values.empty()) {
-		auto in_list = duckdb::make_uniq<duckdb::BoundOperatorExpression>(duckdb::ExpressionType::COMPARE_IN,
-		                                                                  duckdb::LogicalType::BOOLEAN);
-		in_list->GetChildrenMutable().push_back(expression.Copy());
-		for (auto &value : values) {
-			in_list->GetChildrenMutable().push_back(duckdb::make_uniq<duckdb::BoundConstantExpression>(value));
-		}
-		disjuncts.push_back(std::move(in_list));
+                                                     const duckdb::vector<duckdb::Value> &values) {
+	auto in_list = duckdb::make_uniq<duckdb::BoundOperatorExpression>(duckdb::ExpressionType::COMPARE_IN,
+	                                                                  duckdb::LogicalType::BOOLEAN);
+	in_list->GetChildrenMutable().push_back(expression.Copy());
+	for (auto &value : values) {
+		in_list->GetChildrenMutable().push_back(duckdb::make_uniq<duckdb::BoundConstantExpression>(value));
 	}
-	if (any_null && comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-		auto is_null = duckdb::make_uniq<duckdb::BoundOperatorExpression>(duckdb::ExpressionType::OPERATOR_IS_NULL,
-		                                                                  duckdb::LogicalType::BOOLEAN);
-		is_null->GetChildrenMutable().push_back(expression.Copy());
-		disjuncts.push_back(std::move(is_null));
-	}
-
-	if (disjuncts.empty()) {
-		return nullptr;
-	}
-	if (disjuncts.size() == 1) {
-		return std::move(disjuncts[0]);
-	}
-	return duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_OR,
-	                                                             std::move(disjuncts[0]), std::move(disjuncts[1]));
+	return std::move(in_list);
 }
 
 struct RowPruning {
@@ -326,7 +288,7 @@ bool TrySummaryJoin(duckdb::ClientContext &context, duckdb::LogicalComparisonJoi
 	if (!scan) {
 		return false;
 	}
-	bool row_id = false, file_id = false;
+	bool row_id = false;
 	for (auto &condition : join.conditions) {
 		if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
 		    condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
@@ -341,10 +303,8 @@ bool TrySummaryJoin(duckdb::ClientContext &context, duckdb::LogicalComparisonJoi
 		}
 		row_id =
 		    row_id || (index_column == INDEX_READ_ROW_ID_COLUMN && scan_column == duckdb::COLUMN_IDENTIFIER_ROW_ID);
-		file_id = file_id || (index_column == INDEX_READ_DATA_FILE_ID_COLUMN &&
-		                      scan_column == duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID);
 	}
-	return row_id && file_id && UseSummaryScan(context, *scan, index, rows);
+	return row_id && UseSummaryScan(context, *scan, index, rows);
 }
 
 void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
@@ -410,17 +370,14 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 		}
 
 		duckdb::vector<duckdb::Value> values;
-		bool any_null = false;
-		if (!ResolvedValues(*rows, column, values, any_null)) {
+		if (!ResolvedRowIds(*rows, column, values)) {
 			continue;
 		}
-		if (column == INDEX_READ_ROW_ID_COLUMN && values.size() > MAX_EXACT_ROW_ID_VALUES) {
+		if (values.size() > MAX_EXACT_ROW_ID_VALUES) {
 			row_pruning.push_back({other_expression.Copy(), std::move(values)});
 			continue;
 		}
-		if (auto filter = DerivedFilter(other_expression, condition.GetComparisonType(), values, any_null)) {
-			filters.push_back(std::move(filter));
-		}
+		filters.push_back(DerivedFilter(other_expression, values));
 	}
 	auto other_side = 1 - index_side;
 	if (!filters.empty()) {
@@ -606,72 +563,22 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	};
 }
 
-// Pushes `rowid` and `data_file_id` filters for the rows an index resolves a
-// predicate to, as the join rule pushes them for a lookup in the query.
-// Every uncertainty leaves the scan as it was: the filter still runs in full
-// over whatever is read, so a pushed filter can only narrow the reading, and
-// only an index that is complete for the scan's snapshot may narrow it.
+// Replaces the scan with the located scan over the rows an index resolves a
+// predicate to, as the join rule does for a lookup in the query. Only an
+// index that is complete for the scan's snapshot may, and every uncertainty
+// leaves the plan as written. The one exception is exact: no row holds the
+// value, so a range no row id is in makes the scan read nothing.
 void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::LogicalGet &get,
                                  const ResolvedPredicate &found) {
 	auto &table = *found.table;
-	auto &schema_name = found.schema_name;
-	auto &table_name = found.table_name;
-	auto &resolved = found.rows;
 	if (found.rows.empty()) {
-		// No row holds the value, so no row passes: a range no row id is in.
 		get.table_filters.PushFilter(FilterOnlyColumn(get, duckdb::COLUMN_IDENTIFIER_ROW_ID),
 		                             duckdb::ExpressionFilter::CreateComparisonFilter(
 		                                 duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::BIGINT(0)));
 		return;
 	}
-	// The summary scan reads located pages and evaluates the predicate.
-	// With one page per column chunk, it reads as much as row-group pruning.
-	if (UseSummaryScan(context, get, table.ParentCatalog().GetName().GetIdentifierName(), schema_name, table_name,
-	                   resolved)) {
-		return;
-	}
-	duckdb::vector<duckdb::Value> file_ids;
-	bool any_unplaced = false;
-	duckdb::vector<duckdb::Value> row_ids;
-	bool row_null = false;
-	if (!ResolvedValues(resolved, INDEX_READ_DATA_FILE_ID_COLUMN, file_ids, any_unplaced) ||
-	    !ResolvedValues(resolved, INDEX_READ_ROW_ID_COLUMN, row_ids, row_null)) {
-		return;
-	}
-
-	// Files: the ones holding a resolved row, and — for a row the lookup
-	// could not place, or one living inlined — the rows with no file at all.
-	if (!file_ids.empty() || any_unplaced) {
-		duckdb::unique_ptr<duckdb::Expression> file_filter;
-		if (!file_ids.empty()) {
-			file_filter =
-			    duckdb::ExpressionFilter::CreateInExpression(ScanColumn(duckdb::LogicalType::UBIGINT), file_ids);
-		}
-		if (any_unplaced) {
-			auto unplaced = duckdb::ExpressionFilter::CreateNullCheckExpression(
-			    ScanColumn(duckdb::LogicalType::UBIGINT), duckdb::ExpressionType::OPERATOR_IS_NULL);
-			file_filter = file_filter
-			                  ? duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
-			                        duckdb::ExpressionType::CONJUNCTION_OR, std::move(file_filter), std::move(unplaced))
-			                  : std::move(unplaced);
-		}
-		get.table_filters.PushFilter(
-		    FilterOnlyColumn(get, duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID),
-		    duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(file_filter)));
-	}
-
-	// Rows: exact while few, otherwise the ranges the join rule uses, which
-	// cover every resolved id and let the reader skip row groups.
-	duckdb::unique_ptr<duckdb::TableFilter> row_filter;
-	if (row_ids.size() <= MAX_EXACT_ROW_ID_VALUES) {
-		row_filter = duckdb::make_uniq<duckdb::ExpressionFilter>(
-		    duckdb::ExpressionFilter::CreateInExpression(ScanColumn(duckdb::LogicalType::BIGINT), row_ids));
-	} else {
-		row_filter = duckdb::ExpressionFilter::FromTableFilter(*RowRangeFilter(row_ids), duckdb::LogicalType::BIGINT);
-	}
-	if (row_filter) {
-		get.table_filters.PushFilter(FilterOnlyColumn(get, duckdb::COLUMN_IDENTIFIER_ROW_ID), std::move(row_filter));
-	}
+	UseSummaryScan(context, get, table.ParentCatalog().GetName().GetIdentifierName(), found.schema_name,
+	               found.table_name, found.rows);
 }
 
 // The scan a delete reads its rows from, when nothing but projections sit

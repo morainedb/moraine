@@ -11,7 +11,7 @@ fn summary_scan_is_automatic_without_a_public_switch() {
     let data = TempDir::new("selective-control-data");
     let query = "SELECT sum(data.b) FROM lake.main.t data
         JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
-        ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+        ON data.rowid=hits.row_id";
     let options = format!(
         ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
         data.path().display()
@@ -58,7 +58,7 @@ fn summary_scan_uses_physical_coverage() {
          CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          EXPLAIN SELECT sum(length(data.payload)) FROM lake.main.t data
          JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128), lambda x: x * 2048)) hits
-         ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
+         ON data.rowid=hits.row_id;");
     assert!(!result.contains("Moraine Summary Scan"), "{result}");
 }
 
@@ -74,7 +74,7 @@ fn summary_scan_parallel_files_match_serial_and_ordinary() {
     );
     let query = "SELECT 'answer',count(*),sum(length(data.payload)) FROM lake.main.t data
         JOIN moraine_index_lookup('lake','main','t','by_a',0) hits
-        ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+        ON data.rowid=hits.row_id";
     let mut sql = "CALL ducklake_set_option('lake','parquet_row_group_size','2048');
         CREATE TABLE lake.main.t(a BIGINT, payload VARCHAR);"
         .to_owned();
@@ -91,7 +91,7 @@ fn summary_scan_parallel_files_match_serial_and_ordinary() {
     }
     for _ in 0..8 {
         sql.push_str("SELECT data.payload FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',0) hits
-            ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id LIMIT 1;");
+            ON data.rowid=hits.row_id LIMIT 1;");
     }
     let result = run_ducklake_sql_with_options(store.path(), data.path(), &options, &sql);
     let answers: Vec<_> = csv_rows(&result)
@@ -119,7 +119,7 @@ fn summary_driven_scan_keeps_join_and_filters() {
     );
     let query = "SELECT sum(data.b) FROM lake.main.t data
         JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
-        ON data.rowid = hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id
+        ON data.rowid = hits.row_id
         WHERE data.b % 2 = 1 AND data.b > 10";
     let result = run_ducklake_sql_with_options(store.path(), data.path(), &options, &format!(
         "CREATE TABLE lake.main.t AS SELECT i % 10 a, i b, repeat('wide',1000) unused FROM range(10000) r(i);
@@ -162,7 +162,7 @@ fn summary_driven_scan_handles_visibility_and_schema_changes() {
              ALTER TABLE lake.main.t RENAME COLUMN b TO renamed;
              PREPARE p AS SELECT 'answer', sum(data.renamed + data.c) FROM lake.main.t data
              JOIN moraine_index_lookup('lake','main','t','by_a',1) hits
-             ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+             ON data.rowid=hits.row_id;
              EXECUTE p;
              DELETE FROM lake.main.t WHERE renamed=10;
              EXECUTE p;
@@ -186,8 +186,8 @@ fn summary_driven_scan_handles_visibility_and_schema_changes() {
     }
 }
 
-/// Joins missing location identity and unsupported projections keep DuckLake's
-/// scan.
+/// A join against a table the index does not cover and a projection of a
+/// type the located reader cannot decode keep DuckLake's scan.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_driven_scan_declines_unsafe_rewrites() {
@@ -198,14 +198,13 @@ fn summary_driven_scan_declines_unsafe_rewrites() {
         data.path().display()
     );
     let result = run_ducklake_sql_with_options(store.path(), data.path(), &options,
-        "CREATE TABLE lake.main.t AS SELECT 1::BIGINT a, 2::DECIMAL(10,2) b;
+        "CREATE TABLE lake.main.t AS SELECT 1::BIGINT a, INTERVAL 2 MINUTE b;
          CREATE TABLE lake.main.other AS SELECT 1::BIGINT a;
          CREATE UNIQUE INDEX by_a ON lake.main.t(a);
-         EXPLAIN SELECT data.a FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits ON data.rowid=hits.row_id;
          EXPLAIN SELECT data.a FROM lake.main.other data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits
-         ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+         ON data.rowid=hits.row_id;
          EXPLAIN SELECT data.b FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits
-         ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
+         ON data.rowid=hits.row_id;");
     assert!(
         !result.contains("Moraine Summary Scan"),
         "unsafe replacement: {result}"
@@ -228,7 +227,7 @@ fn summary_scan_prepare_defers_projected_reads() {
          CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          CALL enable_logging(level => 'debug', storage => 'memory');
          PREPARE p AS SELECT data.b FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',2) hits
-         ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+         ON data.rowid=hits.row_id;
          SELECT 'opened', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%summary scan opened%';
          EXECUTE p;
          SELECT 'opened', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%summary scan opened%columns=1';
@@ -260,7 +259,7 @@ fn summary_scan_prepare_defers_projected_reads() {
 fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
     let query = "SELECT 'sum', sum(data.b) FROM lake.main.t data
         JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
-        ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+        ON data.rowid=hits.row_id";
     for (limit, table) in [
         (
             0,
@@ -327,7 +326,7 @@ fn summary_scan_reads_uuid_columns() {
     let query = format!(
         "SELECT 'rows', count(*), min(data.owner_id::VARCHAR) FROM lake.main.t data
          JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
-         ON data.rowid = hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id
+         ON data.rowid = hits.row_id
          WHERE data.owner_id = '{owner}'::UUID"
     );
     let result = run_ducklake_sql_with_options(
@@ -373,7 +372,7 @@ fn indexed_operations_stream_positions_above_the_summary_limit() {
          CALL ducklake_flush_inlined_data('lake');
          SELECT 'before',sum(data.b) FROM lake.main.t data
          JOIN moraine_index_lookup('lake','main','t','by_a',7) hits
-         ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+         ON data.rowid=hits.row_id;
          UPDATE lake.main.t SET b=99 WHERE a=7;
          SELECT 'updated',sum(b) FROM lake.main.t WHERE a=7;
          DELETE FROM lake.main.t WHERE a=7;

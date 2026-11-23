@@ -26,9 +26,8 @@ using LookupValueArena = std::deque<LookupValueBacking>;
 // any error. Throws on a type equality indexes do not cover.
 MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueArena &arena, const char *caller);
 
-// Column positions shared by every index read's result.
+// The row id's position in every index read's result.
 constexpr duckdb::idx_t INDEX_READ_ROW_ID_COLUMN = 0;
-constexpr duckdb::idx_t INDEX_READ_DATA_FILE_ID_COLUMN = 1;
 
 // Whether `name` is one of the table functions that resolves index entries to
 // located rows.

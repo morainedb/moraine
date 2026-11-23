@@ -186,32 +186,24 @@ fn a_second_predicate_keeps_the_scan() {
     );
 }
 
-/// Plain UPDATE and an explicit index join prune to one file and read equal
-/// bytes.
+/// Plain UPDATE and an explicit index join both read their row by position
+/// from the one file holding it.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn an_update_matches_explicit_lookup_pruning() {
-    let read_bytes = |plan: &str| -> String {
+    let located = |plan: &str| {
         assert!(
-            plan.lines().any(|line| line.contains("Total Files Read:")
-                && line
-                    .split_once("Total Files Read:")
-                    .unwrap()
-                    .1
-                    .trim_end_matches(['│', ' '])
-                    .trim()
-                    == "1"),
+            plan.contains("Coverage costing ms") && !plan.contains("MORAINE_DELETE_POSITIONS"),
+            "an UPDATE reads by position under DuckLake's own update: {plan}"
+        );
+        assert!(
+            plan.lines()
+                .any(|line| line.contains("Total Files Read: 1")),
             "{plan}"
         );
-        plan.lines()
-            .find_map(|line| {
-                let tail = line.split_once("Data Read:")?.1;
-                Some(tail.trim_end_matches(['│', ' ']).trim().to_owned())
-            })
-            .unwrap_or_else(|| panic!("no Data Read line in {plan}"))
     };
 
-    let predicate = {
+    {
         let store = TempDir::new("update-floor-predicate-store");
         let data = TempDir::new("update-floor-predicate-data");
         let meta = format!(
@@ -220,19 +212,16 @@ fn an_update_matches_explicit_lookup_pruning() {
         );
         let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
         certified_table(&run);
-        let plan = run("EXPLAIN ANALYZE UPDATE lake.main.t SET b = 'z' WHERE a = 30001;");
-        assert!(
-            !plan.contains("MORAINE_DELETE_POSITIONS"),
-            "an UPDATE must keep its scan: {plan}"
-        );
+        located(&run(
+            "EXPLAIN ANALYZE UPDATE lake.main.t SET b = 'z' WHERE a = 30001;",
+        ));
         let result = run("SELECT 'changed', count(*) FROM lake.main.t WHERE a = 30001 AND b = 'z';
              SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
         assert!(has_line(&result, "changed,1"), "{result}");
         assert!(has_line(&result, "verified,0,0,0"), "{result}");
-        read_bytes(&plan)
-    };
+    }
 
-    let named = {
+    {
         let store = TempDir::new("update-floor-named-store");
         let data = TempDir::new("update-floor-named-data");
         let meta = format!(
@@ -241,16 +230,14 @@ fn an_update_matches_explicit_lookup_pruning() {
         );
         let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
         certified_table(&run);
-        read_bytes(&run("EXPLAIN ANALYZE UPDATE lake.main.t SET b = 'z' \
+        located(&run("EXPLAIN ANALYZE UPDATE lake.main.t SET b = 'z' \
              FROM moraine_index_lookup('lake','main','t','by_a',30001) hits \
-             WHERE t.rowid = hits.row_id \
-               AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id;"))
-    };
-
-    assert_eq!(
-        predicate, named,
-        "naming the rows exactly read a different amount than the predicate did"
-    );
+             WHERE t.rowid = hits.row_id;"));
+        let result = run("SELECT 'changed', count(*) FROM lake.main.t WHERE a = 30001 AND b = 'z';
+             SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
+        assert!(has_line(&result, "changed,1"), "{result}");
+        assert!(has_line(&result, "verified,0,0,0"), "{result}");
+    }
 }
 
 /// A prepared delete rebinds after writes and rollback, including pending
@@ -373,7 +360,7 @@ fn a_non_unique_delete_spans_files() {
          CREATE INDEX by_a ON lake.main.t(a);
          SELECT * FROM moraine_index_verify('lake','main','t','by_a');");
     assert_eq!(
-        csv_rows(&run("SELECT count(*), count(DISTINCT data_file_id)
+        csv_rows(&run("SELECT count(*), count(DISTINCT rowid >= 50000)
         FROM lake.main.t WHERE a = 1;")),
         vec![vec!["100", "2"]]
     );

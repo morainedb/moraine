@@ -13,15 +13,7 @@ applies them) and then the series below, in file-name order:
    table and pushes `rowid` filters into its file list before any Parquet
    reader is created. Moraine can therefore return stable row ids without
    taking ownership of DuckLake scans or physical placement.
-2. `0002-feat-expose-DuckLake-data-file-ids-to-scans.patch` exposes
-   `data_file_id` as an internal virtual `UBIGINT` column. A physical file
-   emits its persistent catalog id; inlined and transaction-local sources
-   emit NULL. Filters on it are pushed into the metadata file-list query as
-   predicates on `ducklake_data_file.data_file_id`, using no column
-   statistics, so a located index result restricts the file list as well as
-   the rows read within it. A filter shape the translation does not cover
-   adds no predicate, which keeps every file rather than guessing.
-3. `0003-feat-share-the-DuckLake-inlined-table-cache.patch` moves the
+2. `0003-feat-share-the-DuckLake-inlined-table-cache.patch` moves the
    `insert_inlined_table_name_cache` member to `protected`, so a registered
    metadata manager overriding the inlined-data write reuses the cache
    DuckLake's own `ClearInlinedTableCaches` invalidates. moraine's
@@ -34,7 +26,7 @@ applies them) and then the series below, in file-name order:
    rows with the two builds alternated round by round: the Appender is
    still ~2 ms a commit faster, the bind of one more statement per table,
    so both it and this patch stay.
-4. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
+3. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
    metadata backend's structured `commit_outcome=unknown` error field, with
    Moraine's fixed message as a fallback when DuckDB's COMMIT wrapper drops
    extra fields. It stops retries and releases the transaction's file-cleanup
@@ -55,7 +47,8 @@ The positional DELETE the optimizer selects when a certified index answers the
 entire equality predicate is `moraine_delete_positions`, registered by the
 extension over DuckLake's public transaction API rather than patched in.
 Ordinary `DELETE ... WHERE` selects this path without a caller naming row
-positions. UPDATE retains DuckLake's operator with index-derived scan filters.
+positions. UPDATE keeps DuckLake's operator, fed by moraine's located scan,
+which serves each row's file and position as DuckLake's own scan would.
 
 `0011-perf-stage-snapshots-and-defer-inline-appends.patch` adds optional
 metadata-manager hooks for staging a finalized snapshot without SQL and
@@ -134,11 +127,9 @@ artifact must match on DuckDB version.
 
 ## Index-assisted read
 
-Every lookup function returns a `row_id` column and a nullable
-`data_file_id` — NULL for a row living in inlined data rather than a
-Parquet file. Join the lookup directly to the DuckLake table in one
-relational query: ordinary equality on the row id, null-safe equality on
-the file id.
+Every lookup function returns the `row_id` of each row holding the key,
+once, wherever its live copy sits. Join the lookup directly to the DuckLake
+table on the row id:
 
 ```sql
 SELECT data.*
@@ -147,18 +138,20 @@ JOIN moraine_index_in(
     'lake', 'main', 'items', 'by_external_key',
     ['key-a', 'key-b']
 ) AS hits
-  ON data.rowid = hits.row_id
- AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+  ON data.rowid = hits.row_id;
 ```
 
 The same shape works with `moraine_index_lookup`, `moraine_index_range`, and
-`moraine_index_nulls`; a query that selects only `row_id` can join on it
-alone. The Moraine extension restates the resolved rows as static row-id and
-file-id filters on the scan, and DuckDB adds a dynamic row-ID filter from the
-join key; the patched DuckLake applies both while constructing the
-physical-file list, so the read touches only the files holding the rows.
+`moraine_index_nulls`. The Moraine extension replaces the table's scan
+beneath the join with its own located scan, which reads the named rows from
+the files and inlined tables holding them and evaluates the scan's filters
+itself, so the read touches only the files holding the rows. An ordinary
+predicate a certified index answers plans the same way, with no join in the
+query. Where the located scan cannot serve a query — a projection of part of
+a struct, a column of a type it cannot decode, rows inserted earlier in the
+same transaction — the plan runs as written.
 
-The same conditions locate rows for DML — `DELETE … USING` and
+The same condition locates rows for DML — `DELETE … USING` and
 `UPDATE … FROM` — and inside an `EXISTS` probe:
 
 ```sql
@@ -166,17 +159,8 @@ DELETE FROM lake.main.items
 USING moraine_index_lookup(
     'lake', 'main', 'items', 'by_external_key', 'key-a'
 ) AS hits
-WHERE items.rowid = hits.row_id
-  AND items.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+WHERE items.rowid = hits.row_id;
 ```
-
-**Do not** compare the two columns as a tuple —
-`(rowid, data_file_id) IN (SELECT row_id, data_file_id …)`. Tuple `IN`
-compares with plain equality, under which a NULL file id matches nothing, so
-every inlined row silently drops out of the result; as a DELETE or UPDATE
-predicate that strands the row with no error. The file-id condition is an
-optimization, not a correctness requirement — when in doubt, join on
-`row_id` alone and let DuckLake pick the visible copy.
 
 ## Release
 
