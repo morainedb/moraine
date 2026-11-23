@@ -178,7 +178,7 @@ fn prepared_predicates_refresh_and_writes_keep_residuals() {
         );
     }
     assert!(
-        !output.contains("DUCKLAKE_DELETE_POSITIONS"),
+        !output.contains("MORAINE_DELETE_POSITIONS"),
         "residual predicate was discarded: {output}"
     );
 }
@@ -197,7 +197,7 @@ fn certified_composite_equalities_delete_without_a_scan() {
     run("CREATE INDEX by_key ON lake.main.t(c,a);
          SELECT * FROM moraine_index_verify('lake','main','t','by_key');");
     let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a=37919 AND c=1;");
-    assert!(plan.contains("DUCKLAKE_DELETE_POSITIONS"), "{plan}");
+    assert!(plan.contains("MORAINE_DELETE_POSITIONS"), "{plan}");
     run("DELETE FROM lake.main.t WHERE a=37919 AND c=1;");
     assert_eq!(
         csv_rows(&run(

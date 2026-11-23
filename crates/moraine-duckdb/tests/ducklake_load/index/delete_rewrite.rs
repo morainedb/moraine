@@ -50,7 +50,7 @@ fn a_certified_equality_delete_reads_nothing() {
 
     let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t WHERE a = 30001;");
     assert!(
-        plan.contains("DUCKLAKE_DELETE_POSITIONS"),
+        plan.contains("MORAINE_DELETE_POSITIONS"),
         "the delete was not rewritten: {plan}"
     );
     assert!(
@@ -141,7 +141,7 @@ fn an_uncertified_index_keeps_the_scan() {
         "a declined rewrite must reuse its lookup for scan pruning: {plan}"
     );
     assert!(
-        !plan.contains("DUCKLAKE_DELETE_POSITIONS"),
+        !plan.contains("MORAINE_DELETE_POSITIONS"),
         "an unchecked index must not answer a delete: {plan}"
     );
 
@@ -149,7 +149,7 @@ fn an_uncertified_index_keeps_the_scan() {
     run("SELECT * FROM moraine_index_verify('lake','main','t','by_a');");
     let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a = 30001;");
     assert!(
-        plan.contains("DUCKLAKE_DELETE_POSITIONS"),
+        plan.contains("MORAINE_DELETE_POSITIONS"),
         "a certified index should answer it: {plan}"
     );
 }
@@ -170,7 +170,7 @@ fn a_second_predicate_keeps_the_scan() {
 
     let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a = 30001 AND b = 'nothing';");
     assert!(
-        !plan.contains("DUCKLAKE_DELETE_POSITIONS"),
+        !plan.contains("MORAINE_DELETE_POSITIONS"),
         "a residual predicate must keep the scan: {plan}"
     );
     assert_eq!(
@@ -222,7 +222,7 @@ fn an_update_matches_explicit_lookup_pruning() {
         certified_table(&run);
         let plan = run("EXPLAIN ANALYZE UPDATE lake.main.t SET b = 'z' WHERE a = 30001;");
         assert!(
-            !plan.contains("DUCKLAKE_DELETE_POSITIONS"),
+            !plan.contains("MORAINE_DELETE_POSITIONS"),
             "an UPDATE must keep its scan: {plan}"
         );
         let result = run("SELECT 'changed', count(*) FROM lake.main.t WHERE a = 30001 AND b = 'z';
@@ -298,7 +298,7 @@ fn deletes_preserve_existing_masks_and_local_rows() {
     certified_table(&run);
     run("DELETE FROM lake.main.t WHERE a < 1000;");
     let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t WHERE a = 30001;");
-    assert!(plan.contains("DUCKLAKE_DELETE_POSITIONS"), "{plan}");
+    assert!(plan.contains("MORAINE_DELETE_POSITIONS"), "{plan}");
     let result = run("BEGIN;
         INSERT INTO lake.main.t VALUES (30001, 'local');
         DELETE FROM lake.main.t WHERE a = 30001;
@@ -323,7 +323,7 @@ fn deletion_vectors_keep_the_scan() {
     certified_table(&run);
     run("CALL ducklake_set_option('lake', 'write_deletion_vectors', true);");
     let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a = 30001;");
-    assert!(!plan.contains("DUCKLAKE_DELETE_POSITIONS"), "{plan}");
+    assert!(!plan.contains("MORAINE_DELETE_POSITIONS"), "{plan}");
     // Index upkeep currently decodes Parquet delete files, so exercise
     // the fallback before committing a deletion vector.
     assert_eq!(
@@ -378,7 +378,7 @@ fn a_non_unique_delete_spans_files() {
         vec![vec!["100", "2"]]
     );
     let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t WHERE a = 1;");
-    assert!(plan.contains("DUCKLAKE_DELETE_POSITIONS"), "{plan}");
+    assert!(plan.contains("MORAINE_DELETE_POSITIONS"), "{plan}");
     assert_eq!(
         csv_rows(&run(
             "SELECT count(*), count(*) FILTER (WHERE a = 1) FROM lake.main.t;"

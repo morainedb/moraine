@@ -105,11 +105,12 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
     ensure!(
         stdout.contains("remaining=8"),
         "the build for DuckDB {version} did not stage a positional delete carrying existing \
-         delete positions; its bundled DuckLake is missing part of the patch series"
+         delete positions; the extension and its bundled DuckLake disagree on the transaction \
+         API the delete is staged through"
     );
     println!(
-        "ok: the {platform} build's bundled DuckLake records and prunes by row IDs and takes \
-         existing delete positions under a stock DuckDB {version}"
+        "ok: the {platform} build's bundled DuckLake records and prunes by row IDs and the \
+         extension stages a positional delete through it under a stock DuckDB {version}"
     );
     Ok(())
 }

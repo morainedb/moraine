@@ -25,6 +25,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include "catalog.hpp"
+#include "delete_positions.hpp"
 #include "index_cache.hpp"
 #include "index_functions.hpp"
 #include "owned_array.hpp"
@@ -687,7 +688,7 @@ duckdb::optional_ptr<duckdb::LogicalGet> DeleteSourceScan(duckdb::LogicalOperato
 	return &current->Cast<duckdb::LogicalGet>();
 }
 
-// The `files` argument `ducklake_delete_positions` takes: one entry per data
+// The `files` argument `moraine_delete_positions` takes: one entry per data
 // file, carrying the positions to kill and the positions its current delete
 // file already holds.
 duckdb::Value PositionalFiles(const OwnedArray<MoraineLocatedFile> &files) {
@@ -772,7 +773,7 @@ bool RewriteDeleteByIndexedPredicate(duckdb::ClientContext &context, duckdb::Opt
 		return false;
 	}
 
-	duckdb::DuckLakeDeletePositionsFunction function;
+	MoraineDeletePositionsFunction function;
 	duckdb::vector<duckdb::Value> inputs {duckdb::Value(found.catalog_name), duckdb::Value(found.schema_name),
 	                                      duckdb::Value(found.table_name), PositionalFiles(files)};
 	duckdb::named_argument_map_t named;
