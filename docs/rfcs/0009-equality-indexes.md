@@ -423,7 +423,11 @@ longest usable prefix, probes it, and returns
 `IndexPredicateRows { rows, certified_exact }`, or `None` when no ready index
 covers a leading predicate. The original predicate is still evaluated over the
 candidate rows. A certified full-key probe with no residual predicate is the
-one case where a `DELETE` is rewritten to positional deletion without a scan.
+one case where a `DELETE` is rewritten to positional deletion without a scan,
+through `moraine_delete_positions`, which the extension registers over
+DuckLake's public transaction API: it stages the located positions as `DELETE`
+stages its own, inlined below the inlining threshold and otherwise as a delete
+file replacing the file's current one, so COMMIT and ROLLBACK treat them alike.
 
 Index scans use four components:
 

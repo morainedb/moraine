@@ -27,12 +27,11 @@ const DUCKLAKE_FETCH_DEPTH: &str = "50";
 const SHALLOW: &str = "1";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-pub(crate) const PATCH_PATHS: [&str; 9] = [
+pub(crate) const PATCH_PATHS: [&str; 8] = [
     "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
     "patches/ducklake/0002-feat-expose-DuckLake-data-file-ids-to-scans.patch",
     "patches/ducklake/0003-feat-share-the-DuckLake-inlined-table-cache.patch",
     "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
-    "patches/ducklake/0005-feat-change-DuckLake-rows-by-position.patch",
     "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
     "patches/ducklake/0009-perf-bound-the-commit-time-head-lookup.patch",
     "patches/ducklake/0011-perf-stage-snapshots-and-defer-inline-appends.patch",

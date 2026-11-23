@@ -52,7 +52,6 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0002-feat-expose-DuckLake-data-file-ids-to-scans.patch
             ${CMAKE_CURRENT_LIST_DIR}/0003-feat-share-the-DuckLake-inlined-table-cache.patch
             ${CMAKE_CURRENT_LIST_DIR}/0004-fix-retain-files-after-unknown-commit-outcomes.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0005-feat-change-DuckLake-rows-by-position.patch
             ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch
             ${CMAKE_CURRENT_LIST_DIR}/0009-perf-bound-the-commit-time-head-lookup.patch
             ${CMAKE_CURRENT_LIST_DIR}/0011-perf-stage-snapshots-and-defer-inline-appends.patch

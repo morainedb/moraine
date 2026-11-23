@@ -1,4 +1,4 @@
-# Patched DuckLake row-ID statistics, pruning, inlined writes, commit cleanup, and positional deletes
+# Patched DuckLake row-ID statistics, pruning, inlined writes, and commit cleanup
 
 This directory carries the downstream DuckLake patch series moraine bundles,
 for the DuckDB `.github/duckdb-versions` names as primary. DuckDB patches
@@ -41,31 +41,6 @@ applies them) and then the series below, in file-name order:
    ownership before rollback, so an unacknowledged commit cannot lose files it
    registered. Unregistered files remain eligible for orphan cleanup. Ordinary
    SQL deletion and unknown commit outcomes are tested by `cargo xtask e2e`.
-5. `0005-feat-change-DuckLake-rows-by-position.patch` adds
-   `ducklake_delete_positions(catalog, schema, table, files, snapshot := NULL)`,
-   which stages deletes of already-located rows in the current DuckLake
-   transaction without scanning the table. `files` is a list of
-   `STRUCT(data_file_id UBIGINT, positions UBIGINT[], existing_positions BLOB)`
-   naming positions within committed data files at the transaction's
-   snapshot. `existing_positions` carries the deletions the caller already
-   decoded from that file's current delete file, as whole uint64 positions;
-   NULL means the caller does not know them and DuckLake reads the file
-   itself. `snapshot`, when given, is
-   the snapshot the caller resolved them against, refused with a
-   transaction error if it is older than the one the transaction reads. The
-   function validates every file id and position against that snapshot,
-   subtracts deletions the file
-   already carries, and then stages the rest exactly as `DELETE` would:
-   inlined file deletions below the inlining threshold, otherwise a new
-   delete file that replaces the file's current one. `COMMIT` publishes
-   these together with the transaction's other changes, and `ROLLBACK`
-   discards them and removes any file written. The function returns
-   `file_rows_deleted` and `delete_files_written`. It has no Moraine
-   dependency. Positional UPDATE, inline-row arguments, and deferred
-   position tokens are removed; the optimizer supplies committed file
-   positions directly. Rollback, repeated deletes, prepared statements,
-   and autocommit are covered by `cargo xtask e2e`.
-
 `0009-perf-bound-the-commit-time-head-lookup.patch` adds
 `snapshot_id >= {SNAPSHOT_ID}` to both halves of the commit-time head
 lookup in `GetSnapshotAndStatsAndChangesQuery`: the outer row and the
@@ -76,11 +51,11 @@ transaction began instead of every retained one. The changes arm of the
 same query already carries that bound. Covered by the staged snapshot
 paging tests in `cargo xtask e2e`.
 
-`0005` supplies the positional DELETE used by the optimizer when a certified
-index answers the entire equality predicate. The public located-change SQL
-verbs remain withdrawn; ordinary `DELETE ... WHERE` selects this path without
-a caller naming row positions. UPDATE retains DuckLake's operator with
-index-derived scan filters.
+The positional DELETE the optimizer selects when a certified index answers the
+entire equality predicate is `moraine_delete_positions`, registered by the
+extension over DuckLake's public transaction API rather than patched in.
+Ordinary `DELETE ... WHERE` selects this path without a caller naming row
+positions. UPDATE retains DuckLake's operator with index-derived scan filters.
 
 `0011-perf-stage-snapshots-and-defer-inline-appends.patch` adds optional
 metadata-manager hooks for staging a finalized snapshot without SQL and

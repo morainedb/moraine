@@ -296,6 +296,7 @@ path as its first argument, as noted.
 | `moraine_index_range` | catalog, schema, table, index, bounds | range lookup | [indexes](0009-equality-indexes.md) |
 | `moraine_index_nulls` | catalog, schema, table, index, prefix | null-aware prefix lookup | [indexes](0009-equality-indexes.md) |
 | `moraine_index_verify` | catalog, schema, table, index | verifies and certifies an index | [indexes](0009-equality-indexes.md) |
+| `moraine_delete_positions` | catalog, schema, table, files, snapshot | stages deletes of located rows by file position, without a scan | [indexes](0009-equality-indexes.md) |
 | `moraine_fault_stall_next_read` | milliseconds | arms a stall in the next cancellable read, for cancellation tests | this document |
 | `moraine_fault_drop_next_commit_ack` | | arms the next commit to land and report its outcome as unknown, for retention tests | this document |
 

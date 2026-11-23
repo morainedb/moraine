@@ -41,6 +41,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/catalog.cpp
     ${CPP_DIR}/checkpoints.cpp
     ${CPP_DIR}/census.cpp
+    ${CPP_DIR}/delete_positions.cpp
     ${CPP_DIR}/fault.cpp
     ${CPP_DIR}/settings.cpp
     ${CPP_DIR}/summary_scan.cpp

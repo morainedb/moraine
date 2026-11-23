@@ -739,3 +739,71 @@ fn a_filtered_clear_of_inlined_deletions_removes_only_what_it_matched() {
         "an unqualified clear removes the rest"
     );
 }
+
+/// `moraine_delete_positions` stages a located delete in the caller's
+/// transaction: a rolled-back call leaves the row, a committed one removes
+/// it, and a second call for the same position stages nothing.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn moraine_delete_positions_stages_located_rows_in_the_transaction() {
+    let store = TempDir::new("delete-positions-store");
+    let data = TempDir::new("delete-positions-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SET ducklake_default_data_inlining_row_limit = 0; \
+         CREATE TABLE lake.main.t(a BIGINT); \
+         INSERT INTO lake.main.t SELECT range FROM range(10);",
+    );
+    let file = csv_rows(&run_standalone_sql(
+        store.path(),
+        "SELECT data_file_id FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+    ));
+    assert_eq!(file.len(), 1, "one data file was written: {file:?}");
+    let call = format!(
+        "SELECT file_rows_deleted, delete_files_written FROM moraine_delete_positions(\
+         'lake', 'main', 't', [{{'data_file_id': {}::UBIGINT, 'positions': [3::UBIGINT], \
+         'existing_positions': NULL::BLOB}}]);",
+        file[0][0]
+    );
+
+    let rolled_back = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        &format!("BEGIN; {call} ROLLBACK;"),
+    ));
+    assert_eq!(
+        rolled_back,
+        vec![vec!["1", "0"]],
+        "a positional delete stages one inlined deletion"
+    );
+    let count = "SELECT count(*) FROM lake.main.t;";
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(store.path(), data.path(), count)),
+        vec![vec!["10"]],
+        "a rolled-back positional delete keeps the row"
+    );
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(store.path(), data.path(), &call)),
+        vec![vec!["1", "0"]]
+    );
+    let remaining = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT a FROM lake.main.t ORDER BY a;",
+    ));
+    let remaining: Vec<&str> = remaining.iter().map(|row| row[0].as_str()).collect();
+    assert_eq!(
+        remaining,
+        ["0", "1", "2", "4", "5", "6", "7", "8", "9"],
+        "the row at position 3 is gone and nothing else moved"
+    );
+
+    let repeated = csv_rows(&run_ducklake_sql(store.path(), data.path(), &call));
+    assert_eq!(
+        repeated,
+        vec![vec!["0", "0"]],
+        "a position already deleted stages nothing"
+    );
+}
