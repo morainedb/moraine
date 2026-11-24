@@ -147,9 +147,11 @@ beneath the join with its own located scan, which reads the named rows from
 the files and inlined tables holding them and evaluates the scan's filters
 itself, so the read touches only the files holding the rows. An ordinary
 predicate a certified index answers plans the same way, with no join in the
-query. Where the located scan cannot serve a query — a projection of part of
-a struct, a column of a type it cannot decode, rows inserted earlier in the
-same transaction — the plan runs as written.
+query. Inside a transaction that has inserted rows, the located scan serves
+the committed rows and the transaction's inlined ones, and DuckLake's scan
+over the files the transaction wrote joins it. Where the located scan cannot
+serve a query — a projection of part of a struct, a column of a type it
+cannot decode — the plan runs as written.
 
 The same condition locates rows for DML — `DELETE … USING` and
 `UPDATE … FROM` — and inside an `EXISTS` probe:
