@@ -934,8 +934,8 @@ fn total_files_read(plan: &str) -> u64 {
 }
 
 /// A join against an index read replaces the scan with the located one, which
-/// opens only the file holding the row. DuckLake's row-id statistics alone
-/// admit every update file whose row-id range spans the id.
+/// opens only the file holding the row; DuckLake's own scan of a row named by
+/// its id opens every file.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_join_reads_only_the_file_holding_the_row() {
@@ -962,7 +962,7 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
 
     let located = total_files_read(&run(&format!("EXPLAIN ANALYZE {located_join};")));
     // Row 150 was the 151st inserted, so its id is 150.
-    let by_statistics = total_files_read(&run(
+    let plain = total_files_read(&run(
         "EXPLAIN ANALYZE SELECT b FROM lake.main.t WHERE rowid = 150;",
     ));
     assert_eq!(
@@ -970,9 +970,8 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
         "the located join read more than the holding file"
     );
     assert!(
-        by_statistics > located,
-        "row-id statistics admitted {by_statistics} files and the located join read {located}; \
-         the update files no longer overlap, so this proves nothing"
+        plain > located,
+        "DuckLake's own scan read {plain} files and the located join {located}"
     );
 
     // An outer join keeps rows meeting no condition, so the same restriction

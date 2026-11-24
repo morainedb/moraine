@@ -1,4 +1,4 @@
-# Patched DuckLake row-ID statistics, pruning, inlined writes, and commit cleanup
+# Patched DuckLake row-ID statistics, inlined writes, and commit cleanup
 
 This directory carries the downstream DuckLake patch series moraine bundles,
 for the DuckDB `.github/duckdb-versions` names as primary. DuckDB patches
@@ -8,11 +8,12 @@ DuckDB's own
 (`duckdb/.github/patches/extensions/ducklake/`, three-way, as DuckDB
 applies them) and then the series below, in file-name order:
 
-1. `0001-perf-prune-DuckLake-files-by-row-id.patch` stores file-level row-ID
-   min/max statistics in DuckLake's existing `ducklake_file_column_stats`
-   table and pushes `rowid` filters into its file list before any Parquet
-   reader is created. Moraine can therefore return stable row ids without
-   taking ownership of DuckLake scans or physical placement.
+1. `0001-perf-record-DuckLake-row-id-statistics.patch` stores file-level
+   row-ID min/max statistics in DuckLake's existing
+   `ducklake_file_column_stats` table: read from the Parquet row-id column
+   a flushed or rewritten file carries, synthesized from `row_id_start` and
+   the row count for a dense one. Moraine's file directory reads them to
+   pick the files that can hold a row id without opening any.
 2. `0003-feat-share-the-DuckLake-inlined-table-cache.patch` moves the
    `insert_inlined_table_name_cache` member to `protected`, so a registered
    metadata manager overriding the inlined-data write reuses the cache
@@ -95,11 +96,10 @@ byte-for-byte, and passes the checkout in. Either way DuckLake's `roaring`
 dependency resolves through vcpkg (`vcpkg.json` at the repository root
 declares it).
 
-`cargo xtask e2e` then runs the series' row-ID write, pruning and
-flushed-file-merge sqllogictests against the built moraine artifact, and
-the build workflows run the same row-ID statistics and pruning smoke
-against what they build, in the container that built it
-(`cargo xtask validate-release-artifact`).
+`cargo xtask e2e` then runs the series' row-ID statistics sqllogictest
+against the built moraine artifact, and the build workflows run the same
+row-ID statistics smoke against what they build, in the container that
+built it (`cargo xtask validate-release-artifact`).
 
 ## Load in DuckDB
 
@@ -166,8 +166,8 @@ WHERE items.rowid = hits.row_id;
 
 There is no separate DuckLake release. The moraine release workflow builds
 the bundle for the version in `.github/duckdb-versions` on the four native
-platforms, each build running the row-ID statistics, one-file pruning, and
-positional-delete smoke (`release-smoke.sql`) against itself, through
+platforms, each build running the row-ID statistics and positional-delete
+smoke (`release-smoke.sql`) against itself, through
 `cargo xtask validate-release-artifact`.
 
 `0012-perf-scope-and-stage-append-statistics.patch` lets a metadata manager read

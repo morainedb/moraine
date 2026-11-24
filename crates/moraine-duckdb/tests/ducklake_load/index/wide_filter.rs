@@ -1,8 +1,8 @@
 use crate::helpers::*;
 
 /// Probes above 256 rows use the located scan; a probe the located scan
-/// declines keeps DuckLake's scan, with the lookup's row ids pushed as a few
-/// ranges rather than one residual per row.
+/// declines keeps DuckLake's scan as written, with the join alone matching
+/// the rows.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_wide_sparse_probe_derives_row_pruning() {
@@ -94,16 +94,12 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         "an undecodable projection must keep the scan: {sparse}"
     );
     assert!(
-        sparse.contains("rowid >= "),
-        "no derived row pruning: {sparse}"
-    );
-    assert!(
-        sparse.matches("rowid >= ").count() <= 16,
-        "too many metadata predicates: {sparse}"
+        !sparse.contains("rowid >= ") && !sparse.contains("rowid IN"),
+        "a declined probe pushes nothing into the scan: {sparse}"
     );
     assert!(
         has_line(&sparse, "4096"),
-        "coalesced gaps changed the result: {sparse}"
+        "the declined probe changed the result: {sparse}"
     );
 }
 

@@ -782,16 +782,16 @@ hold the row rather than every file of the table.
 <!-- site:omit -->2026-11-17 at `a491fe5`.<!-- /site:omit -->
 On the benchmark runner, 16 files × 2,000 rows over AWS S3: 166,008
 summary bytes, a cold lookup of 78 ms and a warm one of 0.8 ms. After
-six update batches, DuckLake's row-id statistics alone admit 7 files for a
-row named by its id where the located join reads 1.
+six update batches, each of which wrote a file whose row-id range spans the
+table, the located join still reads 1 file.
 
 <!-- site:omit -->
 `cargo xtask locate-bench [--files N] [--rows-per-file N] [--update-batches N]`
-reports summary bytes, cold and warm lookup time, and the files a scan
-reads through the located join against naming the row id as a constant.
+reports summary bytes, cold and warm lookup time, and the files the located
+join reads before and after each update batch.
 
 Apple M2, 64 files × 8,000 rows: 121,664 summary bytes (a quarter byte per
-row), 0.2 ms warm lookup, and the same 7-against-1 after six batches.
+row), 0.2 ms warm lookup, and the same 1 file after six batches.
 
 `measure_located_lookup_latency_against_the_endpoint` builds summaries
 from 64 real Parquet objects on AWS S3 (2026-08-16): 463 ms cold with 96

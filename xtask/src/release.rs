@@ -60,8 +60,8 @@ pub fn check_release_assets(arguments: &[String]) -> anyhow::Result<()> {
 }
 
 /// Loads one published build into the stock CLI for the DuckDB it was
-/// built for and proves that its bundled DuckLake backfills row-ID
-/// statistics and prunes a three-file scan to one file.
+/// built for and proves that its bundled DuckLake records row-ID statistics
+/// for each of three files.
 ///
 /// `version` and `platform` name the build the artifact is: a loadable
 /// carries both in its footer and loads into nothing else, so a wrong pair
@@ -98,9 +98,9 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let row_id_stat_rows = stdout.matches("2147483540").count();
     ensure!(
-        row_id_stat_rows == 3 && stdout.contains("Total Files Read: 1"),
+        row_id_stat_rows == 3,
         "the build for DuckDB {version} recorded {row_id_stat_rows} of 3 expected row-ID \
-         statistic rows or did not prune the scan to one file"
+         statistic rows"
     );
     ensure!(
         stdout.contains("remaining=8"),
@@ -109,7 +109,7 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
          API the delete is staged through"
     );
     println!(
-        "ok: the {platform} build's bundled DuckLake records and prunes by row IDs and the \
+        "ok: the {platform} build's bundled DuckLake records row-ID statistics and the \
          extension stages a positional delete through it under a stock DuckDB {version}"
     );
     Ok(())

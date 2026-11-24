@@ -28,7 +28,7 @@ const SHALLOW: &str = "1";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
 pub(crate) const PATCH_PATHS: [&str; 7] = [
-    "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
+    "patches/ducklake/0001-perf-record-DuckLake-row-id-statistics.patch",
     "patches/ducklake/0003-feat-share-the-DuckLake-inlined-table-cache.patch",
     "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
     "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
@@ -38,7 +38,7 @@ pub(crate) const PATCH_PATHS: [&str; 7] = [
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.
-const REGRESSION_TEST_PATHS: [&str; 1] = ["test/sql/rowid/ducklake_row_id_file_pruning.test"];
+const REGRESSION_TEST_PATHS: [&str; 1] = ["test/sql/rowid/ducklake_row_id_statistics.test"];
 
 /// The patched DuckLake checkout the moraine build bundles, and the vcpkg
 /// it resolves DuckLake's `roaring` dependency through.
