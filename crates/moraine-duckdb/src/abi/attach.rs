@@ -236,6 +236,19 @@ impl StoreKind {
         Ok((Self::LocalFile, String::new()))
     }
 
+    /// The URL another process opens this store from, without any lake
+    /// path: the bucket, or the directory as it resolves on this machine.
+    /// `None` for a store no other process can reach.
+    pub(crate) fn url(&self, path: &str) -> Option<String> {
+        match self {
+            Self::S3 { bucket } => Some(format!("s3://{bucket}")),
+            Self::LocalFile => std::fs::canonicalize(path)
+                .ok()
+                .map(|directory| format!("file://{}", directory.display())),
+            Self::Memory => None,
+        }
+    }
+
     pub(crate) fn open(
         &self,
         path: &str,
@@ -826,6 +839,7 @@ pub unsafe extern "C" fn moraine_attach_with_options(
         let mut options = CatalogOptions::default();
         options.path = prefix;
         options.cache_identity = Some(cache_identity);
+        options.store_url = store_kind.url(path_str);
         options.encrypted = encrypted;
         options.flush_interval =
             flush_interval_option(flush_interval_ms).unwrap_or(options.flush_interval);
@@ -1216,6 +1230,7 @@ pub unsafe extern "C" fn moraine_migrate_with_wal_store(
         let mut options = moraine::CatalogOptions::default();
         options.path = prefix;
         options.cache_identity = Some(cache_identity);
+        options.store_url = store_kind.url(path_str);
         if let Some(interval) = flush_interval_option(flush_interval_ms) {
             options.flush_interval = interval;
         }

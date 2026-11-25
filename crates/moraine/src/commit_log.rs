@@ -243,6 +243,9 @@ pub struct CatalogHooks {
     pub path: String,
     /// The store's object store, as it was opened.
     pub object_store: Arc<dyn ObjectStore>,
+    /// The URL that object store was opened from, when the catalog was
+    /// given one, for a provider that opens the same store elsewhere.
+    pub store_url: Option<String>,
     /// The cadence and the waits.
     pub settings: CommitLogSettings,
 }
@@ -251,6 +254,7 @@ impl fmt::Debug for CatalogHooks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CatalogHooks")
             .field("path", &self.path)
+            .field("store_url", &self.store_url)
             .field("settings", &self.settings)
             .finish_non_exhaustive()
     }
