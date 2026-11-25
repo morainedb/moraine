@@ -9,12 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.0](https://github.com/morainedb/moraine/compare/v0.9.2...v0.10.0) - 2026-11-19
 
+### Added
+
+- [**breaking**] *(duckdb)* build for DuckDB v2.0.1 ([#490](https://github.com/morainedb/moraine/pull/490))
+- record data files' row-id bounds without the DuckLake patch ([#485](https://github.com/morainedb/moraine/pull/485))
+- *(duckdb)* locate indexed predicates inside a writing transaction ([#484](https://github.com/morainedb/moraine/pull/484))
+- *(duckdb)* read indexed rows by position without the data-file-id patch ([#482](https://github.com/morainedb/moraine/pull/482))
+- *(site)* add a blog with the launch post and Plausible analytics ([#474](https://github.com/morainedb/moraine/pull/474))
+- *(xtask)* generate the published benchmark digest ([#468](https://github.com/morainedb/moraine/pull/468))
+
 ### Fixed
 
+- *(deps)* take the patched url and parquet releases ([#481](https://github.com/morainedb/moraine/pull/481))
+- *(patches)* drop three DuckLake patches the extension no longer needs ([#473](https://github.com/morainedb/moraine/pull/473))
 - *(tests)* match result rows behind a printed log record's reset ([#461](https://github.com/morainedb/moraine/pull/461))
 
 ### Other
 
+- *(duckdb)* keep only the recording half of the row-id patch ([#483](https://github.com/morainedb/moraine/pull/483))
+- *(duckdb)* stage positional deletes from the extension, not a patch ([#477](https://github.com/morainedb/moraine/pull/477))
+- *(duckdb)* prove an unknown commit outcome keeps the written Parquet ([#476](https://github.com/morainedb/moraine/pull/476))
+- *(cache)* count SST ranges when comparing dumps ([#475](https://github.com/morainedb/moraine/pull/475))
+- *(benchmarks)* say what each number measures and keep stamps off the page ([#471](https://github.com/morainedb/moraine/pull/471))
+- *(cache)* compare two settled warms for residency ([#469](https://github.com/morainedb/moraine/pull/469))
 - *(catalog)* admit what a table-scoped metadata cursor reads ([#467](https://github.com/morainedb/moraine/pull/467))
 - *(catalog)* a read-only open needs a checkpoint ([#465](https://github.com/morainedb/moraine/pull/465))
 - *(catalog)* prime a fresh open's first reads in one batch ([#464](https://github.com/morainedb/moraine/pull/464))
