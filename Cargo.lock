@@ -124,7 +124,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "half",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libc",
  "num-complex",
  "num-integer",
@@ -1052,7 +1052,7 @@ dependencies = [
  "foyer-intrusive-collections",
  "foyer-tokio",
  "futures-util",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "itertools",
  "mixtrics",
  "parking_lot",
@@ -1081,7 +1081,7 @@ dependencies = [
  "fs4",
  "futures-core",
  "futures-util",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "io-uring",
  "itertools",
  "libc",
@@ -1317,9 +1317,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 dependencies = [
  "allocator-api2",
  "equivalent",
@@ -1617,7 +1617,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -1868,7 +1868,7 @@ version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -2001,7 +2001,7 @@ dependencies = [
  "fastbloom",
  "foyer",
  "futures",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "imbl",
  "lru-slab",
  "moraine",
@@ -2278,7 +2278,7 @@ dependencies = [
  "chrono",
  "futures",
  "half",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "num-bigint",
  "num-integer",
  "num-traits",
