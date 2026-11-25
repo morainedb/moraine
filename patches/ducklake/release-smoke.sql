@@ -18,7 +18,6 @@ WHERE data.end_snapshot IS NULL
   AND stats.column_id = 2147483540
 ORDER BY data.data_file_id;
 
-EXPLAIN ANALYZE SELECT * FROM lake.items WHERE rowid = 3;
 
 -- moraine's positional delete stages located rows through the bundled
 -- DuckLake's transaction; a bundle whose DuckLake drifted from what it

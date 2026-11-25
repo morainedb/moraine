@@ -19,24 +19,6 @@ index c02a20d4..13d99656 100644
  				continue;
  			}
  
-diff --git a/src/storage/ducklake_multi_file_list.cpp b/src/storage/ducklake_multi_file_list.cpp
-index 400f9b0a..a41d9f6e 100644
---- a/src/storage/ducklake_multi_file_list.cpp
-+++ b/src/storage/ducklake_multi_file_list.cpp
-@@ -171,6 +171,13 @@ unique_ptr<DuckLakeFilterNode> DuckLakeMultiFileList::GetExpressionFilterNode(Mu
- 
- void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
-                                                     unique_ptr<TableFilter> filter) const {
-+	if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
-+		auto field_index = static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID);
-+		ColumnFilterInfo filter_info_entry(field_index, LogicalType::BIGINT,
-+		                                   ExpressionFilter::FromTableFilter(*filter, LogicalType::BIGINT));
-+		pushdown_info.column_filters.emplace(field_index, std::move(filter_info_entry));
-+		return;
-+	}
- 	auto node = GetFilterNode(column_id, std::move(filter));
- 	if (node) {
- 		AddFilterNodeToPushdownInfo(pushdown_info, *node);
 diff --git a/src/storage/ducklake_server_side_commit.cpp b/src/storage/ducklake_server_side_commit.cpp
 index dfb21e48..6ed817f3 100644
 --- a/src/storage/ducklake_server_side_commit.cpp
@@ -122,14 +104,14 @@ index 77f92ffd..4278f3ba 100644
  	return data_file;
  }
  
-diff --git a/test/sql/rowid/ducklake_row_id_file_pruning.test b/test/sql/rowid/ducklake_row_id_file_pruning.test
+diff --git a/test/sql/rowid/ducklake_row_id_statistics.test b/test/sql/rowid/ducklake_row_id_statistics.test
 new file mode 100644
 index 00000000..9c87e00f
 --- /dev/null
-+++ b/test/sql/rowid/ducklake_row_id_file_pruning.test
-@@ -0,0 +1,160 @@
-+# name: test/sql/rowid/ducklake_row_id_file_pruning.test
-+# description: row-id statistics prune files without excluding files whose statistics are missing
++++ b/test/sql/rowid/ducklake_row_id_statistics.test
+@@ -0,0 +1,112 @@
++# name: test/sql/rowid/ducklake_row_id_statistics.test
++# description: row-id statistics are recorded for dense, flushed, and rewritten files
 +# group: [rowid]
 +
 +require ducklake
@@ -141,7 +123,7 @@ index 00000000..9c87e00f
 +test-env DATA_PATH __TEST_DIR__
 +
 +statement ok
-+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_row_id_file_pruning', METADATA_CATALOG 'row_id_meta', DATA_INLINING_ROW_LIMIT 0)
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_row_id_statistics', METADATA_CATALOG 'row_id_meta', DATA_INLINING_ROW_LIMIT 0)
 +
 +statement ok
 +CREATE TABLE ducklake.dense(i INTEGER)
@@ -166,44 +148,6 @@ index 00000000..9c87e00f
 +3	0	2
 +2	3	4
 +4	5	8
-+
-+query II
-+EXPLAIN ANALYZE SELECT * FROM ducklake.dense WHERE rowid = 3
-+----
-+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
-+
-+query II
-+EXPLAIN ANALYZE SELECT * FROM ducklake.dense WHERE rowid IN (1, 7)
-+----
-+analyzed_plan	<REGEX>:.*Total Files Read: 2.*
-+
-+query II
-+EXPLAIN ANALYZE
-+SELECT data.*
-+FROM ducklake.dense AS data
-+JOIN (VALUES (1), (7)) AS hits(row_id)
-+  ON data.rowid = hits.row_id
-+----
-+analyzed_plan	<REGEX>:.*Total Files Read: 2.*
-+
-+statement ok
-+DELETE FROM row_id_meta.ducklake_file_column_stats
-+WHERE column_id = 2147483540
-+  AND data_file_id = (
-+    SELECT min(data_file_id)
-+    FROM row_id_meta.ducklake_data_file
-+    WHERE end_snapshot IS NULL
-+  )
-+
-+query II
-+SELECT rowid, i FROM ducklake.dense WHERE rowid = 0
-+----
-+0	0
-+
-+query II
-+EXPLAIN ANALYZE SELECT * FROM ducklake.dense WHERE rowid = 999
-+----
-+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
 +
 +statement ok
 +CREATE TABLE ducklake.flushed(i INTEGER)
@@ -244,11 +188,6 @@ index 00000000..9c87e00f
 +4	0	23
 +
 +query II
-+EXPLAIN ANALYZE SELECT * FROM ducklake.flushed WHERE rowid = 23
-+----
-+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
-+
-+query II
 +SELECT rowid, i FROM ducklake.flushed WHERE rowid = 23
 +----
 +23	23
@@ -278,11 +217,6 @@ index 00000000..9c87e00f
 +  AND stats.column_id = 2147483540
 +----
 +5	0	8
-+
-+query II
-+EXPLAIN ANALYZE SELECT * FROM ducklake.sparse WHERE rowid = 9
-+----
-+analyzed_plan	<REGEX>:.*Total Files Read: 0.*
 +
 +query II
 +SELECT rowid, i FROM ducklake.sparse WHERE rowid = 8

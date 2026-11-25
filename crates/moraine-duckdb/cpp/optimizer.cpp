@@ -1,15 +1,12 @@
 #include "duckdb/planner/filter/list.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb.hpp"
-#include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
@@ -67,30 +64,13 @@ void ReplaceEmptyIndexReads(duckdb::ClientContext &context, duckdb::unique_ptr<d
 }
 
 // An index read resolves its rows while binding, so a join against one is a
-// join against a list of constants the planner can already see. Restating that
-// list as a filter on the other side reaches the scan, which a join condition
-// alone does not: a hash join's runtime filters arrive after the file list is
-// built.
+// join against rows the planner can already see, and the scan on the other
+// side can be replaced with the located scan over exactly those rows.
 //
 // The pass runs after DuckDB's own optimizers, because that is when every
 // qualifying join exists: DELETE and UPDATE bind their join through the WHERE
 // clause as a filter over a cross product, and an EXISTS probe as a dependent
-// join, both formed into comparison joins only during optimization. The
-// built-in filter pushdown has already run by then, so the pass pushes the
-// derived filter down its own subtree itself.
-//
-// The filter only repeats what the join already enforces, so it is added
-// beside the join rather than replacing it, and holds whatever the query
-// projects from either side.
-
-// Bounds the row-id pruning list and its planning cost.
-constexpr duckdb::idx_t MAX_DERIVED_ROW_ID_VALUES = 4096;
-
-// Larger lists prune scan statistics only; the join performs exact matching.
-constexpr duckdb::idx_t MAX_EXACT_ROW_ID_VALUES = 256;
-
-// DuckLake expands these into metadata predicates as well as scan filters.
-constexpr duckdb::idx_t MAX_ROW_PRUNING_RANGES = 16;
+// join, both formed into comparison joins only during optimization.
 
 duckdb::LogicalGet *IndexReadGet(duckdb::LogicalOperator &op) {
 	if (op.type != duckdb::LogicalOperatorType::LOGICAL_GET) {
@@ -129,19 +109,6 @@ bool ReferencedColumn(const duckdb::Expression &expression, const duckdb::Logica
 	return true;
 }
 
-// Where `column` sits in this scan's projection. A pushed filter is keyed by
-// that position, and the scan resolves it back through its own column list,
-// so a key carrying the table's column index names the wrong column.
-duckdb::optional_idx ProjectedColumn(const duckdb::LogicalGet &get, duckdb::idx_t column) {
-	auto &column_ids = get.GetColumnIds();
-	for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
-		if (column_ids[i].GetPrimaryIndex() == column) {
-			return duckdb::optional_idx(i);
-		}
-	}
-	return duckdb::optional_idx();
-}
-
 // As `ReferencedColumn`, but resolving `expression` through the projections
 // between `op` and `get` — each rebinds the columns it forwards.
 bool ReferencedColumnBeneath(const duckdb::Expression &expression, duckdb::LogicalOperator &op,
@@ -163,114 +130,6 @@ bool ReferencedColumnBeneath(const duckdb::Expression &expression, duckdb::Logic
 		                               column);
 	}
 	return ReferencedColumn(expression, get, column);
-}
-
-// The distinct row ids `rows` carries. False if `column` is not the row id
-// or there are more values than a filter should list.
-bool ResolvedRowIds(const std::vector<MoraineRowId> &rows, duckdb::idx_t column,
-                    duckdb::vector<duckdb::Value> &values) {
-	if (column != INDEX_READ_ROW_ID_COLUMN) {
-		return false;
-	}
-	std::set<uint64_t> seen;
-	for (auto &row : rows) {
-		if (seen.insert(row.value).second) {
-			values.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(row.value)));
-		}
-		if (values.size() > MAX_DERIVED_ROW_ID_VALUES) {
-			return false;
-		}
-	}
-	return true;
-}
-
-// `expression IN (values)`.
-duckdb::unique_ptr<duckdb::Expression> DerivedFilter(const duckdb::Expression &expression,
-                                                     const duckdb::vector<duckdb::Value> &values) {
-	auto in_list = duckdb::make_uniq<duckdb::BoundOperatorExpression>(duckdb::ExpressionType::COMPARE_IN,
-	                                                                  duckdb::LogicalType::BOOLEAN);
-	in_list->GetChildrenMutable().push_back(expression.Copy());
-	for (auto &value : values) {
-		in_list->GetChildrenMutable().push_back(duckdb::make_uniq<duckdb::BoundConstantExpression>(value));
-	}
-	return std::move(in_list);
-}
-
-struct RowPruning {
-	duckdb::unique_ptr<duckdb::Expression> expression;
-	duckdb::vector<duckdb::Value> values;
-};
-
-// Preserve the largest gaps, merging smaller gaps into conservative ranges.
-duckdb::unique_ptr<duckdb::TableFilter> RowRangeFilter(const duckdb::vector<duckdb::Value> &values) {
-	std::vector<int64_t> sorted;
-	for (auto &value : values) {
-		sorted.push_back(value.GetValue<int64_t>());
-	}
-	std::sort(sorted.begin(), sorted.end());
-	std::vector<std::pair<uint64_t, duckdb::idx_t>> gaps;
-	for (duckdb::idx_t i = 1; i < sorted.size(); i++) {
-		auto gap = static_cast<uint64_t>(sorted[i]) - static_cast<uint64_t>(sorted[i - 1]);
-		if (gap > 1) {
-			gaps.emplace_back(gap, i);
-		}
-	}
-	std::sort(gaps.begin(), gaps.end(), std::greater<std::pair<uint64_t, duckdb::idx_t>>());
-	if (gaps.size() >= MAX_ROW_PRUNING_RANGES) {
-		gaps.resize(MAX_ROW_PRUNING_RANGES - 1);
-	}
-	std::set<duckdb::idx_t> ends;
-	for (auto &gap : gaps) {
-		ends.insert(gap.second);
-	}
-	ends.insert(sorted.size());
-	auto result = duckdb::make_uniq<duckdb::LegacyConjunctionOrFilter>();
-	duckdb::idx_t start = 0;
-	for (auto end : ends) {
-		auto range = duckdb::make_uniq<duckdb::LegacyConjunctionAndFilter>();
-		range->child_filters.push_back(duckdb::make_uniq<duckdb::LegacyConstantFilter>(
-		    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(sorted[start])));
-		range->child_filters.push_back(duckdb::make_uniq<duckdb::LegacyConstantFilter>(
-		    duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO, duckdb::Value::BIGINT(sorted[end - 1])));
-		result->child_filters.push_back(std::move(range));
-		start = end;
-	}
-	if (result->child_filters.size() == 1) {
-		return std::move(result->child_filters[0]);
-	}
-	return std::move(result);
-}
-
-// Attach only a statistics filter: an exact IN above the scan would repeat
-// thousands of comparisons per row after the ordinary IN optimizer has run.
-void PushRowPruning(duckdb::LogicalOperator &op, RowPruning &pruning) {
-	auto *scan = &op;
-	while (scan->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
-	       scan->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
-		scan = scan->children[0].get();
-	}
-	if (scan->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
-		return;
-	}
-	auto &get = scan->Cast<duckdb::LogicalGet>();
-	duckdb::idx_t column = 0;
-	if (get.function.GetDefinition()->name != "ducklake_scan" || !get.function.filter_pushdown ||
-	    !ReferencedColumnBeneath(*pruning.expression, op, get, column) ||
-	    pruning.expression->GetReturnType() != duckdb::LogicalType::BIGINT) {
-		return;
-	}
-	auto projected = ProjectedColumn(get, column);
-	if (!projected.IsValid()) {
-		return;
-	}
-	// A pushed filter is an expression now, and carries no "optional" mark:
-	// the ranges cover every located row id, so requiring it drops nothing.
-	auto ranges = RowRangeFilter(pruning.values);
-	auto expression = duckdb::ExpressionFilter::FromTableFilter(*ranges, duckdb::LogicalType::BIGINT);
-	if (!expression || !expression->expr) {
-		return;
-	}
-	get.table_filters.PushFilter(duckdb::ProjectionIndex(projected.GetIndex()), std::move(expression));
 }
 
 duckdb::LogicalGet *ScanBeneath(duckdb::LogicalOperator &op) {
@@ -307,10 +166,9 @@ bool TrySummaryJoin(duckdb::ClientContext &context, duckdb::LogicalComparisonJoi
 	return row_id && UseSummaryScan(context, *scan, index, rows);
 }
 
-void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
-                                  duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
+void LocateJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
-		FilterJoinsAgainstIndexReads(context, optimizer, child);
+		LocateJoinsAgainstIndexReads(context, child);
 	}
 
 	if (plan->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
@@ -331,7 +189,7 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 		if (!candidate) {
 			continue;
 		}
-		// Two index reads leave no scan to prune.
+		// Two index reads leave no scan to replace.
 		if (index_get) {
 			return;
 		}
@@ -345,79 +203,12 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 	if (!rows || rows->empty()) {
 		return;
 	}
-	if (TrySummaryJoin(context, join, index_side, *index_get, *rows)) {
-		return;
-	}
-
-	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filters;
-	std::vector<RowPruning> row_pruning;
-	for (auto &condition : join.conditions) {
-		if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
-		    condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-			continue;
-		}
-		auto &index_expression = index_side == 0 ? condition.GetLHS() : condition.GetRHS();
-		auto &other_expression = index_side == 0 ? condition.GetRHS() : condition.GetLHS();
-
-		duckdb::idx_t column = 0;
-		if (!ReferencedColumnBeneath(index_expression, *join.children[index_side], *index_get, column)) {
-			continue;
-		}
-		// The filter repeats the other side's expression, so only a column
-		// reference is certain to be cheap and free of side effects.
-		if (other_expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
-			continue;
-		}
-
-		duckdb::vector<duckdb::Value> values;
-		if (!ResolvedRowIds(*rows, column, values)) {
-			continue;
-		}
-		if (values.size() > MAX_EXACT_ROW_ID_VALUES) {
-			row_pruning.push_back({other_expression.Copy(), std::move(values)});
-			continue;
-		}
-		filters.push_back(DerivedFilter(other_expression, values));
-	}
-	auto other_side = 1 - index_side;
-	if (!filters.empty()) {
-		auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
-		filter->expressions = std::move(filters);
-		filter->children.push_back(std::move(join.children[other_side]));
-		filter->ResolveOperatorTypes();
-		// The built-in pushdown already ran; carry the filter down to the scan.
-		duckdb::FilterPushdown pushdown(optimizer);
-		join.children[other_side] = pushdown.Rewrite(std::move(filter));
-	}
-	for (auto &pruning : row_pruning) {
-		PushRowPruning(*join.children[other_side], pruning);
-	}
+	TrySummaryJoin(context, join, index_side, *index_get, *rows);
 }
 
 // Below this many bytes of data files a scan is cheaper than the probe it
 // would save: a probe costs about 3 ms, about what scanning a megabyte does.
 constexpr duckdb::idx_t MIN_PRUNABLE_TABLE_BYTES = 4ULL * 1024 * 1024;
-
-// A column the scan reads for a filter and nothing else. Appended after the
-// projected ones, with the projection pinned to what it was, so the
-// operator's output does not change.
-duckdb::ProjectionIndex FilterOnlyColumn(duckdb::LogicalGet &get, duckdb::column_t column_id) {
-	auto existing = get.TryGetProjectionIndex(column_id);
-	if (existing.IsValid()) {
-		return existing;
-	}
-	if (get.projection_ids.empty()) {
-		for (duckdb::idx_t position = 0; position < get.GetColumnIds().size(); position++) {
-			get.projection_ids.push_back(duckdb::ProjectionIndex(position));
-		}
-	}
-	return get.AddColumnId(column_id);
-}
-
-// A filter over the scan's own column, as a pushed filter names it.
-duckdb::unique_ptr<duckdb::Expression> ScanColumn(duckdb::LogicalType type) {
-	return duckdb::make_uniq<duckdb::BoundReferenceExpression>(std::move(type), 0);
-}
 
 // Candidate rows and exact-answer certification at the scan's snapshot.
 struct ResolvedPredicate {
@@ -563,21 +354,19 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	};
 }
 
-// Replaces the scan with the located scan over the rows an index resolves a
-// predicate to, as the join rule does for a lookup in the query. Only an
-// index that is complete for the scan's snapshot may, and every uncertainty
-// leaves the plan as written. The one exception is exact: no row holds the
-// value, so a range no row id is in makes the scan read nothing.
-void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::LogicalGet &get,
+// Replaces the scan in `slot` with the located scan over the rows an index
+// resolves a predicate to, as the join rule does for a lookup in the query.
+// Only an index that is complete for the scan's snapshot may, and every
+// uncertainty leaves the plan as written. The one exception is exact: no row
+// holds the value, so the scan becomes an empty result.
+void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::unique_ptr<duckdb::LogicalOperator> &slot,
                                  const ResolvedPredicate &found) {
-	auto &table = *found.table;
+	auto &get = slot->Cast<duckdb::LogicalGet>();
 	if (found.rows.empty()) {
-		get.table_filters.PushFilter(FilterOnlyColumn(get, duckdb::COLUMN_IDENTIFIER_ROW_ID),
-		                             duckdb::ExpressionFilter::CreateComparisonFilter(
-		                                 duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::BIGINT(0)));
+		slot = duckdb::make_uniq<duckdb::LogicalEmptyResult>(std::move(slot));
 		return;
 	}
-	UseSummaryScan(context, get, table.ParentCatalog().GetName().GetIdentifierName(), found.schema_name,
+	UseSummaryScan(context, get, found.table->ParentCatalog().GetName().GetIdentifierName(), found.schema_name,
 	               found.table_name, found.rows);
 }
 
@@ -593,6 +382,16 @@ duckdb::optional_ptr<duckdb::LogicalGet> DeleteSourceScan(duckdb::LogicalOperato
 		current = current->children[0].get();
 	}
 	return &current->Cast<duckdb::LogicalGet>();
+}
+
+// The slot holding the scan `DeleteSourceScan` found beneath `op`, so a rule
+// can replace it. Valid only once that search succeeded.
+duckdb::unique_ptr<duckdb::LogicalOperator> &DeleteSourceSlot(duckdb::unique_ptr<duckdb::LogicalOperator> &op) {
+	auto *current = &op;
+	while ((*current)->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+		current = &(*current)->children[0];
+	}
+	return *current;
 }
 
 // The `files` argument `moraine_delete_positions` takes: one entry per data
@@ -722,7 +521,7 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 		if (scan && scan->children.empty()) {
 			auto found = ResolveIndexedPredicate(context, optimizer, *scan);
 			if (found && !RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found)) {
-				PruneScanByIndexedPredicate(context, *scan, *found);
+				PruneScanByIndexedPredicate(context, DeleteSourceSlot(plan->children[0]), *found);
 			}
 			return;
 		}
@@ -736,7 +535,7 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 		auto &get = plan->Cast<duckdb::LogicalGet>();
 		auto found = ResolveIndexedPredicate(context, optimizer, get, residual);
 		if (found) {
-			PruneScanByIndexedPredicate(context, get, *found);
+			PruneScanByIndexedPredicate(context, plan, *found);
 		}
 	}
 }
@@ -755,7 +554,7 @@ public:
 
 	static void PostOptimize(duckdb::OptimizerExtensionInput &input,
 	                         duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
-		FilterJoinsAgainstIndexReads(input.context, input.optimizer, plan);
+		LocateJoinsAgainstIndexReads(input.context, plan);
 		OptimizeIndexedPredicates(input.context, input.optimizer, plan);
 	}
 };
