@@ -60,8 +60,9 @@ pub fn check_release_assets(arguments: &[String]) -> anyhow::Result<()> {
 }
 
 /// Loads one published build into the stock CLI for the DuckDB it was
-/// built for and proves that its bundled DuckLake records row-ID statistics
-/// for each of three files.
+/// built for and proves that the extension records row-ID bounds for each of
+/// an indexed table's three files and stages a positional delete through its
+/// bundled DuckLake.
 ///
 /// `version` and `platform` name the build the artifact is: a loadable
 /// carries both in its footer and loads into nothing else, so a wrong pair
@@ -109,8 +110,8 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
          API the delete is staged through"
     );
     println!(
-        "ok: the {platform} build's bundled DuckLake records row-ID statistics and the \
-         extension stages a positional delete through it under a stock DuckDB {version}"
+        "ok: the {platform} build records row-ID bounds and stages a positional delete through \
+         its bundled DuckLake under a stock DuckDB {version}"
     );
     Ok(())
 }

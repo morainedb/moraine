@@ -19,6 +19,17 @@ pub(super) fn embedded_row_id_position(
     })
 }
 
+/// The leaf column carrying the reserved embedded row-id field id, as the
+/// footer's row groups number their column chunks.
+pub(super) fn embedded_row_id_leaf(
+    schema: &parquet::schema::types::SchemaDescriptor,
+) -> Option<usize> {
+    schema.columns().iter().position(|column| {
+        let info = column.self_type().get_basic_info();
+        info.has_id() && u64::try_from(info.id()).ok() == Some(ROW_ID_FIELD_ID)
+    })
+}
+
 /// Resolves `source` against the file's schema into the projection
 /// inputs: the row-id column's position (when it is to be read) and the
 /// dense start.

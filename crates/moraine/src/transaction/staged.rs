@@ -1687,7 +1687,7 @@ async fn stage_rows(
         base,
         authored_snapshot: context.authored_snapshot,
     };
-    reporting_phase(
+    let flushed_bounds = reporting_phase(
         "flushed-row-ids",
         row_id_invariants::verify_flushed_row_ids(
             &premise,
@@ -1698,7 +1698,7 @@ async fn stage_rows(
         ),
     )
     .await?;
-    reporting_phase(
+    let compacted_bounds = reporting_phase(
         "compacted-row-ids",
         row_id_invariants::verify_compacted_row_ids(&premise, &ops, store, &context.data_prefix),
     )
@@ -1728,6 +1728,8 @@ async fn stage_rows(
     // Directory repairs go ahead of the inline writes, so a flush
     // draining a repaired chunk still deletes its locator.
     writes.extend(locator_writes);
+    writes.extend(flushed_bounds);
+    writes.extend(compacted_bounds);
     // A maintenance batch stamps the head too, reusing the standing
     // snapshot id.
     writes.push(commit::head_stamp(result_id, base.batch_seq));

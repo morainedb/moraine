@@ -139,6 +139,8 @@ impl EntrySink for VerifySink {
 
     fn cover_source(&mut self, _file_id: u64, _position: u64) {}
 
+    fn record_file_bounds(&mut self, _file_id: u64, _bounds: (u64, u64)) {}
+
     fn inline_cursor(&self) -> Option<InlineBuildCursorValue> {
         None
     }

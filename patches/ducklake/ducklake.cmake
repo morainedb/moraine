@@ -48,7 +48,6 @@ else()
             ${GIT_EXECUTABLE} apply --3way ${DUCKLAKE_UPSTREAM_PATCHES}
         COMMAND
             ${GIT_EXECUTABLE} apply
-            ${CMAKE_CURRENT_LIST_DIR}/0001-perf-record-DuckLake-row-id-statistics.patch
             ${CMAKE_CURRENT_LIST_DIR}/0003-feat-share-the-DuckLake-inlined-table-cache.patch
             ${CMAKE_CURRENT_LIST_DIR}/0004-fix-retain-files-after-unknown-commit-outcomes.patch
             ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch

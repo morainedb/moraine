@@ -10,6 +10,7 @@ mod native_ddl;
 mod predicates;
 mod prepared;
 mod pushdown;
+mod row_id_bounds;
 mod schema_evolution;
 mod selective;
 mod verify;

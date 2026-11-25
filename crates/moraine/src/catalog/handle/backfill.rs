@@ -33,13 +33,17 @@ pub(super) struct BackfillSource<'a> {
     pub(super) handle: ReadHandle<'a>,
 }
 
+/// The entries of every live file of the table, and the row-id bounds of
+/// each file whose footer states them.
+type ImmediateBackfill = (Vec<IndexEntry>, Vec<(u64, (u64, u64))>);
+
 async fn collect_immediate_backfill(
     object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
     positions: &[usize],
     source: BackfillSource<'_>,
     resolve: impl Fn(&str, bool) -> Result<Path>,
-) -> Result<Vec<IndexEntry>> {
+) -> Result<ImmediateBackfill> {
     let cursor = EntityCursor::open(
         source.handle,
         EntityRecordKind::File,
@@ -77,16 +81,21 @@ async fn collect_immediate_backfill(
                 )
                 .await?;
                 let dead: data_file::RowPositions = dead.into_iter().collect();
-                data_file::scoped_read_entry_batches(
-                    data_file::ParquetFile::new(
-                        object_store,
-                        resolve(&file.path, file.path_is_relative)?,
-                        file.file_size_bytes,
-                        file.footer_size,
-                    )
-                    .with_columns(columns)
-                    .with_metrics(metrics)
-                    .with_range_admission(crate::read_policy::CacheAdmission::ReuseOnly),
+                let parquet = data_file::ParquetFile::new(
+                    object_store,
+                    resolve(&file.path, file.path_is_relative)?,
+                    file.file_size_bytes,
+                    file.footer_size,
+                )
+                .with_columns(columns)
+                .with_metrics(metrics)
+                .with_range_admission(crate::read_policy::CacheAdmission::ReuseOnly);
+                let bounds =
+                    data_file::row_id_bounds(&parquet, file.row_id_start, file.record_count)
+                        .await?
+                        .map(|bounds| (file.data_file_id, bounds));
+                let entries = data_file::scoped_read_entry_batches(
+                    parquet,
                     positions,
                     data_file::ScopedRows::All,
                     data_file::RowIdSource::Resolve {
@@ -106,14 +115,19 @@ async fn collect_immediate_backfill(
                         Ok(entries)
                     }
                 })
-                .await
+                .await?;
+                Ok((entries, bounds))
             }
         })
         .try_buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-        .try_fold(Vec::new(), |mut entries, file_entries| async move {
-            entries.extend(file_entries);
-            Ok(entries)
-        })
+        .try_fold(
+            (Vec::new(), Vec::new()),
+            |(mut entries, mut bounds), (file_entries, file_bounds)| async move {
+                entries.extend(file_entries);
+                bounds.extend(file_bounds);
+                Ok((entries, bounds))
+            },
+        )
         .await
 }
 
@@ -253,6 +267,20 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
+        self.scoped_backfill(object_store, data_prefix, table, columns)
+            .await
+            .map(|(entries, _)| entries)
+    }
+
+    /// [`Self::scoped_backfill_entries`] with the row-id bounds of each file
+    /// read, for the index creation that records them.
+    pub(crate) async fn scoped_backfill(
+        &self,
+        object_store: DataStore,
+        data_prefix: &str,
+        table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<ImmediateBackfill> {
         let session = self.begin_read().await?;
 
         let snapshot = load_table(session.handle(), table, TableRead::Definition).await?;

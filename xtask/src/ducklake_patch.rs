@@ -27,8 +27,7 @@ const DUCKLAKE_FETCH_DEPTH: &str = "50";
 const SHALLOW: &str = "1";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-pub(crate) const PATCH_PATHS: [&str; 7] = [
-    "patches/ducklake/0001-perf-record-DuckLake-row-id-statistics.patch",
+pub(crate) const PATCH_PATHS: [&str; 6] = [
     "patches/ducklake/0003-feat-share-the-DuckLake-inlined-table-cache.patch",
     "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
     "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
@@ -37,8 +36,6 @@ pub(crate) const PATCH_PATHS: [&str; 7] = [
     "patches/ducklake/0012-perf-scope-and-stage-append-statistics.patch",
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
-/// The patched-behaviour sqllogictests, run against the built artifact.
-const REGRESSION_TEST_PATHS: [&str; 1] = ["test/sql/rowid/ducklake_row_id_statistics.test"];
 
 /// The patched DuckLake checkout the moraine build bundles, and the vcpkg
 /// it resolves DuckLake's `roaring` dependency through.
@@ -497,68 +494,6 @@ fn bootstrap_vcpkg(vcpkg: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn preload_ducklake_test(test_path: &str, script: &str) -> anyhow::Result<String> {
-    const REQUIREMENT: &str = "require ducklake\n";
-    ensure!(
-        script.matches(REQUIREMENT).count() == 1,
-        "{test_path} must contain exactly one `{}` directive",
-        REQUIREMENT.trim()
-    );
-    Ok(script.replacen(
-        REQUIREMENT,
-        "# ducklake is preloaded from the artifact under test\n",
-        1,
-    ))
-}
-
-/// Runs the series' own row-ID write, pruning and file-merge sqllogictests
-/// with `artifact` preloaded in place of `require ducklake`.
-pub fn run_row_id_regression(patched: &PatchedDuckLake, artifact: &Path) -> anyhow::Result<()> {
-    let runner = duckdb::workspace_root().join("build/release/test/unittest");
-    ensure!(
-        runner.exists(),
-        "the sqllogictest runner is missing at {}; `cargo xtask e2e` builds it",
-        runner.display()
-    );
-
-    for test_path in REGRESSION_TEST_PATHS {
-        let source_test = patched.source.join(test_path);
-        let script = fs::read_to_string(&source_test)
-            .with_context(|| format!("reading patched test {}", source_test.display()))?;
-        let script = preload_ducklake_test(test_path, &script)?;
-        let test_root = TemporaryDirectory::create(&patched.root, "ducklake-regression")?;
-        let copied_test = test_root.path().join(test_path);
-        let parent = copied_test
-            .parent()
-            .context("the regression test path has no parent")?;
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        fs::write(&copied_test, script)
-            .with_context(|| format!("writing {}", copied_test.display()))?;
-
-        let artifact_literal = artifact.display().to_string().replace('\'', "''");
-        let output = Command::new(&runner)
-            .args(["--test-dir"])
-            .arg(test_root.path())
-            .arg(test_path)
-            .env("DUCKDB_TEST_ON_INIT", format!("LOAD '{artifact_literal}';"))
-            .output()
-            .with_context(|| format!("spawning {}", runner.display()))?;
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        ensure!(
-            output.status.success(),
-            "the patched DuckLake sqllogictest {test_path} failed against {}",
-            artifact.display()
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        ensure!(
-            stdout.contains("All tests passed") && stdout.contains("1 test case"),
-            "the patched DuckLake sqllogictest {test_path} did not report one passing case"
-        );
-    }
-    Ok(())
-}
-
 struct TemporaryDirectory {
     path: PathBuf,
 }
@@ -798,16 +733,5 @@ mod tests {
 
         assert!(error.to_string().contains("DuckDB submodule is dirty"));
         assert!(ensure_clean_checkout_status("DuckDB submodule", "").is_ok());
-    }
-
-    #[test]
-    fn patched_regression_preloads_only_ducklake() {
-        let script = "require ducklake\n\nrequire parquet\n\nstatement ok\nSELECT 1\n";
-        let transformed =
-            preload_ducklake_test("test/sql/example.test", script).expect("DuckLake requirement");
-
-        assert!(!transformed.contains("require ducklake"));
-        assert!(transformed.contains("require parquet"));
-        assert!(transformed.contains("statement ok\nSELECT 1"));
     }
 }

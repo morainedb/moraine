@@ -57,7 +57,7 @@ use parquet::{
         arrow_reader::ArrowReaderOptions,
         async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder},
     },
-    file::metadata::PageIndexPolicy,
+    file::{metadata::PageIndexPolicy, statistics::Statistics},
 };
 
 pub use crate::data_file::data_store::DataStore;
@@ -265,6 +265,51 @@ pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> 
     Ok(embedded_row_id_position(builder.parquet_schema()).is_some())
 }
 
+/// The lowest and highest row id `file` holds: `row_id_start` through the
+/// last record for a file without the embedded row-id column, else that
+/// column's footer statistics over every row group. `None` for an empty
+/// file, a dense file with no recorded start, or a footer without the
+/// statistics.
+pub(crate) async fn row_id_bounds(
+    file: &ParquetFile,
+    row_id_start: Option<u64>,
+    record_count: u64,
+) -> Result<Option<(u64, u64)>> {
+    if record_count == 0 {
+        return Ok(None);
+    }
+    let metadata = ObjectStoreReader::new(file, PageIndexPolicy::Skip)
+        .get_metadata(None)
+        .await
+        .map_err(corrupt("footer read"))?;
+    let Some(leaf) = columns::embedded_row_id_leaf(metadata.file_metadata().schema_descr()) else {
+        return Ok(row_id_start.and_then(|start| {
+            start
+                .checked_add(record_count.saturating_sub(1))
+                .map(|end| (start, end))
+        }));
+    };
+
+    let mut bounds: Option<(i64, i64)> = None;
+    for row_group in metadata.row_groups() {
+        let Some(Statistics::Int64(statistics)) = row_group
+            .columns()
+            .get(leaf)
+            .and_then(|column| column.statistics())
+        else {
+            return Ok(None);
+        };
+        let (Some(low), Some(high)) = (statistics.min_opt(), statistics.max_opt()) else {
+            return Ok(None);
+        };
+        bounds = Some(bounds.map_or((*low, *high), |(lowest, highest)| {
+            (lowest.min(*low), highest.max(*high))
+        }));
+    }
+
+    Ok(bounds.and_then(|(low, high)| Some((u64::try_from(low).ok()?, u64::try_from(high).ok()?))))
+}
+
 /// Loads `file`'s footer into the process cache, with its page index when
 /// `page_index`, so a reader opened on the file afterwards finds it
 /// resident.
@@ -460,6 +505,7 @@ fn read_projection(
         schema::BatchProjection::resolve(builder.schema(), columns, requested, row_id)?;
     let (mask, _, _) = projection(builder.parquet_schema(), &positions, None)?;
     normalization.remap(&positions)?;
+
     Ok((
         mask,
         (0..requested.len()).collect(),

@@ -10,6 +10,7 @@ pub(crate) mod migration;
 pub(crate) mod names;
 pub(crate) mod operations;
 pub(crate) mod read_scope;
+pub(crate) mod row_id_bounds;
 pub(crate) mod scoped;
 pub(crate) mod session;
 pub(crate) mod staged;

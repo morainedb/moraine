@@ -1298,6 +1298,7 @@ async fn finish_and_stage(
         operations,
         index_entries,
         inline_ops,
+        raw_writes,
         mut state,
         next_catalog_id,
         next_file_id,
@@ -1339,6 +1340,7 @@ async fn finish_and_stage(
 
     let mut writes = diff_writes(base, &state, new_id);
     writes.extend(inline_writes);
+    writes.extend(raw_writes);
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
         .iter()
