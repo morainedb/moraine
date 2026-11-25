@@ -65,43 +65,50 @@ MetadataRows MoraineMetadataManager::TableStatisticsRows(const char *name, duckd
 	}
 }
 
-bool MoraineMetadataManager::TryGetTableStats(duckdb::DuckLakeSnapshot, duckdb::TableIndex table_id,
-                                              duckdb::vector<duckdb::DuckLakeGlobalStatsInfo> &stats) {
+duckdb::vector<duckdb::DuckLakeGlobalStatsInfo>
+MoraineMetadataManager::GetGlobalTableStats(duckdb::DuckLakeSnapshot snapshot,
+                                            const duckdb::vector<duckdb::TableIndex> &table_ids) {
+	if (table_ids.empty()) {
+		return DuckLakeMetadataManager::GetGlobalTableStats(snapshot, table_ids);
+	}
 	RecordDrivingContext();
-	auto rows = TableStatisticsRows("ducklake_table_stats", table_id);
-	if (rows.empty()) {
-		return true;
-	}
-	if (rows.size() != 1) {
-		throw duckdb::InvalidInputException("moraine: ambiguous table statistics");
-	}
-	const auto &row = rows[0];
-	duckdb::DuckLakeGlobalStatsInfo entry {};
-	entry.table_id = table_id;
-	entry.initialized = true;
-	entry.record_count_unknown = !ReadOptional(row[1], entry.record_count);
-	entry.next_row_id = row[2].GetValue<duckdb::idx_t>();
-	entry.missing_table_size = !ReadOptional(row[3], entry.table_size_bytes);
-	if (entry.missing_table_size) {
-		// Older catalogs can require DuckLake's data-file size recovery query.
-		return false;
-	}
-	for (const auto &column : TableStatisticsRows("ducklake_table_column_stats", table_id)) {
-		duckdb::DuckLakeGlobalColumnStatsInfo column_stats {};
-		column_stats.column_id = duckdb::FieldIndex(column[1].GetValue<duckdb::idx_t>());
-		column_stats.has_contains_null = ReadOptional(column[2], column_stats.contains_null);
-		column_stats.has_contains_nan = ReadOptional(column[3], column_stats.contains_nan);
-		column_stats.has_min = ReadOptional(column[4], column_stats.min_val);
-		column_stats.has_max = ReadOptional(column[5], column_stats.max_val);
-		column_stats.has_extra_stats = ReadOptional(column[6], column_stats.extra_stats);
-		if (column.size() > 7) {
-			ReadOptional(column[7], column_stats.min_is_exact);
-			ReadOptional(column[8], column_stats.max_is_exact);
+	duckdb::vector<duckdb::DuckLakeGlobalStatsInfo> stats;
+	for (auto table_id : table_ids) {
+		auto rows = TableStatisticsRows("ducklake_table_stats", table_id);
+		if (rows.empty()) {
+			continue;
 		}
-		entry.column_stats.push_back(std::move(column_stats));
+		if (rows.size() != 1) {
+			throw duckdb::InvalidInputException("moraine: ambiguous table statistics");
+		}
+		const auto &row = rows[0];
+		duckdb::DuckLakeGlobalStatsInfo entry {};
+		entry.table_id = table_id;
+		entry.initialized = true;
+		entry.record_count_unknown = !ReadOptional(row[1], entry.record_count);
+		entry.next_row_id = row[2].GetValue<duckdb::idx_t>();
+		entry.missing_table_size = !ReadOptional(row[3], entry.table_size_bytes);
+		if (entry.missing_table_size) {
+			// Older catalogs can require DuckLake's data-file size recovery query.
+			return DuckLakeMetadataManager::GetGlobalTableStats(snapshot, table_ids);
+		}
+		for (const auto &column : TableStatisticsRows("ducklake_table_column_stats", table_id)) {
+			duckdb::DuckLakeGlobalColumnStatsInfo column_stats {};
+			column_stats.column_id = duckdb::FieldIndex(column[1].GetValue<duckdb::idx_t>());
+			column_stats.has_contains_null = ReadOptional(column[2], column_stats.contains_null);
+			column_stats.has_contains_nan = ReadOptional(column[3], column_stats.contains_nan);
+			column_stats.has_min = ReadOptional(column[4], column_stats.min_val);
+			column_stats.has_max = ReadOptional(column[5], column_stats.max_val);
+			column_stats.has_extra_stats = ReadOptional(column[6], column_stats.extra_stats);
+			if (column.size() > 7) {
+				ReadOptional(column[7], column_stats.min_is_exact);
+				ReadOptional(column[8], column_stats.max_is_exact);
+			}
+			entry.column_stats.push_back(std::move(column_stats));
+		}
+		stats.push_back(std::move(entry));
 	}
-	stats.push_back(std::move(entry));
-	return true;
+	return stats;
 }
 
 bool MoraineMetadataManager::TryWriteAppendStats(const duckdb::DuckLakeGlobalStatsInfo &stats) {

@@ -153,6 +153,10 @@ MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std:
 	    catalog_name, metadata_prefix);
 }
 
+MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const duckdb::Identifier &catalog_name) {
+	return ResolveMoraineCatalog(context, catalog_name.GetIdentifierName());
+}
+
 extern "C" bool moraine_shim_is_interrupted(void *client_context) {
 	auto &context = *static_cast<duckdb::ClientContext *>(client_context);
 	if (context.IsInterrupted()) {

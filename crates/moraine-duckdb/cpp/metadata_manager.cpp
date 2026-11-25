@@ -234,7 +234,7 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 	}
 	auto &catalog = transaction.GetCatalog();
 	auto &connection = transaction.GetConnection();
-	auto schema_name = catalog.MetadataSchemaName();
+	auto schema_name = catalog.MetadataSchemaName().GetIdentifierName();
 	if (schema_name.empty()) {
 		schema_name = "main";
 	}
@@ -301,20 +301,21 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 		duckdb::string inlined_table_name;
 		for (auto &inlined_table : new_inlined_data_tables_result) {
 			if (inlined_table.id == entry.table_id) {
-				inlined_table_name = InlinedTableNameFor(inlined_table.id.index, commit_snapshot.schema_version);
+				inlined_table_name =
+				    InlinedTableNameFor(inlined_table.id.index, commit_snapshot.schema_version).GetIdentifierName();
 			}
 		}
 		if (inlined_table_name.empty()) {
 			// get the latest table to insert into
 			auto it = insert_inlined_table_name_cache.find(entry.table_id.index);
 			if (it != insert_inlined_table_name_cache.end()) {
-				inlined_table_name = it->second;
+				inlined_table_name = it->second.GetIdentifierName();
 			}
 		}
 		if (inlined_table_name.empty()) {
 			inlined_table_name = LatestInlineTableName(entry.table_id.index);
 			if (!inlined_table_name.empty()) {
-				insert_inlined_table_name_cache[entry.table_id.index] = inlined_table_name;
+				insert_inlined_table_name_cache[entry.table_id.index] = duckdb::Identifier(inlined_table_name);
 			}
 		}
 
@@ -346,7 +347,8 @@ duckdb::string MoraineMetadataManager::WriteNewInlinedData(
 			duckdb::string inlined_table_queries;
 			commit_snapshot.schema_version++;
 			inlined_table_name =
-			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries);
+			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries)
+			        .GetIdentifierName();
 			batch_query += InsertValuesSql("ducklake_inlined_data_tables", inlined_tables);
 			batch_query += inlined_table_queries;
 		}

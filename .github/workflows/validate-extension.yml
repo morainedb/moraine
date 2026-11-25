@@ -10,7 +10,7 @@ on:
       duckdb_versions:
         description: JSON array of DuckDB releases to validate.
         required: true
-        default: '["v2.0.0"]'
+        default: '["v2.0.1"]'
         type: string
       source_run_id:
         description: Workflow run containing the built extension artifacts.

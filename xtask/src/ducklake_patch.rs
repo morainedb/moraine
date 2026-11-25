@@ -12,8 +12,8 @@ use anyhow::{Context, bail, ensure};
 use crate::duckdb::{self, command_output, optional_command_output};
 
 const DUCKLAKE_URL: &str = "https://github.com/duckdb/ducklake.git";
-const DUCKLAKE_REVISION: &str = "417a9117f590e8141742ac0579d02f6a90162e37";
-const SUPPORTED_DUCKDB_PIN: &str = "v2.0.0";
+const DUCKLAKE_REVISION: &str = "08089b16dc8a18ce04abb6efd87e25cb4d64803a";
+const SUPPORTED_DUCKDB_PIN: &str = "v2.0.1";
 /// DuckDB's own DuckLake patches, which it applies to the commit it pins
 /// before building the extension. The series here targets that patched
 /// source, so every application composes theirs first.
@@ -27,11 +27,10 @@ const DUCKLAKE_FETCH_DEPTH: &str = "50";
 const SHALLOW: &str = "1";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-pub(crate) const PATCH_PATHS: [&str; 6] = [
+pub(crate) const PATCH_PATHS: [&str; 5] = [
     "patches/ducklake/0003-feat-share-the-DuckLake-inlined-table-cache.patch",
     "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
     "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
-    "patches/ducklake/0009-perf-bound-the-commit-time-head-lookup.patch",
     "patches/ducklake/0011-perf-stage-snapshots-and-defer-inline-appends.patch",
     "patches/ducklake/0012-perf-scope-and-stage-append-statistics.patch",
 ];

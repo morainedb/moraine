@@ -101,14 +101,14 @@ its users run.
 
 | What | Pinned at |
 |---|---|
-| DuckDB | **v2.0.0** (git hash `d54cbbe3df`, codename Cyanoptera) |
-| Toolchain | `duckdb/extension-ci-tools` at `78bd1e4abb` |
+| DuckDB | **v2.0.1** (git hash `8d78114e90`, codename Cyanoptera) |
+| Toolchain | `duckdb/extension-ci-tools` at `71304ce91a` |
 | C++ standard | C++17 |
 | Linux C++ compiler | GCC 14 |
 | DuckDB CLI (for `LOAD` testing) | `build/release/duckdb`, built beside the extension and verified to report the pin; a release is validated against the published CLI for the pin |
 | DuckLake (bundled) | the commit `INSTALL ducklake` resolves to against the pinned CLI, plus `patches/ducklake/` — see "The bundled DuckLake" below |
 
-**Bumping** is `cargo xtask bump-duckdb v2.0.0`: it moves both submodules
+**Bumping** is `cargo xtask bump-duckdb v2.0.1`: it moves both submodules
 to that release, rewrites the manifest around it, and carries every derived
 reference along — the workflow refs, the table above, the new release's
 DuckLake source pin, and the DuckLake commit the new DuckDB declares,
@@ -160,7 +160,7 @@ unsigned extensions, and the setting cannot be changed on a running
 database: start the CLI with `-unsigned`, then load the file:
 
 ```sh
-duckdb -unsigned -c "LOAD './moraine.v2.0.0.osx_arm64.duckdb_extension';"
+duckdb -unsigned -c "LOAD './moraine.v2.0.1.osx_arm64.duckdb_extension';"
 ```
 
 DuckDB derives the entry symbol from the filename before its first `.`, so
@@ -198,7 +198,7 @@ $ duckdb -unsigned \
 ┌────────────────┬─────────┬───────────────────┐
 │ extension_name │ loaded  │ extension_version │
 ├────────────────┼─────────┼───────────────────┤
-│ ducklake       │ true    │ 417a911           │
+│ ducklake       │ true    │ 08089b1           │
 │ moraine        │ true    │ …                 │
 └────────────────┴─────────┴───────────────────┘
 ```
@@ -210,15 +210,16 @@ the bundle's.
 The bundled source is the DuckLake commit the pinned DuckDB's own build-time pin
 selects (`.github/config/extensions/ducklake.cmake` in the `duckdb/duckdb`
 source tree names `GIT_URL https://github.com/duckdb/ducklake` at
-`GIT_TAG 417a9117f590e8141742ac0579d02f6a90162e37`), so the bundle tracks
+`GIT_TAG 08089b16dc8a18ce04abb6efd87e25cb4d64803a`), so the bundle tracks
 exactly what `INSTALL ducklake` would install against this DuckDB: that commit,
 then DuckDB's own DuckLake patches, then the series on top.
 `patches/ducklake/source-pins` records that commit per supported DuckDB release;
 `cargo xtask check-pins` keeps it in step.
 
 The patch series shares the inlined-table cache, keeps files after unknown
-commit outcomes, names the table a dropped file belongs to, bounds the
-commit-time head lookup, and stages snapshots and statistics. Index-assisted
+commit outcomes, names the table a dropped file belongs to, and stages
+snapshots and statistics. The commit-time head lookup is bounded by the
+metadata manager's own override of the query. Index-assisted
 reads are a direct join on the stable row id, which the extension's own located
 scan serves; DuckLake owns file selection, inlined data, snapshots, and deletes.
 

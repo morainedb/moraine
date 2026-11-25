@@ -472,8 +472,8 @@ row or per file.
 
 | What | Pinned at |
 |---|---|
-| DuckDB | `v2.0.0`, the version string the loadable is bound to |
-| DuckLake extension | commit `417a9117`, hard-coded by DuckDB in `.github/config/extensions/ducklake.cmake` |
+| DuckDB | `v2.0.1`, the version string the loadable is bound to |
+| DuckLake extension | commit `08089b16`, hard-coded by DuckDB in `.github/config/extensions/ducklake.cmake` |
 | DuckLake branch | `main` |
 | DuckLake catalog format | 1.0 by default, 1.1 on a raised store |
 

@@ -19,7 +19,7 @@ use crate::helpers::*;
 
 /// The exact DuckLake commit whose behaviour these pins describe and that
 /// the repository patch is applied to.
-const DUCKLAKE_SOURCE_COMMIT: &str = "417a9117f590e8141742ac0579d02f6a90162e37";
+const DUCKLAKE_SOURCE_COMMIT: &str = "08089b16dc8a18ce04abb6efd87e25cb4d64803a";
 
 /// Git's default lower bound for an abbreviated object name.
 const MINIMUM_GIT_ABBREVIATION_LENGTH: usize = 7;
@@ -154,9 +154,14 @@ fn ducklakes_catalog_access_set_is_pinned() {
         if !statement.contains("__ducklake_metadata_lake") {
             continue;
         }
+        // A statement may open with a CTE; the verb after it says whether it writes.
+        let upper = statement.trim_start().to_uppercase();
         let writes = ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP"]
             .iter()
-            .any(|verb| statement.trim_start().to_uppercase().starts_with(verb));
+            .any(|verb| {
+                upper.starts_with(verb)
+                    || (upper.starts_with("WITH") && upper.contains(&format!(") {verb} ")))
+            });
         for table in ducklake_tables_named_in(statement) {
             let entry = access.entry(table).or_insert((false, false));
             if writes {
@@ -215,7 +220,7 @@ fn ducklakes_catalog_access_set_is_pinned() {
         "ducklake_table RW",
         // Table-statistics reads use scoped cursors; non-append writes retain SQL.
         "ducklake_table_column_stats W",
-        "ducklake_table_stats RW",
+        "ducklake_table_stats W",
         "ducklake_tag RW",
         "ducklake_view RW",
     ];

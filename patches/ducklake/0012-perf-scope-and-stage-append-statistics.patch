@@ -1,12 +1,16 @@
+diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
+index 7c89c5e6..cbefbdf5 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -515,6 +515,16 @@
+@@ -547,6 +547,18 @@ public:
  	//! SQL templates with {METADATA_CATALOG} / {SNAPSHOT_ID} placeholders, shared with the
  	//! server-side commit path.
  	static string InsertSnapshotSql();
 +	//! Returns only the requested table's statistics when supported by the backend.
 +	virtual bool TryGetTableStats(DuckLakeSnapshot snapshot, TableIndex table_id,
 +	                              vector<DuckLakeGlobalStatsInfo> &stats) { return false; }
++	//! Whether a lookup of one table's statistics should load that table alone.
++	virtual bool ScopesTableStats() const { return false; }
 +	//! Queues append statistics for staging after the commit SQL succeeds.
 +	virtual bool TryWriteAppendStats(const DuckLakeGlobalStatsInfo &stats) { return false; }
 +	virtual void FlushAppendStats() {}
@@ -17,9 +21,11 @@
  	//! Stages the finalized snapshot directly; false retains the SQL insertion.
  	virtual bool TryWriteSnapshot(DuckLakeSnapshot snapshot) {
  		return false;
+diff --git a/src/include/storage/ducklake_transaction_state.hpp b/src/include/storage/ducklake_transaction_state.hpp
+index c047e1c8..6e724465 100644
 --- a/src/include/storage/ducklake_transaction_state.hpp
 +++ b/src/include/storage/ducklake_transaction_state.hpp
-@@ -35,7 +35,14 @@
+@@ -37,7 +37,14 @@ struct DuckLakeCommitContext {
  	};
  	//! Stages the finalized snapshot without SQL when the metadata backend supports it.
  	std::function<bool(DuckLakeSnapshot)> try_write_snapshot = [](DuckLakeSnapshot) { return false; };
@@ -35,53 +41,48 @@
  	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string &)> execute_commit_batch;
  	//! Classifies metadata-catalog errors that are safe to retry.
  	std::function<bool(const string &)> is_retryable_metadata_error = [](const string &) {
-@@ -175,7 +182,7 @@
+@@ -192,7 +199,7 @@ public:
  	GetFilesDeletedOrDroppedAfterSnapshot(const std::function<unique_ptr<QueryResult>(string)> &executor);
- 
+
  	string WriteSnapshotChanges(DuckLakeCommitState &commit_state, TransactionChangeInformation &changes,
 -	                            const DuckLakeSnapshotCommit &commit_info) const;
 +	                            const DuckLakeCommitContext &context) const;
- 
+
  	string CommitChanges(DuckLakeCommitState &commit_state, TransactionChangeInformation &transaction_changes,
  	                     optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats, const DuckLakeCommitContext &context,
+diff --git a/src/storage/ducklake_catalog.cpp b/src/storage/ducklake_catalog.cpp
+index 5112dfd5..f5ad78a5 100644
 --- a/src/storage/ducklake_catalog.cpp
 +++ b/src/storage/ducklake_catalog.cpp
-@@ -986,13 +986,18 @@
- 		// a table that is not part of the snapshot, e.g. one created in this transaction, has no stats in it
- 		return nullptr;
+@@ -1059,7 +1059,12 @@ shared_ptr<DuckLakeTableStats> DuckLakeCatalog::GetTableStats(DuckLakeTransactio
  	}
--	// one query for the whole snapshot, caching the tables without stats as well
--	auto global_stats = transaction.GetMetadataManager().GetGlobalTableStats(snapshot);
-+	vector<DuckLakeGlobalStatsInfo> global_stats;
+ 	// one query for the whole snapshot or for the given tables, caching the tables without stats as well
+ 	vector<TableIndex> cache_tables;
+-	if (!load_tables) {
 +	auto &manager = transaction.GetMetadataManager();
-+	bool scoped = manager.TryGetTableStats(snapshot, table_id, global_stats);
-+	if (!scoped) {
-+		global_stats = manager.GetGlobalTableStats(snapshot);
-+	}
- 	auto lake_stats = ConstructStatsMap(global_stats, schema_entry->catalog_set);
- 
- 	shared_ptr<DuckLakeTableStatsCacheEntry> requested_entry;
--	for (auto &table_entry : table_map) {
--		auto current_id = table_entry.first;
-+	auto table_entry = scoped ? table_map.find(table_id) : table_map.begin();
-+	for (; table_entry != table_map.end(); ++table_entry) {
-+		auto current_id = table_entry->first;
- 		shared_ptr<DuckLakeTableStatsCacheEntry> entry;
- 		auto stats_entry = lake_stats->table_stats.find(current_id);
- 		if (stats_entry == lake_stats->table_stats.end()) {
-@@ -1006,6 +1011,9 @@
- 			requested_entry = entry;
++	bool scoped = load_tables || manager.ScopesTableStats();
++	if (!load_tables && manager.ScopesTableStats()) {
++		// a metadata catalog that narrows a read by table serves this one table instead of every table
++		cache_tables.push_back(table_id);
++	} else if (!load_tables) {
+ 		for (auto &table_entry : table_map) {
+ 			cache_tables.push_back(table_entry.first);
  		}
- 		cache.Put(StatsCacheKey(snapshot.next_file_id, current_id), std::move(entry));
-+		if (scoped) {
-+			break;
-+		}
+@@ -1073,8 +1078,7 @@ shared_ptr<DuckLakeTableStats> DuckLakeCatalog::GetTableStats(DuckLakeTransactio
+ 			}
+ 		}
  	}
- 	if (!requested_entry || !requested_entry->has_stats) {
- 		return nullptr;
+-	auto global_stats = transaction.GetMetadataManager().GetGlobalTableStats(
+-	    snapshot, load_tables ? cache_tables : vector<TableIndex>());
++	auto global_stats = manager.GetGlobalTableStats(snapshot, scoped ? cache_tables : vector<TableIndex>());
+ 	auto lake_stats = ConstructStatsMap(global_stats, schema_entry->catalog_set);
+
+ 	shared_ptr<DuckLakeTableStatsCacheEntry> requested_entry;
+diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
+index 7f93f88d..78e3b60b 100644
 --- a/src/storage/ducklake_transaction.cpp
 +++ b/src/storage/ducklake_transaction.cpp
-@@ -1522,17 +1522,28 @@
+@@ -1626,17 +1626,28 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
  	context.try_write_snapshot = [&](DuckLakeSnapshot snapshot) {
  		return metadata_manager->TryWriteSnapshot(snapshot);
  	};
@@ -104,7 +105,7 @@
  				break;
  			}
  			// Table creation must finish before binding the inlined INSERT.
- 			result = connection->Query(std::move(insert));
+ 			result = ExecuteStatement(std::move(insert));
  		}
  		inlined_inserts.clear();
 -		if (!result->HasError()) {
@@ -113,7 +114,7 @@
  			metadata_manager->FlushInlinedAppends(snapshot);
  		}
  		return result;
-@@ -1550,6 +1561,7 @@
+@@ -1660,6 +1671,7 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
  	};
  	context.try_rollback = [&]() {
  		metadata_manager->ClearInlinedAppends();
@@ -121,10 +122,12 @@
  		if (connection->context->transaction.HasActiveTransaction()) {
  			connection->Rollback();
  		}
+diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
+index fb60f1b5..d7f39876 100644
 --- a/src/storage/ducklake_transaction_state.cpp
 +++ b/src/storage/ducklake_transaction_state.cpp
-@@ -387,7 +387,7 @@
- 
+@@ -397,7 +397,7 @@ void AddCreatedChangeInfo(vector<string> &changes_made,
+
  string DuckLakeTransactionState::WriteSnapshotChanges(DuckLakeCommitState &commit_state,
                                                        TransactionChangeInformation &changes,
 -                                                      const DuckLakeSnapshotCommit &commit_info) const {
@@ -132,7 +135,7 @@
  	// re-add all inserted tables - transaction-local table identifiers should have been converted at this stage
  	changes.tables_deleted_from = tables_deleted_from;
  	for (auto &entry : local_changes.Changes()) {
-@@ -426,7 +426,10 @@
+@@ -436,7 +436,10 @@ string DuckLakeTransactionState::WriteSnapshotChanges(DuckLakeCommitState &commi
  	AddChangeInfo(commit_state, changes_made, changes.tables_rewrite_delete, "rewrite_delete");
  	SnapshotChangeInfo change_info;
  	change_info.changes_made = StringUtil::Join(changes_made, ",");
@@ -142,9 +145,9 @@
 +	}
 +	return DuckLakeMetadataManager::WriteSnapshotChangesSql(change_info, context.commit_info);
  }
- 
- static bool UpdateNestedField(vector<DuckLakeColumnInfo> &fields, FieldIndex parent_id, FieldIndex field_id,
-@@ -1228,8 +1231,11 @@
+
+ //! Replaces a field queued by this transaction, which keeps the children queued for it
+@@ -1242,8 +1245,11 @@ static string WriteGlobalTableStatsSql(TableIndex table_id, DuckLakeNewGlobalSta
  	if (clear_column_stats) {
  		new_globals.stats.column_stats.clear();
  	}
@@ -158,8 +161,8 @@
  	if (clear_column_stats) {
  		result += DeleteTableColumnStatsSql(table_id);
  	}
-@@ -2686,14 +2692,26 @@
- 			can_retry = true;
+@@ -2766,14 +2772,26 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
+ 			}
  			context.set_delete_commit_snapshot(commit_snapshot.snapshot_id);
  			DuckLakeCommitState commit_state(commit_snapshot);
 -			string batch_queries = CommitChanges(commit_state, attempt_changes, stats, context, attempt_dropped_file_stats);

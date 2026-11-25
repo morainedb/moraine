@@ -10,6 +10,10 @@
 namespace moraine_duckdb {
 
 // Replaces a same-table, current-snapshot scan after both location join keys are verified.
+//! Whether `scan` is already the located scan, which carries DuckLake's scan
+//! name and must not be located again.
+bool IsSummaryScan(const duckdb::LogicalGet &scan);
+
 bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const duckdb::LogicalGet &index,
                     const std::vector<MoraineRowId> &rows);
 
