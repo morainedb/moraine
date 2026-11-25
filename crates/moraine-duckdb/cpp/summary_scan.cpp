@@ -19,10 +19,13 @@
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete.hpp"
 #include "storage/ducklake_delete_filter.hpp"
+#include "storage/ducklake_inlined_data.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
+#include "common/index.hpp"
 #include <algorithm>
 #include <chrono>
 #include <map>
@@ -31,6 +34,10 @@
 namespace moraine_duckdb {
 
 namespace {
+
+// The name DuckLake's file list gives the transaction's inlined rows, which
+// keys their deletes.
+constexpr const char *LOCAL_INLINED_ENTRY = "__ducklake_inlined_transaction_local_data";
 
 // Imports an Arrow batch the row scan exported as DuckDB chunks. Consumes
 // both structs, including when the import throws.
@@ -143,6 +150,11 @@ struct SummaryScanBindData : duckdb::MultiFileBindData {
 	// deletions are recorded under.
 	std::map<uint64_t, std::string> file_paths;
 	std::vector<std::string> inlined_tables;
+	// The transaction's own inlined rows for the table, under the name
+	// DuckLake records their deletions under, and the row id of the first;
+	// empty when it inserted none inline.
+	std::string local_inlined_path;
+	uint64_t local_inlined_row_id_start = 0;
 	duckdb::vector<std::string> column_names;
 	duckdb::vector<duckdb::LogicalType> column_types;
 	// The replaced scan's function info, which its file list and reader
@@ -183,6 +195,8 @@ struct SummaryScanBindData : duckdb::MultiFileBindData {
 		result->pairs = pairs;
 		result->file_paths = file_paths;
 		result->inlined_tables = inlined_tables;
+		result->local_inlined_path = local_inlined_path;
+		result->local_inlined_row_id_start = local_inlined_row_id_start;
 		result->column_names = column_names;
 		result->column_types = column_types;
 		result->scan_info = scan_info;
@@ -223,6 +237,9 @@ duckdb::LogicalType LocatedVirtualColumnType(duckdb::column_t column) {
 struct SummaryScanState : duckdb::GlobalTableFunctionState {
 	MoraineRowScan *scan = nullptr;
 	duckdb::vector<duckdb::idx_t> decoded_columns, projection;
+	// The table columns the located read decodes, in the order it emits them.
+	duckdb::vector<duckdb::column_t> requested_columns;
+	bool local_inlined_emitted = false;
 	// Output columns that carry the file's path, derived from its id.
 	duckdb::vector<duckdb::idx_t> filename_columns;
 	duckdb::vector<duckdb::LogicalType> types;
@@ -335,6 +352,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 			state->types.push_back(LocatedVirtualColumnType(column));
 		} else {
 			state->decoded_columns.push_back(requested.size());
+			state->requested_columns.push_back(column);
 			requested.push_back(bound.column_names[column].c_str());
 			state->types.push_back(bound.column_types[column]);
 		}
@@ -447,6 +465,66 @@ void FillFilenames(const SummaryScanBindData &bound, duckdb::Vector &file_ids, d
 	}
 }
 
+// The rows this transaction inserted inline, which the pinned snapshot
+// cannot know and no data file holds, in the located batch layout, so the
+// predicate applies to them as to every located row. Their row ids follow
+// DuckLake's numbering of the same rows.
+void AppendLocalInlinedRows(duckdb::ClientContext &context, const SummaryScanBindData &bound, SummaryScanState &state) {
+	if (bound.local_inlined_path.empty()) {
+		return;
+	}
+	auto &lake = duckdb::Catalog::GetCatalog(context, duckdb::Identifier(bound.lake)).Cast<duckdb::DuckLakeCatalog>();
+	auto &transaction = duckdb::DuckLakeTransaction::Get(context, lake);
+	duckdb::TableIndex table_id(bound.table_id);
+	auto inlined = transaction.GetTransactionLocalInlinedData(table_id);
+	if (!inlined || !inlined->data) {
+		return;
+	}
+	std::set<duckdb::idx_t> deleted;
+	if (auto deletes = transaction.GetInlinedDeletes(table_id, bound.local_inlined_path)) {
+		deleted.insert(deletes->rows.begin(), deletes->rows.end());
+	}
+	duckdb::vector<duckdb::LogicalType> types;
+	for (auto column : state.requested_columns) {
+		types.push_back(bound.column_types[column]);
+	}
+	const auto row_id_at = types.size();
+	for (int trailing = 0; trailing < 3; trailing++) {
+		types.push_back(duckdb::LogicalType::UBIGINT);
+	}
+	duckdb::idx_t position = 0;
+	for (auto &chunk : inlined->data->Chunks()) {
+		duckdb::SelectionVector kept(chunk.size());
+		duckdb::idx_t count = 0;
+		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
+			if (!deleted.count(position + row)) {
+				kept.set_index(count++, row);
+			}
+		}
+		if (count > 0) {
+			auto piece = duckdb::make_uniq<duckdb::DataChunk>();
+			piece->Initialize(context, types);
+			for (duckdb::idx_t i = 0; i < state.requested_columns.size(); i++) {
+				duckdb::VectorOperations::Copy(chunk.data[state.requested_columns[i]], piece->data[i], kept, count, 0,
+				                               0);
+			}
+			auto row_ids = duckdb::FlatVector::GetDataMutable<uint64_t>(piece->data[row_id_at]);
+			for (duckdb::idx_t i = 0; i < count; i++) {
+				auto at = position + kept.get_index(i);
+				row_ids[i] = inlined->HasPreservedRowIds() ? static_cast<uint64_t>(inlined->row_ids[at])
+				                                           : bound.local_inlined_row_id_start + at;
+			}
+			for (auto absent : {row_id_at + 1, row_id_at + 2}) {
+				piece->data[absent].SetVectorType(duckdb::VectorType::CONSTANT_VECTOR);
+				duckdb::ConstantVector::SetNull(piece->data[absent], true);
+			}
+			piece->SetChildCardinality(count);
+			state.pending.push_back(std::move(piece));
+		}
+		position += chunk.size();
+	}
+}
+
 void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &input, duckdb::DataChunk &output) {
 	auto &state = input.global_state->Cast<SummaryScanState>();
 	duckdb::idx_t barren_batches = 0;
@@ -463,6 +541,13 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 			}
 			state.batch_ms += Milliseconds(started);
 			if (!has_batch) {
+				if (!state.local_inlined_emitted) {
+					state.local_inlined_emitted = true;
+					AppendLocalInlinedRows(context, input.bind_data->Cast<SummaryScanBindData>(), state);
+					if (!state.pending.empty()) {
+						continue;
+					}
+				}
 				output.SetChildCardinality(0);
 				return;
 			}
@@ -535,7 +620,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	auto &info = scan.function.function_info->Cast<duckdb::DuckLakeFunctionInfo>();
 	auto &lake = info.table.catalog.Cast<duckdb::DuckLakeCatalog>();
 	auto transaction = info.GetTransaction();
-	auto statistics = info.table.GetTableStats(context);
+	auto statistics = lake.GetTableStats(*transaction, info.table.GetTableId());
 	if (statistics && rows.size() > 4096 && rows.size() > statistics->record_count / 4) {
 		return false;
 	}
@@ -564,6 +649,18 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 			includes_inline = true;
 		}
 	}
+	// The rows the transaction inserted inline, numbered after the rows of
+	// the files it wrote, as DuckLake's own file list places them.
+	std::string local_inlined_path;
+	uint64_t local_inlined_row_id_start = 0;
+	if (info.include_local_changes && transaction->GetTransactionLocalInlinedData(info.table_id)) {
+		local_inlined_path = LOCAL_INLINED_ENTRY;
+		local_inlined_row_id_start = duckdb::DuckLakeConstants::TRANSACTION_LOCAL_ROW_ID_START;
+		for (auto &file : transaction->GetTransactionLocalFiles(info.table_id)) {
+			local_inlined_row_id_start += file.row_count;
+		}
+		includes_inline = true;
+	}
 	// Whole columns of any type the table declares: the located reader decodes
 	// what DuckLake wrote and the import casts to the declared type. A struct
 	// field projection asks for part of a column, which it does not serve,
@@ -582,6 +679,8 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		}
 	}
 	auto bound = duckdb::make_uniq<SummaryScanBindData>();
+	bound->local_inlined_path = local_inlined_path;
+	bound->local_inlined_row_id_start = local_inlined_row_id_start;
 	bound->lake = lake.GetName().GetIdentifierName();
 	bound->schema = schema;
 	bound->table = table;

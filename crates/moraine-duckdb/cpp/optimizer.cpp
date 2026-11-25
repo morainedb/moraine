@@ -16,6 +16,8 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -29,7 +31,9 @@
 #include "optimizer_predicates.hpp"
 #include "summary_scan.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
+#include "common/index.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "functions/ducklake_table_functions.hpp"
@@ -221,6 +225,9 @@ struct ResolvedPredicate {
 	// DuckLake refuses it against a newer view.
 	uint64_t snapshot_id = 0;
 	bool certified = false;
+	// Whether the transaction has inserted rows into the table that the
+	// index, which describes committed rows, cannot know.
+	bool local_inserts = false;
 };
 
 // Resolves supported predicates through a ready index. A declined probe
@@ -256,17 +263,12 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	if (!transaction || table.IsTransactionLocal()) {
 		return std::nullopt;
 	}
-	// Rows this transaction inserted carry no file id and no index entry
-	// yet; a file filter would drop them.
-	if (transaction->HasTransactionLocalInserts(info->table_id)) {
-		return std::nullopt;
-	}
 	// A scan at another snapshot than the transaction's is a different cut
 	// than the one the index resolves against.
 	if (transaction->GetSnapshot().snapshot_id != info->snapshot.snapshot_id) {
 		return std::nullopt;
 	}
-	auto stats = table.GetTableStats(*transaction);
+	auto stats = lake.GetTableStats(*transaction, table.GetTableId());
 	if (!stats || stats->table_size_bytes < MIN_PRUNABLE_TABLE_BYTES) {
 		return std::nullopt;
 	}
@@ -351,23 +353,133 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	    std::vector<MoraineRowId>(rows.begin(), rows.end()),
 	    info->snapshot.snapshot_id,
 	    certified && complete,
+	    transaction->HasTransactionLocalInserts(info->table_id),
 	};
+}
+
+// DuckLake's file list over exactly the given entries. DuckLake rebuilds a
+// list it pushes filters into from the transaction's whole view, which would
+// bring the committed files back, so this one declines every pushdown and
+// copies as itself.
+class FixedFileList final : public duckdb::DuckLakeMultiFileList {
+public:
+	FixedFileList(duckdb::DuckLakeFunctionInfo &info, duckdb::vector<duckdb::DuckLakeFileListEntry> entries)
+	    : duckdb::DuckLakeMultiFileList(info, std::move(entries)), info(info) {
+	}
+	duckdb::unique_ptr<duckdb::MultiFileList>
+	DynamicFilterPushdown(duckdb::MultiFileDynamicPushdownInfo &) const override {
+		return nullptr;
+	}
+	duckdb::unique_ptr<duckdb::MultiFileList>
+	ComplexFilterPushdown(duckdb::ClientContext &, const duckdb::MultiFileOptions &, duckdb::MultiFilePushdownInfo &,
+	                      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &) const override {
+		return nullptr;
+	}
+	duckdb::unique_ptr<duckdb::MultiFileList> Copy() const override {
+		return duckdb::make_uniq<FixedFileList>(info, GetFiles());
+	}
+
+private:
+	duckdb::DuckLakeFunctionInfo &info;
+};
+
+// DuckLake's own scan over the Parquet files this transaction wrote for the
+// table, whose rows the pinned snapshot cannot know. Null when it wrote none.
+duckdb::unique_ptr<duckdb::LogicalOperator> LocalFilesScan(duckdb::Optimizer &optimizer,
+                                                           const duckdb::LogicalGet &get) {
+	auto &info = get.function.function_info->Cast<duckdb::DuckLakeFunctionInfo>();
+	auto &files = get.bind_data->Cast<duckdb::MultiFileBindData>().file_list->Cast<duckdb::DuckLakeMultiFileList>();
+	duckdb::vector<duckdb::DuckLakeFileListEntry> local;
+	for (auto &entry : files.GetFiles()) {
+		if (entry.data_type == duckdb::DuckLakeDataType::DATA_FILE && entry.row_id_start.IsValid() &&
+		    duckdb::DuckLakeConstants::IsTransactionLocalRowId(static_cast<int64_t>(entry.row_id_start.GetIndex()))) {
+			local.push_back(entry);
+		}
+	}
+	if (local.empty()) {
+		return nullptr;
+	}
+	auto bind_data = get.bind_data->Copy();
+	bind_data->Cast<duckdb::MultiFileBindData>().file_list =
+	    duckdb::make_shared_ptr<FixedFileList>(info, std::move(local));
+	auto scan =
+	    duckdb::make_uniq<duckdb::LogicalGet>(optimizer.binder.GenerateTableIndex(), get.function, std::move(bind_data),
+	                                          get.returned_types, get.names, get.virtual_columns);
+	scan->SetColumnIds(duckdb::vector<duckdb::ColumnIndex>(get.GetColumnIds()));
+	scan->projection_ids = get.projection_ids;
+	scan->table_filters = std::move(*get.table_filters.Copy());
+	scan->bind_info = get.bind_info;
+	scan->parameters = get.parameters;
+	scan->named_parameters = get.named_parameters;
+	scan->input_table_types = get.input_table_types;
+	scan->input_table_names = get.input_table_names;
+	return std::move(scan);
+}
+
+// Whether the scan feeds DuckLake's DELETE or UPDATE, which read each row's
+// file and position from it.
+bool ReadsFileLocation(const duckdb::LogicalGet &get) {
+	for (auto &column : get.GetColumnIds()) {
+		auto id = column.GetPrimaryIndex();
+		if (id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME ||
+		    id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX ||
+		    id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 // Replaces the scan in `slot` with the located scan over the rows an index
 // resolves a predicate to, as the join rule does for a lookup in the query.
 // Only an index that is complete for the scan's snapshot may, and every
 // uncertainty leaves the plan as written. The one exception is exact: no row
-// holds the value, so the scan becomes an empty result.
-void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::unique_ptr<duckdb::LogicalOperator> &slot,
-                                 const ResolvedPredicate &found) {
+// holds the value, so the scan becomes an empty result. Inside a transaction
+// that has inserted rows, the located scan serves the committed rows and the
+// transaction's inlined ones, and DuckLake's scan over the files the
+// transaction wrote joins it under a UNION ALL that keeps the scan's bindings.
+void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
+                                 duckdb::unique_ptr<duckdb::LogicalOperator> &slot, const ResolvedPredicate &found) {
 	auto &get = slot->Cast<duckdb::LogicalGet>();
-	if (found.rows.empty()) {
+	if (found.rows.empty() && !found.local_inserts) {
 		slot = duckdb::make_uniq<duckdb::LogicalEmptyResult>(std::move(slot));
 		return;
 	}
-	UseSummaryScan(context, get, found.table->ParentCatalog().GetName().GetIdentifierName(), found.schema_name,
-	               found.table_name, found.rows);
+	auto local_files = found.local_inserts ? LocalFilesScan(optimizer, get) : nullptr;
+	if (!UseSummaryScan(context, get, found.table->ParentCatalog().GetName().GetIdentifierName(), found.schema_name,
+	                    found.table_name, found.rows) ||
+	    !local_files) {
+		return;
+	}
+
+	// The scan's parents name its outputs as (table index, position among its
+	// column ids); the projection keeps that index and places each united
+	// column at that position, with a NULL nobody reads in each gap.
+	auto original_index = get.table_index;
+	auto outputs = get.GetColumnBindings();
+	get.table_index = optimizer.binder.GenerateTableIndex();
+	auto both = duckdb::make_uniq<duckdb::LogicalSetOperation>(optimizer.binder.GenerateTableIndex(), outputs.size(),
+	                                                           std::move(slot), std::move(local_files),
+	                                                           duckdb::LogicalOperatorType::LOGICAL_UNION, true);
+	both->ResolveOperatorTypes();
+	auto united = both->GetColumnBindings();
+	duckdb::idx_t width = 0;
+	for (auto &output : outputs) {
+		width = std::max<duckdb::idx_t>(width, output.column_index + 1);
+	}
+	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> columns;
+	for (duckdb::idx_t position = 0; position < width; position++) {
+		columns.push_back(
+		    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(duckdb::LogicalType::SQLNULL)));
+	}
+	for (duckdb::idx_t i = 0; i < outputs.size(); i++) {
+		columns[outputs[i].column_index] =
+		    duckdb::make_uniq<duckdb::BoundColumnRefExpression>(both->types[i], united[i]);
+	}
+	auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(original_index, std::move(columns));
+	projection->children.push_back(std::move(both));
+	slot = std::move(projection);
 }
 
 // The scan a delete reads its rows from, when nothing but projections sit
@@ -519,9 +631,11 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_DELETE && plan->children.size() == 1) {
 		auto scan = DeleteSourceScan(*plan->children[0]);
 		if (scan && scan->children.empty()) {
+			// A DELETE must remove the transaction's own rows too, which only
+			// DuckLake's scan reaches under its delete.
 			auto found = ResolveIndexedPredicate(context, optimizer, *scan);
-			if (found && !RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found)) {
-				PruneScanByIndexedPredicate(context, DeleteSourceSlot(plan->children[0]), *found);
+			if (found && !found->local_inserts && !RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found)) {
+				PruneScanByIndexedPredicate(context, optimizer, DeleteSourceSlot(plan->children[0]), *found);
 			}
 			return;
 		}
@@ -534,8 +648,8 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
 		auto &get = plan->Cast<duckdb::LogicalGet>();
 		auto found = ResolveIndexedPredicate(context, optimizer, get, residual);
-		if (found) {
-			PruneScanByIndexedPredicate(context, plan, *found);
+		if (found && !(found->local_inserts && ReadsFileLocation(get))) {
+			PruneScanByIndexedPredicate(context, optimizer, plan, *found);
 		}
 	}
 }

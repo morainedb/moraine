@@ -454,14 +454,20 @@ whose file list and row-id statistics stay its own. Results are memoized per
 pinned revision. A transaction with staged writes keeps probing at the
 revision it started on, because entries carry no transaction-local overlay.
 
+Inside a transaction that has inserted rows into the table, the located scan
+serves the committed rows and the rows the transaction inserted inline, and
+DuckLake's scan over the files the transaction wrote joins it under a
+`UNION ALL`; an UPDATE or DELETE in that state keeps the plan as written, since
+DuckLake's delete reads its file map from one scan.
+
 The rule declines, leaving the ordinary plan, for a scan at a snapshot other
-than the transaction's, a transaction with local inserts, no ready index over a
-leading predicate, a value of a type the index does not cover, or a failed
-probe, which is logged. The positional DELETE rewrite additionally requires a
-certified index, every pushed predicate answered in full, every resolved row in
-a committed file, no deletion vectors on the table, no `RETURNING`, and nothing
-but projections between the delete and its scan. UPDATE keeps the ordinary
-operator and narrows its reads through the pushed filters.
+than the transaction's, no ready index over a leading predicate, a value of a
+type the index does not cover, or a failed probe, which is logged. The
+positional DELETE rewrite additionally requires a certified index, every pushed
+predicate answered in full, every resolved row in a committed file, no deletion
+vectors on the table, no `RETURNING`, and nothing but projections between the
+delete and its scan. UPDATE keeps the ordinary operator and narrows its reads
+through the pushed filters.
 
 ## Format gate and reclamation
 

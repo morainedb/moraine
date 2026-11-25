@@ -3,6 +3,7 @@ use std::fmt::Write;
 use crate::helpers::*;
 
 mod delete_rewrite;
+mod local_inserts;
 mod located_types;
 mod located_update;
 mod native_ddl;
