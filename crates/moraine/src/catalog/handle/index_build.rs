@@ -132,6 +132,7 @@ struct PendingStep {
     is_final: bool,
     source: Option<(u64, u64)>,
     inline_cursor: Option<InlineBuildCursorValue>,
+    file_bounds: Vec<(u64, (u64, u64))>,
 }
 
 /// Where a derivation pass sends the entries it reads out of the rows. A
@@ -149,6 +150,10 @@ pub(super) trait EntrySink {
 
     /// Records that `file_id` is derived through `position`.
     fn cover_source(&mut self, file_id: u64, position: u64);
+
+    /// Records the lowest and highest row id `file_id` holds, once its
+    /// footer has been read.
+    fn record_file_bounds(&mut self, file_id: u64, bounds: (u64, u64));
 
     /// Where inline traversal resumes, and where it reached.
     fn inline_cursor(&self) -> Option<InlineBuildCursorValue>;
@@ -206,6 +211,10 @@ impl EntrySink for StepBuffer<'_> {
         self.pending_source = Some((file_id, position));
     }
 
+    fn record_file_bounds(&mut self, file_id: u64, bounds: (u64, u64)) {
+        self.pending_bounds.insert(file_id, bounds);
+    }
+
     fn inline_cursor(&self) -> Option<InlineBuildCursorValue> {
         self.inline_cursor
     }
@@ -231,6 +240,8 @@ struct StepBuffer<'a> {
     entries: Vec<EncodedIndexEntry>,
     staged_bytes: u64,
     pending_source: Option<(u64, u64)>,
+    /// Bounds of the files read since the last step, by file id.
+    pending_bounds: std::collections::BTreeMap<u64, (u64, u64)>,
     inline_cursor: Option<InlineBuildCursorValue>,
     /// `None` once derivation has handed off its final step.
     steps: Option<mpsc::Sender<Result<PendingStep>>>,
@@ -248,6 +259,9 @@ impl StepBuffer<'_> {
             is_final,
             source: self.pending_source,
             inline_cursor: self.inline_cursor,
+            file_bounds: std::mem::take(&mut self.pending_bounds)
+                .into_iter()
+                .collect(),
         };
         self.staged_bytes = 0;
         let steps = self.steps.as_ref().ok_or_else(|| {
@@ -288,6 +302,7 @@ impl Committer<'_> {
             is_final,
             source,
             inline_cursor,
+            file_bounds,
         } = step;
         let step_entries = entries.len();
         let build_cursor = entries.last().map(|entry| entry.row_id);
@@ -307,6 +322,7 @@ impl Committer<'_> {
                     is_final,
                     source,
                     inline_cursor.as_ref(),
+                    &file_bounds,
                 )
                 .map(|_| ())
             })
@@ -358,6 +374,8 @@ struct FilePlan {
     file: data_file::ParquetFile,
     file_id: u64,
     row_id_start: Option<u64>,
+    /// The lowest and highest row id the file holds, when its footer says.
+    bounds: Option<(u64, u64)>,
     dead: Option<RowPositions>,
     group_rows: Vec<u64>,
     /// First physical position this pass still has to cover.
@@ -379,6 +397,7 @@ impl FilePlan {
                     from: self.start.max(group_start),
                     end,
                     row_id_start: self.row_id_start,
+                    bounds: self.bounds,
                     dead: self.dead.clone(),
                     projection: projection.clone(),
                 });
@@ -398,6 +417,7 @@ struct Unit {
     /// One past the last physical position of the group.
     end: u64,
     row_id_start: Option<u64>,
+    bounds: Option<(u64, u64)>,
     dead: Option<RowPositions>,
     projection: data_file::IndexProjection,
 }
@@ -409,6 +429,7 @@ impl Unit {
         let (sender, receiver) = mpsc::channel(UNIT_BUFFERED_BATCHES);
         let file_id = self.file_id;
         let end = self.end;
+        let bounds = self.bounds;
         let task = tokio::spawn(async move {
             let outcome = async {
                 let mut batches = data_file::scoped_read_index_entry_batches(
@@ -439,6 +460,7 @@ impl Unit {
         RunningUnit {
             file_id,
             end,
+            bounds,
             batches: receiver,
             task: AbortOnDrop(task),
         }
@@ -449,6 +471,7 @@ impl Unit {
 struct RunningUnit {
     file_id: u64,
     end: u64,
+    bounds: Option<(u64, u64)>,
     batches: mpsc::Receiver<Result<Vec<ScopedIndexEntry>>>,
     task: AbortOnDrop,
 }
@@ -766,6 +789,7 @@ impl Catalog {
                 entries: Vec::new(),
                 staged_bytes: 0,
                 pending_source: initial_file_cursor.zip(initial_position_cursor),
+                pending_bounds: std::collections::BTreeMap::new(),
                 inline_cursor,
                 steps: Some(steps.clone()),
                 peak_buffered_entries: 0,
@@ -949,7 +973,7 @@ impl ReadOnlyCatalog {
                 .await
             }
         });
-        let (running, mut ready) = mpsc::channel::<RunningUnit>(UNIT_CONCURRENCY);
+        let (running, ready) = mpsc::channel::<RunningUnit>(UNIT_CONCURRENCY);
         let feed = feeder::feed_stream(
             Box::pin(plans),
             |plan| plan.units(&projection),
@@ -957,37 +981,46 @@ impl ReadOnlyCatalog {
             running,
             FILE_PLAN_CONCURRENCY,
         );
-        let consume = async {
-            while let Some(mut unit) = ready.recv().await {
-                while let Some(batch) = unit.batches.recv().await {
-                    for entry in batch? {
-                        let covered =
-                            legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
-                        if covered {
-                            sink.cover_source(unit.file_id, entry.ordinal);
-                            continue;
-                        }
-                        sink.push(
-                            EncodedIndexEntry {
-                                row_id: entry.row_id,
-                                key: entry.key,
-                                unique: entry.unique,
-                                known_absent: false,
-                            },
-                            Some((unit.file_id, entry.ordinal)),
-                        )
-                        .await?;
-                    }
-                }
-                sink.cover_source(unit.file_id, unit.end.saturating_sub(1));
-                drop(unit.task);
-            }
-            Ok(())
-        };
-        futures::future::try_join(feed, consume)
+        futures::future::try_join(feed, drain_units(ready, legacy_row_cursor, sink))
             .await
             .map(|((), ())| ())
     }
+}
+
+/// Feeds every unit's entries to `sink` as the units complete, in the order
+/// they were started, then each file's source position and row-id bounds.
+async fn drain_units(
+    mut ready: mpsc::Receiver<RunningUnit>,
+    legacy_row_cursor: Option<u64>,
+    sink: &mut (impl EntrySink + Send),
+) -> Result<()> {
+    while let Some(mut unit) = ready.recv().await {
+        while let Some(batch) = unit.batches.recv().await {
+            for entry in batch? {
+                let covered = legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
+                if covered {
+                    sink.cover_source(unit.file_id, entry.ordinal);
+                    continue;
+                }
+                sink.push(
+                    EncodedIndexEntry {
+                        row_id: entry.row_id,
+                        key: entry.key,
+                        unique: entry.unique,
+                        known_absent: false,
+                    },
+                    Some((unit.file_id, entry.ordinal)),
+                )
+                .await?;
+            }
+        }
+        sink.cover_source(unit.file_id, unit.end.saturating_sub(1));
+        if let Some(bounds) = unit.bounds {
+            sink.record_file_bounds(unit.file_id, bounds);
+        }
+        drop(unit.task);
+    }
+    Ok(())
 }
 
 /// Fills `filter` with every key the index already holds, so a resumed or
@@ -1046,13 +1079,18 @@ async fn plan_file(
 
     let columns = snapshot.file_read_columns_at(handle, table, file);
     let dead = backfill::dead_positions(handle, table, file_id, object_store, metrics, resolve);
-    let (columns, dead, group_rows) =
-        futures::try_join!(columns, dead, data_file::row_group_row_counts(&parquet))?;
+    let (columns, dead, group_rows, bounds) = futures::try_join!(
+        columns,
+        dead,
+        data_file::row_group_row_counts(&parquet),
+        data_file::row_id_bounds(&parquet, file.row_id_start, file.record_count)
+    )?;
 
     Ok(FilePlan {
         file: parquet.with_columns(columns),
         file_id,
         row_id_start: file.row_id_start,
+        bounds,
         dead: (!dead.is_empty()).then(|| dead.into_iter().collect()),
         group_rows,
         start,

@@ -2777,6 +2777,40 @@ async fn inline_flush_index_maintenance_reads_no_data() {
         "an inline flush reads its output once, for the row ids it must keep"
     );
     assert_eq!(index_entry_keys(&catalog, false, index_id).await, before);
+    assert_eq!(
+        row_id_bounds_of(&catalog, 12).await,
+        Some(("0".to_owned(), "4".to_owned())),
+        "the flushed file's bounds come from the row ids the check read"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// The recorded row-id bounds of `data_file_id`, as `(min, max)` text.
+async fn row_id_bounds_of(catalog: &Catalog, data_file_id: u64) -> Option<(String, String)> {
+    let db_tx = catalog.begin_write_tx().unwrap();
+    let tx = StagedTransaction::begin_detached(catalog, db_tx);
+    let stats = tx.visible_file_column_stats().await.unwrap();
+    tx.rollback();
+    stats
+        .into_iter()
+        .find(|stats| {
+            stats.data_file_id == data_file_id
+                && stats.column_id == crate::data_file::ROW_ID_FIELD_ID
+        })
+        .map(|stats| (stats.min_value.unwrap(), stats.max_value.unwrap()))
+}
+
+/// A dense file registered on an indexed table records the row ids it
+/// holds without the commit reading more than its footer.
+#[tokio::test]
+async fn registering_a_file_on_an_indexed_table_records_its_row_id_bounds() {
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+    assert_eq!(
+        row_id_bounds_of(&catalog, 1).await,
+        Some(("0".to_owned(), "2".to_owned()))
+    );
     catalog.close().await.unwrap();
 }
 
@@ -2885,6 +2919,11 @@ async fn per_row_id_registration_re_derives_entries_idempotently() {
         index_entry_keys(&catalog, true, index_id).await,
         before,
         "the index range is byte-identical: re-derived entries are no-ops"
+    );
+    assert_eq!(
+        row_id_bounds_of(&catalog, 12).await,
+        Some(("0".to_owned(), "2".to_owned())),
+        "a per-row-id file's bounds come from its footer statistics"
     );
 }
 

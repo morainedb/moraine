@@ -121,6 +121,10 @@ pub(crate) struct Transaction {
     /// Per table, the row-id counter as it stood before this commit first
     /// allocated from it.
     inherited_row_ids: HashMap<u64, u64>,
+    /// Writes staged as they are, beside the entity diff: records for
+    /// files the commit's read scope did not load, which the diff would
+    /// otherwise drop as unknown.
+    raw_writes: Vec<crate::transaction::commit::StagedWrite>,
     next_catalog_id: u64,
     next_file_id: u64,
     new_snapshot_id: u64,
@@ -132,6 +136,7 @@ pub(crate) struct TransactionParts {
     pub(crate) operations: Vec<Operation>,
     pub(crate) index_entries: Vec<StagedIndexEntry>,
     pub(crate) inline_ops: Vec<InlineStage>,
+    pub(crate) raw_writes: Vec<crate::transaction::commit::StagedWrite>,
     pub(crate) state: CatalogSnapshot,
     pub(crate) next_catalog_id: u64,
     pub(crate) next_file_id: u64,
@@ -157,6 +162,7 @@ impl Transaction {
             inline_ops: Vec::new(),
             chunk_seqs: HashMap::new(),
             inherited_row_ids: HashMap::new(),
+            raw_writes: Vec::new(),
             next_catalog_id,
             next_file_id,
             new_snapshot_id,
@@ -168,6 +174,7 @@ impl Transaction {
             operations: self.ops,
             index_entries: self.index_entries,
             inline_ops: self.inline_ops,
+            raw_writes: self.raw_writes,
             state: self.state,
             next_catalog_id: self.next_catalog_id,
             next_file_id: self.next_file_id,
@@ -1177,8 +1184,12 @@ impl Transaction {
         is_final: bool,
         source: Option<(u64, u64)>,
         inline: Option<&crate::store::proto::InlineBuildCursorValue>,
+        file_bounds: &[(u64, (u64, u64))],
     ) -> Result<IndexState> {
         let (table_id, value) = self.building_index(index)?;
+        for (data_file_id, bounds) in file_bounds {
+            self.put_row_id_bounds(table_id, *data_file_id, *bounds);
+        }
         let building = IndexShape::of_value(&value).building;
         let mut cursor = value.build_cursor_row_id.unwrap_or(0);
         for entry in batch {
@@ -1458,10 +1469,36 @@ impl Transaction {
             });
         }
         self.stage_file_index_entries(table, row_id_start, index_entries)?;
+        // A file registered here is dense, so its bounds need no read.
+        if live_index_count > 0
+            && let Some(high) = file.record_count.checked_sub(1)
+            && let Some(high) = row_id_start.checked_add(high)
+        {
+            self.put_row_id_bounds(table.get(), data_file_id, (row_id_start, high));
+        }
         self.ops.push(Operation::RegisterDataFile {
             table_id: table.get(),
         });
+
         Ok(DataFileId::new(data_file_id))
+    }
+
+    /// Records that data file `data_file_id` holds row ids `bounds.0`
+    /// through `bounds.1`, under the reserved row-id column. Staged as a
+    /// raw write, since an index build's scope loads no data files for the
+    /// entity diff to recognize the file by.
+    pub(crate) fn put_row_id_bounds(
+        &mut self,
+        table_id: u64,
+        data_file_id: u64,
+        bounds: (u64, u64),
+    ) {
+        self.raw_writes
+            .push(crate::transaction::row_id_bounds::staged_write(
+                table_id,
+                data_file_id,
+                bounds,
+            ));
     }
 
     /// Stages file-supplied index entries, each for the row at

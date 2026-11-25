@@ -1,4 +1,4 @@
-# Patched DuckLake row-ID statistics, inlined writes, and commit cleanup
+# Patched DuckLake inlined writes and commit cleanup
 
 This directory carries the downstream DuckLake patch series moraine bundles,
 for the DuckDB `.github/duckdb-versions` names as primary. DuckDB patches
@@ -8,13 +8,7 @@ DuckDB's own
 (`duckdb/.github/patches/extensions/ducklake/`, three-way, as DuckDB
 applies them) and then the series below, in file-name order:
 
-1. `0001-perf-record-DuckLake-row-id-statistics.patch` stores file-level
-   row-ID min/max statistics in DuckLake's existing
-   `ducklake_file_column_stats` table: read from the Parquet row-id column
-   a flushed or rewritten file carries, synthesized from `row_id_start` and
-   the row count for a dense one. Moraine's file directory reads them to
-   pick the files that can hold a row id without opening any.
-2. `0003-feat-share-the-DuckLake-inlined-table-cache.patch` moves the
+1. `0003-feat-share-the-DuckLake-inlined-table-cache.patch` moves the
    `insert_inlined_table_name_cache` member to `protected`, so a registered
    metadata manager overriding the inlined-data write reuses the cache
    DuckLake's own `ClearInlinedTableCaches` invalidates. moraine's
@@ -27,7 +21,7 @@ applies them) and then the series below, in file-name order:
    rows with the two builds alternated round by round: the Appender is
    still ~2 ms a commit faster, the bind of one more statement per table,
    so both it and this patch stay.
-3. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
+2. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
    metadata backend's structured `commit_outcome=unknown` error field, with
    Moraine's fixed message as a fallback when DuckDB's COMMIT wrapper drops
    extra fields. It stops retries and releases the transaction's file-cleanup
@@ -96,10 +90,9 @@ byte-for-byte, and passes the checkout in. Either way DuckLake's `roaring`
 dependency resolves through vcpkg (`vcpkg.json` at the repository root
 declares it).
 
-`cargo xtask e2e` then runs the series' row-ID statistics sqllogictest
-against the built moraine artifact, and the build workflows run the same
-row-ID statistics smoke against what they build, in the container that
-built it (`cargo xtask validate-release-artifact`).
+The build workflows run a row-ID statistics and positional-delete smoke
+against what they build, in the container that built it
+(`cargo xtask validate-release-artifact`).
 
 ## Load in DuckDB
 

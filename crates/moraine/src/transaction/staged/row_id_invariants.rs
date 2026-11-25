@@ -19,7 +19,7 @@ use crate::{
     data_file::{self, DataStore, RowIdSource, ScopedRows},
     error::{Error, Result},
     store::{key::EntityKey, proto},
-    transaction::operations::ChangeSet,
+    transaction::{commit, operations::ChangeSet},
 };
 
 /// Files read for their row ids at once.
@@ -63,17 +63,17 @@ pub(super) async fn verify_flushed_row_ids(
     drained: &DrainedRows,
     store: Option<&DataStore>,
     data_prefix: &str,
-) -> Result<()> {
+) -> Result<Vec<commit::StagedWrite>> {
     let base = premise.base;
     if drained.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(store) = store else {
         debug!(
             "a flush registered files this commit has no data store to read, so its row ids go \
              unverified"
         );
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     let mut drained_by_table: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -85,6 +85,7 @@ pub(super) async fn verify_flushed_row_ids(
     }
 
     let files = flushed_files(ops, &drained_by_table)?;
+    let mut bounds_writes = Vec::new();
     for (table_id, mut expected) in drained_by_table {
         let Some(files) = files.get(&table_id) else {
             continue;
@@ -93,7 +94,9 @@ pub(super) async fn verify_flushed_row_ids(
 
         let mut found = Vec::with_capacity(expected.len());
         for file in files {
-            found.extend(read_row_ids(base, store, data_prefix, file).await?);
+            let row_ids = read_row_ids(base, store, data_prefix, file).await?;
+            bounds_writes.extend(bounds_write(file, &row_ids));
+            found.extend(row_ids);
         }
         found.sort_unstable();
 
@@ -101,7 +104,19 @@ pub(super) async fn verify_flushed_row_ids(
             return Err(premise.lost_race_or(mismatch(table_id, files, &expected, &found)));
         }
     }
-    Ok(())
+    Ok(bounds_writes)
+}
+
+/// The bounds write for `file`, which holds exactly `row_ids`; none for an
+/// empty file.
+fn bounds_write(file: &proto::DataFileValue, row_ids: &[u64]) -> Option<commit::StagedWrite> {
+    let low = row_ids.iter().copied().min()?;
+    let high = row_ids.iter().copied().max()?;
+    Some(crate::transaction::row_id_bounds::staged_write(
+        file.table_id,
+        file.data_file_id,
+        (low, high),
+    ))
 }
 
 /// Refuses a compaction whose registered files carry row ids other than
@@ -113,10 +128,10 @@ pub(super) async fn verify_compacted_row_ids(
     ops: &[RowOperation],
     store: Option<&DataStore>,
     data_prefix: &str,
-) -> Result<()> {
+) -> Result<Vec<commit::StagedWrite>> {
     let base = premise.base;
     let Some(changes) = change_set(ops)? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let rewritten: BTreeSet<u64> = changes
         .rewrite_delete_tables
@@ -131,17 +146,18 @@ pub(super) async fn verify_compacted_row_ids(
         .copied()
         .collect();
     if compacted.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(store) = store else {
         debug!(
             "a compaction registered files this commit has no data store to read, so its row ids \
              go unverified"
         );
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     let (sources, mut outputs) = compaction_files(ops, &compacted)?;
+    let mut bounds_writes = Vec::new();
     for table_id in compacted {
         let source_ids = sources.get(&table_id).cloned().unwrap_or_default();
         let outputs = outputs.remove(&table_id).unwrap_or_default();
@@ -158,7 +174,12 @@ pub(super) async fn verify_compacted_row_ids(
 
         let mut held = read_all_row_ids(base, store, data_prefix, &records).await?;
         held.sort_unstable();
-        let mut carried = read_all_row_ids(base, store, data_prefix, &outputs).await?;
+        let mut carried = Vec::new();
+        for file in &outputs {
+            let row_ids = read_row_ids(base, store, data_prefix, file).await?;
+            bounds_writes.extend(bounds_write(file, &row_ids));
+            carried.extend(row_ids);
+        }
         carried.sort_unstable();
 
         // A merge of a table also rewriting it is a shape DuckLake never
@@ -181,7 +202,7 @@ pub(super) async fn verify_compacted_row_ids(
             )));
         }
     }
-    Ok(())
+    Ok(bounds_writes)
 }
 
 /// What the commit's `ducklake_snapshot_changes` row says it did.

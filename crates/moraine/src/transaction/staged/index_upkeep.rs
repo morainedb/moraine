@@ -151,6 +151,9 @@ pub(super) struct FileContext<'a> {
     projections: &'a std::sync::RwLock<ProjectionCache>,
     /// Where the commit's stamped file and snapshot references land.
     rebase: &'a Rebase,
+    /// The row-id bounds of the files read for their entries, handed back
+    /// with the locator writes.
+    bounds_writes: std::sync::Mutex<Vec<commit::StagedWrite>>,
 }
 
 impl FileContext<'_> {
@@ -301,6 +304,21 @@ async fn stream_data_file_index_entries(
     if let Some(killed) = &killed {
         refuse_out_of_range(killed, &file)?;
     }
+    if let Some(bounds) =
+        data_file::row_id_bounds(&parquet, file.row_id_start, file.record_count).await?
+    {
+        context
+            .bounds_writes
+            .lock()
+            .map_err(|_| {
+                Error::Interrupted("row-id bounds poisoned by a failed upkeep task".to_owned())
+            })?
+            .push(crate::transaction::row_id_bounds::staged_write(
+                file.table_id,
+                file.data_file_id,
+                bounds,
+            ));
+    }
 
     // A row this same commit deletes out of the file it also registers is
     // never indexed: an entry's key carries no file, so a removal beside an
@@ -424,6 +442,7 @@ pub(super) async fn stage_index_maintenance(
             .collect::<Result<_>>()?,
         projections,
         rebase,
+        bounds_writes: std::sync::Mutex::new(Vec::new()),
     };
 
     let DeletePlan {
@@ -501,6 +520,12 @@ pub(super) async fn stage_index_maintenance(
     // Handed back unstaged: this phase may run beside the inline
     // translation, which reads the directory these would write.
     staged.locator_writes = std::mem::take(&mut *locator_writes.lock().await);
+    staged.locator_writes.extend(
+        context
+            .bounds_writes
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     staged.deferred = deferred.into_iter().collect();
 
     Ok(staged)

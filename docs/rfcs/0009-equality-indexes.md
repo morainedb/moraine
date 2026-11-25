@@ -321,6 +321,15 @@ helper, whose positions are re-mapped onto a freshly allocated dense range, and
 refuses a file carrying the embedded column, since registering it under new ids
 would fork its identity.
 
+Moraine records each data file's row-id bounds itself, as a
+`ducklake_file_column_stats` row under `ROW_ID_FIELD_ID`: at commit for an
+indexed table's new files, dense ones from `row_id_start` and the record count
+and per-row-id ones from the embedded column's footer statistics; for every
+flushed or compacted file, whose row ids the commit reads anyway; and for every
+file an index build reads. The file directory reads them to defer files whose
+range cannot hold a requested id, and a delete file's registration is checked
+against them. A file without them is always summarized.
+
 Deleted positions are passed to the target's scoped read, and an entry is
 removed when its ordinal is named by a delete file or an inline file-delete.
 Indexed columns are located by field id through the
@@ -450,7 +459,7 @@ The located scan replaces DuckLake's scan beneath the join or the predicate
 and reads the candidate rows by position, serving DuckLake's `UPDATE` the file
 and position of each row as its own scan would. Where it declines, the plan
 runs as written: no filter derived from the index reaches DuckLake's scan,
-whose file list and row-id statistics stay its own. Results are memoized per
+whose file list stays its own. Results are memoized per
 pinned revision. A transaction with staged writes keeps probing at the
 revision it started on, because entries carry no transaction-local overlay.
 

@@ -20,7 +20,7 @@ const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb"
 /// `--exact`, since there are many). Adding a test there means bumping this
 /// count, or `e2e` fails — deliberate, so a silently-filtered test can never
 /// pass.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "249 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "250 passed";
 
 /// Every file under `test/sql`, run together through DuckDB's own
 /// sqllogictest runner. Adding one means bumping this count, exactly as for
@@ -48,9 +48,6 @@ pub fn e2e() -> anyhow::Result<()> {
 
     let cli = duckdb::ensure_duckdb_cli()?;
     println!("ok: duckdb CLI at {}", cli.display());
-
-    ducklake_patch::run_row_id_regression(&patched, &extension)?;
-    println!("ok: the bundled DuckLake carries the patch series");
 
     duckdb::run(Command::new("cargo").args(["test", "-p", "moraine-duckdb", "--release"]))?;
 

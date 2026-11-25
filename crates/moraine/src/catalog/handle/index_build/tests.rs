@@ -512,3 +512,102 @@ async fn inline_steps_commit_before_file_inventory_is_decoded() {
     );
     catalog.close().await.unwrap();
 }
+
+/// A staged build records the row-id bounds of every file it reads, so a
+/// table indexed after its files were written gets them too.
+#[tokio::test]
+async fn a_staged_build_records_the_row_id_bounds_of_the_files_it_reads() {
+    use object_store::{ObjectStoreExt, path::Path};
+
+    use crate::{DataFile, DataStore, data_file::ROW_ID_FIELD_ID};
+
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let data = Arc::new(InMemory::new());
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
+    )
+    .unwrap();
+    let mut buffer = Vec::new();
+    {
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    let file_size_bytes = u64::try_from(buffer.len()).unwrap();
+    data.put(&Path::from("main/orders/data.parquet"), buffer.into())
+        .await
+        .unwrap();
+
+    let created = Cell::new(None);
+    catalog
+        .commit_materialized(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let table = tx.create_table(
+                schema,
+                "orders",
+                &[ColumnDef {
+                    name: "a".into(),
+                    column_type: "BIGINT".into(),
+                    nulls_allowed: true,
+                    ..Default::default()
+                }],
+            )?;
+            let file = tx.register_data_file(
+                table,
+                DataFile {
+                    path: "data.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 3,
+                    file_size_bytes,
+                    footer_size,
+                    encryption_key: None,
+                    partition_values: vec![],
+                    column_stats: vec![],
+                },
+                &[],
+            )?;
+            created.set(Some((table, file)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (table, file) = created.get().unwrap();
+    let bounds_of = |snapshot: &CatalogSnapshot| {
+        snapshot
+            .file_column_stats
+            .get(&table.get())
+            .and_then(|stats| stats.get(&(file.get(), ROW_ID_FIELD_ID)))
+            .map(|stats| (stats.min_value.clone(), stats.max_value.clone()))
+    };
+    assert_eq!(
+        bounds_of(&catalog.materialized().await.unwrap()),
+        None,
+        "an unindexed table's file records no bounds"
+    );
+
+    let column = catalog.materialized().await.unwrap().columns_of(table)[0].id;
+    let def = IndexDef {
+        name: "by_a".into(),
+        columns: vec![column],
+        unique: true,
+    };
+    catalog
+        .create_index_staged(table, &def, &[], Some(DataStore::new(data)), "", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bounds_of(&catalog.materialized().await.unwrap()),
+        Some((Some("0".to_owned()), Some("2".to_owned())))
+    );
+    catalog.close().await.unwrap();
+}

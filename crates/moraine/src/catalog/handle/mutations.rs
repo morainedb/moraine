@@ -129,18 +129,13 @@ impl Catalog {
                 match &data_store {
                     Some(store) => {
                         reads
-                            .scoped_backfill_entries(
-                                store.clone(),
-                                data_prefix,
-                                table,
-                                &definition.columns,
-                            )
+                            .scoped_backfill(store.clone(), data_prefix, table, &definition.columns)
                             .await
                     }
-                    None => Ok(Vec::new()),
+                    None => Ok((Vec::new(), Vec::new())),
                 }
             };
-            let (mut backfill, inline) = tokio::try_join!(
+            let ((mut backfill, file_bounds), inline) = tokio::try_join!(
                 files,
                 reads.inline_backfill_entries(table, &definition.columns)
             )?;
@@ -162,6 +157,9 @@ impl Catalog {
                         maintenance,
                         &backfill,
                     )?));
+                    for (data_file_id, bounds) in &file_bounds {
+                        tx.put_row_id_bounds(table.get(), *data_file_id, *bounds);
+                    }
                     Ok(())
                 })
                 .await;
