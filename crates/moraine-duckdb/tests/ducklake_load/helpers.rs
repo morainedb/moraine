@@ -831,3 +831,45 @@ fn strip_ansi_consumes_the_csi_introducer_before_parameters() {
         );
     }
 }
+
+/// Runs `statements` in one CLI session with `QueryLog` capture on, and
+/// returns every statement DuckDB executed — DuckLake's own metadata SQL
+/// among them — newline-flattened, one per element.
+pub fn query_log(store: &Path, data_path: &Path, alias: &str, statements: &[&str]) -> Vec<String> {
+    let capture = TempDir::new("querylog");
+    let out = capture.path().join("log.csv");
+
+    let mut command = Command::new(cli_path());
+    command
+        .arg("-unsigned")
+        .arg("-csv")
+        .arg("-c")
+        .arg("SET threads=1;")
+        .arg("-c")
+        .arg(load_statement())
+        .arg("-c")
+        .arg("CALL enable_logging('QueryLog', storage => 'memory');")
+        .arg("-c")
+        .arg(format!(
+            "ATTACH 'ducklake:moraine:{}' AS {alias} (DATA_PATH '{}');",
+            store.display(),
+            data_path.display()
+        ));
+    for statement in statements {
+        command.arg("-c").arg(*statement);
+    }
+    // Newlines are flattened in SQL so each statement stays one CSV row.
+    command.arg("-c").arg(format!(
+        "COPY (SELECT replace(message, chr(10), ' ') FROM duckdb_logs WHERE type = 'QueryLog') \
+         TO '{}' (FORMAT CSV, HEADER false, QUOTE '');",
+        out.display()
+    ));
+
+    let output = command.output().expect("failed to spawn duckdb CLI");
+    assert_session_ok(output, "query-log session", &statements.join(" "));
+    std::fs::read_to_string(&out)
+        .expect("read the captured query log")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}

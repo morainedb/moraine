@@ -5,6 +5,7 @@
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "catalog.hpp"
 #include "index_functions.hpp"
+#include "metadata_manager.hpp"
 #include "owned_array.hpp"
 #include "transaction_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
@@ -591,17 +592,31 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	}
 	bound->column_types = scan.returned_types;
 	bound->pairs = rows;
-	// The files and inlined tables the scan itself reads, at its snapshot and
-	// with the transaction's own changes. A located row in a file the scan's
-	// pushed filters exclude cannot pass them, and goes with the file.
-	auto &scan_files =
-	    scan.bind_data->Cast<duckdb::MultiFileBindData>().file_list->Cast<duckdb::DuckLakeMultiFileList>();
-	for (auto &entry : scan_files.GetFiles()) {
-		if (entry.data_type == duckdb::DuckLakeDataType::INLINED_DATA) {
-			bound->inlined_tables.push_back(entry.file.path);
-		} else if (entry.data_type == duckdb::DuckLakeDataType::DATA_FILE && entry.file_id.IsValid()) {
-			bound->file_paths.emplace(entry.file_id.index, entry.file.path);
+	// The located files' paths come from the catalog by id, not from the
+	// scan's file list.
+	auto *manager = dynamic_cast<MoraineMetadataManager *>(&transaction->GetMetadataManager());
+	if (!manager) {
+		return false;
+	}
+	if (!file_ids.empty()) {
+		std::vector<uint64_t> requested(file_ids.begin(), file_ids.end());
+		OwnedArray<MoraineDataFilePath> paths(moraine_data_file_paths_free);
+		MoraineError error {};
+		auto code = moraine_data_file_paths(
+		    moraine_snapshot_read_handle(metadata_tx.transaction->Cast<MoraineTransaction>().Snapshot()),
+		    schema.c_str(), table.c_str(), requested.data(), requested.size(), paths.OutItems(), paths.OutLen(),
+		    moraine_shim_is_interrupted, &context, &error);
+		if (code != MORAINE_OK) {
+			ThrowMoraineError(error);
 		}
+		for (auto &file : paths) {
+			bound->file_paths.emplace(
+			    file.data_file_id,
+			    manager->DataFilePath(info.table, duckdb::DuckLakePath {file.path, file.path_is_relative}));
+		}
+	}
+	for (auto &inlined : info.table.GetInlinedDataTables(*transaction, info.snapshot, info.include_local_changes)) {
+		bound->inlined_tables.push_back(inlined.table_name);
 	}
 	std::vector<MoraineRowId> file_pairs;
 	std::vector<MoraineRowId> readable;

@@ -389,3 +389,50 @@ fn indexed_operations_stream_positions_above_the_summary_limit() {
         assert!(has_line(&stdout, answer), "{stdout}");
     }
 }
+
+/// Planning an indexed predicate reads no file list through metadata SQL:
+/// the located files' paths come from the catalog by id, so the statement
+/// count and size do not grow with the predicate.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn summary_scan_plans_without_a_filtered_file_list_query() {
+    let store = TempDir::new("selective-plan-store");
+    let data = TempDir::new("selective-plan-data");
+    let keys = (0..192)
+        .map(|k| (k * 4).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!("SELECT count(*) FROM lake.main.t WHERE a IN ({keys});");
+    let log = query_log(
+        store.path(),
+        data.path(),
+        "lake",
+        &[
+            "CALL ducklake_set_option('lake','parquet_row_group_size','2048');",
+            "CREATE TABLE lake.main.t AS SELECT i // 17 AS a, md5(i::VARCHAR) AS payload \
+             FROM range(524288) t(i);",
+            "CREATE INDEX by_a ON lake.main.t(a);",
+            &query,
+        ],
+    );
+    assert!(
+        log.iter().any(|statement| {
+            statement.trim().trim_end_matches(';') == query.trim_end_matches(';')
+        }),
+        "the predicate query ran: {log:#?}"
+    );
+    // The table's own writes record file column stats; a read of them is
+    // DuckLake selecting files by pushed filters, which planning must not do.
+    let file_list_queries: Vec<_> = log
+        .iter()
+        .filter(|statement| {
+            let statement = statement.trim_start();
+            (statement.starts_with("WITH") || statement.starts_with("SELECT"))
+                && statement.contains("ducklake_file_column_stats")
+        })
+        .collect();
+    assert!(
+        file_list_queries.is_empty(),
+        "planning read a statistics-filtered file list: {file_list_queries:#?}"
+    );
+}

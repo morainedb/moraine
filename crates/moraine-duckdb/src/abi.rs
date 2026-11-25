@@ -18,6 +18,7 @@
 //! [`Catalog`]: moraine::Catalog
 
 mod attach;
+mod data_file_paths;
 mod fault;
 mod indexes;
 mod lookup;
@@ -44,6 +45,7 @@ use std::{
 
 pub use attach::*;
 pub use checkpoints::*;
+pub use data_file_paths::*;
 pub use fault::*;
 pub use indexes::*;
 pub use lookup::*;

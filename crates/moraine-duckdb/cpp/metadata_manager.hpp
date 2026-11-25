@@ -88,6 +88,8 @@ public:
 	                    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_inlined_data_tables_result,
 	                    duckdb::vector<duckdb::unique_ptr<duckdb::SQLStatement>> &inlined_inserts) override;
 
+	duckdb::string DataFilePath(const duckdb::DuckLakeTableEntry &table, const duckdb::DuckLakePath &path);
+
 private:
 	const MetadataTableSpec &MetadataSpec(const char *name);
 	std::vector<std::vector<duckdb::Value>> TableStatisticsRows(const char *name, duckdb::TableIndex table_id);
