@@ -919,6 +919,16 @@ impl CatalogSnapshot {
         files.values().map(|value| data_file_info(value)).collect()
     }
 
+    /// One of the table's data files live at this view's snapshot, by id.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn data_file(&self, table: TableId, file: DataFileId) -> Option<DataFileInfo> {
+        self.data_files
+            .get(&table.get())
+            .and_then(|files| files.get(&file.get()))
+            .map(|value| data_file_info(value))
+    }
+
     /// The table's delete files live at this view's snapshot, ordered by id.
     #[must_use]
     pub fn delete_files_of(&self, table: TableId) -> Vec<DeleteFileInfo> {

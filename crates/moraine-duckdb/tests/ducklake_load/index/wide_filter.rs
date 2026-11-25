@@ -1,7 +1,8 @@
 use crate::helpers::*;
 
-/// Paired locations above 256 rows use the exact scan; row-only joins retain
-/// pruning.
+/// Probes above 256 rows use the located scan; a probe the located scan
+/// declines keeps DuckLake's scan, with the lookup's row ids pushed as a few
+/// ranges rather than one residual per row.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_wide_sparse_probe_derives_row_pruning() {
@@ -13,8 +14,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
     );
     let query = "SELECT count(*) FROM lake.main.t data
         JOIN moraine_index_in('lake','main','t','by_a',list_concat(range(96),range(1000,1096))) hits
-        ON data.rowid IS NOT DISTINCT FROM hits.row_id
-        AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+        ON data.rowid IS NOT DISTINCT FROM hits.row_id";
     let result = run_ducklake_sql_with_options(
         store.path(),
         data.path(),
@@ -47,8 +47,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         "SELECT count(*) FROM lake.main.t data
          JOIN (SELECT * FROM moraine_index_in('lake','main','t','by_a',
                list_concat(range(96),range(1000,1096))) WHERE row_id % 2 = 0) hits
-         ON data.rowid IS NOT DISTINCT FROM hits.row_id
-         AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;",
+         ON data.rowid IS NOT DISTINCT FROM hits.row_id;",
     );
     assert_eq!(csv_rows(&filtered), vec![vec!["1632"]]);
 
@@ -56,14 +55,13 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         store.path(),
         data.path(),
         &options,
-        "CREATE TABLE lake.main.boundary AS SELECT i AS a FROM range(32768) t(i);
+        "CREATE TABLE lake.main.boundary AS SELECT i AS a, INTERVAL (i) SECOND AS span FROM range(32768) t(i);
          CREATE UNIQUE INDEX by_boundary_a ON lake.main.boundary(a);",
     );
     for (end, expected) in [(12048, "4096"), (12049, "4097")] {
         let query = format!("SELECT count(*) FROM lake.main.boundary data
             JOIN moraine_index_in('lake','main','boundary','by_boundary_a',list_concat(range(2048),range(10000,{end}))) hits
-            ON data.rowid IS NOT DISTINCT FROM hits.row_id
-            AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id");
+            ON data.rowid IS NOT DISTINCT FROM hits.row_id");
         let result = run_ducklake_sql_with_options(
             store.path(),
             data.path(),
@@ -80,14 +78,20 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         );
     }
 
+    // Projecting an INTERVAL, which the located reader cannot decode, keeps
+    // DuckLake's scan.
     let sparse = run_ducklake_sql_with_options(
         store.path(), data.path(), &options,
-        "EXPLAIN SELECT count(*) FROM lake.main.boundary data
+        "EXPLAIN SELECT count(*) FILTER (WHERE data.span IS NOT NULL) FROM lake.main.boundary data
          JOIN moraine_index_in('lake','main','boundary','by_boundary_a',list_transform(range(4096), lambda x: x * 7)) hits
          ON data.rowid IS NOT DISTINCT FROM hits.row_id;
-         SELECT count(*) FROM lake.main.boundary data
+         SELECT count(*) FILTER (WHERE data.span IS NOT NULL) FROM lake.main.boundary data
          JOIN moraine_index_in('lake','main','boundary','by_boundary_a',list_transform(range(4096), lambda x: x * 7)) hits
          ON data.rowid IS NOT DISTINCT FROM hits.row_id;",
+    );
+    assert!(
+        !sparse.contains("Moraine Summary Scan"),
+        "an undecodable projection must keep the scan: {sparse}"
     );
     assert!(
         sparse.contains("rowid >= "),
@@ -123,8 +127,7 @@ fn a_wide_probe_skips_embedded_row_groups() {
          CREATE INDEX by_a ON lake.main.t(a);
          EXPLAIN ANALYZE SELECT count(*) FROM lake.main.t data
          JOIN moraine_index_in('lake','main','t','by_a',range(192)) hits
-         ON data.rowid IS NOT DISTINCT FROM hits.row_id
-         AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;",
+         ON data.rowid IS NOT DISTINCT FROM hits.row_id;",
     );
     assert!(
         result.contains("Coverage costing ms") && !result.contains("4,096 rows"),

@@ -216,12 +216,13 @@ then DuckDB's own DuckLake patches, then the series on top.
 `patches/ducklake/source-pins` records that commit per supported DuckDB release;
 `cargo xtask check-pins` keeps it in step.
 
-The patch series records file-level row-id min/max statistics, pushes
-static and dynamic `rowid` filters into DuckLake's file-list query, exposes
-data-file ids to scans, appends inlined rows, keeps files after unknown
-commit outcomes, and adds positional deletes and updates. Index-assisted
-reads remain a direct join on the stable row id; DuckLake owns file
-selection, inlined data, snapshots, and deletes.
+The patch series records file-level row-id min/max statistics and pushes
+`rowid` filters into DuckLake's file-list query, shares the inlined-table
+cache, keeps files after unknown commit outcomes, names the table a dropped
+file belongs to, bounds the commit-time head lookup, and stages snapshots
+and statistics. Index-assisted reads are a direct join on the stable row id,
+which the extension's own located scan serves; DuckLake owns file selection,
+inlined data, snapshots, and deletes.
 
 ## Serving as DuckLake's metadata catalog
 

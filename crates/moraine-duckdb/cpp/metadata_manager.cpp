@@ -367,6 +367,11 @@ CreateMoraineMetadataManager(duckdb::DuckLakeTransaction &transaction) {
 
 } // namespace
 
+duckdb::string MoraineMetadataManager::DataFilePath(const duckdb::DuckLakeTableEntry &table,
+                                                    const duckdb::DuckLakePath &path) {
+	return FromRelativePath(path, table.DataPath());
+}
+
 void RegisterMoraineMetadataManager() {
 	// One registry for the process, one extension load per database
 	// instance, and a duplicate name throws.

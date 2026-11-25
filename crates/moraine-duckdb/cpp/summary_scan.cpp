@@ -5,8 +5,10 @@
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "catalog.hpp"
 #include "index_functions.hpp"
+#include "metadata_manager.hpp"
 #include "owned_array.hpp"
 #include "transaction_manager.hpp"
+#include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -15,11 +17,13 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_delete.hpp"
 #include "storage/ducklake_delete_filter.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <set>
@@ -69,7 +73,6 @@ std::vector<duckdb::unique_ptr<duckdb::DataChunk>> ImportLocatedBatch(duckdb::Cl
 
 namespace {
 
-constexpr auto FILE_ID = duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;
 using ScanClock = std::chrono::steady_clock;
 double Milliseconds(ScanClock::time_point start) {
 	return std::chrono::duration<double, std::milli>(ScanClock::now() - start).count();
@@ -97,35 +100,39 @@ duckdb::unique_ptr<duckdb::Expression> RequiredPredicate(const duckdb::Expressio
 	return std::move(result);
 }
 
-bool SupportedType(const duckdb::LogicalType &type) {
-	using duckdb::LogicalTypeId;
+// Whether `type` is one the located reader cannot decode as DuckLake's scan
+// does, or nests one. parquet-rs types a Parquet INTERVAL as a day-time
+// interval and drops its months; a VARIANT and a GEOMETRY come back as the
+// shredded struct and the WKB the file holds rather than the value.
+bool HoldsUndecodableType(const duckdb::LogicalType &type) {
 	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-	case LogicalTypeId::VARCHAR:
-	case LogicalTypeId::UUID:
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_TZ:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
+	case duckdb::LogicalTypeId::INTERVAL:
+	case duckdb::LogicalTypeId::VARIANT:
+	case duckdb::LogicalTypeId::GEOMETRY:
 		return true;
+	case duckdb::LogicalTypeId::LIST:
+	case duckdb::LogicalTypeId::ARRAY:
+		return HoldsUndecodableType(duckdb::ListType::GetChildType(type));
+	case duckdb::LogicalTypeId::MAP:
+		return HoldsUndecodableType(duckdb::MapType::KeyType(type)) ||
+		       HoldsUndecodableType(duckdb::MapType::ValueType(type));
+	case duckdb::LogicalTypeId::STRUCT:
+	case duckdb::LogicalTypeId::UNION:
+		for (auto &child : duckdb::StructType::GetChildTypes(type)) {
+			if (HoldsUndecodableType(child.second)) {
+				return true;
+			}
+		}
+		return false;
 	default:
 		return false;
 	}
 }
 
-struct SummaryScanBindData : duckdb::FunctionData {
+// Derives from DuckLake's own scan bind data, carrying the scan's file list
+// and reader: DuckLake's DELETE and UPDATE find the scan beneath them by its
+// `file_row_number` column and read their file map from that bind data.
+struct SummaryScanBindData : duckdb::MultiFileBindData {
 	std::string lake, schema, table;
 	uint64_t snapshot_id;
 	uint64_t table_id = 0;
@@ -136,24 +143,88 @@ struct SummaryScanBindData : duckdb::FunctionData {
 	// deletions are recorded under.
 	std::map<uint64_t, std::string> file_paths;
 	std::vector<std::string> inlined_tables;
-	duckdb::vector<std::string> names;
-	duckdb::vector<duckdb::LogicalType> types;
-	duckdb::virtual_column_map_t virtual_columns;
+	duckdb::vector<std::string> column_names;
+	duckdb::vector<duckdb::LogicalType> column_types;
+	// The replaced scan's function info, which its file list and reader
+	// refer to and nothing else keeps alive.
+	duckdb::shared_ptr<duckdb::TableFunctionInfo> scan_info;
+
+	// Takes over the scan's file list, reader, and columns, leaving `scan`
+	// hollow.
+	void AdoptScan(duckdb::MultiFileBindData &scan) {
+		bind_data = std::move(scan.bind_data);
+		file_list = scan.file_list;
+		multi_file_reader = std::move(scan.multi_file_reader);
+		interface = std::move(scan.interface);
+		columns = scan.columns;
+		reader_bind = scan.reader_bind;
+		file_options = scan.file_options;
+		types = scan.types;
+		names = scan.names;
+		virtual_columns = scan.virtual_columns;
+		table_columns = scan.table_columns;
+		initial_reader = scan.initial_reader;
+		union_readers = scan.union_readers;
+	}
 
 	bool SupportStatementCache() const override {
 		return false;
 	}
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-		return duckdb::make_uniq<SummaryScanBindData>(*this);
+		auto result = duckdb::make_uniq<SummaryScanBindData>();
+		auto base = duckdb::MultiFileBindData::Copy();
+		result->AdoptScan(base->Cast<duckdb::MultiFileBindData>());
+		result->lake = lake;
+		result->schema = schema;
+		result->table = table;
+		result->snapshot_id = snapshot_id;
+		result->table_id = table_id;
+		result->costing_ms = costing_ms;
+		result->pairs = pairs;
+		result->file_paths = file_paths;
+		result->inlined_tables = inlined_tables;
+		result->column_names = column_names;
+		result->column_types = column_types;
+		result->scan_info = scan_info;
+		return std::move(result);
 	}
 	bool Equals(const duckdb::FunctionData &) const override {
 		return false;
 	}
 };
 
+// The virtual columns the located scan serves: DuckDB's row id and the three
+// DuckLake's DELETE and UPDATE read their deletion info from.
+bool IsLocatedVirtualColumn(duckdb::column_t column) {
+	return column == duckdb::COLUMN_IDENTIFIER_ROW_ID ||
+	       column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME ||
+	       column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX ||
+	       column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+}
+
+// Whether `column` names a row's file or position, which an inlined row lacks.
+bool IsFileLocationColumn(duckdb::column_t column) {
+	return column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME ||
+	       column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX ||
+	       column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
+}
+
+duckdb::LogicalType LocatedVirtualColumnType(duckdb::column_t column) {
+	if (column == duckdb::COLUMN_IDENTIFIER_ROW_ID ||
+	    column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+		return duckdb::LogicalType::BIGINT;
+	}
+	if (column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
+		return duckdb::LogicalType::VARCHAR;
+	}
+	return duckdb::LogicalType::UBIGINT;
+}
+
 struct SummaryScanState : duckdb::GlobalTableFunctionState {
 	MoraineRowScan *scan = nullptr;
 	duckdb::vector<duckdb::idx_t> decoded_columns, projection;
+	// Output columns that carry the file's path, derived from its id.
+	duckdb::vector<duckdb::idx_t> filename_columns;
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::unique_ptr<duckdb::Expression> predicate;
 	duckdb::unique_ptr<duckdb::ExpressionExecutor> executor;
@@ -225,28 +296,65 @@ LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::D
 	return result;
 }
 
+// A DuckLake delete planned over this scan learns each file's committed
+// deletions from the scan's reader, which never runs here; serve them for
+// the files the located rows touch, as the reader would.
+void PrimeDeleteMap(duckdb::ClientContext &context, const SummaryScanBindData &bound) {
+	auto &reader = bound.multi_file_reader->Cast<duckdb::DuckLakeMultiFileReader>();
+	if (!reader.delete_map) {
+		return;
+	}
+	std::set<uint64_t> touched;
+	for (auto &pair : bound.pairs) {
+		if (pair.has_data_file_id) {
+			touched.insert(pair.data_file_id);
+		}
+	}
+	for (auto &entry : bound.file_list->Cast<duckdb::DuckLakeMultiFileList>().GetFiles()) {
+		if (entry.data_type != duckdb::DuckLakeDataType::DATA_FILE || !entry.file_id.IsValid() ||
+		    !touched.count(entry.file_id.index) || entry.delete_file.path.empty()) {
+			continue;
+		}
+		duckdb::DuckLakeDeleteFilter filter;
+		filter.Initialize(context, entry.delete_file);
+		reader.delete_map->AddDeleteData(entry.file.path,
+		                                 duckdb::make_shared_ptr<duckdb::DuckLakeDeleteData>(*filter.delete_data));
+	}
+}
+
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::ClientContext &context,
                                                                      duckdb::TableFunctionInitInput &input) {
 	auto &bound = input.bind_data->Cast<SummaryScanBindData>();
+	PrimeDeleteMap(context, bound);
 	auto started = ScanClock::now();
 	auto state = duckdb::make_uniq<SummaryScanState>();
 	duckdb::vector<const char *> requested;
 	for (auto column : input.column_ids) {
-		if (column == duckdb::COLUMN_IDENTIFIER_ROW_ID || column == FILE_ID) {
+		if (IsLocatedVirtualColumn(column)) {
 			state->decoded_columns.push_back(0);
-			state->types.push_back(column == FILE_ID ? duckdb::LogicalType::UBIGINT : duckdb::LogicalType::BIGINT);
+			state->types.push_back(LocatedVirtualColumnType(column));
 		} else {
 			state->decoded_columns.push_back(requested.size());
-			requested.push_back(bound.names[column].c_str());
-			state->types.push_back(bound.types[column]);
+			requested.push_back(bound.column_names[column].c_str());
+			state->types.push_back(bound.column_types[column]);
 		}
 	}
+	// Every located batch ends with the row id, the file id, and the row's
+	// position in its file; the deletion-info columns derive from the last two.
+	const auto row_id_at = requested.size();
+	const auto file_id_at = requested.size() + 1;
+	const auto position_at = requested.size() + 2;
 	for (duckdb::idx_t i = 0; i < input.column_ids.size(); i++) {
-		if (input.column_ids[i] == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-			state->decoded_columns[i] = requested.size();
-		}
-		if (input.column_ids[i] == FILE_ID) {
-			state->decoded_columns[i] = requested.size() + 1;
+		auto column = input.column_ids[i];
+		if (column == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+			state->decoded_columns[i] = row_id_at;
+		} else if (column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
+			state->decoded_columns[i] = file_id_at;
+		} else if (column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
+			state->decoded_columns[i] = file_id_at;
+			state->filename_columns.push_back(i);
+		} else if (column == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+			state->decoded_columns[i] = position_at;
 		}
 	}
 	state->projection = input.projection_ids;
@@ -315,6 +423,30 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 // which is unreadable from the outside, so it is bounded here instead.
 constexpr duckdb::idx_t MAX_BARREN_BATCHES = 1024;
 
+// Writes each row's data file path, as DuckLake names the file, from the
+// file id the located batch carries. A row without a file never reaches a
+// scan that asked for one.
+void FillFilenames(const SummaryScanBindData &bound, duckdb::Vector &file_ids, duckdb::Vector &filenames,
+                   duckdb::idx_t count) {
+	duckdb::UnifiedVectorFormat ids;
+	file_ids.ToUnifiedFormat(count, ids);
+	auto values = duckdb::UnifiedVectorFormat::GetData<uint64_t>(ids);
+	auto out = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(filenames);
+	for (duckdb::idx_t row = 0; row < count; row++) {
+		auto index = ids.sel->get_index(row);
+		if (!ids.validity.RowIsValid(index)) {
+			throw duckdb::InternalException(
+			    "moraine summary scan: a row without a data file reached a filename column");
+		}
+		auto path = bound.file_paths.find(values[index]);
+		if (path == bound.file_paths.end()) {
+			throw duckdb::InternalException("moraine summary scan: data file %llu has no recorded path",
+			                                static_cast<unsigned long long>(values[index]));
+		}
+		out[row] = duckdb::StringVector::AddString(filenames, path->second.c_str(), path->second.size());
+	}
+}
+
 void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &input, duckdb::DataChunk &output) {
 	auto &state = input.global_state->Cast<SummaryScanState>();
 	duckdb::idx_t barren_batches = 0;
@@ -358,7 +490,10 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 		projected.SetChildCardinality(piece->size());
 		for (duckdb::idx_t i = 0; i < state.types.size(); i++) {
 			auto &source = piece->data[state.decoded_columns[i]];
-			if (source.GetType() == state.types[i]) {
+			if (std::find(state.filename_columns.begin(), state.filename_columns.end(), i) !=
+			    state.filename_columns.end()) {
+				FillFilenames(input.bind_data->Cast<SummaryScanBindData>(), source, projected.data[i], piece->size());
+			} else if (source.GetType() == state.types[i]) {
 				projected.data[i].Reference(source);
 			} else {
 				duckdb::VectorOperations::DefaultCast(source, projected.data[i], piece->size());
@@ -420,13 +555,29 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	if (!moraine_snapshot_read_handle(metadata_tx.transaction->Cast<MoraineTransaction>().Snapshot())) {
 		return false;
 	}
+	std::set<uint64_t> file_ids;
+	bool includes_inline = false;
+	for (auto &row : rows) {
+		if (row.has_data_file_id) {
+			file_ids.insert(row.data_file_id);
+		} else {
+			includes_inline = true;
+		}
+	}
+	// Whole columns of any type the table declares: the located reader decodes
+	// what DuckLake wrote and the import casts to the declared type. A struct
+	// field projection asks for part of a column, which it does not serve,
+	// and a column of a type it cannot decode as the scan does keeps the scan.
+	// A row's file and position exist only for a row in a data file.
 	for (auto &column : scan.GetColumnIds()) {
 		auto id = column.GetPrimaryIndex();
-		if (column.HasChildren() ||
-		    (id >= scan.returned_types.size() && id != duckdb::COLUMN_IDENTIFIER_ROW_ID && id != FILE_ID)) {
+		if (column.HasChildren() || (id >= scan.returned_types.size() && !IsLocatedVirtualColumn(id))) {
 			return false;
 		}
-		if (id < scan.returned_types.size() && !SupportedType(scan.returned_types[id])) {
+		if (id < scan.returned_types.size() && HoldsUndecodableType(scan.returned_types[id])) {
+			return false;
+		}
+		if (includes_inline && IsFileLocationColumn(id)) {
 			return false;
 		}
 	}
@@ -437,62 +588,48 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	bound->snapshot_id = info.snapshot.snapshot_id;
 	bound->table_id = info.table.GetTableId().index;
 	for (auto &name : scan.names) {
-		bound->names.push_back(name.GetIdentifierName());
+		bound->column_names.push_back(name.GetIdentifierName());
 	}
-	bound->types = scan.returned_types;
-	bound->virtual_columns = scan.virtual_columns;
+	bound->column_types = scan.returned_types;
 	bound->pairs = rows;
-	// Fetch candidate file paths for transaction-local deletion masks. Using
-	// file IDs avoids expanding the original key predicate in metadata SQL.
-	std::set<uint64_t> file_ids;
-	bool includes_inline = false;
-	for (auto &row : rows) {
-		if (row.has_data_file_id) {
-			file_ids.insert(row.data_file_id);
-		} else {
-			includes_inline = true;
+	// The located files' paths come from the catalog by id, not from the
+	// scan's file list.
+	auto *manager = dynamic_cast<MoraineMetadataManager *>(&transaction->GetMetadataManager());
+	if (!manager) {
+		return false;
+	}
+	if (!file_ids.empty()) {
+		std::vector<uint64_t> requested(file_ids.begin(), file_ids.end());
+		OwnedArray<MoraineDataFilePath> paths(moraine_data_file_paths_free);
+		MoraineError error {};
+		auto code = moraine_data_file_paths(
+		    moraine_snapshot_read_handle(metadata_tx.transaction->Cast<MoraineTransaction>().Snapshot()),
+		    schema.c_str(), table.c_str(), requested.data(), requested.size(), paths.OutItems(), paths.OutLen(),
+		    moraine_shim_is_interrupted, &context, &error);
+		if (code != MORAINE_OK) {
+			ThrowMoraineError(error);
+		}
+		for (auto &file : paths) {
+			bound->file_paths.emplace(
+			    file.data_file_id,
+			    manager->DataFilePath(info.table, duckdb::DuckLakePath {file.path, file.path_is_relative}));
 		}
 	}
-	duckdb::vector<duckdb::Value> values;
-	for (auto file_id : file_ids) {
-		values.push_back(duckdb::Value::UBIGINT(file_id));
-	}
-	auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::UBIGINT, 0);
-	duckdb::unique_ptr<duckdb::Expression> file_filter;
-	if (!values.empty()) {
-		file_filter = duckdb::ExpressionFilter::CreateInExpression(column->Copy(), std::move(values));
-	}
-	if (includes_inline) {
-		auto nulls = duckdb::ExpressionFilter::CreateNullCheckExpression(column->Copy(),
-		                                                                 duckdb::ExpressionType::OPERATOR_IS_NULL);
-		file_filter = file_filter
-		                  ? duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
-		                        duckdb::ExpressionType::CONJUNCTION_OR, std::move(file_filter), std::move(nulls))
-		                  : std::move(nulls);
-	}
-	auto filters = duckdb::make_uniq<duckdb::FilterPushdownInfo>();
-	if (file_filter) {
-		filters->data_file_id_filter = duckdb::make_shared_ptr<duckdb::ExpressionFilter>(std::move(file_filter));
-	}
-	duckdb::DuckLakeMultiFileList files(info, duckdb::vector<duckdb::DuckLakeDataFile> {}, nullptr, std::move(filters));
-	for (auto &entry : files.GetFiles()) {
-		if (entry.data_type == duckdb::DuckLakeDataType::INLINED_DATA) {
-			bound->inlined_tables.push_back(entry.file.path);
-		} else if (entry.data_type == duckdb::DuckLakeDataType::DATA_FILE && entry.file_id.IsValid()) {
-			bound->file_paths.emplace(entry.file_id.index, entry.file.path);
-		}
-	}
-	for (auto &pair : bound->pairs) {
-		if (pair.has_data_file_id && !bound->file_paths.count(pair.data_file_id)) {
-			return false;
-		}
+	for (auto &inlined : info.table.GetInlinedDataTables(*transaction, info.snapshot, info.include_local_changes)) {
+		bound->inlined_tables.push_back(inlined.table_name);
 	}
 	std::vector<MoraineRowId> file_pairs;
+	std::vector<MoraineRowId> readable;
 	for (auto &pair : bound->pairs) {
 		if (pair.has_data_file_id) {
+			if (!bound->file_paths.count(pair.data_file_id)) {
+				continue;
+			}
 			file_pairs.push_back(pair);
 		}
+		readable.push_back(pair);
 	}
+	bound->pairs = std::move(readable);
 	if (file_pairs.size() > 16) {
 		auto started = ScanClock::now();
 		SummaryScanState estimate;
@@ -565,6 +702,11 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	function.get_virtual_columns = [](duckdb::ClientContext &, duckdb::optional_ptr<duckdb::FunctionData> data) {
 		return data->Cast<SummaryScanBindData>().virtual_columns;
 	};
+	// Moved rather than copied, and only once the scan is certainly replaced:
+	// the scan's file list and reader refer to the function info its bound
+	// function holds, and a moved pointer keeps its address.
+	bound->AdoptScan(scan.bind_data->Cast<duckdb::MultiFileBindData>());
+	bound->scan_info = scan.function.function_info;
 	scan.bind_data = std::move(bound);
 	scan.function = duckdb::BoundTableFunction(function);
 	scan.extra_info.file_filters.clear();

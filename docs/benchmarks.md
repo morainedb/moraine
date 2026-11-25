@@ -782,13 +782,13 @@ hold the row rather than every file of the table.
 <!-- site:omit -->2026-11-17 at `a491fe5`.<!-- /site:omit -->
 On the benchmark runner, 16 files × 2,000 rows over AWS S3: 166,008
 summary bytes, a cold lookup of 78 ms and a warm one of 0.8 ms. After
-six update batches the row-id path reads 7 files where the located join
-reads 1.
+six update batches, DuckLake's row-id statistics alone admit 7 files for a
+row named by its id where the located join reads 1.
 
 <!-- site:omit -->
 `cargo xtask locate-bench [--files N] [--rows-per-file N] [--update-batches N]`
 reports summary bytes, cold and warm lookup time, and the files a scan
-reads with and without the located join.
+reads through the located join against naming the row id as a constant.
 
 Apple M2, 64 files × 8,000 rows: 121,664 summary bytes (a quarter byte per
 row), 0.2 ms warm lookup, and the same 7-against-1 after six batches.

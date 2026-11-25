@@ -227,6 +227,17 @@ typedef struct MoraineMemoryBudgets {
   uint64_t host_headroom;
 } MoraineMemoryBudgets;
 
+// One data file's recorded path, as [`moraine_data_file_paths`] returns
+// it. Free with [`moraine_data_file_paths_free`].
+typedef struct MoraineDataFilePath {
+  // The data file.
+  uint64_t data_file_id;
+  // The path the catalog records, owned.
+  char *path;
+  // Whether `path` is relative to the table's data path.
+  bool path_is_relative;
+} MoraineDataFilePath;
+
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -1679,6 +1690,34 @@ int32_t moraine_validate_host_memory(uint64_t duckdb_bytes,
                                      uint64_t cache_bytes,
                                      bool writer,
                                      struct MoraineError *err);
+
+// Resolves data file ids of one table to the paths the catalog records at
+// the handle's pinned revision. Every id must name a current data file of
+// the table. Free the result with [`moraine_data_file_paths_free`].
+//
+// # Safety
+// Every pointer must satisfy the ABI contract; `file_ids` points to
+// `file_ids_len` ids, output pointers are non-null and writable, and
+// `probe`/`probe_ctx` satisfy the interrupt-probe contract.
+int32_t moraine_data_file_paths(struct MoraineCatalogHandle *handle,
+                                const char *schema_name,
+                                const char *table_name,
+                                const uint64_t *file_ids,
+                                size_t file_ids_len,
+                                struct MoraineDataFilePath **out_items,
+                                size_t *out_len,
+                                MoraineInterruptProbe probe,
+                                void *probe_ctx,
+                                struct MoraineError *err);
+
+// Frees the array [`moraine_data_file_paths`] wrote to
+// `out_items`/`out_len`, including each row's path.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written there by a
+// matching call, not yet freed.
+void moraine_data_file_paths_free(struct MoraineDataFilePath *items, size_t len);
 
 // Arms the next commit on this thread to land and then report its outcome
 // as unknown, as a commit whose acknowledgement was lost does.

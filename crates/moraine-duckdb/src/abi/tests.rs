@@ -3183,3 +3183,99 @@ fn lookup_cache_status_rejects_null_outputs_without_writing() {
     );
     assert!(occupancy <= capacity);
 }
+
+/// Data file paths come back by id with the recorded relativity, and an id
+/// the table does not hold is an error rather than a missing row.
+#[test]
+fn data_file_paths_resolve_by_id() {
+    let dir = TempDir::new("data-file-paths");
+    seed(dir.path());
+    let c_path = dir.c_path();
+    let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+    let mut err = MoraineError::default();
+    // SAFETY: all pointers are valid C strings / local slots.
+    let code = unsafe {
+        moraine_attach_with_wal_store(
+            c_path.as_ptr(),
+            ptr::null(),
+            false,
+            false,
+            0,
+            false,
+            ptr::null(),
+            0,
+            0,
+            0,
+            false,
+            false,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            None,
+            ptr::null_mut(),
+            &raw mut handle,
+            &raw mut err,
+        )
+    };
+    assert_eq!(code, codes::OK);
+    let schema = CString::new("sales").expect("no NUL");
+    let table = CString::new("orders").expect("no NUL");
+
+    let ids = [0_u64];
+    let mut items: *mut MoraineDataFilePath = ptr::null_mut();
+    let mut len = 0_usize;
+    let mut err = MoraineError::default();
+    // SAFETY: valid pointers over a live handle.
+    let code = unsafe {
+        moraine_data_file_paths(
+            handle,
+            schema.as_ptr(),
+            table.as_ptr(),
+            ids.as_ptr(),
+            ids.len(),
+            &raw mut items,
+            &raw mut len,
+            None,
+            ptr::null_mut(),
+            &raw mut err,
+        )
+    };
+    assert_eq!(code, codes::OK);
+    assert_eq!(len, 1);
+    // SAFETY: one row was written.
+    let row = unsafe { &*items };
+    assert_eq!(row.data_file_id, 0);
+    assert!(row.path_is_relative);
+    // SAFETY: `path` is the NUL-terminated string the call owns.
+    let path = unsafe { std::ffi::CStr::from_ptr(row.path) }
+        .to_str()
+        .expect("utf-8");
+    assert_eq!(path, "orders/data-1.parquet");
+    // SAFETY: exactly the pair written above.
+    unsafe { moraine_data_file_paths_free(items, len) };
+
+    let missing = [7_u64];
+    let mut items: *mut MoraineDataFilePath = ptr::null_mut();
+    let mut len = 0_usize;
+    let mut err = MoraineError::default();
+    // SAFETY: as above.
+    let code = unsafe {
+        moraine_data_file_paths(
+            handle,
+            schema.as_ptr(),
+            table.as_ptr(),
+            missing.as_ptr(),
+            missing.len(),
+            &raw mut items,
+            &raw mut len,
+            None,
+            ptr::null_mut(),
+            &raw mut err,
+        )
+    };
+    assert_ne!(code, codes::OK);
+    assert!(items.is_null());
+    // SAFETY: a live handle from the attach above.
+    unsafe { moraine_detach(handle) };
+}

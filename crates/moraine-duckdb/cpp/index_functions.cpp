@@ -12,6 +12,7 @@
 #include "duckdb/common/types/uuid.hpp"
 
 #include <deque>
+#include <unordered_set>
 
 namespace moraine_duckdb {
 
@@ -139,18 +140,18 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 // moraine_index_lookup: resolves an equality key to the rows holding it. The
 // variadic values are one per indexed column, in the index's column order.
 
-// Emits one located row: its stable id, and the file currently holding it.
-// A NULL file id is a live inlined row or one the lookup could not place,
-// so a consumer joins the second column with null-safe equality.
-void SetRowId(duckdb::DataChunk &output, duckdb::idx_t row_index, const MoraineRowId &row_id) {
-	output.SetValue(0, row_index, duckdb::Value::BIGINT(static_cast<int64_t>(row_id.value)));
-	output.SetValue(1, row_index,
-	                row_id.has_data_file_id ? duckdb::Value::UBIGINT(row_id.data_file_id)
-	                                        : duckdb::Value(duckdb::LogicalType::UBIGINT));
+// Emits one located row's stable id.
+void SetRowId(duckdb::DataChunk &output, duckdb::idx_t row_index, int64_t row_id) {
+	output.SetValue(0, row_index, duckdb::Value::BIGINT(row_id));
 }
 
 struct IndexReadBindData : public duckdb::FunctionData {
 	bool cacheable = false;
+	// The distinct ids of the rows the read resolved, in resolution order:
+	// the read's output. The candidate `(row_id, data_file_id)` pairs behind
+	// them, which name every copy a row may still have, feed the located
+	// scan and stay in the bind data of each read.
+	std::vector<int64_t> row_ids;
 	bool SupportStatementCache() const override {
 		return cacheable;
 	}
@@ -158,7 +159,13 @@ struct IndexReadBindData : public duckdb::FunctionData {
 
 template <class BindData>
 void FinishIndexBind(duckdb::ClientContext &context, BindData &data) {
-	const auto bytes = data.rows.capacity() * sizeof(MoraineRowId);
+	std::unordered_set<uint64_t> seen;
+	for (auto &row : data.rows) {
+		if (seen.insert(row.value).second) {
+			data.row_ids.push_back(static_cast<int64_t>(row.value));
+		}
+	}
+	const auto bytes = data.rows.capacity() * sizeof(MoraineRowId) + data.row_ids.capacity() * sizeof(int64_t);
 	data.cacheable = data.cacheable && bytes <= 8 * 1024 * 1024;
 	WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
 	                "index bind resolved rows=" + std::to_string(data.rows.size()) +
@@ -190,7 +197,7 @@ struct LookupBindData : public IndexReadBindData {
 template <class BindData>
 duckdb::unique_ptr<duckdb::NodeStatistics> ExactIndexCardinality(duckdb::ClientContext &,
                                                                  const duckdb::FunctionData *bind_data) {
-	auto count = bind_data->Cast<BindData>().rows.size();
+	auto count = bind_data->Cast<BindData>().row_ids.size();
 	return duckdb::make_uniq<duckdb::NodeStatistics>(count, count);
 }
 
@@ -311,8 +318,8 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 	}
 
 	FinishIndexBind(context, *bind_data);
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
-	names = {"row_id", "data_file_id"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return bind_data;
 }
 
@@ -373,8 +380,8 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context, 
 	}
 
 	FinishIndexBind(context, *bind_data);
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
-	names = {"row_id", "data_file_id"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return bind_data;
 }
 
@@ -393,14 +400,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> LookupInitGlobal(duckdb::Cl
 void LookupImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<LookupBindData>();
 	auto &state = data.global_state->Cast<LookupGlobalState>();
-	if (state.offset >= bind_data.rows.size()) {
+	if (state.offset >= bind_data.row_ids.size()) {
 		output.SetChildCardinality(0);
 		return;
 	}
-	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.row_ids.size() - state.offset);
 	for (duckdb::idx_t i = 0; i < count; i++) {
-		auto &row = bind_data.rows[state.offset + i];
-		SetRowId(output, i, row);
+		SetRowId(output, i, bind_data.row_ids[state.offset + i]);
 	}
 	state.offset += count;
 	output.SetChildCardinality(count);
@@ -494,8 +500,8 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	}
 
 	FinishIndexBind(context, *bind_data);
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
-	names = {"row_id", "data_file_id"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return bind_data;
 }
 
@@ -514,14 +520,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RangeInitGlobal(duckdb::Cli
 void RangeImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RangeBindData>();
 	auto &state = data.global_state->Cast<RangeGlobalState>();
-	if (state.offset >= bind_data.rows.size()) {
+	if (state.offset >= bind_data.row_ids.size()) {
 		output.SetChildCardinality(0);
 		return;
 	}
-	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.row_ids.size() - state.offset);
 	for (duckdb::idx_t i = 0; i < count; i++) {
-		auto &row = bind_data.rows[state.offset + i];
-		SetRowId(output, i, row);
+		SetRowId(output, i, bind_data.row_ids[state.offset + i]);
 	}
 	state.offset += count;
 	output.SetChildCardinality(count);
@@ -595,8 +600,8 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 	}
 
 	FinishIndexBind(context, *bind_data);
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
-	names = {"row_id", "data_file_id"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return bind_data;
 }
 
@@ -615,14 +620,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> NullsInitGlobal(duckdb::Cli
 void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<NullsBindData>();
 	auto &state = data.global_state->Cast<NullsGlobalState>();
-	if (state.offset >= bind_data.rows.size()) {
+	if (state.offset >= bind_data.row_ids.size()) {
 		output.SetChildCardinality(0);
 		return;
 	}
-	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.row_ids.size() - state.offset);
 	for (duckdb::idx_t i = 0; i < count; i++) {
-		auto &row = bind_data.rows[state.offset + i];
-		SetRowId(output, i, row);
+		SetRowId(output, i, bind_data.row_ids[state.offset + i]);
 	}
 	state.offset += count;
 	output.SetChildCardinality(count);

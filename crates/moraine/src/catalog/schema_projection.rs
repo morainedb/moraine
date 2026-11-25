@@ -199,8 +199,25 @@ fn arrow_type(column_type: &str) -> Option<DataType> {
         "TIMESTAMP_S" => DataType::Timestamp(TimeUnit::Second, None),
         "TIMESTAMP_MS" => DataType::Timestamp(TimeUnit::Millisecond, None),
         "TIMESTAMP_NS" => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        _ => return None,
+        "TIME" => DataType::Time64(TimeUnit::Microsecond),
+        "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => DataType::Binary,
+        other => return decimal_type(other),
     })
+}
+
+/// `DECIMAL(p,s)` as the Arrow decimal Parquet holds it; `None` for any
+/// other type, which the reader then passes through as written.
+fn decimal_type(column_type: &str) -> Option<DataType> {
+    let inner = column_type
+        .strip_prefix("DECIMAL(")
+        .or_else(|| column_type.strip_prefix("NUMERIC("))?
+        .strip_suffix(')')?;
+    let (precision, scale) = inner.split_once(',')?;
+    let precision: u8 = precision.trim().parse().ok()?;
+    let scale: i8 = scale.trim().parse().ok()?;
+    (1..=38)
+        .contains(&precision)
+        .then_some(DataType::Decimal128(precision, scale))
 }
 
 /// The virtual field in a Hive-style directory, decoded as DuckLake reads it.
@@ -250,6 +267,33 @@ fn hive_value(path: &str, name: &str, data_type: Option<&DataType>) -> Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Declared types resolve to the Arrow type Parquet holds them as, and
+    /// unknown ones to `None`, which passes the written array through.
+    #[test]
+    fn declared_types_resolve_decimals_time_and_blob() {
+        assert_eq!(
+            arrow_type("DECIMAL(18,3)"),
+            Some(DataType::Decimal128(18, 3))
+        );
+        assert_eq!(
+            arrow_type("decimal(38, 6)"),
+            Some(DataType::Decimal128(38, 6))
+        );
+        assert_eq!(
+            arrow_type("NUMERIC(10,0)"),
+            Some(DataType::Decimal128(10, 0))
+        );
+        assert_eq!(arrow_type("DECIMAL(39,0)"), None);
+        assert_eq!(arrow_type("DECIMAL(x,0)"), None);
+        assert_eq!(
+            arrow_type("TIME"),
+            Some(DataType::Time64(TimeUnit::Microsecond))
+        );
+        assert_eq!(arrow_type("BLOB"), Some(DataType::Binary));
+        assert_eq!(arrow_type("INTERVAL"), None);
+        assert_eq!(arrow_type("STRUCT(a INTEGER)"), None);
+    }
 
     #[tokio::test]
     async fn historical_column_resolution_reads_only_its_table() {

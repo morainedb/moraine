@@ -264,3 +264,64 @@ async fn positioning_sources_do_not_decode_unrelated_records() {
     read.finish();
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn positioning_sources_expose_each_named_file_by_id() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    catalog
+        .commit(async |tx| {
+            let schema = tx.schema_by_name("main").await?.expect("main schema").id;
+            let table = tx
+                .create_table(
+                    schema,
+                    "t",
+                    &[crate::ColumnDef {
+                        name: "id".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .await?;
+            for path in ["t/first.parquet", "t/second.parquet"] {
+                tx.register_data_file(
+                    table,
+                    crate::DataFile {
+                        path: path.into(),
+                        path_is_relative: true,
+                        file_format: "parquet".into(),
+                        record_count: 2,
+                        file_size_bytes: 1024,
+                        footer_size: 64,
+                        encryption_key: None,
+                        partition_values: vec![],
+                        column_stats: vec![],
+                    },
+                    &[],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let second = crate::DataFileId::new(1);
+    let view = table_sources_for(&catalog, "main", "t", &[second])
+        .await
+        .unwrap();
+    let table = view
+        .table_by_name(view.schema_by_name("main").unwrap().id, "t")
+        .unwrap()
+        .id;
+
+    let file = view.data_file(table, second).unwrap();
+    assert_eq!(file.id, second);
+    assert_eq!(file.path, "t/second.parquet");
+    assert!(file.path_is_relative);
+    assert!(view.data_file(table, crate::DataFileId::new(9)).is_none());
+    catalog.close().await.unwrap();
+}

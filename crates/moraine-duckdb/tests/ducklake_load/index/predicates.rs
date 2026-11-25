@@ -62,10 +62,8 @@ fn ordinary_predicates_probe_single_and_composite_indexes() {
             assert_eq!(csv_rows(&run(&query)), expected, "{predicate}");
             let plan = run(&format!("EXPLAIN ANALYZE {query}"));
             assert!(
-                plan.contains("Coverage costing ms")
-                    || plan.contains("rowid")
-                    || plan.contains("data_file_id"),
-                "no indexed read for {predicate}: {plan}"
+                plan.contains("Coverage costing ms"),
+                "no located read for {predicate}: {plan}"
             );
         }
     }

@@ -350,7 +350,12 @@ async fn file_rows_come_back_with_the_current_columns_and_their_ids() {
             .iter()
             .map(|field| field.name().clone())
             .collect::<Vec<_>>(),
-        ["a", "b", "row_id", "data_file_id"]
+        ["a", "b", "row_id", "data_file_id", "position"]
+    );
+    assert_eq!(
+        batch.column_by_name("position").unwrap().null_count(),
+        0,
+        "a file row carries its position"
     );
     assert_eq!(
         batch
@@ -426,7 +431,7 @@ async fn selective_cursor_projects_and_streams_exact_rows() {
             .await
             .unwrap();
         let batch = scan.next_record_batch().await.unwrap().unwrap();
-        assert_eq!(batch.num_columns(), requested.len() + 2);
+        assert_eq!(batch.num_columns(), requested.len() + 3);
         assert_eq!(batch.num_rows(), 2);
         if !requested.is_empty() {
             assert_eq!(

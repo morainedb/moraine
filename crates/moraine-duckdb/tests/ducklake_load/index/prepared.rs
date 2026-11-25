@@ -14,9 +14,7 @@ fn prepared_index_reads_reuse_scoped_probes() {
                         data.path().display()
                     );
                     let from = if joined {
-                        format!(
-                            "lake.main.t data JOIN {read} hits ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id"
-                        )
+                        format!("lake.main.t data JOIN {read} hits ON data.rowid=hits.row_id")
                     } else {
                         read
                     };
@@ -252,7 +250,7 @@ fn prepared_index_reads_refresh_after_inserts_updates_and_deletes() {
 
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged extensions"]
-fn prepared_located_joins_refresh_rows_and_file_filters() {
+fn prepared_located_joins_refresh_their_rows() {
     for limit in [0, 10] {
         for parameterized in [false, true] {
             for (kind, read, arguments) in reads(parameterized) {
@@ -273,20 +271,14 @@ fn prepared_located_joins_refresh_rows_and_file_filters() {
                          PREPARE located AS
                            SELECT 'probe' AS phase, coalesce(string_agg(data.b,',' ORDER BY data.b),'missing') AS matched
                            FROM lake.main.t data JOIN {read} hits
-                             ON data.rowid=hits.row_id
-                            AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+                             ON data.rowid=hits.row_id;
                          EXECUTE located{arguments};
                          INSERT INTO lake.main.t VALUES (2,'before'),(NULL,'before');
                          EXECUTE located{arguments};
-                         PREPARE holding_file AS
-                           SELECT 'file' AS phase, coalesce(data_file_id::VARCHAR,'inline') AS file
-                           FROM {read};
-                         EXECUTE holding_file{arguments};
                          UPDATE lake.main.t SET b='updated' WHERE a=2 OR a IS NULL;
                          EXECUTE located{arguments};
                          CALL ducklake_flush_inlined_data('lake');
                          EXECUTE located{arguments};
-                         EXECUTE holding_file{arguments};
                          DELETE FROM lake.main.t WHERE a=1;
                          CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.01);
                          CALL ducklake_merge_adjacent_files('lake');
@@ -312,19 +304,6 @@ fn prepared_located_joins_refresh_rows_and_file_filters() {
                     ],
                     "{kind}, limit={limit}, parameterized={parameterized}"
                 );
-                let files: Vec<_> = csv_rows(&result)
-                    .into_iter()
-                    .filter(|row| row.first().is_some_and(|phase| phase == "file"))
-                    .collect();
-                assert_eq!(
-                    files.len(),
-                    2,
-                    "{kind}, limit={limit}, parameterized={parameterized}"
-                );
-                assert_ne!(
-                    files[0][1], files[1][1],
-                    "the prepared read retained its old file: {kind}, limit={limit}, parameterized={parameterized}"
-                );
             }
         }
     }
@@ -343,7 +322,7 @@ fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
             data.path().display()
         );
         let joined = "lake.main.t data JOIN moraine_index_in('lake','main','t','by_a',[1,2,3]) hits \
-             ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+             ON data.rowid=hits.row_id";
         let counts = "SELECT 'lookups', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index lookup resolved%';";
         let result = run_session_with_env(
             &Attach::Moraine {

@@ -203,8 +203,7 @@ fn measure(
                 format!(
                     "SELECT count(*),sum(length(data.payload)) FROM lake.main.t data
                  JOIN moraine_index_in('lake','main','t','by_a',[{keys}]) hits
-                 ON data.rowid = hits.row_id
-                 AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id"
+                 ON data.rowid = hits.row_id"
                 ),
             ),
         ] {
