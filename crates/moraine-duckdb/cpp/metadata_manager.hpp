@@ -66,8 +66,15 @@ public:
 	                            const duckdb::TransactionChangeInformation &transaction_changes,
 	                            const duckdb::DuckLakeRetryConfig &retry_config) override;
 
-	bool TryGetTableStats(duckdb::DuckLakeSnapshot snapshot, duckdb::TableIndex table_id,
-	                      duckdb::vector<duckdb::DuckLakeGlobalStatsInfo> &stats) override;
+	bool ScopesTableStats() const override {
+		return true;
+	}
+	//! Reads the named tables' statistics alone, through the catalog's row
+	//! contract; an unscoped request or a table without a recorded size
+	//! takes DuckLake's query.
+	duckdb::vector<duckdb::DuckLakeGlobalStatsInfo>
+	GetGlobalTableStats(duckdb::DuckLakeSnapshot snapshot,
+	                    const duckdb::vector<duckdb::TableIndex> &table_ids = {}) override;
 	bool TryWriteAppendStats(const duckdb::DuckLakeGlobalStatsInfo &stats) override;
 	void FlushAppendStats() override;
 	void ClearAppendStats() override;

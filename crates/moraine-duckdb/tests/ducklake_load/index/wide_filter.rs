@@ -26,7 +26,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         ),
     );
     assert!(
-        result.contains("Moraine Summary Scan"),
+        result.contains("Moraine Located"),
         "the wide probe lost its exact scan: {result}"
     );
     assert!(
@@ -69,7 +69,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
             &format!("EXPLAIN {query}; {query};"),
         );
         assert!(
-            result.contains("Moraine Summary Scan"),
+            result.contains("Moraine Located"),
             "cap boundary {expected}: {result}"
         );
         assert!(
@@ -90,7 +90,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
          ON data.rowid IS NOT DISTINCT FROM hits.row_id;",
     );
     assert!(
-        !sparse.contains("Moraine Summary Scan"),
+        !sparse.contains("Moraine Located"),
         "an undecodable projection must keep the scan: {sparse}"
     );
     assert!(

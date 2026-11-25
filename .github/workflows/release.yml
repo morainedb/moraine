@@ -95,10 +95,10 @@ jobs:
         duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}
     # duckdb_version checks DuckDB out at that release and stamps every
     # version string from it; ci_tools_version must match the ref above.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@78bd1e4abbd543822166d5b07644751ba1fc6e8d
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@71304ce91a20127650bb65335da5b8dadc28a3ea
     with:
       extension_name: moraine
-      ci_tools_version: 78bd1e4abbd543822166d5b07644751ba1fc6e8d
+      ci_tools_version: 71304ce91a20127650bb65335da5b8dadc28a3ea
       duckdb_version: ${{ matrix.duckdb_version }}
       enable_rust: true
       opt_in_archs: "osx_amd64"

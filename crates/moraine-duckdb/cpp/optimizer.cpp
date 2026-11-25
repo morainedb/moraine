@@ -235,7 +235,7 @@ struct ResolvedPredicate {
 std::optional<ResolvedPredicate>
 ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer, duckdb::LogicalGet &get,
                         duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
-	if (!get.function.GetDefinition() || get.function.GetDefinition()->name != "ducklake_scan") {
+	if (!get.function.GetDefinition() || get.function.GetDefinition()->name != "ducklake_scan" || IsSummaryScan(get)) {
 		return std::nullopt;
 	}
 	if (!get.function.filter_pushdown) {

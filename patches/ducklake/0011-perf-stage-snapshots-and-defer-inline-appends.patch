@@ -1,6 +1,8 @@
+diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
+index 3689deb2..7c89c5e6 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -515,6 +515,16 @@
+@@ -547,6 +547,16 @@ public:
  	//! SQL templates with {METADATA_CATALOG} / {SNAPSHOT_ID} placeholders, shared with the
  	//! server-side commit path.
  	static string InsertSnapshotSql();
@@ -17,9 +19,11 @@
  	static string WriteSnapshotChangesSql(const SnapshotChangeInfo &change_info,
  	                                      const DuckLakeSnapshotCommit &commit_info);
  	static string UpdateGlobalTableStatsSql(const DuckLakeGlobalStatsInfo &stats, bool write_stats_exactness);
+diff --git a/src/include/storage/ducklake_transaction_state.hpp b/src/include/storage/ducklake_transaction_state.hpp
+index f6b19758..c047e1c8 100644
 --- a/src/include/storage/ducklake_transaction_state.hpp
 +++ b/src/include/storage/ducklake_transaction_state.hpp
-@@ -33,6 +33,8 @@
+@@ -35,6 +35,8 @@ struct DuckLakeCommitContext {
  	//! Rewrites the delete files whose new deletes are not dated to the commit snapshot.
  	std::function<void(idx_t)> set_delete_commit_snapshot = [](idx_t) {
  	};
@@ -28,9 +32,11 @@
  	//! Executes the batched snapshot/changes SQL against the metadata DB.
  	std::function<unique_ptr<QueryResult>(DuckLakeSnapshot, string &)> execute_commit_batch;
  	//! Classifies metadata-catalog errors that are safe to retry.
+diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
+index c6f9fe92..7f93f88d 100644
 --- a/src/storage/ducklake_transaction.cpp
 +++ b/src/storage/ducklake_transaction.cpp
-@@ -1519,6 +1519,9 @@
+@@ -1623,6 +1623,9 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
  		// the client context has no active transaction during the commit
  		state->local_changes.SetDeleteCommitSnapshot(*GetConnection().context, *this, commit_snapshot);
  	};
@@ -40,8 +46,8 @@
  	context.execute_commit_batch = [&](DuckLakeSnapshot snapshot, string &query) {
  		auto result = metadata_manager->Execute(snapshot, query);
  		for (auto &insert : inlined_inserts) {
-@@ -1529,6 +1532,9 @@
- 			result = connection->Query(std::move(insert));
+@@ -1633,6 +1636,9 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
+ 			result = ExecuteStatement(std::move(insert));
  		}
  		inlined_inserts.clear();
 +		if (!result->HasError()) {
@@ -50,7 +56,7 @@
  		return result;
  	};
  	context.is_retryable_metadata_error = [&](const string &message) {
-@@ -1543,6 +1549,7 @@
+@@ -1653,6 +1659,7 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
  		connection->Commit();
  	};
  	context.try_rollback = [&]() {
@@ -58,10 +64,12 @@
  		if (connection->context->transaction.HasActiveTransaction()) {
  			connection->Rollback();
  		}
+diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
+index 01a741b6..fb60f1b5 100644
 --- a/src/storage/ducklake_transaction_state.cpp
 +++ b/src/storage/ducklake_transaction_state.cpp
-@@ -2686,10 +2686,12 @@
- 			can_retry = true;
+@@ -2766,10 +2766,12 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
+ 			}
  			context.set_delete_commit_snapshot(commit_snapshot.snapshot_id);
  			DuckLakeCommitState commit_state(commit_snapshot);
 -			// write the new snapshot

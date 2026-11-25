@@ -25,4 +25,4 @@
 # each build into. The distribution build is handed this version as
 # `duckdb_version`, so every string it stamps comes from the release
 # rather than from `git describe` over a shallow checkout.
-v2.0.0 duckdb=d54cbbe3df17e8e5ce68312f483b4155836112aa extension-ci-tools=78bd1e4abbd543822166d5b07644751ba1fc6e8d
+v2.0.1 duckdb=8d78114e90a53823803660bf821f6073ac87da8c extension-ci-tools=71304ce91a20127650bb65335da5b8dadc28a3ea

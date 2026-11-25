@@ -286,5 +286,6 @@ private:
 // reports `<store path>`, so the fallback matches on that. Throws
 // `InvalidInputException` when neither names a moraine catalog.
 MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std::string &catalog_name);
+MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const duckdb::Identifier &catalog_name);
 
 } // namespace moraine_duckdb

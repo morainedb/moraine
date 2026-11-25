@@ -30,11 +30,7 @@ fn summary_scan_is_automatic_without_a_public_switch() {
         ),
     );
     assert!(has_line(&result, "switches,0"), "{result}");
-    assert_eq!(
-        result.matches("Moraine Summary Scan").count(),
-        1,
-        "{result}"
-    );
+    assert_eq!(result.matches("Moraine Located").count(), 1, "{result}");
     assert_eq!(
         result.lines().filter(|line| *line == "22").count(),
         4,
@@ -59,7 +55,7 @@ fn summary_scan_uses_physical_coverage() {
          EXPLAIN SELECT sum(length(data.payload)) FROM lake.main.t data
          JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128), lambda x: x * 2048)) hits
          ON data.rowid=hits.row_id;");
-    assert!(!result.contains("Moraine Summary Scan"), "{result}");
+    assert!(!result.contains("Moraine Located"), "{result}");
 }
 
 /// Parallel cursors preserve nullable strings and early-stop ownership.
@@ -126,7 +122,7 @@ fn summary_driven_scan_keeps_join_and_filters() {
          CREATE INDEX by_a ON lake.main.t(a);
          EXPLAIN {query}; {query};"));
     assert!(
-        result.contains("Moraine Summary Scan"),
+        result.contains("Moraine Located"),
         "no selective scan: {result}"
     );
     assert!(
@@ -206,7 +202,7 @@ fn summary_driven_scan_declines_unsafe_rewrites() {
          EXPLAIN SELECT data.b FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits
          ON data.rowid=hits.row_id;");
     assert!(
-        !result.contains("Moraine Summary Scan"),
+        !result.contains("Moraine Located"),
         "unsafe replacement: {result}"
     );
 }
@@ -299,7 +295,7 @@ fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
             ),
         );
         assert_eq!(
-            result.matches("Moraine Summary Scan").count(),
+            result.matches("Moraine Located").count(),
             3,
             "limit={limit}: {result}"
         );
@@ -341,7 +337,7 @@ fn summary_scan_reads_uuid_columns() {
         ),
     );
     assert!(
-        result.contains("Moraine Summary Scan"),
+        result.contains("Moraine Located"),
         "no selective scan: {result}"
     );
     assert!(

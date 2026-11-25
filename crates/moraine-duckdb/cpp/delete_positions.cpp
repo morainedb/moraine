@@ -157,7 +157,7 @@ duckdb::DuckLakeTableEntry &LookupTable(duckdb::ClientContext &context, duckdb::
 void AddInlinedFileDeletes(duckdb::DuckLakeTransaction &transaction, duckdb::DuckLakeSnapshot snapshot,
                            duckdb::TableIndex table, idx_t file_id, set<idx_t> &positions) {
 	transaction.GetLocalInlinedFileDeletesForFile(table, file_id, positions);
-	auto name = transaction.GetMetadataManager().GetInlinedDeletionTableName(table, snapshot);
+	auto name = transaction.GetMetadataManager().GetInlinedDeletionTableName(table, snapshot).GetIdentifierName();
 	if (name.empty()) {
 		return;
 	}

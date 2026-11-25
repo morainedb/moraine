@@ -28,16 +28,6 @@ applies them) and then the series below, in file-name order:
    ownership before rollback, so an unacknowledged commit cannot lose files it
    registered. Unregistered files remain eligible for orphan cleanup. Ordinary
    SQL deletion and unknown commit outcomes are tested by `cargo xtask e2e`.
-`0009-perf-bound-the-commit-time-head-lookup.patch` adds
-`snapshot_id >= {SNAPSHOT_ID}` to both halves of the commit-time head
-lookup in `GetSnapshotAndStatsAndChangesQuery`: the outer row and the
-`MAX(snapshot_id)` beneath it. The head is never below the transaction's
-own start snapshot, so the answer is unchanged, and a metadata scan that
-can start from a snapshot floor reads only the snapshots since the
-transaction began instead of every retained one. The changes arm of the
-same query already carries that bound. Covered by the staged snapshot
-paging tests in `cargo xtask e2e`.
-
 The positional DELETE the optimizer selects when a certified index answers the
 entire equality predicate is `moraine_delete_positions`, registered by the
 extension over DuckLake's public transaction API rather than patched in.
@@ -165,11 +155,12 @@ platforms, each build running the row-ID statistics and positional-delete
 smoke (`release-smoke.sql`) against itself, through
 `cargo xtask validate-release-artifact`.
 
-`0012-perf-scope-and-stage-append-statistics.patch` lets a metadata manager read
-statistics for one table and cache only that result. Optional write hooks stage
-append statistics and snapshot changes through the backend's existing row
-contract. Direct statistics writes apply to appends without schema, deletion,
-or maintenance changes; other commits retain SQL ordering. Pending statistics
-flush after successful SQL execution and clear on rollback. Empty SQL batches
-still run the pending writes and commit the metadata transaction. Default hooks
-retain DuckLake's SQL behavior for other metadata backends.
+`0012-perf-scope-and-stage-append-statistics.patch` lets a metadata manager
+declare that a lookup of one table's statistics loads that table alone, which
+DuckLake then asks for through its table-scoped statistics read. Optional write
+hooks stage append statistics and snapshot changes through the backend's
+existing row contract. Direct statistics writes apply to appends without schema,
+deletion, or maintenance changes; other commits retain SQL ordering. Pending
+statistics flush after successful SQL execution and clear on rollback. Empty SQL
+batches still run the pending writes and commit the metadata transaction.
+Default hooks retain DuckLake's SQL behavior for other metadata backends.

@@ -299,7 +299,7 @@ LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::D
 	}
 	std::set<duckdb::idx_t> deleted_inlined;
 	for (auto &name : bound.inlined_tables) {
-		auto deletes = transaction.GetInlinedDeletes(table_id, name);
+		auto deletes = transaction.GetInlinedDeletes(table_id, duckdb::Identifier(name));
 		if (deletes) {
 			deleted_inlined.insert(deletes->rows.begin(), deletes->rows.end());
 		}
@@ -481,7 +481,7 @@ void AppendLocalInlinedRows(duckdb::ClientContext &context, const SummaryScanBin
 		return;
 	}
 	std::set<duckdb::idx_t> deleted;
-	if (auto deletes = transaction.GetInlinedDeletes(table_id, bound.local_inlined_path)) {
+	if (auto deletes = transaction.GetInlinedDeletes(table_id, duckdb::Identifier(bound.local_inlined_path))) {
 		deleted.insert(deletes->rows.begin(), deletes->rows.end());
 	}
 	duckdb::vector<duckdb::LogicalType> types;
@@ -602,6 +602,10 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 
 } // namespace
 
+bool IsSummaryScan(const duckdb::LogicalGet &scan) {
+	return scan.bind_data && dynamic_cast<const SummaryScanBindData *>(scan.bind_data.get()) != nullptr;
+}
+
 bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const duckdb::LogicalGet &index,
                     const std::vector<MoraineRowId> &rows) {
 	std::string catalog_name, schema, table;
@@ -615,6 +619,9 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
                     const std::string &schema, const std::string &table, const std::vector<MoraineRowId> &rows) {
 	if (scan.function.GetDefinition()->name != "ducklake_scan" || !scan.function.function_info ||
 	    scan.row_group_order_options || scan.table_filters.HasMultiColumnFilters() || scan.extra_info.sample_options) {
+		return false;
+	}
+	if (IsSummaryScan(scan)) {
 		return false;
 	}
 	auto &info = scan.function.function_info->Cast<duckdb::DuckLakeFunctionInfo>();
@@ -715,7 +722,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		}
 	}
 	for (auto &inlined : info.table.GetInlinedDataTables(*transaction, info.snapshot, info.include_local_changes)) {
-		bound->inlined_tables.push_back(inlined.table_name);
+		bound->inlined_tables.push_back(inlined.table_name.GetIdentifierName());
 	}
 	std::vector<MoraineRowId> file_pairs;
 	std::vector<MoraineRowId> readable;
@@ -764,7 +771,12 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 			return false;
 		}
 	}
-	duckdb::TableFunction function("moraine_summary_scan", {}, ScanSummary, nullptr, InitSummaryScan);
+	// Named as DuckLake's own scan, with its function info: DuckLake's DELETE
+	// and UPDATE recognize the scan they read positions from by that name,
+	// and the label keeps the located scan apart in a plan.
+	duckdb::TableFunction function("ducklake_scan", {}, ScanSummary, nullptr, InitSummaryScan);
+	function.extra_info = "(moraine located)";
+	function.function_info = scan.function.function_info;
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
