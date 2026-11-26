@@ -1,7 +1,7 @@
 extension:
   name: moraine
   description: A DuckLake catalog in object storage, on SlateDB
-  version: 0.10.0
+  version: 0.10.1
   language: Rust & C++
   build: cmake
   license: MIT OR Apache-2.0
@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: morainedb/moraine
-  ref: 18c9e53cd56a068edfc4ed4bfd0eeb33284ab792
+  ref: 1041a209b633e472f53669ddbc3071d75b0c5f26
 
 docs:
   hello_world: |
