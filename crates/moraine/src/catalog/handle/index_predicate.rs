@@ -255,5 +255,86 @@ impl ReadOnlyCatalog {
     }
 }
 
+impl ReadOnlyCatalog {
+    /// Resolves a set of complete equality keys over `columns`, named in any
+    /// order, through a ready index over exactly those columns. Every key is
+    /// answered in full, so `certified_exact` reports the index's trust alone.
+    /// Returns `None` when no such index exists or the set exceeds 4,096 keys
+    /// or rows.
+    ///
+    /// # Errors
+    /// Returns [`Error::Constraint`](crate::Error::Constraint) for a key that
+    /// does not name every column, or a lookup error when the index cannot be
+    /// read.
+    #[doc(hidden)]
+    pub async fn index_key_rows_projected(
+        &self,
+        snapshot: &CatalogSnapshot,
+        table: TableId,
+        columns: &[ColumnId],
+        keys: &[Vec<IndexKeyValue>],
+    ) -> Result<Option<IndexPredicateRows>> {
+        if keys.len() > MAX_PREDICATE_ROWS {
+            return Ok(None);
+        }
+        let Some(index) = snapshot
+            .indexes_of(table)
+            .into_iter()
+            .filter(|index| index.state == IndexState::Ready)
+            .find(|index| {
+                index.columns.len() == columns.len()
+                    && index.columns.iter().all(|column| columns.contains(column))
+            })
+        else {
+            return Ok(None);
+        };
+        let mut ordered = Vec::with_capacity(keys.len());
+        for key in keys {
+            if key.len() != columns.len() {
+                return Err(crate::Error::Constraint(format!(
+                    "index key set: a key of {} values does not name the {} columns",
+                    key.len(),
+                    columns.len()
+                )));
+            }
+            let values = index
+                .columns
+                .iter()
+                .map(|column| {
+                    let position = columns.iter().position(|named| named == column)?;
+                    key.get(position).cloned()
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    crate::Error::Constraint("index key set: columns repeat".to_owned())
+                })?;
+            ordered.push(encode_ordered_values(
+                &values.into_iter().map(Some).collect::<Vec<_>>(),
+                &index.directions,
+                &index.nulls,
+            )?);
+        }
+        let certified_exact = index.verified_at_snapshot.is_some() || index.derived_only;
+        let mut rows = self
+            .probe_limited(
+                table,
+                index.id,
+                Probe::Many(ordered),
+                MAX_PREDICATE_ROWS + 1,
+            )
+            .await?
+            .to_vec();
+        if rows.len() > MAX_PREDICATE_ROWS {
+            return Ok(None);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        Ok(Some(IndexPredicateRows {
+            rows,
+            certified_exact,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests;

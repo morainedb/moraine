@@ -233,18 +233,34 @@ struct ResolvedPredicate {
 	bool local_files = false;
 };
 
-// Resolves supported predicates through a ready index. A declined probe
-// leaves the scan unchanged.
-std::optional<ResolvedPredicate>
-ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer, duckdb::LogicalGet &get,
-                        duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
+// A DuckLake table scan whose rows an index may resolve: moraine serves its
+// metadata, it reads the transaction's own snapshot, and the table is large
+// enough for a probe to pay.
+struct QualifiedScan {
+	duckdb::DuckLakeTableEntry *table;
+	duckdb::DuckLakeFunctionInfo *info;
+	duckdb::shared_ptr<duckdb::DuckLakeTransaction> transaction;
+
+	ResolvedPredicate Resolved(std::vector<MoraineRowId> rows, bool certified) const {
+		return ResolvedPredicate {
+		    table,
+		    table->ParentCatalog().GetName().GetIdentifierName(),
+		    table->ParentSchema().name.GetIdentifierName(),
+		    table->name.GetIdentifierName(),
+		    std::move(rows),
+		    info->snapshot.snapshot_id,
+		    certified,
+		    transaction->GetTransactionLocalInlinedData(info->table_id) != nullptr,
+		    !transaction->GetTransactionLocalFiles(info->table_id).empty(),
+		};
+	}
+};
+
+std::optional<QualifiedScan> QualifyIndexedScan(duckdb::ClientContext &context, duckdb::LogicalGet &get) {
 	if (!get.function.GetDefinition() || get.function.GetDefinition()->name != "ducklake_scan" || IsSummaryScan(get)) {
 		return std::nullopt;
 	}
 	if (!get.function.filter_pushdown) {
-		return std::nullopt;
-	}
-	if (!get.table_filters.HasFilters()) {
 		return std::nullopt;
 	}
 	// DuckLake hands its scan state to the function rather than the operator.
@@ -275,6 +291,30 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	if (!stats || stats->table_size_bytes < MIN_PRUNABLE_TABLE_BYTES) {
 		return std::nullopt;
 	}
+	return QualifiedScan {&table, info, std::move(transaction)};
+}
+
+// Logs a probe the core declined and releases its message. The scan still
+// answers from every file; pruning is an optimization.
+void LogDeclinedProbe(duckdb::ClientContext &context, const char *what, MoraineError &error) {
+	WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
+	                std::string(what) + ": " + (error.message != nullptr ? error.message : "unknown error"));
+	moraine_error_free(error.message);
+}
+
+// Resolves supported predicates through a ready index. A declined probe
+// leaves the scan unchanged.
+std::optional<ResolvedPredicate>
+ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer, duckdb::LogicalGet &get,
+                        duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
+	if (!get.table_filters.HasFilters()) {
+		return std::nullopt;
+	}
+	auto qualified = QualifyIndexedScan(context, get);
+	if (!qualified) {
+		return std::nullopt;
+	}
+	auto &table = *qualified->table;
 
 	auto &column_ids = get.GetColumnIds();
 	auto stored_columns = table.GetColumns().PhysicalColumnCount();
@@ -337,28 +377,183 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 		ThrowMoraineError(error);
 	}
 	if (code != MORAINE_OK) {
-		// The scan still answers from every file; pruning is an optimization.
-		WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
-		                std::string("index pushdown declined: ") +
-		                    (error.message != nullptr ? error.message : "unknown error"));
-		moraine_error_free(error.message);
+		LogDeclinedProbe(context, "index pushdown declined", error);
 		return std::nullopt;
 	}
 	if (!covered) {
 		return std::nullopt;
 	}
 
-	return ResolvedPredicate {
-	    &table,
-	    table.ParentCatalog().GetName().GetIdentifierName(),
-	    schema_name,
-	    table_name,
-	    std::vector<MoraineRowId>(rows.begin(), rows.end()),
-	    info->snapshot.snapshot_id,
-	    certified && complete,
-	    transaction->GetTransactionLocalInlinedData(info->table_id) != nullptr,
-	    !transaction->GetTransactionLocalFiles(info->table_id).empty(),
+	return qualified->Resolved(std::vector<MoraineRowId>(rows.begin(), rows.end()), certified && complete);
+}
+
+// Resolves a delete's whole predicate, the scan's pushed filters, the filter
+// DuckDB kept above it, and the IN lists it planned as MARK joins, as a set
+// of complete keys through an index over exactly those columns. Every row the
+// keys name is an answer and no predicate is left over, so the result is
+// certified whenever the index is. Declines when any conjunct is not an
+// equality list, when the columns match no index, or when the keys outnumber
+// what a probe collects.
+std::optional<ResolvedPredicate> ResolveKeySet(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
+                                               duckdb::LogicalGet &get, duckdb::LogicalFilter &filter,
+                                               const std::vector<duckdb::LogicalComparisonJoin *> &marks) {
+	if (get.table_filters.HasMultiColumnFilters()) {
+		return std::nullopt;
+	}
+	// Each mark must be what exactly one kept expression tests, bare: a mark
+	// nothing tests would not constrain the rows, and a negated one is NOT IN.
+	std::vector<duckdb::idx_t> tested(marks.size(), 0);
+	auto mark_of = [&](const duckdb::Expression &expression) -> std::optional<size_t> {
+		if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+			return std::nullopt;
+		}
+		auto table_index = expression.Cast<duckdb::BoundColumnRefExpression>().Binding().table_index;
+		for (size_t i = 0; i < marks.size(); i++) {
+			if (marks[i]->mark_index == table_index) {
+				return i;
+			}
+		}
+		return std::nullopt;
 	};
+	for (auto &expression : filter.expressions) {
+		if (auto mark = mark_of(*expression)) {
+			tested[*mark]++;
+		}
+	}
+	if (std::any_of(tested.begin(), tested.end(), [](duckdb::idx_t count) { return count != 1; })) {
+		return std::nullopt;
+	}
+	auto qualified = QualifyIndexedScan(context, get);
+	if (!qualified) {
+		return std::nullopt;
+	}
+	auto &table = *qualified->table;
+	auto stored_columns = table.GetColumns().PhysicalColumnCount();
+
+	KeySet keys;
+	keys.keys.push_back({});
+	auto conjoin = [&](const std::optional<KeySet> &part) {
+		if (!part) {
+			return false;
+		}
+		auto joined = ConjoinKeySets(keys, *part);
+		if (!joined) {
+			return false;
+		}
+		keys = std::move(*joined);
+		return true;
+	};
+	// A pushed filter that is an equality list joins the key set. One that is
+	// not, a range DuckDB folded a list into, is checked against each key's
+	// constant for its column instead, once the kept filter has named the keys;
+	// an optional one is a copy of what the kept filter still evaluates.
+	std::vector<std::pair<duckdb::idx_t, const duckdb::ExpressionFilter *>> checks;
+	auto &column_ids = get.GetColumnIds();
+	for (duckdb::idx_t position = 0; position < column_ids.size(); position++) {
+		auto pushed = get.table_filters.TryGetFilterByColumnIndex(duckdb::ProjectionIndex(position));
+		if (!pushed) {
+			continue;
+		}
+		if (conjoin(TableFilterKeySet(*pushed, column_ids[position].GetPrimaryIndex()))) {
+			continue;
+		}
+		if (pushed->filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) {
+			return std::nullopt;
+		}
+		auto &expression = pushed->Cast<duckdb::ExpressionFilter>();
+		if (!expression.column_indexes.empty()) {
+			return std::nullopt;
+		}
+		if (duckdb::ExpressionFilter::GetOptionalFilterChild(*expression.expr)) {
+			continue;
+		}
+		checks.emplace_back(column_ids[position].GetPrimaryIndex(), &expression);
+	}
+	for (auto mark : marks) {
+		if (!conjoin(MarkJoinKeySet(context, *mark, get))) {
+			return std::nullopt;
+		}
+	}
+	for (auto &expression : filter.expressions) {
+		if (mark_of(*expression)) {
+			continue;
+		}
+		try {
+			if (!conjoin(ExtractKeySet(context, *expression, get))) {
+				return std::nullopt;
+			}
+		} catch (const std::exception &) {
+			return std::nullopt;
+		}
+	}
+	if (keys.columns.empty()) {
+		return std::nullopt;
+	}
+	for (auto &check : checks) {
+		auto found = std::find(keys.columns.begin(), keys.columns.end(), check.first);
+		if (found == keys.columns.end()) {
+			return std::nullopt;
+		}
+		auto position = static_cast<duckdb::idx_t>(found - keys.columns.begin());
+		try {
+			keys.keys.erase(std::remove_if(keys.keys.begin(), keys.keys.end(),
+			                               [&](const duckdb::vector<duckdb::Value> &key) {
+				                               return !check.second->EvaluateWithConstant(context, key[position]);
+			                               }),
+			                keys.keys.end());
+		} catch (const std::exception &) {
+			return std::nullopt;
+		}
+	}
+	for (auto column : keys.columns) {
+		if (column >= stored_columns) {
+			return std::nullopt;
+		}
+	}
+
+	std::vector<uint64_t> fields;
+	for (auto column : keys.columns) {
+		fields.push_back(table.GetFieldId(duckdb::PhysicalIndex(column)).GetFieldIndex().index);
+	}
+	LookupValueArena arena;
+	std::vector<std::vector<MoraineLookupValue>> values;
+	std::vector<MoraineLookupKey> lookup_keys;
+	try {
+		for (auto &key : keys.keys) {
+			std::vector<MoraineLookupValue> converted;
+			for (auto &value : key) {
+				converted.push_back(BuildLookupValue(value, arena, "moraine index key set"));
+			}
+			values.push_back(std::move(converted));
+			lookup_keys.push_back({values.back().data(), values.back().size()});
+		}
+	} catch (const std::exception &) {
+		return std::nullopt;
+	}
+
+	bool cacheable = false;
+	auto handle =
+	    BindIndexReadFor(context, table.ParentCatalog().GetName().GetIdentifierName(), &optimizer.binder, cacheable);
+	auto schema_name = table.ParentSchema().name.GetIdentifierName();
+	auto table_name = table.name.GetIdentifierName();
+	OwnedArray<MoraineRowId> rows(moraine_index_lookup_free);
+	bool covered = false;
+	bool certified = false;
+	MoraineError error {};
+	auto code = moraine_index_key_rows(handle, schema_name.c_str(), table_name.c_str(), fields.data(), fields.size(),
+	                                   lookup_keys.data(), lookup_keys.size(), rows.OutItems(), rows.OutLen(), &covered,
+	                                   &certified, moraine_shim_is_interrupted, &context, &error);
+	if (code == MORAINE_INTERRUPTED) {
+		ThrowMoraineError(error);
+	}
+	if (code != MORAINE_OK) {
+		LogDeclinedProbe(context, "index key set declined", error);
+		return std::nullopt;
+	}
+	if (!covered) {
+		return std::nullopt;
+	}
+	return qualified->Resolved(std::vector<MoraineRowId>(rows.begin(), rows.end()), certified);
 }
 
 // DuckLake's file list over exactly the given entries. DuckLake rebuilds a
@@ -486,18 +681,47 @@ void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimiz
 	slot = std::move(projection);
 }
 
-// The scan a delete reads its rows from, when nothing but projections sit
-// between them. A filter, join or aggregate in that chain means a residual
-// predicate the index cannot speak for, so the rewrite declines.
-duckdb::optional_ptr<duckdb::LogicalGet> DeleteSourceScan(duckdb::LogicalOperator &op) {
+// The scan a delete reads its rows from, when nothing but projections, at
+// most one filter, and MARK joins against constant chunks sit between them.
+// The filter is the predicate DuckDB kept out of the scan, and each such join
+// is an IN list of five or more constants it planned as a join. Any other
+// join or an aggregate means rows the index cannot speak for, so the rewrite
+// declines.
+struct DeleteSource {
+	duckdb::optional_ptr<duckdb::LogicalGet> scan;
+	duckdb::optional_ptr<duckdb::LogicalFilter> filter;
+	std::vector<duckdb::LogicalComparisonJoin *> marks;
+	// Whether a projection rebinds the scan's columns below the filter.
+	bool rebinds = false;
+};
+
+bool IsConstantMarkJoin(const duckdb::LogicalOperator &op) {
+	if (op.type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.children.size() != 2) {
+		return false;
+	}
+	return op.Cast<duckdb::LogicalComparisonJoin>().join_type == duckdb::JoinType::MARK &&
+	       op.children[1]->type == duckdb::LogicalOperatorType::LOGICAL_CHUNK_GET;
+}
+
+DeleteSource DeleteSourceScan(duckdb::LogicalOperator &op) {
+	DeleteSource source;
 	auto *current = &op;
 	while (current->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
-		if (current->children.size() != 1 || current->type != duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
-			return nullptr;
+		if (IsConstantMarkJoin(*current)) {
+			source.marks.push_back(&current->Cast<duckdb::LogicalComparisonJoin>());
+		} else if (current->children.size() != 1) {
+			return {};
+		} else if (current->type == duckdb::LogicalOperatorType::LOGICAL_FILTER && !source.filter) {
+			source.filter = &current->Cast<duckdb::LogicalFilter>();
+		} else if (current->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+			source.rebinds = source.rebinds || source.filter;
+		} else {
+			return {};
 		}
 		current = current->children[0].get();
 	}
-	return &current->Cast<duckdb::LogicalGet>();
+	source.scan = &current->Cast<duckdb::LogicalGet>();
+	return source;
 }
 
 // The slot holding the scan `DeleteSourceScan` found beneath `op`, so a rule
@@ -633,15 +857,28 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
                                duckdb::unique_ptr<duckdb::LogicalOperator> &plan,
                                duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_DELETE && plan->children.size() == 1) {
-		auto scan = DeleteSourceScan(*plan->children[0]);
+		auto source = DeleteSourceScan(*plan->children[0]);
+		auto scan = source.scan;
 		if (scan && scan->children.empty()) {
 			// A DELETE must remove the transaction's own rows too. The located
 			// scan serves the inlined ones; rows in files the transaction wrote
 			// need DuckLake's scan, and the positional delete reaches neither.
-			auto found = ResolveIndexedPredicate(context, optimizer, *scan);
+			auto filter = source.filter;
+			// A filter DuckDB kept above the scan is a residual predicate,
+			// unless with the pushed filters it spells complete keys: then the
+			// index answers the whole predicate and the filter has nothing
+			// left to decide.
+			if (filter && !source.rebinds) {
+				auto keyed = ResolveKeySet(context, optimizer, *scan, *filter, source.marks);
+				if (keyed && !keyed->local_inlined && !keyed->local_files &&
+				    RewriteDeleteByIndexedPredicate(context, optimizer, plan, *keyed)) {
+					return;
+				}
+			}
+			auto found = ResolveIndexedPredicate(context, optimizer, *scan, filter);
 			if (found && !found->local_files) {
-				bool positional =
-				    !found->local_inlined && RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found);
+				bool positional = !filter && !found->local_inlined &&
+				                  RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found);
 				if (!positional) {
 					PruneScanByIndexedPredicate(context, optimizer, DeleteSourceSlot(plan->children[0]), *found);
 				}

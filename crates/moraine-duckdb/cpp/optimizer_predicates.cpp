@@ -10,6 +10,11 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+
+#include <algorithm>
 
 namespace moraine_duckdb {
 
@@ -279,6 +284,294 @@ void ExposeTuplePredicates(duckdb::ClientContext &context, duckdb::LogicalOperat
 			}
 		}
 	}
+}
+
+namespace {
+
+constexpr size_t MAX_KEY_SET = 4096;
+
+// The physical column of `get` that `expression` names directly.
+bool ScanColumn(const duckdb::Expression &expression, const duckdb::LogicalGet &get, duckdb::idx_t &column) {
+	if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &binding = expression.Cast<duckdb::BoundColumnRefExpression>().Binding();
+	auto &column_ids = get.GetColumnIds();
+	if (binding.table_index != get.table_index || binding.column_index >= column_ids.size()) {
+		return false;
+	}
+	column = column_ids[binding.column_index].GetPrimaryIndex();
+	return true;
+}
+
+// The distinct columns of `get` a `row(...)` of column references names.
+bool TupleColumns(const duckdb::Expression &expression, const duckdb::LogicalGet &get,
+                  std::vector<duckdb::idx_t> &columns) {
+	if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &row = expression.Cast<duckdb::BoundFunctionExpression>();
+	if (row.Function().GetName() != "row" || row.GetChildren().empty()) {
+		return false;
+	}
+	for (auto &child : row.GetChildren()) {
+		duckdb::idx_t column;
+		if (!ScanColumn(*child, get, column) || std::find(columns.begin(), columns.end(), column) != columns.end()) {
+			return false;
+		}
+		columns.push_back(column);
+	}
+	return true;
+}
+
+// Names the columns `subject` keys: one column, or the distinct columns of a
+// `row(...)`, which `tuple` reports.
+bool SubjectColumns(const duckdb::Expression &subject, const duckdb::LogicalGet &get, KeySet &result, bool &tuple) {
+	duckdb::idx_t column;
+	if (ScanColumn(subject, get, column)) {
+		result.columns.push_back(column);
+		tuple = false;
+		return true;
+	}
+	tuple = true;
+	return TupleColumns(subject, get, result.columns);
+}
+
+// Adds one constant as a key: a value for a column, a struct for a tuple. A
+// NULL constant names no row and is dropped; a NULL field inside a tuple
+// declines.
+bool AppendKey(KeySet &result, bool tuple, const duckdb::Value &value) {
+	if (value.IsNull()) {
+		return true;
+	}
+	if (!tuple) {
+		result.keys.push_back({value});
+		return true;
+	}
+	if (!duckdb::StructType::IsStruct(value.type())) {
+		return false;
+	}
+	auto &fields = duckdb::StructValue::GetChildren(value);
+	if (fields.size() != result.columns.size()) {
+		return false;
+	}
+	for (auto &field : fields) {
+		if (field.IsNull()) {
+			return false;
+		}
+	}
+	result.keys.push_back(fields);
+	return true;
+}
+
+// The keys `subject` takes from `constants`.
+std::optional<KeySet> SubjectKeys(duckdb::ClientContext &context, const duckdb::Expression &subject,
+                                  const duckdb::vector<const duckdb::Expression *> &constants,
+                                  const duckdb::LogicalGet &get) {
+	KeySet result;
+	bool tuple = false;
+	if (!SubjectColumns(subject, get, result, tuple)) {
+		return std::nullopt;
+	}
+	for (auto constant : constants) {
+		duckdb::Value value;
+		if (!constant->IsFoldable() || !duckdb::ExpressionExecutor::TryEvaluateScalar(context, *constant, value) ||
+		    !AppendKey(result, tuple, value)) {
+			return std::nullopt;
+		}
+	}
+	if (result.keys.size() > MAX_KEY_SET) {
+		return std::nullopt;
+	}
+	return result;
+}
+
+// The keys in either set, which must name the same columns.
+std::optional<KeySet> UniteKeySets(KeySet left, const KeySet &right) {
+	if (left.columns.size() != right.columns.size()) {
+		return std::nullopt;
+	}
+	std::vector<duckdb::idx_t> positions;
+	for (auto column : left.columns) {
+		auto found = std::find(right.columns.begin(), right.columns.end(), column);
+		if (found == right.columns.end()) {
+			return std::nullopt;
+		}
+		positions.push_back(static_cast<duckdb::idx_t>(found - right.columns.begin()));
+	}
+	for (auto &key : right.keys) {
+		duckdb::vector<duckdb::Value> reordered;
+		for (auto position : positions) {
+			reordered.push_back(key[position]);
+		}
+		left.keys.push_back(std::move(reordered));
+		if (left.keys.size() > MAX_KEY_SET) {
+			return std::nullopt;
+		}
+	}
+	return left;
+}
+
+} // namespace
+
+std::optional<KeySet> ConjoinKeySets(const KeySet &left, const KeySet &right) {
+	KeySet result;
+	result.columns = left.columns;
+	std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> shared;
+	std::vector<duckdb::idx_t> appended;
+	for (duckdb::idx_t position = 0; position < right.columns.size(); position++) {
+		auto found = std::find(left.columns.begin(), left.columns.end(), right.columns[position]);
+		if (found == left.columns.end()) {
+			result.columns.push_back(right.columns[position]);
+			appended.push_back(position);
+		} else {
+			shared.emplace_back(static_cast<duckdb::idx_t>(found - left.columns.begin()), position);
+		}
+	}
+	for (auto &left_key : left.keys) {
+		for (auto &right_key : right.keys) {
+			bool agree =
+			    std::all_of(shared.begin(), shared.end(), [&](const std::pair<duckdb::idx_t, duckdb::idx_t> &pair) {
+				    return duckdb::Value::NotDistinctFrom(left_key[pair.first], right_key[pair.second]);
+			    });
+			if (!agree) {
+				continue;
+			}
+			auto key = left_key;
+			for (auto position : appended) {
+				key.push_back(right_key[position]);
+			}
+			result.keys.push_back(std::move(key));
+			if (result.keys.size() > MAX_KEY_SET) {
+				return std::nullopt;
+			}
+		}
+	}
+	return result;
+}
+
+std::optional<KeySet> ExtractKeySet(duckdb::ClientContext &context, const duckdb::Expression &expression,
+                                    const duckdb::LogicalGet &get) {
+	switch (expression.GetExpressionType()) {
+	case duckdb::ExpressionType::CONJUNCTION_AND: {
+		KeySet result;
+		result.keys.push_back({});
+		for (auto &child : expression.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
+			auto part = ExtractKeySet(context, *child, get);
+			if (!part) {
+				return std::nullopt;
+			}
+			auto joined = ConjoinKeySets(result, *part);
+			if (!joined) {
+				return std::nullopt;
+			}
+			result = std::move(*joined);
+		}
+		return result;
+	}
+	case duckdb::ExpressionType::CONJUNCTION_OR: {
+		std::optional<KeySet> result;
+		for (auto &child : expression.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
+			auto part = ExtractKeySet(context, *child, get);
+			if (!part) {
+				return std::nullopt;
+			}
+			result = result ? UniteKeySets(std::move(*result), *part) : std::move(part);
+			if (!result) {
+				return std::nullopt;
+			}
+		}
+		return result;
+	}
+	case duckdb::ExpressionType::COMPARE_IN: {
+		auto &children = expression.Cast<duckdb::BoundOperatorExpression>().GetChildren();
+		if (children.empty()) {
+			return std::nullopt;
+		}
+		duckdb::vector<const duckdb::Expression *> constants;
+		for (duckdb::idx_t i = 1; i < children.size(); i++) {
+			constants.push_back(children[i].get());
+		}
+		return SubjectKeys(context, *children[0], constants, get);
+	}
+	case duckdb::ExpressionType::COMPARE_EQUAL: {
+		if (!duckdb::BoundComparisonExpression::IsComparison(expression)) {
+			return std::nullopt;
+		}
+		auto &comparison = expression.Cast<duckdb::BoundFunctionExpression>();
+		const duckdb::Expression *subject = &duckdb::BoundComparisonExpression::Left(comparison);
+		const duckdb::Expression *constant = &duckdb::BoundComparisonExpression::Right(comparison);
+		if (subject->IsFoldable()) {
+			std::swap(subject, constant);
+		}
+		return SubjectKeys(context, *subject, {constant}, get);
+	}
+	default:
+		return std::nullopt;
+	}
+}
+
+std::optional<KeySet> MarkJoinKeySet(duckdb::ClientContext &context, const duckdb::LogicalComparisonJoin &join,
+                                     const duckdb::LogicalGet &get) {
+	if (join.join_type != duckdb::JoinType::MARK || join.children.size() != 2 ||
+	    join.children[1]->type != duckdb::LogicalOperatorType::LOGICAL_CHUNK_GET || join.conditions.size() != 1) {
+		return std::nullopt;
+	}
+	auto &chunk = join.children[1]->Cast<duckdb::LogicalColumnDataGet>();
+	auto &condition = join.conditions[0];
+	if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL || !chunk.collection ||
+	    chunk.collection->ColumnCount() != 1) {
+		return std::nullopt;
+	}
+	auto &constants = condition.GetRHS();
+	if (constants.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+		return std::nullopt;
+	}
+	auto &binding = constants.Cast<duckdb::BoundColumnRefExpression>().Binding();
+	if (binding.table_index != chunk.table_index || binding.column_index != 0) {
+		return std::nullopt;
+	}
+	KeySet result;
+	bool tuple = false;
+	if (!SubjectColumns(condition.GetLHS(), get, result, tuple)) {
+		return std::nullopt;
+	}
+	auto count = chunk.collection->Count();
+	if (count > MAX_KEY_SET) {
+		return std::nullopt;
+	}
+	for (duckdb::idx_t i = 0; i < count; i++) {
+		if (!AppendKey(result, tuple, chunk.collection->GetValue(0, i))) {
+			return std::nullopt;
+		}
+	}
+	return result;
+}
+
+std::optional<KeySet> TableFilterKeySet(const duckdb::TableFilter &filter, duckdb::idx_t column) {
+	if (filter.filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) {
+		return std::nullopt;
+	}
+	auto &expression = filter.Cast<duckdb::ExpressionFilter>();
+	if (!expression.column_indexes.empty()) {
+		return std::nullopt;
+	}
+	const duckdb::Expression *inner = expression.expr.get();
+	if (auto child = duckdb::ExpressionFilter::GetOptionalFilterChild(*inner)) {
+		inner = child.get();
+	}
+	duckdb::vector<duckdb::Value> values;
+	if (!EqualityValues(*inner, values)) {
+		return std::nullopt;
+	}
+	KeySet result;
+	result.columns.push_back(column);
+	for (auto &value : values) {
+		if (!value.IsNull()) {
+			result.keys.push_back({value});
+		}
+	}
+	return result;
 }
 
 } // namespace moraine_duckdb

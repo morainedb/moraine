@@ -4,7 +4,9 @@ use std::ffi::{c_char, c_void};
 
 use moraine::IndexComparison;
 
-use super::{MoraineLookupValue, MoraineRowId, abi_located_row_ids, coerce_lookup_value};
+use super::{
+    MoraineLookupKey, MoraineLookupValue, MoraineRowId, abi_located_row_ids, coerce_lookup_value,
+};
 use crate::{
     abi::{borrow_str, handle_list, resolve_table},
     error::{AbiError, MoraineError},
@@ -124,6 +126,138 @@ pub unsafe extern "C" fn moraine_index_predicate_rows(
                 probe,
                 probe_ctx,
                 reads.index_predicate_rows_projected(&snapshot, table_id, &predicates),
+            )
+        }?;
+        let Some(result) = result else {
+            return Ok((Vec::new(), moraine::MemoryReservation::reserve(0)?));
+        };
+        // SAFETY: output pointers checked above.
+        unsafe {
+            *out_covered = true;
+            *out_certified = result.certified_exact;
+        }
+        // SAFETY: caller contract for interrupt callbacks.
+        unsafe {
+            abi_located_row_ids(handle_ref, probe, probe_ctx, table_id, async {
+                Ok(result.rows)
+            })
+        }
+    };
+    // SAFETY: caller contract for handle and output pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Resolves a set of complete equality keys over `columns`, named by field id
+/// in any order, through a ready index over exactly those columns, or
+/// declines via `out_covered`. Each key lists one value per column in the
+/// order of `columns`; a NULL-bearing key matches no row. `out_certified`
+/// means the index is certified or derived-only, so the rows are the exact
+/// answer. Free the result with `moraine_index_lookup_free`.
+///
+/// # Safety
+/// All input arrays and their nested pointers must be readable for their
+/// lengths. Output pointers must be writable; strings and interrupt callbacks
+/// satisfy the ABI contract.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_index_key_rows(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    columns: *const u64,
+    columns_len: usize,
+    keys: *const MoraineLookupKey,
+    keys_len: usize,
+    out_items: *mut *mut MoraineRowId,
+    out_len: *mut usize,
+    out_covered: *mut bool,
+    out_certified: *mut bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<(Vec<MoraineRowId>, moraine::MemoryReservation), AbiError> {
+        if out_covered.is_null() || out_certified.is_null() || columns.is_null() {
+            return Err(AbiError::invalid_argument(
+                "null column or coverage pointer",
+            ));
+        }
+        if keys.is_null() && keys_len != 0 {
+            return Err(AbiError::invalid_argument(
+                "`keys` is null but its length is nonzero",
+            ));
+        }
+        // SAFETY: checked non-null; output validity is the caller's contract.
+        unsafe {
+            *out_covered = false;
+            *out_certified = false;
+        }
+        // SAFETY: caller contract for strings.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract for strings.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        let reads = handle_ref.catalog.reads();
+        // SAFETY: caller contract for interrupt callbacks.
+        let snapshot =
+            unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, moraine::ffi_support::catalog_read::index_table(reads, schema, table, false)) }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let table_columns = snapshot.columns_of(table_id);
+        // SAFETY: non-null above; caller provides the array length.
+        let named = unsafe { std::slice::from_raw_parts(columns, columns_len) }
+            .iter()
+            .map(|field_id| {
+                table_columns
+                    .iter()
+                    .find(|column| column.id.get() == *field_id)
+                    .ok_or_else(|| AbiError::invalid_argument("unknown key column"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw_keys = if keys_len == 0 {
+            &[]
+        } else {
+            // SAFETY: checked non-null; caller provides readable descriptors.
+            unsafe { std::slice::from_raw_parts(keys, keys_len) }
+        };
+        let coerced_keys = raw_keys
+            .iter()
+            .filter_map(|raw_key| {
+                if raw_key.values_len != named.len() {
+                    return Some(Err(AbiError::invalid_argument(format!(
+                        "index key set: a key of {} values does not name the {} columns",
+                        raw_key.values_len,
+                        named.len()
+                    ))));
+                }
+                if raw_key.values.is_null() {
+                    return Some(Err(AbiError::invalid_argument("`key.values` is null")));
+                }
+                // SAFETY: caller contract for this descriptor's nested array.
+                let raw_values =
+                    unsafe { std::slice::from_raw_parts(raw_key.values, raw_key.values_len) };
+                let coerced = raw_values
+                    .iter()
+                    .zip(&named)
+                    .map(|(value, column)| {
+                        if value.kind == 0 {
+                            return Ok(None);
+                        }
+                        // SAFETY: nested constant buffers satisfy the caller's contract.
+                        unsafe { coerce_lookup_value(value, &column.column_type) }.map(Some)
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>();
+                match coerced {
+                    Ok(values) => values.into_iter().collect::<Option<Vec<_>>>().map(Ok),
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        let column_ids = named.iter().map(|column| column.id).collect::<Vec<_>>();
+        // SAFETY: caller contract for interrupt callbacks.
+        let result = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                reads.index_key_rows_projected(&snapshot, table_id, &column_ids, &coerced_keys),
             )
         }?;
         let Some(result) = result else {

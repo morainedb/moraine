@@ -381,6 +381,20 @@ fn i64_lookup(v: i64) -> MoraineLookupValue {
     }
 }
 
+/// Builds the lookup value that means SQL NULL.
+fn null_lookup() -> MoraineLookupValue {
+    MoraineLookupValue {
+        kind: 0,
+        i64_value: 0,
+        u64_value: 0,
+        f64_value: 0.0,
+        bool_value: false,
+        str_value: ptr::null(),
+        bytes_value: ptr::null(),
+        bytes_len: 0,
+    }
+}
+
 /// Builds a string lookup value borrowing `text` for the call.
 fn str_lookup(text: &CStr) -> MoraineLookupValue {
     MoraineLookupValue {
@@ -552,6 +566,109 @@ fn index_in_resolves_distinct_composite_keys() {
     assert_eq!(rows, vec![0, 2]);
     // SAFETY: the array is freed exactly once by its matching function.
     unsafe { moraine_index_in_free(items, len) };
+
+    // SAFETY: `handle` was minted by `attach_ok`, detached once.
+    unsafe { moraine_detach(handle) };
+}
+
+/// Drives `moraine_index_key_rows`, returning the row ids with the coverage
+/// and certification flags, or the error message.
+fn key_rows(
+    handle: *mut MoraineCatalogHandle,
+    columns: &[u64],
+    keys: &[MoraineLookupKey],
+) -> Result<(Vec<u64>, bool, bool), String> {
+    let schema = CString::new("sales").expect("no NUL");
+    let table = CString::new("t").expect("no NUL");
+    let mut items: *mut MoraineRowId = ptr::null_mut();
+    let mut len = 0;
+    let mut covered = false;
+    let mut certified = false;
+    let mut err = MoraineError::default();
+    // SAFETY: the handle, strings, column and nested key slices, and output
+    // slots remain valid for the call.
+    let code = unsafe {
+        moraine_index_key_rows(
+            handle,
+            schema.as_ptr(),
+            table.as_ptr(),
+            columns.as_ptr(),
+            columns.len(),
+            keys.as_ptr(),
+            keys.len(),
+            &raw mut items,
+            &raw mut len,
+            &raw mut covered,
+            &raw mut certified,
+            None,
+            ptr::null_mut(),
+            &raw mut err,
+        )
+    };
+    if code != codes::OK {
+        // SAFETY: a failed call wrote a non-null message.
+        let message = unsafe { CStr::from_ptr(err.message) }
+            .to_str()
+            .expect("utf-8")
+            .to_owned();
+        // SAFETY: the message was minted by the failed call, freed once.
+        unsafe { moraine_error_free(err.message) };
+        return Err(message);
+    }
+    // SAFETY: the successful call wrote `items`/`len` as one valid array.
+    let rows = unsafe { std::slice::from_raw_parts(items, len) }
+        .iter()
+        .map(|row_id| row_id.value)
+        .collect::<Vec<_>>();
+    // SAFETY: the array is freed exactly once by its matching function.
+    unsafe { moraine_index_lookup_free(items, len) };
+    Ok((rows, covered, certified))
+}
+
+/// A key set names the index's columns in any order and resolves exactly its
+/// keys; a NULL-bearing key matches no row; a column set no index covers
+/// declines; a short key is refused.
+#[test]
+fn index_key_rows_resolve_keys_in_any_column_order() {
+    let dir = TempDir::new("composite-key-rows");
+    seed_composite(dir.path());
+    let handle = attach_ok(dir.path());
+
+    let x = CString::new("x").expect("no NUL");
+    let y = CString::new("y").expect("no NUL");
+    let first = [str_lookup(&y), i64_lookup(5)];
+    let second = [str_lookup(&x), i64_lookup(7)];
+    let with_null = [null_lookup(), i64_lookup(5)];
+    let keys = [
+        MoraineLookupKey {
+            values: first.as_ptr(),
+            values_len: first.len(),
+        },
+        MoraineLookupKey {
+            values: second.as_ptr(),
+            values_len: second.len(),
+        },
+        MoraineLookupKey {
+            values: with_null.as_ptr(),
+            values_len: with_null.len(),
+        },
+    ];
+    assert_eq!(
+        key_rows(handle, &[2, 1], &keys),
+        Ok((vec![1, 2], true, false)),
+        "writer-supplied entries are covered but untrusted"
+    );
+
+    let (rows, covered, _) = key_rows(handle, &[1], &keys[..0]).expect("call succeeds");
+    assert!(rows.is_empty() && !covered, "no index covers `a` alone");
+
+    let short = [i64_lookup(5)];
+    let short_keys = [MoraineLookupKey {
+        values: short.as_ptr(),
+        values_len: short.len(),
+    }];
+    let message = key_rows(handle, &[1, 2], &short_keys).expect_err("a short key is refused");
+    assert!(message.contains("2 columns"), "{message}");
 
     // SAFETY: `handle` was minted by `attach_ok`, detached once.
     unsafe { moraine_detach(handle) };
