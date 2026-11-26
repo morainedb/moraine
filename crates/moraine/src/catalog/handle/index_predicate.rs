@@ -191,8 +191,9 @@ impl ReadOnlyCatalog {
             && plan.prefixes.iter().all(|prefix| {
                 prefix.len() == plan.index.columns.len() && prefix.iter().all(Option::is_some)
             });
-        let certified_exact =
-            full_keys && plan.used == predicates.len() && plan.index.verified_at_snapshot.is_some();
+        let certified_exact = full_keys
+            && plan.used == predicates.len()
+            && (plan.index.verified_at_snapshot.is_some() || plan.index.derived_only);
         let probes = if full_keys {
             vec![Probe::Many(
                 plan.prefixes

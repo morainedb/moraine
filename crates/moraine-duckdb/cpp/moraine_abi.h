@@ -255,6 +255,9 @@ typedef struct MoraineIndexDesc {
   // Whether a verifier pass has agreed with the rows since the
   // definition last changed.
   bool has_certificate;
+  // Whether every entry came from the catalog's own reads, which a plan
+  // trusts as it trusts a certificate.
+  bool derived_only;
   // The index name, owned — free via [`moraine_indexes_free`].
   char *name;
 } MoraineIndexDesc;

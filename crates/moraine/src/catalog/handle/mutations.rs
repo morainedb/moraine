@@ -150,7 +150,7 @@ impl Catalog {
                             "catalog changed during index derivation".into(),
                         ));
                     }
-                    index.set(Some(tx.create_index_ordered_with_maintenance(
+                    index.set(Some(tx.create_index_derived(
                         table,
                         definition,
                         orders,

@@ -1356,6 +1356,7 @@ pub(crate) fn index_info(value: &IndexValue) -> IndexInfo {
         state,
         build_cursor: value.build_cursor_row_id,
         verified_at_snapshot: value.verified_at_snapshot.map(SnapshotId::new),
+        derived_only: value.derived_only == Some(true),
         build_file_cursor: value.build_cursor_file.map(DataFileId::new),
         build_position_cursor: value.build_cursor_position,
     }
@@ -2128,6 +2129,7 @@ mod tests {
             ducklake_index_id: None,
             deferred_maintenance: None,
             verified_at_snapshot: None,
+            derived_only: None,
         }
     }
 

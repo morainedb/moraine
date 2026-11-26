@@ -197,6 +197,11 @@ message IndexValue {
   // means no pass has agreed since the definition last changed, which is
   // what a plan that would trust the index reads.
   optional uint64 verified_at_snapshot = 19;
+  // Every entry the index has held came from the catalog's own reads of
+  // rows and files. Set by the catalog's create paths and cleared for good
+  // by a writer-supplied entry, backfill batch, or removal; a plan trusts
+  // such an index as it trusts a certificate.
+  optional bool derived_only = 20;
 }
 
 message InlineBuildCursorValue {

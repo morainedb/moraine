@@ -378,7 +378,7 @@ written `…` below; `moraine_indexes` stops at the table.
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | Rows for a value window. A NULL bound is an open side. |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | Rows for an `IS NULL` query. A `NULL` argument means `IS NULL`, any other means equality. |
 | `moraine_index_verify(…)` | Recomputes the entry set and reports `stored`, `expected`, `missing`, `dead`, `mismatched`, and `certified_at`. |
-| `moraine_indexes(catalog, schema, table)` | `index_id`, `index_name`, `is_unique`, `is_building`, `state`, and `certified_at`. `state` is `ready`, `building`, `maintaining`, or `poisoned`. |
+| `moraine_indexes(catalog, schema, table)` | `index_id`, `index_name`, `is_unique`, `is_building`, `state`, `certified_at`, and `derived_only`. `state` is `ready`, `building`, `maintaining`, or `poisoned`. |
 
 Each function resolves the store handle from the attached catalog and the table
 id from `ducklake_table`, then drives the same core accessors as the embedding
@@ -422,6 +422,17 @@ a separate field whose only state coupling is requiring `Ready`;
 `moraine_indexes` reports it as `certified_at`, and a read-only attach reports
 without writing.
 
+An index can also be exact by construction. Reads re-evaluate the predicate
+over the rows they fetch, so a stale entry costs a read and never an answer,
+and a commit that omits a required entry is refused; what the certificate
+guards against is an entry moraine did not derive. `derived_only` records that
+every entry the index has held came from the catalog's own reads: the
+catalog's create paths set it, and a writer-supplied backfill, build batch,
+file entry, or removal on the embedding API clears it for good. A plan trusts
+a derived-only index as it trusts a certified one, and `moraine_indexes`
+reports the flag. A lake written through the extension alone never supplies
+an entry, so its indexes are exact from the moment they are ready.
+
 ## Index-accelerated planning
 
 DuckLake owns the planner. The extension's optimizer rule translates pushed
@@ -432,8 +443,9 @@ constant predicates into conjunctive column comparisons and offers them to
 longest usable prefix, probes it, and returns
 `IndexPredicateRows { rows, certified_exact }`, or `None` when no ready index
 covers a leading predicate. The original predicate is still evaluated over the
-candidate rows. A certified full-key probe with no residual predicate is the
-one case where a `DELETE` is rewritten to positional deletion without a scan,
+candidate rows. A full-key probe against a certified or derived-only index with
+no residual predicate is the one case where a `DELETE` is rewritten to
+positional deletion without a scan,
 through `moraine_delete_positions`, which the extension registers over
 DuckLake's public transaction API: it stages the located positions as `DELETE`
 stages its own, inlined below the inlining threshold and otherwise as a delete
@@ -476,7 +488,8 @@ local rows at all.
 The rule declines, leaving the ordinary plan, for a scan at a snapshot other
 than the transaction's, no ready index over a leading predicate, a value of a
 type the index does not cover, or a failed probe, which is logged. The
-positional DELETE rewrite additionally requires a certified index, every pushed
+positional DELETE rewrite additionally requires a certified or derived-only
+index, every pushed
 predicate answered in full, every resolved row in a committed file, no deletion
 vectors on the table, no `RETURNING`, and nothing but projections between the
 delete and its scan. UPDATE keeps the ordinary operator and narrows its reads

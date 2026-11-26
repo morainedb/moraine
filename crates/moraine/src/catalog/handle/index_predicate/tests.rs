@@ -4,7 +4,10 @@ use IndexComparison::{Any, IsNull, Lower, Upper};
 use object_store::memory::InMemory;
 
 use super::*;
-use crate::{Catalog, CatalogOptions, ColumnDef, FileIndexEntry, IndexDef, InlineChunk, IntWidth};
+use crate::{
+    Catalog, CatalogOptions, ColumnDef, DataFile, FileIndexEntry, IndexDef, IndexId,
+    IndexMaintenance, InlineChunk, IntWidth,
+};
 
 fn number(value: i128) -> IndexKeyValue {
     IndexKeyValue::Int {
@@ -227,6 +230,167 @@ async fn broad_predicates_decline_instead_of_collecting_all_matches() {
             .len()
             > 4096
     );
+    drop(scope);
+    catalog.close().await.unwrap();
+}
+
+/// A single-column table with a unique index the catalog built from its own
+/// reads, and the index's id.
+async fn catalog_built_index(catalog: &Catalog) -> (TableId, ColumnId, IndexId) {
+    let ids = Cell::new(None);
+    catalog
+        .commit_materialized(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let table = tx.create_table(
+                schema,
+                "t",
+                &[ColumnDef {
+                    name: "a".into(),
+                    column_type: "BIGINT".into(),
+                    ..Default::default()
+                }],
+            )?;
+            ids.set(Some((table, tx.columns_of(table)[0].id)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (table, a) = ids.get().unwrap();
+    let index = catalog
+        .create_index(
+            table,
+            &IndexDef {
+                name: "by_a".into(),
+                columns: vec![a],
+                unique: true,
+            },
+            &[],
+            IndexMaintenance::Synchronous,
+            None,
+            "",
+        )
+        .await
+        .unwrap();
+    (table, a, index)
+}
+
+/// The index's record and whether a full-key probe on `a = 7` is exact.
+async fn derived_and_exact(
+    catalog: &Catalog,
+    table: TableId,
+    a: ColumnId,
+    index: IndexId,
+) -> (bool, bool, usize) {
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    let info = snapshot
+        .indexes_of(table)
+        .into_iter()
+        .find(|info| info.id == index)
+        .unwrap();
+    assert!(info.verified_at_snapshot.is_none(), "no pass ran");
+    let predicates = [IndexPredicate {
+        column: a,
+        comparison: Any(vec![number(7)]),
+    }];
+    let result = reads
+        .index_predicate_rows_projected(&snapshot, table, &predicates)
+        .await
+        .unwrap()
+        .unwrap();
+    (info.derived_only, result.certified_exact, result.rows.len())
+}
+
+/// An index the catalog built from its own reads answers a full-key probe
+/// exactly without a certificate.
+#[tokio::test]
+async fn a_catalog_built_index_is_exact_without_a_certificate() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, index) = catalog_built_index(&catalog).await;
+    assert_eq!(
+        derived_and_exact(&catalog, table, a, index).await,
+        (true, true, 0)
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A writer-supplied entry withdraws the derived-only mark for good, and
+/// with it the exactness nothing has checked.
+#[tokio::test]
+async fn a_writer_supplied_entry_withdraws_the_derived_mark() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, index) = catalog_built_index(&catalog).await;
+    catalog
+        .commit_materialized(|tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    path: "t/f.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 1,
+                    file_size_bytes: 1,
+                    footer_size: 1,
+                    encryption_key: None,
+                    partition_values: vec![],
+                    column_stats: vec![],
+                },
+                &[FileIndexEntry {
+                    index,
+                    ordinal: 0,
+                    values: vec![Some(number(7))],
+                }],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        derived_and_exact(&catalog, table, a, index).await,
+        (false, false, 1)
+    );
+    catalog.close().await.unwrap();
+}
+
+/// An index a writer backfilled and fed entries through the embedding API
+/// is not exact until a verifier pass certifies it.
+#[tokio::test]
+async fn a_writer_built_index_is_not_exact_without_a_certificate() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b) = seed(&catalog, true).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    assert!(
+        snapshot
+            .indexes_of(table)
+            .iter()
+            .all(|info| !info.derived_only)
+    );
+    let predicates = [
+        IndexPredicate {
+            column: a,
+            comparison: Any(vec![number(0)]),
+        },
+        IndexPredicate {
+            column: b,
+            comparison: Any(vec![number(2)]),
+        },
+    ];
+    let result = reads
+        .index_predicate_rows_projected(&snapshot, table, &predicates)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!result.certified_exact);
+    assert_eq!(result.rows.len(), 1);
     drop(scope);
     catalog.close().await.unwrap();
 }

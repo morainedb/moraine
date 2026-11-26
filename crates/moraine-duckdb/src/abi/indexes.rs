@@ -45,6 +45,9 @@ pub struct MoraineIndexDesc {
     /// Whether a verifier pass has agreed with the rows since the
     /// definition last changed.
     pub has_certificate: bool,
+    /// Whether every entry came from the catalog's own reads, which a plan
+    /// trusts as it trusts a certificate.
+    pub derived_only: bool,
     /// The index name, owned — free via [`moraine_indexes_free`].
     pub name: *mut c_char,
 }
@@ -436,6 +439,7 @@ pub unsafe extern "C" fn moraine_indexes(
             bool,
             moraine::IndexState,
             Option<moraine::SnapshotId>,
+            bool,
             CString,
         )> = snapshot
             .indexes_of(table_id)
@@ -446,21 +450,23 @@ pub unsafe extern "C" fn moraine_indexes(
                     index.unique,
                     index.state,
                     index.verified_at_snapshot,
+                    index.derived_only,
                     to_c_string(index.name)?,
                 ))
             })
             .collect::<Result<_, AbiError>>()?;
-        let memory = crate::abi::reserve_array::<MoraineIndexDesc>(owned.len(), owned.iter().map(|row| row.4.as_bytes_with_nul().len() as u64).sum())?;
+        let memory = crate::abi::reserve_array::<MoraineIndexDesc>(owned.len(), owned.iter().map(|row| row.5.as_bytes_with_nul().len() as u64).sum())?;
             Ok((owned
             .into_iter()
             .map(
-                |(index_id, unique, state, certified, name)| MoraineIndexDesc {
+                |(index_id, unique, state, certified, derived_only, name)| MoraineIndexDesc {
                     index_id,
                     unique,
                     building: state != moraine::IndexState::Ready,
                     state: state.into(),
                     certified_at: certified.map_or(0, moraine::SnapshotId::get),
                     has_certificate: certified.is_some(),
+                    derived_only,
                     name: name.into_raw(),
                 },
             )

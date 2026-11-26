@@ -57,6 +57,7 @@ struct IndexesBindData : public duckdb::FunctionData {
 		std::string state;
 		uint64_t certified_at;
 		bool has_certificate;
+		bool derived_only;
 	};
 	std::vector<Row> rows;
 
@@ -93,12 +94,14 @@ duckdb::unique_ptr<duckdb::FunctionData> IndexesBind(duckdb::ClientContext &cont
 	}
 	for (auto &desc : descs) {
 		bind_data->rows.push_back({static_cast<int64_t>(desc.index_id), std::string(desc.name), desc.unique,
-		                           desc.building, IndexStateName(desc.state), desc.certified_at, desc.has_certificate});
+		                           desc.building, IndexStateName(desc.state), desc.certified_at, desc.has_certificate,
+		                           desc.derived_only});
 	}
 
 	return_types = {duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,
-	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT};
-	names = {"index_id", "index_name", "is_unique", "is_building", "state", "certified_at"};
+	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::BOOLEAN};
+	names = {"index_id", "index_name", "is_unique", "is_building", "state", "certified_at", "derived_only"};
 	return bind_data;
 }
 
@@ -132,6 +135,7 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 		output.SetValue(5, i,
 		                row.has_certificate ? duckdb::Value::UBIGINT(row.certified_at)
 		                                    : duckdb::Value(duckdb::LogicalType::UBIGINT));
+		output.SetValue(6, i, duckdb::Value::BOOLEAN(row.derived_only));
 	}
 	state.offset += count;
 	output.SetChildCardinality(count);

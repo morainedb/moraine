@@ -27,13 +27,14 @@ applies them) and then the series below, in file-name order:
    extra fields. It stops retries and releases the transaction's file-cleanup
    ownership before rollback, so an unacknowledged commit cannot lose files it
    registered. Unregistered files remain eligible for orphan cleanup. Ordinary
-   SQL deletion and unknown commit outcomes are tested by `cargo xtask e2e`.
-The positional DELETE the optimizer selects when a certified index answers the
-entire equality predicate is `moraine_delete_positions`, registered by the
-extension over DuckLake's public transaction API rather than patched in.
-Ordinary `DELETE ... WHERE` selects this path without a caller naming row
-positions. UPDATE keeps DuckLake's operator, fed by moraine's located scan,
-which serves each row's file and position as DuckLake's own scan would.
+   SQL deletion and unknown commit outcomes are tested by `cargo xtask e2e`. The
+   positional DELETE the optimizer selects when a certified or derived-only
+   index answers the entire equality predicate is `moraine_delete_positions`,
+   registered by the extension over DuckLake's public transaction API rather
+   than patched in. Ordinary `DELETE ... WHERE` selects this path without a
+   caller naming row positions. UPDATE keeps DuckLake's operator, fed by
+   moraine's located scan, which serves each row's file and position as
+   DuckLake's own scan would.
 
 `0011-perf-stage-snapshots-and-defer-inline-appends.patch` adds optional
 metadata-manager hooks for staging a finalized snapshot without SQL and
@@ -125,18 +126,19 @@ JOIN moraine_index_in(
 ```
 
 The same shape works with `moraine_index_lookup`, `moraine_index_range`, and
-`moraine_index_nulls`. The Moraine extension replaces the table's scan
-beneath the join with its own located scan, which reads the named rows from
-the files and inlined tables holding them and evaluates the scan's filters
-itself, so the read touches only the files holding the rows. An ordinary
-predicate a certified index answers plans the same way, with no join in the
-query. Inside a transaction that has inserted rows, the located scan serves
-the committed rows and the transaction's inlined ones, under an UPDATE or
-DELETE as well; once the transaction has written a file for the table, a read
-joins DuckLake's scan over those files and a mutation keeps DuckLake's scan.
-Where the located scan cannot
-serve a query — a projection of part of a struct, a column of a type it
-cannot decode — the plan runs as written.
+`moraine_index_nulls`. The Moraine extension replaces the table's scan beneath
+the join with its own located scan, which reads the named rows from the files
+and inlined tables holding them and evaluates the scan's filters itself, so the
+read touches only the files holding the rows. An ordinary predicate an index
+answers plans the same way, with no join in the query; a `DELETE` it answers in
+full runs as a positional delete with no scan when the index is certified or
+every entry came from moraine's own reads. Inside a transaction that has
+inserted rows, the located scan serves the committed rows and the transaction's
+inlined ones, under an UPDATE or DELETE as well; once the transaction has
+written a file for the table, a read joins DuckLake's scan over those files and
+a mutation keeps DuckLake's scan. Where the located scan cannot serve a query —
+a projection of part of a struct, a column of a type it cannot decode — the plan
+runs as written.
 
 The same condition locates rows for DML — `DELETE … USING` and
 `UPDATE … FROM` — and inside an `EXISTS` probe:
