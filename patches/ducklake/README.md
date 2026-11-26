@@ -131,8 +131,10 @@ the files and inlined tables holding them and evaluates the scan's filters
 itself, so the read touches only the files holding the rows. An ordinary
 predicate a certified index answers plans the same way, with no join in the
 query. Inside a transaction that has inserted rows, the located scan serves
-the committed rows and the transaction's inlined ones, and DuckLake's scan
-over the files the transaction wrote joins it. Where the located scan cannot
+the committed rows and the transaction's inlined ones, under an UPDATE or
+DELETE as well; once the transaction has written a file for the table, a read
+joins DuckLake's scan over those files and a mutation keeps DuckLake's scan.
+Where the located scan cannot
 serve a query — a projection of part of a struct, a column of a type it
 cannot decode — the plan runs as written.
 

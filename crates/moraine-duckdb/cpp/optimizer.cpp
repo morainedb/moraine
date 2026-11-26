@@ -225,9 +225,12 @@ struct ResolvedPredicate {
 	// DuckLake refuses it against a newer view.
 	uint64_t snapshot_id = 0;
 	bool certified = false;
-	// Whether the transaction has inserted rows into the table that the
-	// index, which describes committed rows, cannot know.
-	bool local_inserts = false;
+	// Rows the transaction inserted into the table, which the index, which
+	// describes committed rows, cannot know: inlined ones the located scan
+	// serves from the transaction's buffer, ones in files it wrote need
+	// DuckLake's scan.
+	bool local_inlined = false;
+	bool local_files = false;
 };
 
 // Resolves supported predicates through a ready index. A declined probe
@@ -353,7 +356,8 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	    std::vector<MoraineRowId>(rows.begin(), rows.end()),
 	    info->snapshot.snapshot_id,
 	    certified && complete,
-	    transaction->HasTransactionLocalInserts(info->table_id),
+	    transaction->GetTransactionLocalInlinedData(info->table_id) != nullptr,
+	    !transaction->GetTransactionLocalFiles(info->table_id).empty(),
 	};
 }
 
@@ -442,11 +446,11 @@ bool ReadsFileLocation(const duckdb::LogicalGet &get) {
 void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
                                  duckdb::unique_ptr<duckdb::LogicalOperator> &slot, const ResolvedPredicate &found) {
 	auto &get = slot->Cast<duckdb::LogicalGet>();
-	if (found.rows.empty() && !found.local_inserts) {
+	if (found.rows.empty() && !found.local_inlined && !found.local_files) {
 		slot = duckdb::make_uniq<duckdb::LogicalEmptyResult>(std::move(slot));
 		return;
 	}
-	auto local_files = found.local_inserts ? LocalFilesScan(optimizer, get) : nullptr;
+	auto local_files = found.local_files ? LocalFilesScan(optimizer, get) : nullptr;
 	if (!UseSummaryScan(context, get, found.table->ParentCatalog().GetName().GetIdentifierName(), found.schema_name,
 	                    found.table_name, found.rows) ||
 	    !local_files) {
@@ -631,11 +635,16 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_DELETE && plan->children.size() == 1) {
 		auto scan = DeleteSourceScan(*plan->children[0]);
 		if (scan && scan->children.empty()) {
-			// A DELETE must remove the transaction's own rows too, which only
-			// DuckLake's scan reaches under its delete.
+			// A DELETE must remove the transaction's own rows too. The located
+			// scan serves the inlined ones; rows in files the transaction wrote
+			// need DuckLake's scan, and the positional delete reaches neither.
 			auto found = ResolveIndexedPredicate(context, optimizer, *scan);
-			if (found && !found->local_inserts && !RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found)) {
-				PruneScanByIndexedPredicate(context, optimizer, DeleteSourceSlot(plan->children[0]), *found);
+			if (found && !found->local_files) {
+				bool positional =
+				    !found->local_inlined && RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found);
+				if (!positional) {
+					PruneScanByIndexedPredicate(context, optimizer, DeleteSourceSlot(plan->children[0]), *found);
+				}
 			}
 			return;
 		}
@@ -648,7 +657,7 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
 		auto &get = plan->Cast<duckdb::LogicalGet>();
 		auto found = ResolveIndexedPredicate(context, optimizer, get, residual);
-		if (found && !(found->local_inserts && ReadsFileLocation(get))) {
+		if (found && !(found->local_files && ReadsFileLocation(get))) {
 			PruneScanByIndexedPredicate(context, optimizer, plan, *found);
 		}
 	}
