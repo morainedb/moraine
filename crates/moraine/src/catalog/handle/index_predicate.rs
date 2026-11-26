@@ -29,6 +29,17 @@ pub enum IndexComparison {
     Lower(IndexKeyValue, bool),
     /// An upper bound, inclusive when the boolean is true.
     Upper(IndexKeyValue, bool),
+    /// Equality to a value every live row holds, derived from column
+    /// statistics rather than asked by the statement. Extends a key like
+    /// [`Self::Any`] but is never residual: an index that does not consume
+    /// it still answers exactly.
+    Implied(IndexKeyValue),
+}
+
+impl IndexComparison {
+    fn is_implied(&self) -> bool {
+        matches!(self, Self::Implied(_))
+    }
 }
 
 /// Candidate rows returned by an automatically selected index.
@@ -42,7 +53,10 @@ pub struct IndexPredicateRows {
 struct Plan {
     index: IndexInfo,
     prefixes: Vec<Vec<Option<IndexKeyValue>>>,
+    /// Index columns the plan narrows by.
     used: usize,
+    /// Predicates the statement asked that the plan consumed.
+    asked: usize,
     lower: Option<(IndexKeyValue, bool)>,
     upper: Option<(IndexKeyValue, bool)>,
 }
@@ -52,6 +66,7 @@ fn plan(index: IndexInfo, predicates: &[IndexPredicate]) -> Option<Plan> {
         index,
         prefixes: vec![Vec::new()],
         used: 0,
+        asked: 0,
         lower: None,
         upper: None,
     };
@@ -61,12 +76,19 @@ fn plan(index: IndexInfo, predicates: &[IndexPredicate]) -> Option<Plan> {
             .filter(|p| p.column == *column)
             .map(|p| &p.comparison)
             .collect();
-        let values = comparisons.iter().find_map(|comparison| match comparison {
+        // An asked equality wins over an implied one, which only fills in.
+        let asked_values = comparisons.iter().find_map(|comparison| match comparison {
             IndexComparison::Any(values) => {
                 Some(values.iter().cloned().map(Some).collect::<Vec<_>>())
             }
             IndexComparison::IsNull => Some(vec![None]),
             _ => None,
+        });
+        let values = asked_values.clone().or_else(|| {
+            comparisons.iter().find_map(|comparison| match comparison {
+                IndexComparison::Implied(value) => Some(vec![Some(value.clone())]),
+                _ => None,
+            })
         });
         if let Some(values) = values {
             // Bound expansion of independent IN lists across composite columns.
@@ -85,6 +107,7 @@ fn plan(index: IndexInfo, predicates: &[IndexPredicate]) -> Option<Plan> {
                 })
                 .collect();
             result.used += 1;
+            result.asked += usize::from(asked_values.is_some());
             continue;
         }
         // A NULL prefix can still prune, but cannot serve an ordered range.
@@ -100,10 +123,12 @@ fn plan(index: IndexInfo, predicates: &[IndexPredicate]) -> Option<Plan> {
                 IndexComparison::Lower(value, inclusive) if result.lower.is_none() => {
                     result.lower = Some((value.clone(), *inclusive));
                     result.used += 1;
+                    result.asked += 1;
                 }
                 IndexComparison::Upper(value, inclusive) if result.upper.is_none() => {
                     result.upper = Some((value.clone(), *inclusive));
                     result.used += 1;
+                    result.asked += 1;
                 }
                 _ => {}
             }
@@ -121,7 +146,7 @@ fn plan(index: IndexInfo, predicates: &[IndexPredicate]) -> Option<Plan> {
     {
         return None;
     }
-    (result.used > 0).then_some(result)
+    (result.asked > 0).then_some(result)
 }
 
 fn range_bound(
@@ -191,8 +216,12 @@ impl ReadOnlyCatalog {
             && plan.prefixes.iter().all(|prefix| {
                 prefix.len() == plan.index.columns.len() && prefix.iter().all(Option::is_some)
             });
+        let asked = predicates
+            .iter()
+            .filter(|predicate| !predicate.comparison.is_implied())
+            .count();
         let certified_exact = full_keys
-            && plan.used == predicates.len()
+            && plan.asked == asked
             && (plan.index.verified_at_snapshot.is_some() || plan.index.derived_only);
         let probes = if full_keys {
             vec![Probe::Many(
@@ -257,10 +286,11 @@ impl ReadOnlyCatalog {
 
 impl ReadOnlyCatalog {
     /// Resolves a set of complete equality keys over `columns`, named in any
-    /// order, through a ready index over exactly those columns. Every key is
-    /// answered in full, so `certified_exact` reports the index's trust alone.
-    /// Returns `None` when no such index exists or the set exceeds 4,096 keys
-    /// or rows.
+    /// order, through a ready index over those columns, filling any further
+    /// index column from `implied`, the constants every live row holds.
+    /// Every key is answered in full, so `certified_exact` reports the
+    /// index's trust alone. Returns `None` when no such index exists or the
+    /// set exceeds 4,096 keys or rows.
     ///
     /// # Errors
     /// Returns [`Error::Constraint`](crate::Error::Constraint) for a key that
@@ -273,8 +303,9 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
         keys: &[Vec<IndexKeyValue>],
+        implied: &[(ColumnId, IndexKeyValue)],
     ) -> Result<Option<IndexPredicateRows>> {
-        if keys.len() > MAX_PREDICATE_ROWS {
+        if keys.len() > MAX_PREDICATE_ROWS || columns.is_empty() {
             return Ok(None);
         }
         let Some(index) = snapshot
@@ -282,8 +313,11 @@ impl ReadOnlyCatalog {
             .into_iter()
             .filter(|index| index.state == IndexState::Ready)
             .find(|index| {
-                index.columns.len() == columns.len()
-                    && index.columns.iter().all(|column| columns.contains(column))
+                columns.iter().all(|column| index.columns.contains(column))
+                    && index.columns.iter().all(|column| {
+                        columns.contains(column)
+                            || implied.iter().any(|(implied, _)| implied == column)
+                    })
             })
         else {
             return Ok(None);
@@ -300,10 +334,15 @@ impl ReadOnlyCatalog {
             let values = index
                 .columns
                 .iter()
-                .map(|column| {
-                    let position = columns.iter().position(|named| named == column)?;
-                    key.get(position).cloned()
-                })
+                .map(
+                    |column| match columns.iter().position(|named| named == column) {
+                        Some(position) => key.get(position).cloned(),
+                        None => implied
+                            .iter()
+                            .find(|(implied, _)| implied == column)
+                            .map(|(_, value)| value.clone()),
+                    },
+                )
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| {
                     crate::Error::Constraint("index key set: columns repeat".to_owned())

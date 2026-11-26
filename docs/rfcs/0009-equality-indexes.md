@@ -439,17 +439,24 @@ DuckLake owns the planner. The extension's optimizer rule translates pushed
 constant predicates into conjunctive column comparisons and offers them to
 `ReadOnlyCatalog::index_predicate_rows(scope, table, predicates)`, which takes
 `IndexPredicate { column, comparison }` with `IndexComparison` an equality list,
-`IsNull`, or an inclusive or exclusive bound. It selects a ready index with the
-longest usable prefix, probes it, and returns
+`IsNull`, an inclusive or exclusive bound, or `Implied`. It selects a ready
+index with the longest usable prefix, probes it, and returns
 `IndexPredicateRows { rows, certified_exact }`, or `None` when no ready index
-covers a leading predicate. The original predicate is still evaluated over the
-candidate rows. A full-key probe against a certified or derived-only index with
-no residual predicate is the one case where a `DELETE` is rewritten to
-positional deletion without a scan,
-through `moraine_delete_positions`, which the extension registers over
-DuckLake's public transaction API: it stages the located positions as `DELETE`
-stages its own, inlined below the inlining threshold and otherwise as a delete
-file replacing the file's current one, so COMMIT and ROLLBACK treat them alike.
+covers a leading predicate the statement asked. The original predicate is still
+evaluated over the candidate rows.
+
+The rule reads the predicate after DuckDB's statistics pass, which removes an
+equality on a column every row holds the same value in, because it is always
+true. That is often the leading column of a composite index, and without it no
+index covers the rest. So for each column the pushed filters do not name, the
+rule reads the column statistics DuckDB consulted, through the table entry, and
+where they cannot hold NULL and their numeric bounds coincide, which is the
+case DuckDB removes, it adds `Implied(value)`: it extends a key like an
+equality, since every row holds the value, and is never residual, so an index
+that does not consume it still answers exactly. The same constants fill the
+index columns a key set does not name. String bounds are prefixes and imply
+nothing, a column with any NULL or two values implies nothing, and a plan
+whose only consumed predicates are implied is no plan.
 
 DuckDB keeps part of a `DELETE`'s predicate above the scan when it pushes an
 `IN` list as an optional filter, plans a list of five or more constants as a
