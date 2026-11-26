@@ -62,7 +62,7 @@ revalidation; the catalog never writes a logged batch into SlateDB itself.
 | `holding(db, session, hooks)` | A `CommitStore` over a writer the catalog opened with the session's plug: a holder, into which every slot folds. |
 | `following(reader, session, hooks)` | A `CommitStore` over a reader the catalog opened with the session's plug: a follower, whose writes land as slots. |
 | `garbage_collector(log_store, path)` | The `WalGc` plug SlateDB's collector truncates the log through. |
-| `external_compaction` | Whether another process compacts the stores opened over this provider. Defaults to `false`. |
+| `external_compaction` | Whether a coordinator outside the catalog's SlateDB handle compacts the stores opened over this provider. Defaults to `false`. |
 
 A session is the cursor one open shares with its plug. `WriterSession` yields
 `writer_init`, the SlateDB `WriterInit` the `Db` is built with, and answers
@@ -124,6 +124,40 @@ configured. Otherwise the provider may compact in bounded cadence passes using
 its own coordinator lifecycle. Ordinary writer opens still have no embedded
 compactor. Deployments with a continuous maintenance coordinator must set the
 external option on every catalog.
+
+### In-process maintenance
+
+A provider may run its maintenance coordinator as a background worker in the
+application process. It uses `CatalogHooks::object_store` and `take`, together
+with the provider session's configured log store. Store handles retain custom
+backends, wrappers, and credential refresh. Maintenance does not reconstruct a
+store from a URL or its `Display` output, and needs no store URL in
+`CatalogOptions` or `CatalogHooks`. An in-memory store is eligible for the same
+maintenance as a persistent store.
+
+The provider owns worker startup, folding, compaction, collection, and shutdown.
+Commits schedule work without awaiting a maintenance pass. Temporary writer
+opens for adoption or maintenance do not recursively start workers. The worker
+must preserve a separately configured WAL store when opening writers and
+collectors.
+
+Workers may be shared by compatible read-write opens over the same catalog and
+log stores and lake path. A path alone is not an identity: two distinct stores
+can contain the same path. The provider retains the worker's runtime until its
+last dependent open closes, then cancels and joins the worker and closes its
+resources. Read-only opens do not keep automatic maintenance alive.
+
+In-process execution does not replace coordination between applications. A
+provider with a per-lake maintenance lease uses it for embedded workers and
+standalone services alike; SlateDB fencing remains the final protection against
+overlapping holders. An embedded coordinator owns compaction independently of
+the catalog's SlateDB handle and therefore also uses `external_compaction`.
+Deployments may disable automatic workers when a standalone service maintains
+their lakes.
+
+Provider tests cover maintenance on a real in-memory store, a separate WAL
+store, distinct stores with equal paths, shared-worker shutdown, and lease
+handoff between embedded and standalone coordinators.
 
 Staged transaction creation is asynchronous because acquiring a protected fixed
 view performs object-store operations. The DuckDB ABI remains synchronous and

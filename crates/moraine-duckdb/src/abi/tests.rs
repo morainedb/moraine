@@ -2155,29 +2155,6 @@ fn store_kind_parses_s3_bucket_and_prefix() {
     );
 }
 
-/// The store URL another process opens the store from: the bucket, the
-/// directory as it resolves, and nothing for memory.
-#[test]
-fn store_kind_names_the_url_another_process_opens() {
-    let (kind, _) = StoreKind::from_path("s3://my-bucket/catalogs/lake").unwrap();
-    assert_eq!(
-        kind.url("s3://my-bucket/catalogs/lake").as_deref(),
-        Some("s3://my-bucket")
-    );
-
-    let directory = TempDir::new("store-url");
-    let path = directory.path().to_str().unwrap();
-    assert_eq!(
-        StoreKind::LocalFile.url(path),
-        Some(format!(
-            "file://{}",
-            std::fs::canonicalize(path).unwrap().display()
-        ))
-    );
-    assert_eq!(StoreKind::LocalFile.url("/nonexistent/moraine/lake"), None);
-    assert_eq!(StoreKind::Memory.url("memory://"), None);
-}
-
 #[test]
 fn attach_null_path_reports_invalid_argument_without_crashing() {
     let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();

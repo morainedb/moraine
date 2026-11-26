@@ -376,11 +376,6 @@ pub struct CatalogOptions {
     /// sees a later commit, however long the catalog stays open. Refused by
     /// [`Catalog::open`], which is a writer.
     pub checkpoint: Option<String>,
-    /// The URL the object store was opened from, without the lake's path:
-    /// `s3://bucket`, `file:///dir`. For a commit-log provider that starts
-    /// a process over the lake, which must open the same store. `None`
-    /// when there is none to give, as for an in-memory store.
-    pub store_url: Option<String>,
 }
 
 impl Default for CatalogOptions {
@@ -408,7 +403,6 @@ impl Default for CatalogOptions {
             data_path: None,
             reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
-            store_url: None,
         }
     }
 }
@@ -585,7 +579,6 @@ fn catalog_hooks(
         inspect: Arc::new(inspect_head_stamp),
         path: options.path.clone(),
         object_store: Arc::clone(object_store),
-        store_url: options.store_url.clone(),
         settings: crate::CommitLogSettings {
             fold_every: options.commit_log_fold_slots,
             compact: !options.external_compaction,

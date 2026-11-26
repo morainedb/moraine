@@ -1264,23 +1264,3 @@ async fn acknowledged_log_commits_are_visible_to_fixed_readers() {
 }
 
 mod name_migration;
-
-/// The hooks carry the store URL the options were given, for a provider
-/// that opens the same store from another process.
-#[test]
-fn the_hooks_carry_the_store_url() {
-    let object_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
-    let mut options = CatalogOptions::default();
-    assert_eq!(
-        Catalog::commit_log_hooks(&object_store, &options).store_url,
-        None
-    );
-    options.store_url = Some("s3://lakes".to_string());
-    assert_eq!(
-        Catalog::commit_log_hooks(&object_store, &options)
-            .store_url
-            .as_deref(),
-        Some("s3://lakes")
-    );
-}
