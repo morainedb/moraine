@@ -96,11 +96,12 @@ fn an_update_of_an_inlined_row_keeps_the_scan() {
     );
 }
 
-/// Rows inserted earlier in the same transaction have no committed
-/// position, so the update keeps DuckLake's scan.
+/// Rows the transaction wrote to a Parquet file have no committed position
+/// and would need a second scan under the update, so the update keeps
+/// DuckLake's scan.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn an_update_after_a_local_insert_keeps_the_scan() {
+fn an_update_after_a_local_file_insert_keeps_the_scan() {
     let store = TempDir::new("located-update-local-store");
     let data = TempDir::new("located-update-local-data");
     let meta = format!(
@@ -118,10 +119,112 @@ fn an_update_after_a_local_insert_keeps_the_scan() {
         COMMIT;");
     assert!(
         !result.contains("Coverage costing ms"),
-        "a transaction with local inserts must keep the scan: {result}"
+        "a transaction that wrote a file must keep the scan: {result}"
     );
     assert!(has_line(&result, "changed,z"), "{result}");
     assert!(has_line(&result, "local,local"), "{result}");
+}
+
+/// The certified table with small inserts inlined rather than written.
+fn certified_table_with_inlining(run: &dyn Fn(&str) -> String) {
+    run("SET ducklake_default_data_inlining_row_limit = 0;");
+    certified_table(run);
+}
+
+/// Rows the transaction inserted inline have a position in its inlined
+/// buffer, which the update deletes by and reinserts after, so the update
+/// reads by position and changes committed and local rows alike.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn an_update_after_a_local_inlined_insert_reads_by_position() {
+    let store = TempDir::new("located-update-inlined-local-store");
+    let data = TempDir::new("located-update-inlined-local-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    certified_table_with_inlining(&run);
+
+    let result = run("BEGIN;
+        INSERT INTO lake.main.t VALUES (100001, 'local'), (100002, 'other');
+        EXPLAIN ANALYZE UPDATE lake.main.t SET b = 'z' WHERE a IN (30001, 100001);
+        SELECT 'changed', a, b FROM lake.main.t WHERE a IN (30001, 100001, 100002) ORDER BY a;
+        COMMIT;
+        SELECT 'committed', a, b FROM lake.main.t WHERE a IN (30001, 100001, 100002) ORDER BY a;
+        SELECT 'count', count(*) FROM lake.main.t;
+        SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
+    assert!(
+        result.contains("Coverage costing ms"),
+        "an update after an inlined insert reads by position: {result}"
+    );
+    for prefix in ["changed", "committed"] {
+        assert!(has_line(&result, &format!("{prefix},30001,z")), "{result}");
+        assert!(has_line(&result, &format!("{prefix},100001,z")), "{result}");
+        assert!(
+            has_line(&result, &format!("{prefix},100002,other")),
+            "{result}"
+        );
+    }
+    assert!(has_line(&result, "count,100002"), "{result}");
+    assert!(has_line(&result, "verified,0,0,0"), "{result}");
+}
+
+/// A delete after an inlined insert reads by position too, removing the
+/// committed row through its file and the local row from the buffer.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn a_delete_after_a_local_inlined_insert_reads_by_position() {
+    let store = TempDir::new("located-delete-inlined-local-store");
+    let data = TempDir::new("located-delete-inlined-local-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    certified_table_with_inlining(&run);
+
+    let result = run("BEGIN;
+        INSERT INTO lake.main.t VALUES (100001, 'local'), (100002, 'other');
+        EXPLAIN ANALYZE DELETE FROM lake.main.t WHERE a IN (30001, 100001);
+        SELECT 'remaining', a FROM lake.main.t WHERE a IN (30001, 100001, 100002) ORDER BY a;
+        COMMIT;
+        SELECT 'count', count(*) FROM lake.main.t;
+        SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
+    assert!(
+        result.contains("Coverage costing ms"),
+        "a delete after an inlined insert reads by position: {result}"
+    );
+    assert!(
+        !result.contains("MORAINE_DELETE_POSITIONS"),
+        "the positional delete cannot reach the local row: {result}"
+    );
+    assert!(has_line(&result, "remaining,100002"), "{result}");
+    assert!(!has_line(&result, "remaining,30001"), "{result}");
+    assert!(!has_line(&result, "remaining,100001"), "{result}");
+    assert!(has_line(&result, "count,100000"), "{result}");
+    assert!(has_line(&result, "verified,0,0,0"), "{result}");
+}
+
+/// The lookup join reaches the same located scan under an update, so it
+/// too reads by position after an inlined insert.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn a_join_update_after_a_local_inlined_insert_reads_by_position() {
+    let store = TempDir::new("located-join-update-inlined-store");
+    let data = TempDir::new("located-join-update-inlined-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    certified_table_with_inlining(&run);
+
+    let result = run("BEGIN;
+        INSERT INTO lake.main.t VALUES (100001, 'local');
+        EXPLAIN ANALYZE UPDATE lake.main.t SET b = 'z'
+            FROM moraine_index_lookup('lake','main','t','by_a',30001) hits WHERE t.rowid = hits.row_id;
+        SELECT 'changed', a, b FROM lake.main.t WHERE a IN (30001, 100001) ORDER BY a;
+        COMMIT;
+        SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
+    assert!(
+        result.contains("Coverage costing ms"),
+        "a join update after an inlined insert reads by position: {result}"
+    );
+    assert!(has_line(&result, "changed,30001,z"), "{result}");
+    assert!(has_line(&result, "changed,100001,local"), "{result}");
+    assert!(has_line(&result, "verified,0,0,0"), "{result}");
 }
 
 /// Keys `7919` and `15838` are the first file's second and third rows, so a

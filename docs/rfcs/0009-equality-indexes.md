@@ -464,10 +464,14 @@ pinned revision. A transaction with staged writes keeps probing at the
 revision it started on, because entries carry no transaction-local overlay.
 
 Inside a transaction that has inserted rows into the table, the located scan
-serves the committed rows and the rows the transaction inserted inline, and
-DuckLake's scan over the files the transaction wrote joins it under a
-`UNION ALL`; an UPDATE or DELETE in that state keeps the plan as written, since
-DuckLake's delete reads its file map from one scan.
+serves the committed rows and the rows the transaction inserted inline, giving
+each inlined row the transaction-local entry's name and its position in the
+buffer, which DuckLake's delete removes by. An UPDATE or DELETE in that state
+reads by position too. Once the transaction has written a Parquet file for the
+table, a read joins DuckLake's scan over those files under a `UNION ALL`, and
+an UPDATE or DELETE keeps the plan as written, since DuckLake's delete reads
+its file map from one scan. The positional delete needs a transaction with no
+local rows at all.
 
 The rule declines, leaving the ordinary plan, for a scan at a snapshot other
 than the transaction's, no ready index over a leading predicate, a value of a

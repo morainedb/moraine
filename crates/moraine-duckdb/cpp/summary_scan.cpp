@@ -28,6 +28,7 @@
 #include "common/index.hpp"
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <set>
 
@@ -38,6 +39,11 @@ namespace {
 // The name DuckLake's file list gives the transaction's inlined rows, which
 // keys their deletes.
 constexpr const char *LOCAL_INLINED_ENTRY = "__ducklake_inlined_transaction_local_data";
+
+// The file index the located scan gives the transaction's inlined rows.
+// DuckLake's delete keys its per-file name map by it, so it only has to be
+// one no data file carries.
+constexpr uint64_t LOCAL_INLINED_FILE_INDEX = std::numeric_limits<uint64_t>::max();
 
 // Imports an Arrow batch the row scan exported as DuckDB chunks. Consumes
 // both structs, including when the import throws.
@@ -456,6 +462,11 @@ void FillFilenames(const SummaryScanBindData &bound, duckdb::Vector &file_ids, d
 			throw duckdb::InternalException(
 			    "moraine summary scan: a row without a data file reached a filename column");
 		}
+		if (values[index] == LOCAL_INLINED_FILE_INDEX) {
+			out[row] = duckdb::StringVector::AddString(filenames, bound.local_inlined_path.c_str(),
+			                                           bound.local_inlined_path.size());
+			continue;
+		}
 		auto path = bound.file_paths.find(values[index]);
 		if (path == bound.file_paths.end()) {
 			throw duckdb::InternalException("moraine summary scan: data file %llu has no recorded path",
@@ -514,9 +525,13 @@ void AppendLocalInlinedRows(duckdb::ClientContext &context, const SummaryScanBin
 				row_ids[i] = inlined->HasPreservedRowIds() ? static_cast<uint64_t>(inlined->row_ids[at])
 				                                           : bound.local_inlined_row_id_start + at;
 			}
-			for (auto absent : {row_id_at + 1, row_id_at + 2}) {
-				piece->data[absent].SetVectorType(duckdb::VectorType::CONSTANT_VECTOR);
-				duckdb::ConstantVector::SetNull(piece->data[absent], true);
+			// The row's file is the transaction's inlined buffer and its
+			// position is its place in it, which DuckLake's delete removes by.
+			auto file_ids = duckdb::FlatVector::GetDataMutable<uint64_t>(piece->data[row_id_at + 1]);
+			auto positions = duckdb::FlatVector::GetDataMutable<uint64_t>(piece->data[row_id_at + 2]);
+			for (duckdb::idx_t i = 0; i < count; i++) {
+				file_ids[i] = LOCAL_INLINED_FILE_INDEX;
+				positions[i] = position + kept.get_index(i);
 			}
 			piece->SetChildCardinality(count);
 			state.pending.push_back(std::move(piece));
@@ -648,12 +663,12 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		return false;
 	}
 	std::set<uint64_t> file_ids;
-	bool includes_inline = false;
+	bool committed_inline = false;
 	for (auto &row : rows) {
 		if (row.has_data_file_id) {
 			file_ids.insert(row.data_file_id);
 		} else {
-			includes_inline = true;
+			committed_inline = true;
 		}
 	}
 	// The rows the transaction inserted inline, numbered after the rows of
@@ -666,13 +681,13 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		for (auto &file : transaction->GetTransactionLocalFiles(info.table_id)) {
 			local_inlined_row_id_start += file.row_count;
 		}
-		includes_inline = true;
 	}
 	// Whole columns of any type the table declares: the located reader decodes
 	// what DuckLake wrote and the import casts to the declared type. A struct
 	// field projection asks for part of a column, which it does not serve,
 	// and a column of a type it cannot decode as the scan does keeps the scan.
-	// A row's file and position exist only for a row in a data file.
+	// A row's file and position exist for a row in a data file and for one in
+	// the transaction's inlined buffer, not for a committed inlined row.
 	for (auto &column : scan.GetColumnIds()) {
 		auto id = column.GetPrimaryIndex();
 		if (column.HasChildren() || (id >= scan.returned_types.size() && !IsLocatedVirtualColumn(id))) {
@@ -681,7 +696,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		if (id < scan.returned_types.size() && HoldsUndecodableType(scan.returned_types[id])) {
 			return false;
 		}
-		if (includes_inline && IsFileLocationColumn(id)) {
+		if (committed_inline && IsFileLocationColumn(id)) {
 			return false;
 		}
 	}
