@@ -394,3 +394,104 @@ async fn a_writer_built_index_is_not_exact_without_a_certificate() {
     drop(scope);
     catalog.close().await.unwrap();
 }
+
+/// A key set names its columns in any order and resolves exactly the rows
+/// holding one of its keys, never a row the keys' cross product would add.
+#[tokio::test]
+async fn key_sets_resolve_their_keys_and_nothing_the_cross_product_adds() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b) = seed(&catalog, false).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+
+    let result = reads
+        .index_key_rows_projected(
+            &snapshot,
+            table,
+            &[b, a],
+            &[vec![number(2), number(0)], vec![number(3), number(1)]],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.rows, vec![1, 2]);
+    assert!(
+        !result.certified_exact,
+        "writer-supplied entries are untrusted"
+    );
+
+    // (0,1) and (1,2): the cross product holds (0,2), which row 1 carries.
+    let result = reads
+        .index_key_rows_projected(
+            &snapshot,
+            table,
+            &[a, b],
+            &[vec![number(0), number(1)], vec![number(1), number(2)]],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.rows, vec![0]);
+
+    assert!(
+        reads
+            .index_key_rows_projected(&snapshot, table, &[a], &[vec![number(0)]])
+            .await
+            .unwrap()
+            .is_none(),
+        "a key set needs an index over exactly its columns"
+    );
+    assert!(matches!(
+        reads
+            .index_key_rows_projected(&snapshot, table, &[a, b], &[vec![number(0)]])
+            .await,
+        Err(crate::Error::Constraint(_))
+    ));
+    catalog.close().await.unwrap();
+}
+
+/// A key set wider than the planner collects declines like a broad predicate.
+#[tokio::test]
+async fn broad_key_sets_decline() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b) = seed(&catalog, false).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    let keys = (0..4097i128)
+        .map(|key| vec![number(key), number(key)])
+        .collect::<Vec<_>>();
+    assert!(
+        reads
+            .index_key_rows_projected(&snapshot, table, &[a, b], &keys)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A catalog-built index answers a key set exactly without a certificate.
+#[tokio::test]
+async fn a_catalog_built_index_answers_key_sets_exactly() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, _) = catalog_built_index(&catalog).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    let result = reads
+        .index_key_rows_projected(&snapshot, table, &[a], &[vec![number(7)]])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.certified_exact);
+    assert!(result.rows.is_empty());
+    catalog.close().await.unwrap();
+}

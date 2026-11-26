@@ -451,6 +451,28 @@ DuckLake's public transaction API: it stages the located positions as `DELETE`
 stages its own, inlined below the inlining threshold and otherwise as a delete
 file replacing the file's current one, so COMMIT and ROLLBACK treat them alike.
 
+DuckDB keeps part of a `DELETE`'s predicate above the scan when it pushes an
+`IN` list as an optional filter, plans a list of five or more constants as a
+`MARK` join against a chunk of them with the mark tested above, and for a tuple
+`IN` or a disjunction of conjunctions pushes only per-column lists while the
+filter above keeps the tuples. Read as conjunctive per-column predicates those
+are a cross product that names rows the statement did not. The rule therefore
+reads the pushed filters, the kept filter, and such joins together as a key set,
+a disjunction of complete keys over one column set, when every conjunct is a
+constant equality, an `IN` list, a tuple equality or `IN` list, or an `AND` or
+`OR` of those, multiplying conjunctions out to at most 4,096 keys. A pushed
+filter that is not an equality list, such as the range DuckDB folds a list into,
+is checked against each key's constant instead.
+`ReadOnlyCatalog::index_key_rows(scope, table, columns, keys)` resolves such a
+set through a ready index over exactly those columns, named in any order, and
+reports `certified_exact` from the index's trust alone, since every key is
+answered in full. A kept filter that spells complete keys is then not residual:
+the rewrite replaces the delete, the filter, and the scan together. A conjunct
+of any other shape, a column set no index covers, or more keys than a probe
+collects leaves the kept filter residual and the plan on the located scan. A
+consecutive integer list that DuckDB folds into a range before the rule runs
+stays a range probe.
+
 Index scans use four components:
 
 - `IndexReadScope` pins catalog, index, file, and inline reads to one committed
@@ -491,9 +513,9 @@ type the index does not cover, or a failed probe, which is logged. The
 positional DELETE rewrite additionally requires a certified or derived-only
 index, every pushed
 predicate answered in full, every resolved row in a committed file, no deletion
-vectors on the table, no `RETURNING`, and nothing but projections between the
-delete and its scan. UPDATE keeps the ordinary operator and narrows its reads
-through the pushed filters.
+vectors on the table, no `RETURNING`, and nothing but projections and at most
+one filter the key set absorbs between the delete and its scan. UPDATE keeps
+the ordinary operator and narrows its reads through the pushed filters.
 
 ## Format gate and reclamation
 

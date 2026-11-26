@@ -1970,6 +1970,32 @@ int32_t moraine_index_predicate_rows(struct MoraineCatalogHandle *handle,
                                      void *probe_ctx,
                                      struct MoraineError *err);
 
+// Resolves a set of complete equality keys over `columns`, named by field id
+// in any order, through a ready index over exactly those columns, or
+// declines via `out_covered`. Each key lists one value per column in the
+// order of `columns`; a NULL-bearing key matches no row. `out_certified`
+// means the index is certified or derived-only, so the rows are the exact
+// answer. Free the result with `moraine_index_lookup_free`.
+//
+// # Safety
+// All input arrays and their nested pointers must be readable for their
+// lengths. Output pointers must be writable; strings and interrupt callbacks
+// satisfy the ABI contract.
+int32_t moraine_index_key_rows(struct MoraineCatalogHandle *handle,
+                               const char *schema_name,
+                               const char *table_name,
+                               const uint64_t *columns,
+                               size_t columns_len,
+                               const struct MoraineLookupKey *keys,
+                               size_t keys_len,
+                               struct MoraineRowId **out_items,
+                               size_t *out_len,
+                               bool *out_covered,
+                               bool *out_certified,
+                               MoraineInterruptProbe probe,
+                               void *probe_ctx,
+                               struct MoraineError *err);
+
 // Runs one moraine-owned maintenance pass, reclaiming the entry ranges
 // of indexes no longer live, the file column statistics of data files no
 // snapshot can still resolve, and the `inline/*` records of tables the

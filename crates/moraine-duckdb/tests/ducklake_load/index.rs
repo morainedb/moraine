@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use crate::helpers::*;
 
+mod delete_key_sets;
 mod delete_rewrite;
 mod local_inserts;
 mod located_types;

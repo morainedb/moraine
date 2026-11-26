@@ -135,4 +135,25 @@ impl ReadOnlyCatalog {
             .index_predicate_rows_projected(&view, table, predicates)
             .await
     }
+
+    /// Resolves a set of complete equality keys using one fixed catalog
+    /// revision.
+    ///
+    /// # Errors
+    /// Returns a read or index-probe error.
+    pub async fn index_key_rows(
+        &self,
+        scope: &ReadScope,
+        table: TableId,
+        columns: &[crate::ColumnId],
+        keys: &[Vec<crate::IndexKeyValue>],
+    ) -> Result<Option<crate::IndexPredicateRows>> {
+        let view = scope
+            .projection(&[Selection::Range(Kind::Index, Some(table.get()))])
+            .await?;
+        scope
+            .reads()
+            .index_key_rows_projected(&view, table, columns, keys)
+            .await
+    }
 }
