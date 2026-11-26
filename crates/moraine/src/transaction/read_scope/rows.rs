@@ -147,13 +147,14 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[crate::ColumnId],
         keys: &[Vec<crate::IndexKeyValue>],
+        implied: &[(crate::ColumnId, crate::IndexKeyValue)],
     ) -> Result<Option<crate::IndexPredicateRows>> {
         let view = scope
             .projection(&[Selection::Range(Kind::Index, Some(table.get()))])
             .await?;
         scope
             .reads()
-            .index_key_rows_projected(&view, table, columns, keys)
+            .index_key_rows_projected(&view, table, columns, keys, implied)
             .await
     }
 }

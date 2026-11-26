@@ -1,6 +1,6 @@
 use std::{cell::Cell, sync::Arc};
 
-use IndexComparison::{Any, IsNull, Lower, Upper};
+use IndexComparison::{Any, Implied, IsNull, Lower, Upper};
 use object_store::memory::InMemory;
 
 use super::*;
@@ -413,6 +413,7 @@ async fn key_sets_resolve_their_keys_and_nothing_the_cross_product_adds() {
             table,
             &[b, a],
             &[vec![number(2), number(0)], vec![number(3), number(1)]],
+            &[],
         )
         .await
         .unwrap()
@@ -430,6 +431,7 @@ async fn key_sets_resolve_their_keys_and_nothing_the_cross_product_adds() {
             table,
             &[a, b],
             &[vec![number(0), number(1)], vec![number(1), number(2)]],
+            &[],
         )
         .await
         .unwrap()
@@ -438,7 +440,7 @@ async fn key_sets_resolve_their_keys_and_nothing_the_cross_product_adds() {
 
     assert!(
         reads
-            .index_key_rows_projected(&snapshot, table, &[a], &[vec![number(0)]])
+            .index_key_rows_projected(&snapshot, table, &[a], &[vec![number(0)]], &[])
             .await
             .unwrap()
             .is_none(),
@@ -446,7 +448,7 @@ async fn key_sets_resolve_their_keys_and_nothing_the_cross_product_adds() {
     );
     assert!(matches!(
         reads
-            .index_key_rows_projected(&snapshot, table, &[a, b], &[vec![number(0)]])
+            .index_key_rows_projected(&snapshot, table, &[a, b], &[vec![number(0)]], &[])
             .await,
         Err(crate::Error::Constraint(_))
     ));
@@ -468,7 +470,7 @@ async fn broad_key_sets_decline() {
         .collect::<Vec<_>>();
     assert!(
         reads
-            .index_key_rows_projected(&snapshot, table, &[a, b], &keys)
+            .index_key_rows_projected(&snapshot, table, &[a, b], &keys, &[])
             .await
             .unwrap()
             .is_none()
@@ -487,11 +489,186 @@ async fn a_catalog_built_index_answers_key_sets_exactly() {
     let reads = scope.reads();
     let snapshot = reads.materialized().await.unwrap();
     let result = reads
-        .index_key_rows_projected(&snapshot, table, &[a], &[vec![number(7)]])
+        .index_key_rows_projected(&snapshot, table, &[a], &[vec![number(7)]], &[])
         .await
         .unwrap()
         .unwrap();
     assert!(result.certified_exact);
     assert!(result.rows.is_empty());
+    catalog.close().await.unwrap();
+}
+
+/// A three-column table with a catalog-built unique index over `(a, b)` and
+/// no rows.
+async fn catalog_built_composite(catalog: &Catalog) -> (TableId, ColumnId, ColumnId, ColumnId) {
+    let ids = Cell::new(None);
+    catalog
+        .commit_materialized(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let table = tx.create_table(
+                schema,
+                "t",
+                &["a", "b", "c"].map(|name| ColumnDef {
+                    name: name.into(),
+                    column_type: "BIGINT".into(),
+                    ..Default::default()
+                }),
+            )?;
+            let columns = tx.columns_of(table);
+            ids.set(Some((table, columns[0].id, columns[1].id, columns[2].id)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (table, a, b, c) = ids.get().unwrap();
+    catalog
+        .create_index(
+            table,
+            &IndexDef {
+                name: "by_ab".into(),
+                columns: vec![a, b],
+                unique: true,
+            },
+            &[],
+            IndexMaintenance::Synchronous,
+            None,
+            "",
+        )
+        .await
+        .unwrap();
+    (table, a, b, c)
+}
+
+/// An implied equality extends the key prefix like any equality, but is
+/// never residual: one the index does not consume costs no exactness, and
+/// one alone, with nothing the statement asked, plans nothing.
+#[tokio::test]
+async fn an_implied_constant_extends_the_key_but_is_never_residual() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b) = seed(&catalog, false).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    let probe = |predicates: Vec<(ColumnId, IndexComparison)>| {
+        let predicates = predicates
+            .into_iter()
+            .map(|(column, comparison)| IndexPredicate { column, comparison })
+            .collect::<Vec<_>>();
+        let reads = &reads;
+        let snapshot = &snapshot;
+        async move {
+            reads
+                .index_predicate_rows_projected(snapshot, table, &predicates)
+                .await
+        }
+    };
+    assert!(
+        probe(vec![(b, Any(vec![number(2)]))])
+            .await
+            .unwrap()
+            .is_none(),
+        "no leading predicate"
+    );
+    let result = probe(vec![(b, Any(vec![number(2)])), (a, Implied(number(0)))])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.rows, vec![1]);
+    assert!(
+        probe(vec![(a, Implied(number(0)))])
+            .await
+            .unwrap()
+            .is_none(),
+        "an implied constant alone asks nothing"
+    );
+    catalog.close().await.unwrap();
+
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b, c) = catalog_built_composite(&catalog).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    let predicates = [
+        IndexPredicate {
+            column: c,
+            comparison: Implied(number(5)),
+        },
+        IndexPredicate {
+            column: a,
+            comparison: Implied(number(0)),
+        },
+        IndexPredicate {
+            column: b,
+            comparison: Any(vec![number(2)]),
+        },
+    ];
+    let result = reads
+        .index_predicate_rows_projected(&snapshot, table, &predicates)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.certified_exact,
+        "an unconsumed implied constant is not residual"
+    );
+    assert!(result.rows.is_empty());
+    catalog.close().await.unwrap();
+}
+
+/// A key set may lean on implied constants for the index columns it does not
+/// name, and an implied constant on a column outside the index is ignored.
+#[tokio::test]
+async fn key_sets_complete_their_columns_from_implied_constants() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b) = seed(&catalog, false).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    assert!(
+        reads
+            .index_key_rows_projected(&snapshot, table, &[b], &[vec![number(2)]], &[])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let result = reads
+        .index_key_rows_projected(
+            &snapshot,
+            table,
+            &[b],
+            &[vec![number(2)], vec![number(3)]],
+            &[(a, number(0))],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.rows, vec![1]);
+    catalog.close().await.unwrap();
+
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b, c) = catalog_built_composite(&catalog).await;
+    let scope = catalog.index_read_scope().await.unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.materialized().await.unwrap();
+    let result = reads
+        .index_key_rows_projected(
+            &snapshot,
+            table,
+            &[b],
+            &[vec![number(2)]],
+            &[(c, number(5)), (a, number(0))],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.certified_exact && result.rows.is_empty());
     catalog.close().await.unwrap();
 }

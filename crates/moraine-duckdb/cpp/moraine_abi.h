@@ -329,7 +329,9 @@ typedef struct MoraineLookupKey {
 typedef struct MoraineIndexPredicate {
   // Stable catalog field identifier.
   uint64_t field_id;
-  // 0: equality list, 1: IS NULL, 2: >, 3: >=, 4: <, 5: <=.
+  // 0: equality list, 1: IS NULL, 2: >, 3: >=, 4: <, 5: <=, 6: implied
+  // equality to the one value every row holds, which extends a key but
+  // is never residual.
   uint8_t kind;
   // Constants for the comparison; empty for IS NULL.
   const struct MoraineLookupValue *values;
@@ -1971,11 +1973,13 @@ int32_t moraine_index_predicate_rows(struct MoraineCatalogHandle *handle,
                                      struct MoraineError *err);
 
 // Resolves a set of complete equality keys over `columns`, named by field id
-// in any order, through a ready index over exactly those columns, or
-// declines via `out_covered`. Each key lists one value per column in the
-// order of `columns`; a NULL-bearing key matches no row. `out_certified`
-// means the index is certified or derived-only, so the rows are the exact
-// answer. Free the result with `moraine_index_lookup_free`.
+// in any order, through a ready index over those columns, or declines via
+// `out_covered`. Each key lists one value per column in the order of
+// `columns`; a NULL-bearing key matches no row. `implied` holds kind-6
+// predicates, one value each, for columns every row holds one value in; an
+// index may fill its remaining columns from them. `out_certified` means the
+// index is certified or derived-only, so the rows are the exact answer.
+// Free the result with `moraine_index_lookup_free`.
 //
 // # Safety
 // All input arrays and their nested pointers must be readable for their
@@ -1988,6 +1992,8 @@ int32_t moraine_index_key_rows(struct MoraineCatalogHandle *handle,
                                size_t columns_len,
                                const struct MoraineLookupKey *keys,
                                size_t keys_len,
+                               const struct MoraineIndexPredicate *implied,
+                               size_t implied_len,
                                struct MoraineRowId **out_items,
                                size_t *out_len,
                                bool *out_covered,

@@ -577,6 +577,7 @@ fn key_rows(
     handle: *mut MoraineCatalogHandle,
     columns: &[u64],
     keys: &[MoraineLookupKey],
+    implied: &[MoraineIndexPredicate],
 ) -> Result<(Vec<u64>, bool, bool), String> {
     let schema = CString::new("sales").expect("no NUL");
     let table = CString::new("t").expect("no NUL");
@@ -596,6 +597,8 @@ fn key_rows(
             columns.len(),
             keys.as_ptr(),
             keys.len(),
+            implied.as_ptr(),
+            implied.len(),
             &raw mut items,
             &raw mut len,
             &raw mut covered,
@@ -654,12 +657,12 @@ fn index_key_rows_resolve_keys_in_any_column_order() {
         },
     ];
     assert_eq!(
-        key_rows(handle, &[2, 1], &keys),
+        key_rows(handle, &[2, 1], &keys, &[]),
         Ok((vec![1, 2], true, false)),
         "writer-supplied entries are covered but untrusted"
     );
 
-    let (rows, covered, _) = key_rows(handle, &[1], &keys[..0]).expect("call succeeds");
+    let (rows, covered, _) = key_rows(handle, &[1], &keys[..0], &[]).expect("call succeeds");
     assert!(rows.is_empty() && !covered, "no index covers `a` alone");
 
     let short = [i64_lookup(5)];
@@ -667,8 +670,26 @@ fn index_key_rows_resolve_keys_in_any_column_order() {
         values: short.as_ptr(),
         values_len: short.len(),
     }];
-    let message = key_rows(handle, &[1, 2], &short_keys).expect_err("a short key is refused");
+    let message = key_rows(handle, &[1, 2], &short_keys, &[]).expect_err("a short key is refused");
     assert!(message.contains("2 columns"), "{message}");
+
+    // An implied constant fills the index column the keys do not name.
+    let five = [i64_lookup(5)];
+    let implied = [MoraineIndexPredicate {
+        field_id: 1,
+        kind: 6,
+        values: five.as_ptr(),
+        values_len: 1,
+    }];
+    let by_b = [str_lookup(&y)];
+    let b_keys = [MoraineLookupKey {
+        values: by_b.as_ptr(),
+        values_len: by_b.len(),
+    }];
+    assert_eq!(
+        key_rows(handle, &[2], &b_keys, &implied),
+        Ok((vec![1], true, false))
+    );
 
     // SAFETY: `handle` was minted by `attach_ok`, detached once.
     unsafe { moraine_detach(handle) };

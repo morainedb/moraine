@@ -18,6 +18,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -294,6 +295,30 @@ std::optional<QualifiedScan> QualifyIndexedScan(duckdb::ClientContext &context, 
 	return QualifiedScan {&table, info, std::move(transaction)};
 }
 
+// Columns whose statistics say every row holds one value, read as DuckDB's
+// statistics pass reads them when it removes an equality on such a column as
+// always true: no NULL possible, and numeric bounds that coincide. An
+// equality on such a column is implied by every row, so it may complete a
+// key without being residual. String bounds are prefixes and imply nothing.
+std::vector<std::pair<duckdb::idx_t, duckdb::Value>> ImpliedConstants(duckdb::ClientContext &context,
+                                                                      const QualifiedScan &qualified) {
+	std::vector<std::pair<duckdb::idx_t, duckdb::Value>> result;
+	auto &table = *qualified.table;
+	for (duckdb::idx_t column = 0; column < table.GetColumns().PhysicalColumnCount(); column++) {
+		auto stats = table.GetStatistics(context, column);
+		if (!stats || stats->CanHaveNull() || stats->GetStatsType() != duckdb::StatisticsType::NUMERIC_STATS ||
+		    !duckdb::NumericStats::HasMinMax(*stats)) {
+			continue;
+		}
+		auto min = duckdb::NumericStats::Min(*stats);
+		if (min.IsNull() || !duckdb::Value::NotDistinctFrom(min, duckdb::NumericStats::Max(*stats))) {
+			continue;
+		}
+		result.emplace_back(column, std::move(min));
+	}
+	return result;
+}
+
 // Logs a probe the core declined and releases its message. The scan still
 // answers from every file; pruning is an optimization.
 void LogDeclinedProbe(duckdb::ClientContext &context, const char *what, MoraineError &error) {
@@ -319,6 +344,7 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	auto &column_ids = get.GetColumnIds();
 	auto stored_columns = table.GetColumns().PhysicalColumnCount();
 	PredicateArena predicates;
+	std::set<duckdb::idx_t> filtered;
 	bool complete = !get.table_filters.HasMultiColumnFilters();
 	for (duckdb::idx_t position = 0; position < column_ids.size(); position++) {
 		auto filter = get.table_filters.TryGetFilterByColumnIndex(duckdb::ProjectionIndex(position));
@@ -326,6 +352,7 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 			continue;
 		}
 		auto column = column_ids[position].GetPrimaryIndex();
+		filtered.insert(column);
 		if (column >= stored_columns || filter->filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) {
 			complete = false;
 			continue;
@@ -359,6 +386,21 @@ ResolveIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optim
 	}
 	if (predicates.predicates.empty()) {
 		return std::nullopt;
+	}
+	// Implied equalities complete a key whose leading column the statement
+	// did not name, or named and DuckDB removed; the core never counts them
+	// as residual.
+	for (auto &implied : ImpliedConstants(context, *qualified)) {
+		if (filtered.count(implied.first)) {
+			continue;
+		}
+		auto previous = predicates.predicates.size();
+		try {
+			predicates.Add(table.GetFieldId(duckdb::PhysicalIndex(implied.first)).GetFieldIndex().index, 6,
+			               {implied.second});
+		} catch (const std::exception &) {
+			predicates.predicates.resize(previous);
+		}
 	}
 
 	bool cacheable = false;
@@ -515,6 +557,20 @@ std::optional<ResolvedPredicate> ResolveKeySet(duckdb::ClientContext &context, d
 	for (auto column : keys.columns) {
 		fields.push_back(table.GetFieldId(duckdb::PhysicalIndex(column)).GetFieldIndex().index);
 	}
+	// Implied equalities may fill the index columns the keys do not name.
+	PredicateArena implied;
+	for (auto &constant : ImpliedConstants(context, *qualified)) {
+		if (std::find(keys.columns.begin(), keys.columns.end(), constant.first) != keys.columns.end()) {
+			continue;
+		}
+		auto previous = implied.predicates.size();
+		try {
+			implied.Add(table.GetFieldId(duckdb::PhysicalIndex(constant.first)).GetFieldIndex().index, 6,
+			            {constant.second});
+		} catch (const std::exception &) {
+			implied.predicates.resize(previous);
+		}
+	}
 	LookupValueArena arena;
 	std::vector<std::vector<MoraineLookupValue>> values;
 	std::vector<MoraineLookupKey> lookup_keys;
@@ -541,8 +597,9 @@ std::optional<ResolvedPredicate> ResolveKeySet(duckdb::ClientContext &context, d
 	bool certified = false;
 	MoraineError error {};
 	auto code = moraine_index_key_rows(handle, schema_name.c_str(), table_name.c_str(), fields.data(), fields.size(),
-	                                   lookup_keys.data(), lookup_keys.size(), rows.OutItems(), rows.OutLen(), &covered,
-	                                   &certified, moraine_shim_is_interrupted, &context, &error);
+	                                   lookup_keys.data(), lookup_keys.size(), implied.predicates.data(),
+	                                   implied.predicates.size(), rows.OutItems(), rows.OutLen(), &covered, &certified,
+	                                   moraine_shim_is_interrupted, &context, &error);
 	if (code == MORAINE_INTERRUPTED) {
 		ThrowMoraineError(error);
 	}
