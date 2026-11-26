@@ -107,19 +107,51 @@ fn the_rewrite_deletes_exactly_its_rows() {
     );
 }
 
-/// Without a certificate the scan stays: the rewrite replaces predicate
-/// evaluation, so it will not run on an index nothing has checked.
+/// An index the extension created is exact by construction: every entry
+/// came from moraine's own reads, so the rewrite runs on it without a
+/// verifier pass, and SQL writes after creation keep it so.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn an_uncertified_index_keeps_the_scan() {
-    let store = TempDir::new("delete-rewrite-uncertified-store");
-    let data = TempDir::new("delete-rewrite-uncertified-data");
+fn a_fresh_index_answers_a_positional_delete_without_a_verify_pass() {
+    let store = TempDir::new("delete-rewrite-derived-store");
+    let data = TempDir::new("delete-rewrite-derived-data");
     let meta = format!(
         ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
         data.path().display()
     );
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
     indexed_table(&run);
+    run("INSERT INTO lake.main.t VALUES (100001, 'after');");
+
+    let listing = run(
+        "SELECT index_name, certified_at, derived_only FROM moraine_indexes('lake','main','t');",
+    );
+    assert!(has_line(&listing, "by_a,NULL,true"), "{listing}");
+    let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t WHERE a = 30001;");
+    assert!(
+        plan.contains("MORAINE_DELETE_POSITIONS"),
+        "a derived-only index must drive the positional delete: {plan}"
+    );
+    let result = run("SELECT 'remaining', count(*) FROM lake.main.t;
+         SELECT 'verified', missing, dead, mismatched FROM moraine_index_verify('lake','main','t','by_a');");
+    assert!(has_line(&result, "remaining,100000"), "{result}");
+    assert!(has_line(&result, "verified,0,0,0"), "{result}");
+}
+
+/// A declined rewrite still reuses its lookup for scan pruning rather than
+/// probing twice; deletion vectors are the decline here.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn a_declined_rewrite_reuses_its_lookup_for_pruning() {
+    let store = TempDir::new("delete-rewrite-declined-store");
+    let data = TempDir::new("delete-rewrite-declined-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    indexed_table(&run);
+    run("CALL ducklake_set_option('lake', 'write_deletion_vectors', true);");
 
     let result = run_session_with_env(
         &Attach::Moraine {
@@ -136,21 +168,10 @@ fn an_uncertified_index_keeps_the_scan() {
     );
     let plan = combined_output(&result);
     assert!(result.status.success(), "{plan}");
+    assert!(!plan.contains("MORAINE_DELETE_POSITIONS"), "{plan}");
     assert!(
         csv_rows(&plan).contains(&vec!["placements".into(), "1".into()]),
         "a declined rewrite must reuse its lookup for scan pruning: {plan}"
-    );
-    assert!(
-        !plan.contains("MORAINE_DELETE_POSITIONS"),
-        "an unchecked index must not answer a delete: {plan}"
-    );
-
-    // Certifying it, and only that, lets the rewrite fire.
-    run("SELECT * FROM moraine_index_verify('lake','main','t','by_a');");
-    let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a = 30001;");
-    assert!(
-        plan.contains("MORAINE_DELETE_POSITIONS"),
-        "a certified index should answer it: {plan}"
     );
 }
 

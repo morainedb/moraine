@@ -694,8 +694,7 @@ impl Catalog {
         let index = std::cell::Cell::new(None);
         self.commit_table(table, TableRead::IndexCreation, |tx| {
             require_data_store(tx, table, has_data_store)?;
-            let id =
-                tx.create_index_staged_ordered_with_maintenance(table, def, orders, maintenance)?;
+            let id = tx.create_index_staged_derived(table, def, orders, maintenance)?;
             index.set(Some(id));
             Ok(())
         })

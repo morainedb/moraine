@@ -637,6 +637,10 @@ pub struct IndexInfo {
     /// rebuild or a repair withdraws it, ordinary maintained writes do
     /// not.
     pub verified_at_snapshot: Option<SnapshotId>,
+    /// Whether every entry the index has held came from the catalog's own
+    /// reads, which a plan trusts as it trusts a certificate. Cleared for
+    /// good by a writer-supplied entry, backfill batch, or removal.
+    pub derived_only: bool,
     /// Row-id watermark for manual steps and older builds. Streamed inline
     /// steps leave it unchanged until the inline leg completes, using a
     /// separate source checkpoint. Always `None` on a single-commit index.

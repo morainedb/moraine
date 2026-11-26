@@ -927,7 +927,33 @@ impl Transaction {
         maintenance: IndexMaintenance,
         backfill: &[IndexEntry],
     ) -> Result<IndexId> {
-        let index_id = self.insert_index_definition(table, def, maintenance, None, orders)?;
+        self.create_index_from(table, def, orders, maintenance, backfill, false)
+    }
+
+    /// As [`Self::create_index_ordered_with_maintenance`], for a backfill
+    /// the catalog derived itself, which marks the index derived-only.
+    pub(crate) fn create_index_derived(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        maintenance: IndexMaintenance,
+        backfill: &[IndexEntry],
+    ) -> Result<IndexId> {
+        self.create_index_from(table, def, orders, maintenance, backfill, true)
+    }
+
+    fn create_index_from(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        maintenance: IndexMaintenance,
+        backfill: &[IndexEntry],
+        derived_only: bool,
+    ) -> Result<IndexId> {
+        let index_id =
+            self.insert_index_definition(table, def, maintenance, None, orders, derived_only)?;
         let shape = IndexShape::of_definition(def, orders);
         for entry in backfill {
             self.stage_index_entry(index_id, &shape, entry.row_id, &entry.values, false)?;
@@ -947,6 +973,7 @@ impl Transaction {
         maintenance: IndexMaintenance,
         build_state: Option<String>,
         orders: &[ColumnOrder],
+        derived_only: bool,
     ) -> Result<u64> {
         nonempty_name("index", &def.name)?;
         self.live_table(table)?;
@@ -1013,6 +1040,7 @@ impl Transaction {
             ducklake_index_id: None,
             deferred_maintenance: (maintenance == IndexMaintenance::Deferred).then_some(true),
             verified_at_snapshot: None,
+            derived_only: derived_only.then_some(true),
         });
         Ok(index_id)
     }
@@ -1129,16 +1157,51 @@ impl Transaction {
         orders: &[ColumnOrder],
         maintenance: IndexMaintenance,
     ) -> Result<IndexId> {
+        self.create_index_staged_from(table, def, orders, maintenance, false)
+    }
+
+    /// As [`Self::create_index_staged_ordered_with_maintenance`], for a
+    /// build the catalog drives itself, which marks the index derived-only.
+    pub(crate) fn create_index_staged_derived(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        maintenance: IndexMaintenance,
+    ) -> Result<IndexId> {
+        self.create_index_staged_from(table, def, orders, maintenance, true)
+    }
+
+    fn create_index_staged_from(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        maintenance: IndexMaintenance,
+        derived_only: bool,
+    ) -> Result<IndexId> {
         let index_id = self.insert_index_definition(
             table,
             def,
             maintenance,
             Some("building".to_owned()),
             orders,
+            derived_only,
         )?;
         self.mark_altered(table.get());
 
         Ok(IndexId::new(index_id))
+    }
+
+    /// Records that a writer supplied entries or removals for `index`, after
+    /// which nothing but a verifier pass can vouch for it.
+    fn mark_index_supplied(&mut self, index: IndexId) -> Result<()> {
+        let (_, mut value) = self.live_index(index)?;
+        if value.derived_only == Some(true) {
+            value.derived_only = None;
+            self.state.put_index(value);
+        }
+        Ok(())
     }
 
     /// Advances a staged build by one batch of writer-supplied entries,
@@ -1158,6 +1221,9 @@ impl Transaction {
         batch: &[IndexEntry],
         is_final: bool,
     ) -> Result<IndexState> {
+        if !batch.is_empty() {
+            self.mark_index_supplied(index)?;
+        }
         self.build_index_step_at(index, batch, is_final, None, None)
     }
 
@@ -1511,6 +1577,7 @@ impl Transaction {
     ) -> Result<()> {
         let mut shapes = HashMap::new();
         for file_entry in index_entries {
+            self.mark_index_supplied(file_entry.index)?;
             let shape = self.cached_index_shape(&mut shapes, table, file_entry.index)?;
             let row_id = row_id_start
                 .checked_add(file_entry.ordinal)
@@ -1647,6 +1714,9 @@ impl Transaction {
             }
         }
 
+        for entry in index_entries {
+            self.mark_index_supplied(entry.index)?;
+        }
         let delete_file_id = self.alloc_file_id();
         self.state.put_delete_file(DeleteFileValue {
             delete_file_id,
@@ -2282,6 +2352,9 @@ impl Transaction {
                 )));
             }
         }
+        for entry in index_entries {
+            self.mark_index_supplied(entry.index)?;
+        }
 
         let tstat = self.live_table_stats(table)?;
         let row_id_start = self.allocate_row_ids(table, &tstat);
@@ -2359,6 +2432,9 @@ impl Transaction {
                     entry.row_id
                 )));
             }
+        }
+        for entry in index_entries {
+            self.mark_index_supplied(entry.index)?;
         }
 
         self.inline_ops.push(InlineStage::Tombstone {
