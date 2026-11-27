@@ -33,7 +33,7 @@ serving potentially stale state.
 
 `ReaderSession::open_incremental_reader` may create a successor from an existing
 fixed reader. Its checkpoint and renewal must be independent, its captured view
-must remain fixed, and sharing replay buffers must retain their memory admission.
+must remain fixed, and shared replay buffers must retain their memory admission.
 Returning `None` declines this optimization and opens a fresh reader after
 retiring an unused cached reader. Errors fail acquisition and leave old scopes
 unchanged. Providers need no new implementation unless they opt in.
