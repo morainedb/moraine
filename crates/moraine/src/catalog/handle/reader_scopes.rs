@@ -1,7 +1,7 @@
 //! Acquires fixed log views or shares native store readers.
 
 use std::{
-    sync::{Arc, Weak},
+    sync::{Arc, OnceLock, Weak},
     time::Duration,
 };
 
@@ -80,7 +80,7 @@ pub(crate) struct ReaderScopes {
     explicit: Option<Arc<CheckpointReader>>,
     /// The attach's counters; every reader opened here reports to them.
     counters: Arc<CacheCounters>,
-    session: Option<Arc<dyn crate::ReaderSession>>,
+    session: OnceLock<Option<Arc<dyn crate::ReaderSession>>>,
     /// How long a scope may share the reader its predecessor opened before
     /// opening a newer one. Zero opens one per scope.
     reuse: Duration,
@@ -97,9 +97,8 @@ impl ReaderScopes {
         counters: Arc<CacheCounters>,
     ) -> Self {
         let explicit = explicit.map(CheckpointReader::external);
-        let session = reader_session(objects.clone(), &options);
         Self {
-            session,
+            session: OnceLock::new(),
             objects,
             options,
             readers: Mutex::new(Readers::default()),
@@ -212,7 +211,10 @@ impl ReaderScopes {
         if let Some(explicit) = &self.explicit {
             return Ok(explicit.clone());
         }
-        if let Some(session) = &self.session {
+        if let Some(session) = self
+            .session
+            .get_or_init(|| reader_session(self.objects.clone(), &self.options))
+        {
             return Box::pin(self.acquire_logged(session.as_ref())).await;
         }
         let mut readers = self.readers.lock().await;
