@@ -34,6 +34,8 @@ pub enum SubspaceName {
     Name,
     /// Current delete files ordered by target data file.
     DeleteTarget,
+    /// Permanent orphan-deletion reservations.
+    OrphanDeletion,
     /// A segment whose prefix names no subspace this build knows. The raw
     /// prefix is carried verbatim; empty means the unsegmented root tree,
     /// which a store moraine wrote never has.
@@ -60,6 +62,7 @@ impl SubspaceName {
             Self::Changelog => Some(Subspace::Changelog),
             Self::Name => Some(Subspace::Name),
             Self::DeleteTarget => Some(Subspace::DeleteTarget),
+            Self::OrphanDeletion => Some(Subspace::OrphanDeletion),
             Self::Unknown(_) => None,
         }
     }
@@ -78,6 +81,7 @@ impl From<Subspace> for SubspaceName {
             Subspace::Changelog => Self::Changelog,
             Subspace::Name => Self::Name,
             Subspace::DeleteTarget => Self::DeleteTarget,
+            Subspace::OrphanDeletion => Self::OrphanDeletion,
         }
     }
 }
@@ -95,6 +99,7 @@ impl fmt::Display for SubspaceName {
             Self::Changelog => f.write_str("changelog"),
             Self::Name => f.write_str("name"),
             Self::DeleteTarget => f.write_str("delete_target"),
+            Self::OrphanDeletion => f.write_str("orphan_deletion"),
             Self::Unknown(prefix) => {
                 f.write_str("unknown(")?;
                 for byte in prefix {

@@ -40,6 +40,29 @@ MoraineMetadataManager::MoraineMetadataManager(duckdb::DuckLakeTransaction &tran
 	transaction.GetCatalog().SetRetrialsServerSide(true);
 }
 
+duckdb::vector<duckdb::DuckLakeFileForCleanup>
+MoraineMetadataManager::PrepareOrphanDeletion(const duckdb::vector<duckdb::DuckLakeFileForCleanup> &files) {
+	auto &context = *transaction.GetConnection().context;
+	auto &catalog = ResolveMoraineCatalog(context, transaction.GetCatalog().MetadataDatabaseName());
+	std::vector<const char *> paths;
+	std::vector<uint8_t> approved(files.size(), 0);
+	for (const auto &file : files) {
+		paths.push_back(file.path.c_str());
+	}
+	MoraineError error {};
+	if (moraine_plan_orphan_deletion(catalog.Handle(), paths.data(), paths.size(), approved.data(),
+	                                 moraine_shim_is_interrupted, &context, &error) != MORAINE_OK) {
+		ThrowMoraineError(error);
+	}
+	duckdb::vector<duckdb::DuckLakeFileForCleanup> result;
+	for (size_t index = 0; index < files.size(); index++) {
+		if (approved[index]) {
+			result.push_back(files[index]);
+		}
+	}
+	return result;
+}
+
 void MoraineMetadataManager::FlushChangesServerSide(duckdb::DuckLakeTransaction &flush_transaction,
                                                     duckdb::DuckLakeSnapshot transaction_snapshot,
                                                     const duckdb::TransactionChangeInformation &transaction_changes,

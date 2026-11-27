@@ -64,7 +64,9 @@ pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
 pub(crate) const FORMAT_WITH_COMMIT_LOG: u64 = 10;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_DELETE_TARGETS;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_ORPHAN_DELETION;
+/// File publication honors durable orphan-deletion reservations.
+pub(crate) const FORMAT_WITH_ORPHAN_DELETION: u64 = 13;
 /// Current schemas and tables have an atomic exact-name directory.
 pub(crate) const FORMAT_WITH_NAMES: u64 = 11;
 /// Current delete files have an atomic target-data-file directory.
@@ -1518,6 +1520,11 @@ pub(crate) async fn submit_batch(
     staged_bytes: StagedBytes,
     landing: Landing<'_>,
 ) -> Result<Submission> {
+    Box::pin(super::orphan_cleanup::validate_publication(
+        db_tx.handle(),
+        writes,
+    ))
+    .await?;
     let Landing { projections, log } = landing;
     // The probes read the transaction from their own tasks, so it is
     // shared; every one is awaited before staging returns, leaving this

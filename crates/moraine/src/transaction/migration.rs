@@ -17,6 +17,7 @@ use super::session::CommitSession;
 mod delete_targets;
 mod inline_tombstones;
 mod names;
+mod orphan_deletion;
 
 use crate::{
     error::{Error, Result},
@@ -67,6 +68,7 @@ pub(crate) const MIGRATIONS: &[MigrationUnit] = &[
     names::NATIVE,
     names::COMMIT_LOG,
     delete_targets::MIGRATION,
+    orphan_deletion::MIGRATION,
 ];
 
 /// What one raise call did.

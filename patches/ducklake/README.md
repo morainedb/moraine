@@ -168,3 +168,9 @@ deletion, or maintenance changes; other commits retain SQL ordering. Pending
 statistics flush after successful SQL execution and clear on rollback. Empty SQL
 batches still run the pending writes and commit the metadata transaction.
 Default hooks retain DuckLake's SQL behavior for other metadata backends.
+
+`0013-feat-authorize-orphan-deletion-before-removing-files.patch` adds an
+optional metadata-manager hook immediately before orphan deletion. Moraine
+commits deletion reservations against a fresh catalog view and returns the
+approved subset. The function deletes and reports only that subset. Dry runs
+create no reservations; other metadata backends retain their existing policy.

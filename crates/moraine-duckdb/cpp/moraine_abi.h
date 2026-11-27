@@ -2272,6 +2272,22 @@ int32_t moraine_sweep_row_summaries(struct MoraineCatalogHandle *handle,
                                     void *probe_ctx,
                                     struct MoraineError *err);
 
+// Reserves unreferenced paths durably and writes one approval byte per input.
+// Physical deletion is permitted only for nonzero approvals after success.
+//
+// # Safety
+// `handle` must be a live writable catalog. `paths` must contain `len` valid
+// UTF-8 C strings and `approved` must hold `len` writable bytes. Both arrays
+// may be null only when `len` is zero. Probe and error pointers follow the
+// standard ABI contract.
+int32_t moraine_plan_orphan_deletion(struct MoraineCatalogHandle *handle,
+                                     const char *const *paths,
+                                     size_t len,
+                                     uint8_t *approved,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
+
 // Resolves index hits in committed files to exact positions for deletion.
 // The handle must pin the scan's catalog revision. Free the returned files
 // with [`moraine_locate_row_positions_free_files`].

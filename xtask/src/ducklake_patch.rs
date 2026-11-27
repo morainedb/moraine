@@ -27,12 +27,13 @@ const DUCKLAKE_FETCH_DEPTH: &str = "50";
 const SHALLOW: &str = "1";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-pub(crate) const PATCH_PATHS: [&str; 5] = [
+pub(crate) const PATCH_PATHS: [&str; 6] = [
     "patches/ducklake/0003-feat-share-the-DuckLake-inlined-table-cache.patch",
     "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
     "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
     "patches/ducklake/0011-perf-stage-snapshots-and-defer-inline-appends.patch",
     "patches/ducklake/0012-perf-scope-and-stage-append-statistics.patch",
+    "patches/ducklake/0013-feat-authorize-orphan-deletion-before-removing-files.patch",
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 

@@ -118,7 +118,10 @@ async fn legacy_targets_scan_and_migration_resumes_between_batches() {
     .await
     .unwrap();
     assert!(report.resumed);
-    assert_eq!((report.from_format, report.to_format), (11, 12));
+    assert_eq!(
+        (report.from_format, report.to_format),
+        (11, crate::transaction::commit::MAX_FORMAT_VERSION)
+    );
     let reader = Catalog::open_read_only(store.clone(), CatalogOptions::default())
         .await
         .unwrap();
@@ -130,7 +133,7 @@ async fn legacy_targets_scan_and_migration_resumes_between_batches() {
             .unwrap()
             .unwrap()
             .format_version,
-        12,
+        crate::transaction::commit::MAX_FORMAT_VERSION,
         "read-only scopes must acquire the migrated version without reopening a writer"
     );
     read.finish();

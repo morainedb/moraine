@@ -121,7 +121,8 @@ async fn old_formats_migrate_to_versioned_inline_tombstones() {
             [
                 "version-inline-tombstones",
                 "index-current-names",
-                "index-delete-file-targets"
+                "index-delete-file-targets",
+                "enable-orphan-deletion-reservations"
             ]
         );
         assert_rewritten(&store, 3).await;
