@@ -64,7 +64,9 @@ pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
 pub(crate) const FORMAT_WITH_COMMIT_LOG: u64 = 10;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_DELETE_TARGETS;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_ORPHAN_DELETION;
+/// File publication honors durable orphan-deletion reservations.
+pub(crate) const FORMAT_WITH_ORPHAN_DELETION: u64 = 13;
 /// Current schemas and tables have an atomic exact-name directory.
 pub(crate) const FORMAT_WITH_NAMES: u64 = 11;
 /// Current delete files have an atomic target-data-file directory.
@@ -1186,6 +1188,7 @@ where
             head_before: staged.head_before,
         }),
         Outcome::Abandoned => Ok(CommitOutcome::Abandoned),
+        Outcome::Rejected(reason) => Err(Error::Constraint(reason)),
         Outcome::Unknown(reason) => Err(Error::CommitOutcomeUnknown(reason)),
         Outcome::Fenced(reason) => Err(Error::Fenced(reason)),
     }
@@ -1473,6 +1476,8 @@ pub(crate) enum Submission {
     Submitted(Submitted),
     /// A concurrent commit advanced the head first; nothing was written.
     LostRace,
+    /// Validation refused the batch before any write was submitted.
+    Rejected(String),
 }
 
 /// Discards everything staged on the transaction. Rolling back is dropping
@@ -1518,6 +1523,16 @@ pub(crate) async fn submit_batch(
     staged_bytes: StagedBytes,
     landing: Landing<'_>,
 ) -> Result<Submission> {
+    let validation = Box::pin(super::orphan_cleanup::validate_publication(
+        db_tx.handle(),
+        writes,
+    ))
+    .await;
+    if let Err(Error::Constraint(reason)) = validation {
+        rollback(db_tx);
+        return Ok(Submission::Rejected(reason));
+    }
+    validation?;
     let Landing { projections, log } = landing;
     // The probes read the transaction from their own tasks, so it is
     // shared; every one is awaited before staging returns, leaving this
@@ -1686,6 +1701,7 @@ pub(crate) async fn commit_batch(
     durability: &CommitDurability,
 ) -> Result<Landed> {
     match submit_batch(db_tx, heads, writes, staged_bytes, landing).await? {
+        Submission::Rejected(reason) => Err(Error::Constraint(reason)),
         Submission::LostRace => Ok(Landed::LostRace),
         Submission::Submitted(submitted) => {
             await_submitted(submitted, landing.projections, durability, 1).await

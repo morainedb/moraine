@@ -196,7 +196,10 @@ async fn delete_target_migration_resumes_through_log_slots() {
     .await
     .unwrap();
     assert!(report.resumed);
-    assert_eq!((report.from_format, report.to_format), (11, 12));
+    assert_eq!(
+        (report.from_format, report.to_format),
+        (11, crate::transaction::commit::MAX_FORMAT_VERSION)
+    );
     let reader = Catalog::open_read_only(objects.clone(), options.clone())
         .await
         .unwrap();
@@ -208,7 +211,7 @@ async fn delete_target_migration_resumes_through_log_slots() {
             .unwrap()
             .unwrap()
             .format_version,
-        12
+        crate::transaction::commit::MAX_FORMAT_VERSION
     );
     read.finish();
     drop(scope);

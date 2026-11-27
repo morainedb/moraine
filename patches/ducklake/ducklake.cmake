@@ -53,6 +53,7 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch
             ${CMAKE_CURRENT_LIST_DIR}/0011-perf-stage-snapshots-and-defer-inline-appends.patch
             ${CMAKE_CURRENT_LIST_DIR}/0012-perf-scope-and-stage-append-statistics.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0013-feat-authorize-orphan-deletion-before-removing-files.patch
     )
     FetchContent_GetProperties(moraine_patched_ducklake)
     if(NOT moraine_patched_ducklake_POPULATED)

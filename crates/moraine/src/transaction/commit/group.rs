@@ -40,6 +40,8 @@ pub(crate) enum Outcome {
     LostRace,
     /// Abandoned before submission; every member may re-attempt.
     Abandoned,
+    /// Refused before submission. No member was committed.
+    Rejected(String),
     /// Submitted, but durability was not acknowledged. Never re-attempt.
     Unknown(String),
     /// The writer lost its epoch and cannot submit further work.
@@ -707,6 +709,7 @@ impl Coalescer {
                 }
             }
             Ok(Ok(Submission::LostRace)) => Outcome::LostRace,
+            Ok(Ok(Submission::Rejected(reason))) => Outcome::Rejected(reason),
             Ok(Err(Error::Fenced(reason))) => Outcome::Fenced(reason),
             Ok(Err(err)) => {
                 tracing::warn!(error = %err, "commit batch outcome is unknown; its members must not retry");

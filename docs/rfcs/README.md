@@ -57,6 +57,8 @@ Rust embedders.
 
 - [Extension surface](0006-extension-surface.md) — the DuckDB extension:
   attach, options, functions, relocating a copied lake, the C ABI, runtime
+- [Safe orphan cleanup](0013-safe-orphan-cleanup.md) — durable deletion
+  reservations ordered against file publication
 - [Maintenance](0010-maintenance.md) — expiry and compaction translation,
   the scheduled pass, sweeps
 

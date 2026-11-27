@@ -1752,6 +1752,7 @@ impl Catalog {
             let submitted =
                 commit::submit_batch(Arc::new(session), heads, &batch, staged, landing).await?;
             match submitted {
+                commit::Submission::Rejected(reason) => return Err(Error::Constraint(reason)),
                 commit::Submission::LostRace => {}
                 commit::Submission::Submitted(submitted) if await_durable => {
                     commit::await_submitted(

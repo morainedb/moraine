@@ -77,6 +77,11 @@ pub(crate) enum Key {
         /// Referenced current delete-file record.
         delete_file_id: u64,
     },
+    /// Permanent deletion reservations; the empty path marks their presence.
+    OrphanDeletion {
+        /// Canonical object path, or empty for the presence marker.
+        path: String,
+    },
 }
 
 /// An equality-index entry key. The unique kind keys on the value alone,
@@ -557,12 +562,14 @@ pub(crate) enum Subspace {
     Name,
     /// Current delete files ordered by target.
     DeleteTarget,
+    /// Permanent orphan-deletion reservations.
+    OrphanDeletion,
 }
 
 impl Subspace {
     /// Every subspace, in discriminant order. A census walks this, so a
     /// subspace added to [`Key`] and left out here goes unreported.
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::System,
         Self::Snapshot,
         Self::Current,
@@ -573,6 +580,7 @@ impl Subspace {
         Self::Changelog,
         Self::Name,
         Self::DeleteTarget,
+        Self::OrphanDeletion,
     ];
 
     /// The subspace whose keys carry exactly `prefix`, or `None` for a
@@ -607,6 +615,9 @@ impl Subspace {
                 table_id: 0,
                 data_file_id: 0,
                 delete_file_id: 0,
+            },
+            Self::OrphanDeletion => Key::OrphanDeletion {
+                path: String::new(),
             },
             Self::Name => Key::Name(NameKey {
                 kind: NameKind::Schema,

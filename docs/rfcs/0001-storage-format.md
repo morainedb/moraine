@@ -31,6 +31,7 @@ convention and opaque to SlateDB.
 | `changelog` | The `current` keys each recent commit wrote | Sliding window of 64 commits |
 | `name` | Exact names of current schemas and tables | Atomic with their entities |
 | `delete_target` | Current delete files by target data file | Atomic with their delete records |
+| `orphan_deletion` | Paths durably reserved for deletion | Permanent publication fence |
 
 The `Key` enum in `crates/moraine/src/store/key.rs` declares the subspaces in
 this order, and `SubspaceName` reports them in the census and compaction
@@ -134,6 +135,7 @@ It has no lifecycle and no `history` mirror.
 | `index` | `Unique { index_id, key }` or `Multi { index_id, key, row_id }` | Equality-index entries. A unique entry's value is the holding row id. A multi entry's value is empty |
 | `name` | `kind, parent, name, entity_id` | Empty value. `kind` 0 is a schema with `parent` 0. `kind` 1 is a table with `parent` its schema id |
 | `delete_target` | `table_id, data_file_id, delete_file_id` | Empty value. A `(table_id, data_file_id)` prefix lists the current delete files targeting one data file |
+| `orphan_deletion` | `path` | Empty value. Reserves an object identity permanently; the empty path marks that reservations exist |
 
 The `name` and `delete_target` subspaces are directories over `current`. The
 commit that changes a current schema, table, or delete file deletes the old
@@ -211,7 +213,8 @@ in `crates/moraine/src/transaction/commit.rs`. A fresh store is stamped at
 | 9 | Inline tombstones keyed per deletion snapshot, a rewrite. The floor |
 | <!-- site:omit -->10 | Commit-log catalogs, whose commits are slot objects in a bucket-resident log  <!-- /site:omit -->|
 | 11 | The `name` directory |
-| 12 | The `delete_target` directory. The newest |
+| 12 | The `delete_target` directory |
+| 13 | Durable orphan-deletion reservations. The newest |
 
 Formats 1 through 8 are below the floor.<!-- site:omit --> Format 10 marks a
 commit-log catalog. From 11, a nonempty `commit_log_batch_origin` in

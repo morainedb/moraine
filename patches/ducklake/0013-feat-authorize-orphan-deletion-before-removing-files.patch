@@ -1,0 +1,94 @@
+--- a/src/include/storage/ducklake_metadata_manager.hpp
++++ b/src/include/storage/ducklake_metadata_manager.hpp
+@@ -413,6 +413,11 @@
+ 	virtual vector<DuckLakeFileForCleanup> GetOldFilesForCleanup(const string &filter);
+ 	virtual vector<DuckLakeFileForCleanup> GetOrphanFilesForCleanup(const string &filter);
+ 	virtual vector<DuckLakeFileForCleanup> GetFilesForCleanup(const string &filter, CleanupType type);
++
++	//! Durably authorize orphan deletion; other backends retain their existing policy.
++	virtual vector<DuckLakeFileForCleanup> PrepareOrphanDeletion(const vector<DuckLakeFileForCleanup> &files) {
++		return files;
++	}
+ 
+ 	virtual void RemoveFilesScheduledForCleanup(const vector<DuckLakeFileForCleanup> &cleaned_up_files);
+ 	static string DropSchemas(const set<SchemaIndex> &ids);
+
+--- a/src/functions/ducklake_cleanup_files.cpp
++++ b/src/functions/ducklake_cleanup_files.cpp
+@@ -113,30 +113,44 @@
+ 	return CleanupBind(context, input, return_types, names, CleanupType::ORPHANED_FILES);
+ }
+ 
++struct CleanupState : public GlobalTableFunctionState {
++	bool executed = false;
++	idx_t offset = 0;
++	vector<vector<Value>> rows;
++
++	static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &) {
++		return make_uniq<CleanupState>();
++	}
++};
++
+ void DuckLakeCleanupExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+ 	auto &data = data_p.bind_data->Cast<CleanupBindData>();
+-	auto &state = data_p.global_state->Cast<DuckLakeRunOnceState>();
+-	if (state.offset >= data.files.size()) {
+-		return;
+-	}
+-	if (!state.executed && !data.dry_run) {
+-		// delete the files
+-		auto &fs = FileSystem::GetFileSystem(context);
+-		vector<string> paths;
+-		paths.reserve(data.files.size());
+-		for (const auto &file : data.files) {
+-			paths.push_back(file.path);
+-		}
+-		fs.RemoveFiles(paths);
+-		if (data.type == CleanupType::OLD_FILES) {
+-			// If we are removing old files, we need to remove them from the catalog
++	auto &state = data_p.global_state->Cast<CleanupState>();
++	if (!state.executed) {
++		auto files = data.files;
++		if (!data.dry_run && !files.empty()) {
+ 			auto &transaction = DuckLakeTransaction::Get(context, data.catalog);
+ 			auto &metadata_manager = transaction.GetMetadataManager();
+-			metadata_manager.RemoveFilesScheduledForCleanup(data.files);
++			if (data.type == CleanupType::ORPHANED_FILES) {
++				files = metadata_manager.PrepareOrphanDeletion(files);
++			}
++			vector<string> paths;
++			for (const auto &file : files) {
++				paths.push_back(file.path);
++			}
++			if (!paths.empty()) {
++				FileSystem::GetFileSystem(context).RemoveFiles(paths);
++			}
++			if (data.type == CleanupType::OLD_FILES) {
++				metadata_manager.RemoveFilesScheduledForCleanup(files);
++			}
++		}
++		for (const auto &file : files) {
++			state.rows.push_back({Value(file.path)});
+ 		}
+ 		state.executed = true;
+ 	}
+-	DuckLakeBaseMetadataFunction::ScanRows(data.rows, state.offset, output);
++	DuckLakeBaseMetadataFunction::ScanRows(state.rows, state.offset, output);
+ }
+ 
+ static FunctionSignature CleanupSignature() {
+@@ -151,12 +165,12 @@
+ 
+ DuckLakeCleanupOldFilesFunction::DuckLakeCleanupOldFilesFunction()
+     : TableFunction("ducklake_cleanup_old_files", CleanupSignature(), DuckLakeCleanupExecute,
+-                    DuckLakeCleanupOldFilesBind, DuckLakeRunOnceState::Init) {
++                    DuckLakeCleanupOldFilesBind, CleanupState::Init) {
+ }
+ 
+ DuckLakeCleanupOrphanedFilesFunction::DuckLakeCleanupOrphanedFilesFunction()
+     : TableFunction("ducklake_delete_orphaned_files", CleanupSignature(), DuckLakeCleanupExecute,
+-                    DuckLakeCleanupOrphanedFilesBind, DuckLakeRunOnceState::Init) {
++                    DuckLakeCleanupOrphanedFilesBind, CleanupState::Init) {
+ }
+ 
+ } // namespace duckdb

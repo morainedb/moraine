@@ -95,6 +95,9 @@ public:
 	                    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_inlined_data_tables_result,
 	                    duckdb::vector<duckdb::unique_ptr<duckdb::SQLStatement>> &inlined_inserts) override;
 
+	duckdb::vector<duckdb::DuckLakeFileForCleanup>
+	PrepareOrphanDeletion(const duckdb::vector<duckdb::DuckLakeFileForCleanup> &files) override;
+
 	duckdb::string DataFilePath(const duckdb::DuckLakeTableEntry &table, const duckdb::DuckLakePath &path);
 
 private:

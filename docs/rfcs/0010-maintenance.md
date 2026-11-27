@@ -20,8 +20,9 @@ surviving snapshot id falls in `[begin_snapshot, end_snapshot)`. The selected
 set is arbitrary, since `versions` names interior snapshots directly.
 `ducklake_cleanup_old_files` reads the deletion schedule, removes the files
 through DuckDB's filesystem, then deletes the schedule rows.
-`ducklake_delete_orphaned_files` lists the data prefix and deletes unreferenced
-files without touching the catalog. The cascade is specified by
+`ducklake_delete_orphaned_files` lists the data prefix, commits reservations
+for unreferenced paths, then deletes the approved files. The cascade is
+specified by
 [DuckLake's metadata manager](https://github.com/duckdb/ducklake/blob/main/src/metadata_manager/ducklake_metadata_manager.cpp).
 
 DuckLake determines which records and files to delete and validates the
@@ -459,3 +460,16 @@ checked again when a root DuckLake recorded is adopted after attach.
   every attached lake's handle and lake name and outlive any of them. One
   thread per read-write attach ties the pass to the handle it mutates and
   stops with it.
+
+## Safe orphan deletion
+
+Before physically deleting orphan candidates, the metadata manager asks core
+to commit deletion reservations against a fresh read view. It deletes only
+the approved subset. File publication checks the same reservations before
+committing, including when retrying a prepared transaction. See
+[Safe orphan cleanup](0013-safe-orphan-cleanup.md) for the ordering, path
+identity, format upgrade, and permanent-reservation contract.
+
+Age filters and dry runs retain their existing behavior. A dry run is
+advisory and writes nothing. Retention for files already scheduled for
+deletion remains separate and continues to protect open readers by age.
