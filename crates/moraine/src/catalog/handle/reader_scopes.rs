@@ -229,7 +229,7 @@ impl ReaderScopes {
     ) -> Result<Arc<CheckpointReader>> {
         let mut readers = self.readers.lock().await;
         if let Some(latest) = &readers.latest {
-            let reader = latest.reader()?;
+            let reader = latest.reader();
             if reader.status().close_reason.is_none() && session.can_reuse(reader).await? {
                 return Ok(latest.clone());
             }
@@ -249,7 +249,7 @@ impl ReaderScopes {
         // Distinct fixed views are bounded by the replay-memory budget.
         let (reader, _) = self.builder().open_fixed_reader().await?;
         let reader = CheckpointReader::fixed(reader);
-        if session.can_reuse(reader.reader()?).await? {
+        if session.can_reuse(reader.reader()).await? {
             readers.latest = Some(reader.clone());
         }
         Ok(reader)
