@@ -25,6 +25,18 @@ won one slot, in order.
 
 The catalog configures every SlateDB store and reader. A provider completes
 fixed reader construction so it can capture and protect its log boundary.
+`ReaderSession::can_reuse` optionally confirms that an existing protected reader
+still includes every durable commit, without advancing it. The default is false.
+The catalog serializes scope acquisition and retains the latest reader only;
+old scopes keep their own references. Probe errors fail acquisition rather than
+serving potentially stale state.
+
+`ReaderSession::open_incremental_reader` may create a successor from an existing
+fixed reader. Its checkpoint and renewal must be independent, its captured view
+must remain fixed, and shared replay buffers must retain their memory admission.
+Returning `None` declines this optimization and opens a fresh reader after
+retiring an unused cached reader. Errors fail acquisition and leave old scopes
+unchanged. Providers need no new implementation unless they opt in.
 
 ## Commit store
 

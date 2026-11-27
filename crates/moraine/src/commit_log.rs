@@ -207,6 +207,31 @@ pub trait ReaderSession: Any + Send + Sync + 'static {
         admin: slatedb::admin::Admin,
     ) -> Result<DbReader>;
 
+    /// Opens a successor fixed view, sharing the previous reader's replay data.
+    /// Returns `None` when incremental opening is unsupported. The successor
+    /// must own independent protection and leave the previous view unchanged.
+    ///
+    /// # Errors
+    /// Returns an error when the successor cannot be captured or replayed.
+    async fn open_incremental_reader(
+        &self,
+        _previous: &DbReader,
+        _builder: slatedb::DbReaderBuilder<String>,
+        _options: slatedb::config::DbReaderOptions,
+        _admin: slatedb::admin::Admin,
+    ) -> Result<Option<DbReader>> {
+        Ok(None)
+    }
+
+    /// Whether a protected reader still contains every durable commit.
+    /// Defaults to false. Returning true must not advance the reader's view.
+    ///
+    /// # Errors
+    /// Returns an error when freshness cannot be established.
+    async fn can_reuse(&self, _reader: &DbReader) -> Result<bool> {
+        Ok(false)
+    }
+
     /// The session as the crate that minted it knows it.
     fn as_any(&self) -> &dyn Any;
 }

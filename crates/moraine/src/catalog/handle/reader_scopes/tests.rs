@@ -463,3 +463,26 @@ async fn a_reader_that_cannot_write_a_checkpoint_is_refused_with_guidance() {
     let admin = slatedb::admin::AdminBuilder::new("", objects.clone()).build();
     assert!(admin.list_checkpoints(None).await.unwrap().is_empty());
 }
+
+/// Providers that do not opt into reuse still open distinct protected views.
+#[tokio::test]
+async fn log_view_reuse_is_opt_in() {
+    let objects = Arc::new(InMemory::new());
+    let catalog = Catalog::open(
+        objects,
+        CatalogOptions {
+            commit_log: Some(Arc::new(
+                crate::commit_log::test_log::TestProvider::default(),
+            )),
+            ..CatalogOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let scopes = catalog.reader_scopes.as_ref().unwrap();
+    let first = scopes.acquire().await.unwrap();
+    let second = scopes.acquire().await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    drop((first, second));
+    catalog.close().await.unwrap();
+}
