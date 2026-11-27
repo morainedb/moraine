@@ -86,9 +86,11 @@ slot. An attach caches its latest fixed reader and serializes acquisition. The
 provider may opt into reuse by confirming that the protected view includes every
 durable commit without advancing it. A false result opens a new reader; an error
 fails acquisition. Providers that do not opt in keep opening a reader per scope.
-Old scopes retain their original reader; unused cached readers close before a
-replacement reserves replay memory. Closing the attach drops the cached
-reference.
+Old scopes retain their original reader. A provider can open a successor through
+`open_incremental_reader`, sharing admitted replay buffers while owning a new
+checkpoint and independent renewal. Only the delta needs new admission. If the
+provider declines incremental opening, an unused cached reader closes before
+fresh replay reserves memory. Closing the attach drops the cached reference.
 The interval-based reader-sharing rules below apply to single-writer catalogs.
 <!-- /site:omit -->
 

@@ -131,10 +131,20 @@ impl<'a> StoreBuilder<'a> {
     /// opened on reads through retries, since SlateDB drains some of its
     /// reads outside its own.
     pub(crate) fn new(path: &'a str, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self::from_retrying_stores(path, retry::Store::wrap(object_store), None)
+    }
+
+    /// Uses stores already wrapped for read retries, preserving their identity
+    /// across views.
+    pub(crate) fn from_retrying_stores(
+        path: &'a str,
+        object_store: Arc<dyn ObjectStore>,
+        wal_object_store: Option<Arc<dyn ObjectStore>>,
+    ) -> Self {
         Self {
             path,
-            object_store: retry::Store::wrap(object_store),
-            wal_object_store: None,
+            object_store,
+            wal_object_store,
             writer_session: None,
             reader_session: None,
             counters: None,
@@ -357,6 +367,41 @@ impl<'a> StoreBuilder<'a> {
     }
 
     async fn open_reader_mode(&self, fixed: bool) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
+        let (builder, options, counters) = self.reader_builder(fixed).await?;
+        let reader = if fixed && let Some(session) = &self.reader_session {
+            session
+                .open_fixed_reader(builder, options, self.admin())
+                .await?
+        } else {
+            builder.build().await.map_err(Error::from)?
+        };
+        Ok((reader, counters))
+    }
+
+    /// Opens a successor with independent protection when the provider supports
+    /// it.
+    pub(crate) async fn open_incremental_reader(
+        &self,
+        previous: &DbReader,
+    ) -> Result<Option<(DbReader, Arc<cache::CacheCounters>)>> {
+        let Some(session) = &self.reader_session else {
+            return Ok(None);
+        };
+        let (builder, options, counters) = self.reader_builder(true).await?;
+        let reader = session
+            .open_incremental_reader(previous, builder, options, self.admin())
+            .await?;
+        Ok(reader.map(|reader| (reader, counters)))
+    }
+
+    async fn reader_builder(
+        &self,
+        fixed: bool,
+    ) -> Result<(
+        slatedb::DbReaderBuilder<String>,
+        DbReaderOptions,
+        Arc<cache::CacheCounters>,
+    )> {
         let defaults = DbReaderOptions::default();
         let options = DbReaderOptions {
             manifest_poll_interval: self.poll_interval,
@@ -430,14 +475,7 @@ impl<'a> StoreBuilder<'a> {
         };
         builder = builder.with_wal_reader(Arc::new(admitted));
 
-        let reader = if fixed && let Some(session) = &self.reader_session {
-            session
-                .open_fixed_reader(builder, options, self.admin())
-                .await?
-        } else {
-            builder.build().await.map_err(Error::from)?
-        };
-        Ok((reader, counters))
+        Ok((builder, options, counters))
     }
 
     /// Deletes the checkpoint `checkpoint`, unpinning whatever it held

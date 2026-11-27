@@ -16,6 +16,7 @@ use crate::{
         cache::CacheCounters,
         checkpoint::CheckpointReader,
         open::{READ_WINDOW, StoreBuilder},
+        retry,
     },
 };
 
@@ -75,6 +76,7 @@ fn checkpoint_refused(path: &str, error: &slatedb::Error) -> Error {
 
 pub(crate) struct ReaderScopes {
     objects: Arc<dyn ObjectStore>,
+    wal_objects: Option<Arc<dyn ObjectStore>>,
     options: CatalogOptions,
     readers: Mutex<Readers>,
     explicit: Option<Arc<CheckpointReader>>,
@@ -99,7 +101,11 @@ impl ReaderScopes {
         let explicit = explicit.map(CheckpointReader::external);
         Self {
             session: OnceLock::new(),
-            objects,
+            objects: retry::Store::wrap(objects),
+            wal_objects: options
+                .wal_store
+                .as_ref()
+                .map(|wal| retry::Store::wrap(wal.object_store().clone())),
             options,
             readers: Mutex::new(Readers::default()),
             explicit,
@@ -116,22 +122,20 @@ impl ReaderScopes {
     /// read window: a reader that re-pointed mid-scope would advance state a
     /// transaction had already started reading.
     fn builder(&self) -> StoreBuilder<'_> {
-        let builder = StoreBuilder::new(&self.options.path, self.objects.clone())
-            .counters(self.counters.clone())
-            .poll_interval(READ_WINDOW)
-            .wal_object_store(
-                self.options
-                    .wal_store
-                    .as_ref()
-                    .map(|wal| wal.object_store().clone()),
-            )
-            .cache_dir(self.options.cache_dir.clone())
-            .cache_identity(self.options.cache_identity)
-            .cache_size(self.options.cache_size)
-            .cache_memory(self.options.cache_memory)
-            .cache_auxiliary_percent(self.options.cache_auxiliary_percent)
-            .cache_puts(self.options.cache_puts)
-            .cache_compaction_puts(self.options.cache_compaction_puts);
+        let builder = StoreBuilder::from_retrying_stores(
+            &self.options.path,
+            self.objects.clone(),
+            self.wal_objects.clone(),
+        )
+        .counters(self.counters.clone())
+        .poll_interval(READ_WINDOW)
+        .cache_dir(self.options.cache_dir.clone())
+        .cache_identity(self.options.cache_identity)
+        .cache_size(self.options.cache_size)
+        .cache_memory(self.options.cache_memory)
+        .cache_auxiliary_percent(self.options.cache_auxiliary_percent)
+        .cache_puts(self.options.cache_puts)
+        .cache_compaction_puts(self.options.cache_compaction_puts);
         let session = reader_session(self.objects.clone(), &self.options);
         builder.reader_session(session)
     }
@@ -232,8 +236,19 @@ impl ReaderScopes {
         let mut readers = self.readers.lock().await;
         if let Some(latest) = &readers.latest {
             let reader = latest.reader();
-            if reader.status().close_reason.is_none() && session.can_reuse(reader).await? {
-                return Ok(latest.clone());
+            if reader.status().close_reason.is_none() {
+                if session.can_reuse(reader).await? {
+                    return Ok(latest.clone());
+                }
+                if let Some((successor, _)) =
+                    Box::pin(self.builder().open_incremental_reader(reader)).await?
+                {
+                    let successor = CheckpointReader::fixed(successor);
+                    if session.can_reuse(successor.reader()).await? {
+                        readers.latest = Some(successor.clone());
+                    }
+                    return Ok(successor);
+                }
             }
         }
         // Release an unused replay allocation before reserving its replacement.
