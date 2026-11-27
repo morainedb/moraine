@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/morainedb/moraine/compare/v0.10.0...v0.11.0) - 2026-11-26
+
+### Added
+
+- *(duckdb)* complete an index key from a column every row holds one value in ([#498](https://github.com/morainedb/moraine/pull/498))
+- *(duckdb)* delete by complete key sets without a scan ([#497](https://github.com/morainedb/moraine/pull/497))
+- trust an index whose every entry the catalog derived itself ([#496](https://github.com/morainedb/moraine/pull/496))
+- *(duckdb)* locate UPDATE and DELETE over a transaction's inlined rows ([#495](https://github.com/morainedb/moraine/pull/495))
+
 ## [0.10.0](https://github.com/morainedb/moraine/compare/v0.9.2...v0.10.0) - 2026-11-19
 
 ### Added
