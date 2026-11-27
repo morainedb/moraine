@@ -1509,7 +1509,7 @@ impl Catalog {
         }
         // A logged open takes a writer only if the log needs adoption.
         if let Some(provider) = commit_log_provider(&options) {
-            return Self::open_as_committer(object_store, options, provider).await;
+            return Box::pin(Self::open_as_committer(object_store, options, provider)).await;
         }
         let started = Instant::now();
         let located = Arc::clone(&object_store);
@@ -1522,11 +1522,11 @@ impl Catalog {
             cache,
             format,
             pacer,
-        } = open_writer_store(
+        } = Box::pin(open_writer_store(
             Arc::clone(&object_store),
             &options,
             wal_object_store.clone(),
-        )
+        ))
         .await?;
         // The manifest the open loaded serves the diagnostics.
         warn_if_caches_cannot_hold(
