@@ -207,6 +207,15 @@ pub trait ReaderSession: Any + Send + Sync + 'static {
         admin: slatedb::admin::Admin,
     ) -> Result<DbReader>;
 
+    /// Whether a protected reader still contains every durable commit.
+    /// Defaults to false. Returning true must not advance the reader's view.
+    ///
+    /// # Errors
+    /// Returns an error when freshness cannot be established.
+    async fn can_reuse(&self, _reader: &DbReader) -> Result<bool> {
+        Ok(false)
+    }
+
     /// The session as the crate that minted it knows it.
     fn as_any(&self) -> &dyn Any;
 }

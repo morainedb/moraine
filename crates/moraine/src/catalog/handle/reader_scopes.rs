@@ -80,6 +80,7 @@ pub(crate) struct ReaderScopes {
     explicit: Option<Arc<CheckpointReader>>,
     /// The attach's counters; every reader opened here reports to them.
     counters: Arc<CacheCounters>,
+    session: Option<Arc<dyn crate::ReaderSession>>,
     /// How long a scope may share the reader its predecessor opened before
     /// opening a newer one. Zero opens one per scope.
     reuse: Duration,
@@ -96,7 +97,9 @@ impl ReaderScopes {
         counters: Arc<CacheCounters>,
     ) -> Self {
         let explicit = explicit.map(CheckpointReader::external);
+        let session = reader_session(objects.clone(), &options);
         Self {
+            session,
             objects,
             options,
             readers: Mutex::new(Readers::default()),
@@ -209,16 +212,46 @@ impl ReaderScopes {
         if let Some(explicit) = &self.explicit {
             return Ok(explicit.clone());
         }
-        if self.captures_log() {
-            // Replay bytes are admitted by the process working-memory budget.
-            let (reader, _) = self.builder().open_fixed_reader().await?;
-            return Ok(CheckpointReader::fixed(reader));
+        if let Some(session) = &self.session {
+            return Box::pin(self.acquire_logged(session.as_ref())).await;
         }
         let mut readers = self.readers.lock().await;
         if let Some(reader) = self.reusable(&readers) {
             return Ok(reader);
         }
         let (reader, _) = self.open(&mut readers).await?;
+        Ok(reader)
+    }
+
+    async fn acquire_logged(
+        &self,
+        session: &dyn crate::ReaderSession,
+    ) -> Result<Arc<CheckpointReader>> {
+        let mut readers = self.readers.lock().await;
+        if let Some(latest) = &readers.latest {
+            let reader = latest.reader()?;
+            if reader.status().close_reason.is_none() && session.can_reuse(reader).await? {
+                return Ok(latest.clone());
+            }
+        }
+        // Release an unused replay allocation before reserving its replacement.
+        if readers
+            .latest
+            .as_ref()
+            .is_some_and(|reader| Arc::strong_count(reader) == 1)
+            && let Some(latest) = readers.latest.take()
+        {
+            match Arc::try_unwrap(latest) {
+                Ok(latest) => latest.retire().await,
+                Err(latest) => readers.latest = Some(latest),
+            }
+        }
+        // Distinct fixed views are bounded by the replay-memory budget.
+        let (reader, _) = self.builder().open_fixed_reader().await?;
+        let reader = CheckpointReader::fixed(reader);
+        if session.can_reuse(reader.reader()?).await? {
+            readers.latest = Some(reader.clone());
+        }
         Ok(reader)
     }
 
