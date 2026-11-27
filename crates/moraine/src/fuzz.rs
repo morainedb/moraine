@@ -56,6 +56,10 @@ pub fn decode_record(key_bytes: &[u8], value_bytes: &[u8]) {
         Key::Sys(SysKey::MaintenanceStatus) => {
             let _ = value::decode_value::<proto::MaintenanceStatusValue>(value_bytes);
         }
-        Key::Inline(_) | Key::Index(_) | Key::Name(_) | Key::DeleteTarget { .. } => {}
+        Key::Inline(_)
+        | Key::Index(_)
+        | Key::Name(_)
+        | Key::DeleteTarget { .. }
+        | Key::OrphanDeletion { .. } => {}
     }
 }

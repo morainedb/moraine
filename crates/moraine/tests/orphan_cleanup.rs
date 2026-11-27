@@ -67,6 +67,7 @@ async fn deletion_plan_prevents_publication_and_survives_reopening() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("orphan deletion"), "{error}");
+    assert!(matches!(error, moraine::Error::Constraint(_)), "{error}");
     catalog.close().await.unwrap();
     let reopened = Catalog::open(objects, CatalogOptions::default())
         .await
